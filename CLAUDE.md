@@ -41,7 +41,7 @@ You MUST verify your changes before considering them done:
    `test_delegations_real.py` need `claude`; `test_backend_codex_real.py` +
    `test_codex_login_real.py` need `codex`; `test_agent_memory_real.py` +
    the claude→codex case in `test_delegations_real.py` need **both** —
-   run with the nvm bin prepended, see Conventions)
+   run with both binaries resolvable on PATH, see Conventions)
 2. **Frontend unit tests**: `cd web && bun run test` (84 tests)
 3. **TypeScript check**: `cd web && npx tsc --noEmit`
 4. **E2E tests**: `cd web && bun run test:e2e` (67 tests, ~3.5 min, Playwright
@@ -120,5 +120,4 @@ cd web && npx playwright test --reporter=list  # verbose output
 - Backend uses Python 3.12+, type hints, async/await
 - Frontend uses React 19, TypeScript strict mode, zustand for state
 - Use `useSessionStore.getState()` (not hook selectors) inside callbacks/effects that mutate store to avoid re-render loops
-- The SDK message parser is patched locally (`.venv/lib/.../message_parser.py`) to handle unknown message types — if you reinstall deps, the patch must be reapplied
-- The JS toolchain (`bun`, `node`, `npm`, `npx`) and `codex` live under `~/.nvm/versions/node/*/bin`, **not** on the default PATH. Prepend that bin dir for any frontend/codex command (`export PATH="$HOME/.nvm/versions/node/<ver>/bin:$PATH"`). It's also required for the 4 `test_backend_codex_real.py` tests to resolve `codex` (otherwise they error rather than skip)
+- The JS toolchain (`bun`, `node`, `npm`, `npx`) and `codex` install locations vary by machine (nvm under `~/.nvm/versions/node/*/bin`, or homebrew under `/opt/homebrew/bin` which is already on the default PATH). Confirm with `which bun` / `which codex`; only if a tool is missing from PATH do you need to manually prepend its bin dir (e.g. `export PATH="$HOME/.nvm/versions/node/<ver>/bin:$PATH"`). The real-CLI tests (`test_backend_codex_real.py` etc.) need `codex` resolvable the same way (otherwise they error rather than skip)
