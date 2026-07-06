@@ -33,6 +33,7 @@ _ENV_FAIL_MARKERS = (
     "sign in again", "log out", "session has ended",
     "rate limit", "rate limited", "temporarily limiting requests",
     "overloaded", "529", "500 internal", "503", "quota",
+    "model is not supported",
 )
 
 

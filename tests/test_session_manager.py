@@ -73,7 +73,7 @@ async def test_resolve_working_dir_is_absolute_and_cwd_independent(monkeypatch):
 
     # Relative input resolves against the current cwd at call time.
     monkeypatch.chdir("/tmp")
-    assert resolve_working_dir("proj") == str(Path("/tmp/proj"))
+    assert resolve_working_dir("proj") == os.path.abspath("proj")
     assert os.path.isabs(resolve_working_dir("."))
 
 

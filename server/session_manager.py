@@ -78,7 +78,7 @@ def resolve_working_dir(working_dir: str | None) -> str:
     (the natural meaning of a path the caller typed), then frozen.
     """
     raw = working_dir or settings.default_working_dir
-    return str(Path(raw).expanduser().resolve())
+    return os.path.abspath(os.path.expanduser(raw))
 
 
 def _session_fork_kwargs(row: dict[str, Any]) -> dict[str, Any]:
