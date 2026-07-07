@@ -60,10 +60,10 @@ def test_claude_sets_memory_override_not_config_dir(monkeypatch):
 
 def test_claude_no_memory_env_without_agent(monkeypatch):
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-    # The suite may itself run inside a Claude Code session that carries the
-    # override (e.g. an Octopus agent working on this repo) — the assertion
-    # targets what the harness *adds*, not what the caller's env inherits.
-    monkeypatch.delenv("CLAUDE_COWORK_MEMORY_PATH_OVERRIDE", raising=False)
+    # Simulate the server itself running inside a Claude Code session that
+    # carries the override (e.g. an Octopus agent working on this repo): a
+    # run without agent memory must strip it, not pass it through.
+    monkeypatch.setenv("CLAUDE_COWORK_MEMORY_PATH_OVERRIDE", "/inherited/memory")
     run = get_harness("claude-code").create_run(RunConfig(session_id="s1"))
     argv, kwargs = run.build_argv("hi", "/tmp", None)
     assert "CLAUDE_COWORK_MEMORY_PATH_OVERRIDE" not in kwargs["env"]

@@ -240,6 +240,11 @@ def build_turn_argv(ctx: TurnContext) -> tuple[list[str], dict[str, Any]]:
     # host config dir untouched.
     if ctx.memory_dir:
         env["CLAUDE_COWORK_MEMORY_PATH_OVERRIDE"] = ctx.memory_dir
+    else:
+        # No agent memory for this run: strip any override inherited from the
+        # parent process (e.g. Octopus itself launched from inside a Claude
+        # Code session), or the child would write its memories there.
+        env.pop("CLAUDE_COWORK_MEMORY_PATH_OVERRIDE", None)
     return argv, {"cwd": ctx.working_dir, "env": env}
 
 
