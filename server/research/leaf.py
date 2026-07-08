@@ -21,7 +21,13 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-from ..harness import HarnessCredential, HarnessOneshotError, OneShotContext, RunConfig
+from ..harness import (
+    HarnessCredential,
+    HarnessOneshotError,
+    OneShotContext,
+    RunConfig,
+    TokenUsage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,10 +42,14 @@ _LEAF_SYSTEM = (
 @dataclass
 class LeafResult:
     """One leaf's outcome. `text` is the model's final reply (empty on error);
-    `cost` is USD when the backend reports it; `error` is set on any failure."""
+    `cost` is USD when the backend reports it; `usage` is the normalized token
+    consumption when the backend reports it (WEB leaves only — reasoning
+    leaves go through `run_oneshot`, which returns text alone, the same
+    boundary as `cost`); `error` is set on any failure."""
 
     text: str
     cost: float | None = None
+    usage: TokenUsage | None = None
     error: str | None = None
 
 
@@ -70,18 +80,21 @@ async def run_web_leaf(
     run = harness.create_run(config)
     parts: list[str] = []
     cost = 0.0
+    usage: TokenUsage | None = None
     error: str | None = None
     try:
         await run.start(prompt, working_dir, None, credential=credential)
 
         async def _consume() -> None:
-            nonlocal cost, error
+            nonlocal cost, usage, error
             async for ev in run.stream():
                 if ev.type == "text" and ev.content:
                     parts.append(ev.content)
                 elif ev.type == "result":
                     if ev.cost:
                         cost += ev.cost
+                    if ev.usage is not None:
+                        usage = merge_usage(usage, ev.usage)
                     if ev.is_error:
                         error = error or (ev.content or "web leaf failed")
                 elif ev.type == "error" and ev.is_error:
@@ -100,7 +113,31 @@ async def run_web_leaf(
             await run.stop()
         except Exception:
             logger.exception("web research leaf stop() failed")
-    return LeafResult(text="".join(parts).strip(), cost=cost or None, error=error)
+    return LeafResult(
+        text="".join(parts).strip(), cost=cost or None, usage=usage, error=error
+    )
+
+
+def merge_usage(acc: TokenUsage | None, ev_usage: TokenUsage | None) -> TokenUsage | None:
+    """Merge a usage reading into the accumulator; None readings pass the
+    accumulator through unchanged. Also used by the orchestrator to sum
+    per-leaf usages into the job total (usage-tracking.md §4)."""
+    if ev_usage is None:
+        return acc
+    if acc is None:
+        return TokenUsage(
+            input_tokens=ev_usage.input_tokens,
+            cache_read_tokens=ev_usage.cache_read_tokens,
+            cache_creation_tokens=ev_usage.cache_creation_tokens,
+            output_tokens=ev_usage.output_tokens,
+            reasoning_tokens=ev_usage.reasoning_tokens,
+        )
+    acc.input_tokens += ev_usage.input_tokens
+    acc.cache_read_tokens += ev_usage.cache_read_tokens
+    acc.cache_creation_tokens += ev_usage.cache_creation_tokens
+    acc.output_tokens += ev_usage.output_tokens
+    acc.reasoning_tokens += ev_usage.reasoning_tokens
+    return acc
 
 
 async def run_reason_leaf(

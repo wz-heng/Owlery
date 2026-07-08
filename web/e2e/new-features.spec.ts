@@ -1188,7 +1188,7 @@ test.describe("slash-command autocomplete", () => {
     // Bare "/" lists every command.
     await input.fill("/");
     await expect(menu).toBeVisible();
-    await expect(menu.locator(".slash-item")).toHaveCount(5);
+    await expect(menu.locator(".slash-item")).toHaveCount(8);
     await expect(menu).toContainText("/showme");
 
     // A prefix narrows to the single match.
@@ -1397,6 +1397,46 @@ test.describe("/archive command @llm", () => {
     await request.delete(`${API}/sessions/${fresh.id}`, {
       headers: { Authorization: `Bearer ${TOKEN}` },
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Usage manage page (usage-tracking.md §6) — pure UI: the account-menu entry
+// opens the aggregation table over whatever the ledger holds. Seeding rows
+// needs a real turn (no write API by design), so this asserts the dialog
+// chrome + controls against either the empty state or a populated table.
+// ---------------------------------------------------------------------------
+
+test.describe("Usage manage page", () => {
+  test("account menu opens the usage dialog; grouping + window toggles work", async ({
+    page,
+  }) => {
+    await login(page);
+
+    await page.locator(".btn-account").click();
+    await page.locator(".menu-usage").click();
+    await expect(page.locator(".usage-dialog")).toBeVisible();
+
+    // One of the two content states is always present.
+    await expect(
+      page.locator(".usage-table, .usage-empty").first()
+    ).toBeVisible();
+
+    // Group-by + window controls re-query without breaking the dialog.
+    await page.locator(".usage-group-day").click();
+    await expect(
+      page.locator(".usage-table, .usage-empty").first()
+    ).toBeVisible();
+    await page.locator(".usage-window-0").click();
+    await expect(
+      page.locator(".usage-table, .usage-empty").first()
+    ).toBeVisible();
+    // If the ledger has rows (an earlier @llm test ran a turn), the totals
+    // footer must be there; the empty state otherwise.
+    const table = page.locator(".usage-table");
+    if (await table.isVisible()) {
+      await expect(page.locator(".usage-totals")).toBeVisible();
+    }
   });
 });
 

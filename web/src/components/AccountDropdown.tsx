@@ -1,5 +1,6 @@
 import {
   IconArchive,
+  IconChartBar,
   IconCopy,
   IconLogout,
   IconSettings,
@@ -24,11 +25,13 @@ export function AccountDropdown({
   onOpenSettings,
   onOpenAgentSettings,
   onOpenArchivedSessions,
+  onOpenUsage,
 }: {
   onSignOut: () => void;
   onOpenSettings: () => void;
   onOpenAgentSettings: () => void;
   onOpenArchivedSessions: () => void;
+  onOpenUsage: () => void;
 }) {
   // The token IS the "username" for single-user mode. Show it whole so
   // the user can scan it; CSS truncate only kicks in for tokens longer
@@ -98,6 +101,13 @@ export function AccountDropdown({
         >
           <IconArchive size={16} stroke={1.5} className="text-muted-foreground" />
           <span>Archived sessions</span>
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          className="menu-usage gap-2 px-2 py-2 rounded-md"
+          onSelect={onOpenUsage}
+        >
+          <IconChartBar size={16} stroke={1.5} className="text-muted-foreground" />
+          <span>Usage</span>
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem

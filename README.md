@@ -175,10 +175,10 @@ aiosqlite · APScheduler · cryptography (Fernet) · MCP stdio servers
 ## Testing
 
 ```bash
-.venv/bin/pytest tests/ -v        # 903 backend tests (real-CLI tests run when `claude`/`codex` on PATH)
-cd web && bun run test            # 84 frontend unit tests (vitest)
+.venv/bin/pytest tests/ -v        # 921 backend tests (real-CLI tests run when `claude`/`codex` on PATH)
+cd web && bun run test            # 88 frontend unit tests (vitest)
 cd web && npx tsc --noEmit        # TypeScript check
-cd web && bun run test:e2e        # 67 Playwright e2e tests (app · handoff/pull · telegram · agents · connectors · agent-collaboration · real-CLI). Split into `:fast` (35 UI-only, ~16s) and `:llm` (32 real Claude/Codex, ~3min) for dev iteration.
+cd web && bun run test:e2e        # 68 Playwright e2e tests (app · handoff/pull · telegram · agents · connectors · agent-collaboration · real-CLI). Split into `:fast` (36 UI-only, ~16s) and `:llm` (32 real Claude/Codex, ~3min) for dev iteration.
 ```
 
 ### Pre-commit hooks (optional)

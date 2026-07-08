@@ -14,7 +14,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
-from .leaf import LeafResult, run_reason_leaf, run_web_leaf
+from ..harness import TokenUsage
+from .leaf import LeafResult, merge_usage, run_reason_leaf, run_web_leaf
 from .schemas import (
     Finding,
     dedup_and_rank,
@@ -67,6 +68,9 @@ class ResearchReport:
     # scope/synthesis cost is NOT included. Codex reports no USD at all → often
     # None. Treat as a partial lower bound, not a total (Vera review).
     cost: float | None = None
+    # Same boundary, in tokens: the sum of per-WEB-leaf normalized usage
+    # (usage-tracking.md §4). None when no leaf reported any.
+    usage: TokenUsage | None = None
 
 
 async def run_research(
@@ -87,6 +91,7 @@ async def run_research(
     limits = limits or ResearchLimits()
     sem = asyncio.Semaphore(max(1, limits.concurrency))
     cost = 0.0
+    usage_acc: TokenUsage | None = None
 
     if search is None:
         async def search(p: str) -> LeafResult:  # noqa: E306
@@ -113,6 +118,7 @@ async def run_research(
     await _emit("scope", "Decomposing the question into search angles…")
     scope_res = await reason(scope_prompt(question, limits.max_angles))
     cost += scope_res.cost or 0.0
+    usage_acc = merge_usage(usage_acc, scope_res.usage)
     angles = parse_angles(scope_res.text, question=question, max_angles=limits.max_angles)
 
     # 2. Search (parallel web leaves, bounded) ---------------------------------
@@ -124,6 +130,7 @@ async def run_research(
     findings: list[Finding] = []
     for angle, res in zip(angles, search_results):
         cost += res.cost or 0.0
+        usage_acc = merge_usage(usage_acc, res.usage)
         findings.extend(
             parse_findings(res.text, angle=angle, max_findings=limits.max_findings_per_angle)
         )
@@ -136,20 +143,24 @@ async def run_research(
                 claims=len(claims), gathered=len(findings))
     kill_threshold = limits.votes_per_claim // 2 + 1
 
-    async def _verify(f: Finding) -> tuple[bool, float]:
+    async def _verify(f: Finding) -> tuple[bool, float, TokenUsage | None]:
         votes = await asyncio.gather(
             *(_bounded(search(verify_prompt(f.claim, f.url, question)))
               for _ in range(limits.votes_per_claim))
         )
         refutes = sum(1 for v in votes if not v.error and parse_verdict(v.text))
         leaf_cost = sum(v.cost or 0.0 for v in votes)
-        return refutes < kill_threshold, leaf_cost
+        leaf_usage: TokenUsage | None = None
+        for v in votes:
+            leaf_usage = merge_usage(leaf_usage, v.usage)
+        return refutes < kill_threshold, leaf_cost, leaf_usage
 
     survivors: list[Finding] = []
     if claims:
         verdicts = await asyncio.gather(*(_verify(f) for f in claims))
-        for f, (survived, c) in zip(claims, verdicts):
+        for f, (survived, c, u) in zip(claims, verdicts):
             cost += c
+            usage_acc = merge_usage(usage_acc, u)
             if survived:
                 survivors.append(f)
 
@@ -158,6 +169,7 @@ async def run_research(
                 verified=len(survivors))
     synth_res = await reason(synthesize_prompt(question, survivors))
     cost += synth_res.cost or 0.0
+    usage_acc = merge_usage(usage_acc, synth_res.usage)
     report_text = synth_res.text or "(the model produced no report)"
 
     sources = sorted({f.url for f in survivors if f.url})
@@ -171,4 +183,5 @@ async def run_research(
         angles=angles,
         claims_examined=len(claims),
         cost=cost or None,
+        usage=usage_acc,
     )

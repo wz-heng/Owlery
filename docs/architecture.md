@@ -409,6 +409,7 @@ migrations (never re-create or duplicate the schema in docs).
 - **`bg_tasks`** — cross-turn background task state (`status`, `exit_code`,
   captured stdio, timestamps).
 - **`research_jobs`** — native deep-research job state: `question`, `status` (`running`|`completed`|`cancelled`|`failed`|`interrupted`), `phase`, `completed_at`, `injection_status` / `injected_at` / `delivery_error` (delivery tracked separately from completion so a job can be "done but report queued"), `report_path`, and per-phase progress counters. A boot sweep marks any `running` row `interrupted`.
+- **`turn_usage`** — per-turn consumption ledger ([`plans/usage-tracking.md`](plans/usage-tracking.md)): one row per completed turn (`origin='turn'`, error results included) and one per finished deep-research job (`origin='research'`), with `created_at`, denormalized `agent_id`/`backend`/`model`, `cost`, the five normalized token columns + denormalized `total_tokens`, and Claude's `modelUsage` JSON verbatim. `session_id` is a plain ref (no FK) — rows survive session deletion. Aggregated by `GET /api/usage/summary` (group by agent/session/day/backend over a window); surfaced in the account-menu Usage dialog.
 
 ## Memory
 
@@ -531,8 +532,8 @@ octopus pull SESSION_ID [--cwd DIR]            # export a session to local JSONL
 ## Tests
 
 ```bash
-.venv/bin/pytest tests/ -v        # 903 backend (real-CLI tests run when claude/codex on PATH)
-cd web && bun run test            # 84 frontend unit (vitest)
+.venv/bin/pytest tests/ -v        # 921 backend (real-CLI tests run when claude/codex on PATH)
+cd web && bun run test            # 88 frontend unit (vitest)
 cd web && npx tsc --noEmit        # TypeScript check
-cd web && bun run test:e2e        # 67 Playwright e2e (35 fast UI-only + 32 real-CLI @llm)
+cd web && bun run test:e2e        # 68 Playwright e2e (36 fast UI-only + 32 real-CLI @llm)
 ```

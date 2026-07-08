@@ -20,7 +20,7 @@ import logging
 import os
 from typing import Any
 
-from .events import HarnessCredential, HarnessEvent
+from .events import HarnessCredential, HarnessEvent, TokenUsage
 from .harness import Harness
 from .login import LoginMethod
 from .profile import (
@@ -183,6 +183,30 @@ def _mcp_result_text(result: Any) -> str:
     return str(result)
 
 
+def _normalize_usage(usage: Any) -> TokenUsage | None:
+    """Codex `turn.completed.usage` → normalized TokenUsage
+    (usage-tracking.md §2). Confirmed shape: `{input_tokens,
+    cached_input_tokens, output_tokens, reasoning_output_tokens}`, where
+    `input_tokens` INCLUDES the cached portion (the opposite of Claude's
+    convention) — subtract it out, clamped at 0, so the normalized
+    `input_tokens` means fresh input on both backends.
+    `reasoning_output_tokens` is a subset of `output_tokens`."""
+    if not isinstance(usage, dict):
+        return None
+
+    def _n(key: str) -> int:
+        v = usage.get(key)
+        return v if isinstance(v, int) and v > 0 else 0
+
+    cached = _n("cached_input_tokens")
+    return TokenUsage(
+        input_tokens=max(_n("input_tokens") - cached, 0),
+        cache_read_tokens=cached,
+        output_tokens=_n("output_tokens"),
+        reasoning_tokens=_n("reasoning_output_tokens"),
+    )
+
+
 class CodexEventParser(EventParser):
     """Normalize `codex exec --json` into HarnessEvents. Holds the captured
     thread id (the resume id), surfaced early on `session_started`."""
@@ -214,6 +238,7 @@ class CodexEventParser(EventParser):
                         session_id=self._captured_thread_id,
                         cost=None,  # Codex reports tokens, not USD
                         num_turns=1,
+                        usage=_normalize_usage(usage),
                         raw={"usage": usage},
                     )
                 ],
