@@ -532,8 +532,8 @@ octopus pull SESSION_ID [--cwd DIR]            # export a session to local JSONL
 ## Tests
 
 ```bash
-.venv/bin/pytest tests/ -v        # 921 backend (real-CLI tests run when claude/codex on PATH)
-cd web && bun run test            # 88 frontend unit (vitest)
+.venv/bin/pytest tests/ -v        # 922 backend (real-CLI tests run when claude/codex on PATH)
+cd web && bun run test            # 89 frontend unit (vitest)
 cd web && npx tsc --noEmit        # TypeScript check
 cd web && bun run test:e2e        # 68 Playwright e2e (36 fast UI-only + 32 real-CLI @llm)
 ```

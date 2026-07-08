@@ -153,4 +153,44 @@ describe("UsageDialog", () => {
     });
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it("aborts the previous request and drops its stale response on switch", async () => {
+    // First request hangs; we resolve it manually AFTER switching group-by.
+    let resolveFirst!: (r: Response) => void;
+    fetchMock.mockImplementationOnce(
+      (_url: string, init: RequestInit) =>
+        new Promise<Response>((res) => {
+          resolveFirst = res;
+          void init;
+        })
+    );
+    await act(async () => {
+      render(<UsageDialog open onOpenChange={() => {}} />);
+    });
+
+    payload = summary({
+      group_by: "day",
+      rows: [{ ...summary().rows[0], key: "2026-07-01" }],
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText("Day"));
+    });
+    expect(await screen.findByText("2026-07-01")).toBeInTheDocument();
+
+    // Switching aborted the first request's signal…
+    const firstInit = fetchMock.mock.calls[0][1] as RequestInit;
+    expect((firstInit.signal as AbortSignal).aborted).toBe(true);
+
+    // …and its late (agent-shaped) response must not clobber the day table.
+    await act(async () => {
+      resolveFirst(
+        new Response(JSON.stringify(summary()), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        })
+      );
+    });
+    expect(screen.queryByText("🐙 Octo")).not.toBeInTheDocument();
+    expect(screen.getByText("2026-07-01")).toBeInTheDocument();
+  });
 });

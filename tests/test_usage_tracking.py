@@ -258,10 +258,45 @@ async def test_summary_validation(client):
     )
     assert resp.status_code == 422
 
+    for bad in (
+        "not-a-date",
+        "2026-07-01T10:00:00",  # naive datetime: zone would be a guess
+        "2026-07-01 10:00:00",  # space-separated AND naive — still a guess
+    ):
+        resp = await client.get(
+            "/api/usage/summary", params={"since": bad}, headers=HEADERS
+        )
+        assert resp.status_code == 422, bad
+
+
+@pytest.mark.asyncio
+async def test_summary_normalizes_timezone_bounds(client, db):
+    # Row at 10:00 UTC; the same instant expressed as +08:00 must behave
+    # identically to its UTC form (TEXT compare happens post-normalization).
+    await _add(db, created_at="2026-07-01T10:00:00+00:00")
+
     resp = await client.get(
-        "/api/usage/summary", params={"since": "not-a-date"}, headers=HEADERS
+        "/api/usage/summary",
+        params={"since": "2026-07-01T18:00:00+08:00"},  # == 10:00 UTC, inclusive
+        headers=HEADERS,
     )
-    assert resp.status_code == 422
+    assert resp.json()["totals"]["turns"] == 1
+
+    resp = await client.get(
+        "/api/usage/summary",
+        params={"since": "2026-07-01T18:00:01+08:00"},  # one second past the row
+        headers=HEADERS,
+    )
+    assert resp.json()["totals"]["turns"] == 0
+
+    # The frontend's toISOString() "Z" suffix normalizes too ("Z" would
+    # otherwise compare wrongly against "+00:00" rows as raw TEXT).
+    resp = await client.get(
+        "/api/usage/summary",
+        params={"until": "2026-07-01T10:00:00Z"},  # exclusive at the row's instant
+        headers=HEADERS,
+    )
+    assert resp.json()["totals"]["turns"] == 0
 
 
 @pytest.mark.asyncio

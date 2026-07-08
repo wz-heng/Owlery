@@ -8,7 +8,7 @@ outlive them by design).
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, timezone
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -26,18 +26,31 @@ def _get_db() -> Database:
     return _db
 
 
-def _validate_iso(value: str | None, param: str) -> str | None:
-    """Window bounds are compared as TEXT against ISO-8601 UTC created_at;
-    reject anything that isn't itself valid ISO-8601 up front."""
+def _normalize_bound(value: str | None, param: str) -> str | None:
+    """Window bounds are compared as TEXT against `turn_usage.created_at`
+    (UTC `datetime.isoformat()`), so anything reaching the DB must be in
+    that same vocabulary. Two forms are accepted: a plain `YYYY-MM-DD`
+    (a valid day boundary against the fixed layout) and a timezone-aware
+    ISO-8601 datetime, converted to UTC here. Naive datetimes are
+    rejected — guessing their zone would silently shift the window."""
     if value is None:
         return None
     try:
-        datetime.fromisoformat(value)
+        if len(value) == 10:
+            date.fromisoformat(value)
+            return value
+        dt = datetime.fromisoformat(value)
     except ValueError:
         raise HTTPException(
-            status_code=422, detail=f"{param} must be an ISO-8601 date/datetime"
+            status_code=422,
+            detail=f"{param} must be YYYY-MM-DD or an ISO-8601 datetime",
         )
-    return value
+    if dt.tzinfo is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{param} must carry an explicit timezone (or be YYYY-MM-DD)",
+        )
+    return dt.astimezone(timezone.utc).isoformat()
 
 
 @router.get("/summary")
@@ -51,8 +64,8 @@ async def usage_summary(
 ) -> dict:
     return await _get_db().summarize_usage(
         group_by=group_by,
-        since=_validate_iso(since, "since"),
-        until=_validate_iso(until, "until"),
+        since=_normalize_bound(since, "since"),
+        until=_normalize_bound(until, "until"),
         agent_id=agent_id,
         session_id=session_id,
     )

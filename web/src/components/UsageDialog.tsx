@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { useSessionStore } from "../stores/sessionStore";
 import {
   Dialog,
@@ -66,31 +66,39 @@ export function UsageDialog({ open, onOpenChange }: Props) {
   const [data, setData] = useState<UsageSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const fetchSummary = useCallback(async () => {
-    if (!token) return;
+  // Abort the in-flight request whenever the controls change or the dialog
+  // closes — a slow stale response must never land after a fresh one and
+  // mislabel the table. The explicit aborted checks also cover fetch
+  // implementations that resolve (rather than reject) after abort.
+  useEffect(() => {
+    if (!open || !token) return;
+    const ctrl = new AbortController();
     const params = new URLSearchParams({ group_by: groupBy });
     if (windowDays > 0) {
       const since = new Date(Date.now() - windowDays * 86_400_000);
       params.set("since", since.toISOString());
     }
-    try {
-      const res = await fetch(`${API_URL}/api/usage/summary?${params}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (!res.ok) {
-        setError(`Failed to load usage (${res.status})`);
-        return;
+    (async () => {
+      try {
+        const res = await fetch(`${API_URL}/api/usage/summary?${params}`, {
+          headers: { Authorization: `Bearer ${token}` },
+          signal: ctrl.signal,
+        });
+        if (ctrl.signal.aborted) return;
+        if (!res.ok) {
+          setError(`Failed to load usage (${res.status})`);
+          return;
+        }
+        const body = (await res.json()) as UsageSummary;
+        if (ctrl.signal.aborted) return;
+        setError(null);
+        setData(body);
+      } catch {
+        if (!ctrl.signal.aborted) setError("Failed to load usage");
       }
-      setError(null);
-      setData((await res.json()) as UsageSummary);
-    } catch {
-      setError("Failed to load usage");
-    }
-  }, [token, groupBy, windowDays]);
-
-  useEffect(() => {
-    if (open) fetchSummary();
-  }, [open, fetchSummary]);
+    })();
+    return () => ctrl.abort();
+  }, [open, token, groupBy, windowDays]);
 
   const keyLabel = (key: string | null): string => {
     if (key == null) return "(none)";
