@@ -148,13 +148,14 @@ test.describe("Scheduled Tasks UI @llm", () => {
 
     // A confirmation notice renders in chat (not attributed to You/Claude).
     // The /schedule command flows through schedule_ai's parse — even the
-    // rigid fast-path takes a moment under load, and the UI transitions
-    // "📅 Scheduling…" → "📅 Scheduled …" once parsed. Default 5s expect
-    // timeout caught that mid-transition under heavy parallel load; 15s
-    // is comfortably above the observed worst case.
-    await expect(page.locator(".msg-notice")).toContainText("Scheduled", {
-      timeout: 15000,
-    });
+    // rigid fast-path takes a moment under load, and the transient
+    // "📅 Scheduling…" notice can persist in the transcript alongside the
+    // final "📅 Scheduled …" one, so target the confirmation specifically
+    // (a bare .msg-notice locator trips strict mode on the pair). 15s is
+    // comfortably above the worst parse latency observed under load.
+    await expect(
+      page.locator(".msg-notice", { hasText: "Scheduled" }).last()
+    ).toBeVisible({ timeout: 15000 });
 
     // Open the overview and find our schedule (scope by its unique prompt).
     await page.locator(".schedule-header").click();
