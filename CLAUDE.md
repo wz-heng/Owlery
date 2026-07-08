@@ -32,7 +32,11 @@ shortcut. Do the real thing the first time.
 
 ## After Every Code Change
 
-You MUST verify your changes before considering them done:
+Verification is tiered: cheap checks on every change, the full E2E suite
+once per task. Real-LLM tests burn real subscription quota — don't rerun
+them on every iteration.
+
+**On every code change (iteration loop):**
 
 1. **Backend unit tests**: `.venv/bin/pytest tests/ -v` (903 tests; the
    real-CLI tests auto-skip unless their binary is on PATH —
@@ -44,16 +48,26 @@ You MUST verify your changes before considering them done:
    run with both binaries resolvable on PATH, see Conventions)
 2. **Frontend unit tests**: `cd web && bun run test` (84 tests)
 3. **TypeScript check**: `cd web && npx tsc --noEmit`
-4. **E2E tests**: `cd web && bun run test:e2e` (67 tests, ~3.5 min, Playwright
-   auto-starts servers). Split into two buckets for dev iteration —
-   `bun run test:e2e:fast` (35 pure-UI tests, ~16 s — login / sessions /
-   dialogs / sidebar / virtualized chat / attachments / etc.) and
-   `bun run test:e2e:llm` (32 real-LLM tests, ~3 min — chat, /schedule,
-   /showme, /archive, mcp__bg__run, AskUserQuestion, agent-collaboration,
-   notifier, codex sign-in, handoff/pull). Anything that drives a real
-   `claude` / `codex` turn carries `@llm` in its describe title; the
-   `:fast` script uses `--grep-invert @llm`. Telegram bridge tests have
-   their own config and run via `test:e2e:bridge`.
+4. **Fast E2E**: `cd web && bun run test:e2e:fast` (35 pure-UI tests, ~16 s —
+   login / sessions / dialogs / sidebar / virtualized chat / attachments /
+   etc.)
+
+**Once per task, before the final commit / requesting review:**
+
+5. **Full E2E**: `cd web && bun run test:e2e` (67 tests, ~3.5 min, Playwright
+   auto-starts servers). This includes `bun run test:e2e:llm` (32 real-LLM
+   tests, ~3 min — chat, /schedule, /showme, /archive, mcp__bg__run,
+   AskUserQuestion, agent-collaboration, notifier, codex sign-in,
+   handoff/pull), which drives real `claude` / `codex` turns. Run it once
+   when the task's code is final; rerun only if later fixes touch what it
+   covers. Anything that drives a real turn carries `@llm` in its describe
+   title; the `:fast` script uses `--grep-invert @llm`. Telegram bridge
+   tests have their own config and run via `test:e2e:bridge`.
+
+**Keep test output out of your context**: redirect suite output to a file
+(e.g. `.venv/bin/pytest tests/ > /tmp/pytest.log 2>&1`) and read back only
+the summary line and failure sections — never load a full passing run into
+the conversation.
 
 **Zero test failures are acceptable.** All tests must pass before committing. If a test fails, investigate and fix it — do not ignore, skip, or dismiss any failure as "flaky" or "pre-existing".
 
