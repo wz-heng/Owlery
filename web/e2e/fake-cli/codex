@@ -1,0 +1,8 @@
+#!/bin/sh
+# Tripwire `codex` shim for the e2e suite. Placed first on the e2e backend's
+# PATH so `HarnessRun.prepare_spawn` resolves it instead of the real CLI. It
+# execs the real `codex` only from a `.owlery-real-cli`-marked working dir,
+# and otherwise refuses loudly. See fake_codex.py.
+set -e
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "$DIR/../../../.venv/bin/python" "$DIR/fake_codex.py" "$@"

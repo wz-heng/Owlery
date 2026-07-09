@@ -51,6 +51,38 @@ lives in the plan docs it points to.
 - Telegram bridge e2e (own config, already isolated).
 - Any product code changes beyond what the fake-CLI fixture needs.
 
+### A fake `codex` — deferred until it has a consumer
+
+There is a fake `claude` but **no fake `codex`**, and that asymmetry is
+deliberate. Exactly one e2e test drives a codex turn (the codex chat
+smoke, §2), and it is *supposed* to burn quota. A fake codex today
+would be speculative infrastructure with zero consumers.
+
+**The failure mode this leaves open.** On the claude side the fake makes
+routing self-enforcing: an unmarked working dir gets canned output, so a
+test cannot reach the real model by accident. Codex has no such gate, so
+routing there is not controlled by the `.owlery-real-cli` marker at all —
+a codex-backed turn resolves straight to the real binary. Any future
+codex-backed test outside the `@llm` bucket would therefore burn real
+subscription quota on every run, quietly. This is the same class of
+silent misroute that let `agent-collaboration.spec.ts` sit broken: it
+ran against a fake with no `ask_agent` op, and because `@llm` tests are
+excluded from `test:e2e:fast`, nothing surfaced it.
+
+**What guards it in the meantime.** A tripwire `codex` shim
+(`web/e2e/fake-cli/codex`) sits on the same PATH. It execs the real
+binary from a marked dir and otherwise refuses the turn and records the
+breach; `global-teardown` fails the whole run if any breach was
+recorded. That converts "silently burns quota" into a red run. It is a
+tripwire, not a fake — it cannot serve a test that needs a *working*
+canned codex turn.
+
+**Trigger to build the real thing.** The first person who wants a
+codex-backed test that must not burn quota. At that point the fake has
+its second use case, and `fake_claude.py` is the template: same
+directive protocol, same marker passthrough, emitting codex's own event
+schema instead of claude's `stream-json`.
+
 ## 5. Sequencing
 
 After `feat/usage-tracking` merges — both touch `web/e2e/` and

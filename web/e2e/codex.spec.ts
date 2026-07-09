@@ -1,9 +1,22 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { test, expect, type Page } from "@playwright/test";
 
-// Full-stack Codex proof: the backend selector appears when codex is
-// available, a Codex session is created through the UI, and a real codex
-// turn streams back. Auto-skips when codex isn't installed/logged-in on the
-// host running the e2e backend (codex-backend.md §6 / Phase E).
+import { realCliDir } from "./fake-cli";
+
+// SMOKE (1 of 3 quota burners, docs/plans/e2e-slim.md §2). Full-stack Codex
+// proof: the backend selector appears when codex is available, a Codex session
+// is created through the UI, and a real codex turn streams back. Auto-skips
+// when codex isn't installed/logged-in on the host running the e2e backend
+// (codex-backend.md §6 / Phase E).
+//
+// The working dir carries `.owlery-real-cli`. There is no fake `codex` — only
+// a tripwire shim that refuses to spawn the real binary from an unmarked dir
+// — so this marker is what lets the one test that's *meant* to burn quota do
+// so. A private mkdtemp dir, never a shared one: the marker is a directory
+// property and every spec shares this backend.
 
 const TOKEN = "changeme";
 const API = "http://localhost:8765/api";
@@ -20,6 +33,12 @@ const addOctoSession = (page: Page) =>
     .click();
 
 test.describe.configure({ timeout: 120_000 });
+
+let workingDir: string;
+test.beforeAll(() => {
+  workingDir = realCliDir(mkdtempSync(join(tmpdir(), "owlery-real-codex-")));
+});
+test.afterAll(() => rmSync(workingDir, { recursive: true, force: true }));
 
 test.afterAll(async ({ request }) => {
   const res = await request.get(`${API}/sessions`, {
@@ -65,7 +84,7 @@ test("create a Codex session via the UI and get a real response @llm", async ({
     .fill("Codex E2E");
   await page
     .locator('.session-create input[placeholder*="Working directory"]')
-    .fill("/tmp");
+    .fill(workingDir);
   await page.locator("button.btn-create").click();
   await expect(page.locator(".chat-header h3")).toHaveText("Codex E2E");
 

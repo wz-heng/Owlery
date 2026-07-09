@@ -53,6 +53,9 @@ import uuid
 # smoke tests keep burning real quota while sharing one server with the fakes
 # (PATH is per-process, so it can't discriminate). A delegation child inherits
 # its parent's working dir, so a real 2-hop chain needs no model cooperation.
+#
+# Shared with the tripwire `codex` shim (fake_codex.py), which reads the same
+# marker. Never drop it in a shared dir — see `realCliDir` in fake-cli.ts.
 _REAL_CLI_MARKER = ".owlery-real-cli"
 
 # A turn's directive. Embedded in the prompt so a Playwright spec can script

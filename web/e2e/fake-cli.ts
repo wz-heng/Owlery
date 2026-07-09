@@ -42,9 +42,19 @@ export function fake(...ops: FakeOp[]): string {
 }
 
 /**
- * Opt a working dir into the REAL `claude` binary — the fake execs it when it
- * finds this marker in its cwd. Delegation children inherit the parent's
- * working dir, so a real multi-hop chain needs no further marking.
+ * Opt a working dir into the REAL `claude` / `codex` binary — the shim execs
+ * it when it finds this marker in its cwd. Delegation children inherit the
+ * parent's working dir, so a real multi-hop chain needs no further marking.
+ *
+ * The marker is a property of a DIRECTORY, and all specs share one e2e
+ * backend. So pass a private `mkdtemp` dir, never a shared one: a marker
+ * dropped in `/tmp` would silently route every spec whose session sits there
+ * — much of the fast suite — to the real CLIs, burning quota on each run.
+ *
+ * The two directions fail differently. For `claude` an unmarked dir is safe
+ * (canned output). For `codex` there is no fake, only a tripwire shim that
+ * refuses to spawn the real binary from an unmarked dir and makes
+ * `global-teardown` fail the run (docs/plans/e2e-slim.md §4).
  */
 export function realCliDir(dir: string): string {
   writeFileSync(join(dir, ".owlery-real-cli"), "");

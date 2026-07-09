@@ -23,17 +23,34 @@ export const E2E_HOME_DIR = path.join(os.tmpdir(), "owlery-e2e-home");
 // state. Removed in global-teardown.
 export const E2E_FAKE_STATE_DIR = path.join(os.tmpdir(), "owlery-e2e-fake-cli");
 
-// Dir holding the fake `claude` shim, prepended to the backend's PATH so
-// `HarnessRun.prepare_spawn` resolves it instead of the real CLI. The spawn,
-// stream-json and MCP paths all stay real — only the model is canned. A
-// session whose working dir contains `.owlery-real-cli` passes through to the
-// real binary, which is how the `@llm` smoke tests still drive a real model
-// from this same server (PATH is per-process, so it can't discriminate).
+// Where the tripwire `codex` shim records a real-CLI spawn from an UNMARKED
+// working dir; global-teardown fails the run if this file exists. Kept OUTSIDE
+// E2E_FAKE_STATE_DIR on purpose: teardown deletes that tree, so a log written
+// inside it would be destroyed before it could be read — a breach would
+// register as a silent pass. (That false negative bit us while auditing.)
+export const E2E_TRIPWIRE_LOG = path.join(
+  os.tmpdir(),
+  "owlery-e2e-codex-tripwire.log"
+);
+
+// Dir holding the fake `claude` + tripwire `codex` shims, prepended to the
+// backend's PATH so `HarnessRun.prepare_spawn` resolves them instead of the
+// real CLIs. For claude the spawn, stream-json and MCP paths all stay real —
+// only the model is canned. A session whose working dir contains
+// `.owlery-real-cli` passes through to the real binary, which is how the
+// `@llm` smoke tests still drive a real model from this same server (PATH is
+// per-process, so it can't discriminate).
+//
+// The marker is a property of a DIRECTORY, and every spec shares this one
+// backend. So never drop it in a shared dir (`/tmp`, a repo checkout): each
+// `@llm` smoke mints its own `mkdtemp` dir and marks that. A marker on /tmp
+// would silently route much of the fast suite to the real CLIs.
 const FAKE_CLI_DIR = path.join(__dirname, "e2e", "fake-cli");
 
 export default defineConfig({
   testDir: "./e2e",
   testIgnore: ["telegram-bridge.spec.ts"],
+  globalSetup: "./e2e/global-setup.ts",
   globalTeardown: "./e2e/global-teardown.ts",
   timeout: 30_000,
   retries: 0,
@@ -69,6 +86,7 @@ export default defineConfig({
         ].join(path.delimiter),
         OWLERY_AUTH_TOKEN: "changeme",
         OWLERY_FAKE_STATE_DIR: E2E_FAKE_STATE_DIR,
+        OWLERY_FAKE_TRIPWIRE_LOG: E2E_TRIPWIRE_LOG,
         // Tell pydantic-settings the actual uvicorn port (matches the
         // `port: 8765` above and `--port 8765` in the command). The bg
         // MCP server reads settings.port to build OWLERY_API_BASE; the
