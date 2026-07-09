@@ -1,0 +1,7 @@
+#!/bin/sh
+# Fake `claude` binary for the deterministic e2e suite. Placed first on the
+# e2e backend's PATH so `HarnessRun.prepare_spawn` resolves it instead of the
+# real CLI. Runs under the repo venv because fake_claude.py speaks MCP.
+set -e
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "$DIR/../../../.venv/bin/python" "$DIR/fake_claude.py" "$@"

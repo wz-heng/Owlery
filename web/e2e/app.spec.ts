@@ -1,4 +1,10 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { test, expect, type Page } from "@playwright/test";
+
+import { fake, realCliDir } from "./fake-cli";
 
 const TOKEN = "changeme";
 const API = "http://localhost:8765/api/sessions";
@@ -19,6 +25,7 @@ const OWNED_NAMES = new Set([
   "E2E Test Session",
   "To Delete",
   "Chat Test",
+  "Real Chat Test",
 ]);
 
 // Clean up only sessions created by this spec
@@ -121,10 +128,9 @@ test.describe("Session Management", () => {
   });
 });
 
-test.describe("Chat @llm", () => {
-  // Claude SDK initialization can take >60s; the global 30s timeout is too short.
-  test.describe.configure({ timeout: 120_000 });
-
+// Chat against the fake CLI: the real spawn → stream-json → WS → store path,
+// with a canned model reply. Same assertions as when these drove a real turn.
+test.describe("Chat", () => {
   test.beforeEach(async ({ page }) => {
     await page.goto("/");
     await page.locator('input[type="password"]').fill(TOKEN);
@@ -150,7 +156,7 @@ test.describe("Chat @llm", () => {
   test("sends a message and receives response", async ({ page }) => {
     // Type and send a simple message
     const input = page.locator(".chat-input-bar textarea");
-    await input.fill("What is 2+2? Reply with just the number.");
+    await input.fill(`What is 2+2? ${fake({ t: "text", v: "4" })}`);
     await page.locator("button.btn-send").click();
 
     // User message should appear
@@ -176,7 +182,7 @@ test.describe("Chat @llm", () => {
 
   test("send with Enter key", async ({ page }) => {
     const input = page.locator(".chat-input-bar textarea");
-    await input.fill("Say hello");
+    await input.fill(`Say hello ${fake({ t: "text", v: "Hello!" })}`);
     await input.press("Enter");
 
     // User message should appear
@@ -190,7 +196,7 @@ test.describe("Chat @llm", () => {
 
   test("disables input while running", async ({ page }) => {
     const input = page.locator(".chat-input-bar textarea");
-    await input.fill("What is 1+1? Reply with just the number.");
+    await input.fill(`What is 1+1? ${fake({ t: "text", v: "2" })}`);
     await page.locator("button.btn-send").click();
 
     // Input should be disabled while Claude is processing
@@ -200,6 +206,57 @@ test.describe("Chat @llm", () => {
 
     // After completion, input should be enabled again
     await expect(input).toBeEnabled();
+  });
+});
+
+// SMOKE (1 of 3 quota burners, docs/plans/e2e-slim.md §2). The only claude
+// test that drives the real model: proves the UI → WS → server → real CLI
+// wiring end-to-end. Everything above canned the model; this doesn't.
+test.describe("Chat against the real claude CLI @llm", () => {
+  // Claude SDK initialization can take >60s; the global 30s timeout is too short.
+  test.describe.configure({ timeout: 120_000 });
+
+  let workingDir: string;
+  test.beforeAll(() => {
+    workingDir = realCliDir(mkdtempSync(join(tmpdir(), "owlery-real-chat-")));
+  });
+  test.afterAll(() => rmSync(workingDir, { recursive: true, force: true }));
+
+  test("sends a message and receives a real response", async ({ page }) => {
+    await page.goto("/");
+    await page.locator('input[type="password"]').fill(TOKEN);
+    await page.locator("button.btn-login").click();
+    await expect(page.locator(".agent-list-header")).toBeVisible();
+
+    await addOctoSession(page);
+    await page
+      .locator('.session-create input[placeholder="Session name"]')
+      .fill("Real Chat Test");
+    await page
+      .locator('.session-create input[placeholder*="Working directory"]')
+      .fill(workingDir);
+    await page.locator("button.btn-create").click();
+    await expect(page.locator(".chat-header h3")).toHaveText("Real Chat Test");
+
+    await page
+      .locator(".chat-input-bar textarea")
+      .fill("What is 2+2? Reply with just the number.");
+    await page.locator("button.btn-send").click();
+
+    await expect(page.locator(".msg-user .msg-content")).toContainText(
+      "What is 2+2?"
+    );
+    await expect(page.locator(".msg-assistant .msg-content")).toBeVisible({
+      timeout: 60_000,
+    });
+    // A real model actually answered — not just "some text arrived".
+    const assistantText = await page
+      .locator(".msg-assistant .msg-content")
+      .first()
+      .textContent();
+    expect(assistantText).toContain("4");
+
+    await expect(page.locator(".result-badge")).toBeVisible({ timeout: 60_000 });
   });
 });
 

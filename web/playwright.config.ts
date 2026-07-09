@@ -1,7 +1,10 @@
+import { fileURLToPath } from "node:url";
 import os from "node:os";
 import path from "node:path";
 
 import { defineConfig } from "@playwright/test";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Isolate the e2e backend's per-agent state (canonical memory/ + claude-home/)
 // under a temp dir so runs never litter the developer's real
@@ -13,6 +16,20 @@ export const E2E_AGENTS_DIR = path.join(os.tmpdir(), "owlery-e2e-agents");
 // attachments). Kept separate from E2E_AGENTS_DIR so the existing teardown
 // contract for the agents dir is unchanged.
 export const E2E_HOME_DIR = path.join(os.tmpdir(), "owlery-e2e-home");
+
+// Scratch for the fake `claude` (docs/plans/e2e-slim.md): per-session
+// remember/rule state, so a `--resume`d turn reads back what the previous turn
+// stored. That keeps the resume assertion honest — an unresumed turn finds no
+// state. Removed in global-teardown.
+export const E2E_FAKE_STATE_DIR = path.join(os.tmpdir(), "owlery-e2e-fake-cli");
+
+// Dir holding the fake `claude` shim, prepended to the backend's PATH so
+// `HarnessRun.prepare_spawn` resolves it instead of the real CLI. The spawn,
+// stream-json and MCP paths all stay real — only the model is canned. A
+// session whose working dir contains `.owlery-real-cli` passes through to the
+// real binary, which is how the `@llm` smoke tests still drive a real model
+// from this same server (PATH is per-process, so it can't discriminate).
+const FAKE_CLI_DIR = path.join(__dirname, "e2e", "fake-cli");
 
 export default defineConfig({
   testDir: "./e2e",
@@ -40,11 +57,18 @@ export default defineConfig({
       env: {
         ...process.env,
         // The backend spawns the `claude` CLI directly via PATH lookup.
-        // ~/.local/bin is the typical install location and may not be on
-        // a non-interactive shell's PATH. Prepend it so the e2e server
-        // can find the binary without the user having to configure shell.
-        PATH: `${process.env.HOME ?? ""}/.local/bin:${process.env.PATH ?? ""}`,
+        // FAKE_CLI_DIR goes first so it wins that lookup (see above);
+        // ~/.local/bin follows because it's the typical real-CLI install
+        // location and may not be on a non-interactive shell's PATH — the
+        // fake execs the real binary from there for `.owlery-real-cli`
+        // sessions.
+        PATH: [
+          FAKE_CLI_DIR,
+          `${process.env.HOME ?? ""}/.local/bin`,
+          process.env.PATH ?? "",
+        ].join(path.delimiter),
         OWLERY_AUTH_TOKEN: "changeme",
+        OWLERY_FAKE_STATE_DIR: E2E_FAKE_STATE_DIR,
         // Tell pydantic-settings the actual uvicorn port (matches the
         // `port: 8765` above and `--port 8765` in the command). The bg
         // MCP server reads settings.port to build OWLERY_API_BASE; the
