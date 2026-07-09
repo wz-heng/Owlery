@@ -21,6 +21,41 @@ _ENV_PREFIX = "OWLERY_"
 _LEGACY_ENV_PREFIX = "OCTOPUS_"
 
 
+# Each state dir and the leaf it takes under `home_dir` when unset.
+_STATE_DIRS = (
+    ("attachments_dir", "attachments"),
+    ("large_prompts_dir", "large-prompts"),
+    ("codex_home_dir", "codex"),
+    ("agents_dir", "agents"),
+    ("fork_dir", "fork"),
+    ("research_dir", "research"),
+)
+
+
+def _rehome_legacy_dir(value: str, legacy_home: str, home: str) -> str:
+    """Re-point `value` from `legacy_home` to `home` when it sits inside the
+    old tree; otherwise return it untouched.
+
+    Compares on expanded, normalized paths so `~/.octopus/x` and
+    `/home/u/.octopus/x` both match, but preserves the caller's `~`-relative
+    style in the result. A sibling like `~/.octopus-backup` shares a string
+    prefix without being *under* the tree, and must not match.
+    """
+    if not legacy_home or not value:
+        return value
+
+    def norm(p: str) -> str:
+        return os.path.normpath(os.path.expanduser(p))
+
+    old, new, val = norm(legacy_home), norm(home), norm(value)
+    if val != old and not val.startswith(old + os.sep):
+        return value
+    suffix = val[len(old) :]  # "" or "/attachments"
+    # Rebuild on the *unexpanded* new home so a `~`-relative setting stays
+    # `~`-relative — expansion must keep happening at use time.
+    return home.rstrip("/") + suffix if suffix else home
+
+
 class Settings(BaseSettings):
     auth_token: str = "changeme"
     host: str = "0.0.0.0"
@@ -141,21 +176,37 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _derive_state_dirs(self) -> "Settings":
-        """Fill the unset state dirs from `home_dir`. Done here rather than with
-        literal defaults so that overriding `home_dir` alone relocates the whole
-        tree — which is what makes the legacy migration safe to key off a single
-        setting, and what lets tests isolate their state with one env var."""
+        """Fill the unset state dirs from `home_dir`, then re-home any that a
+        legacy config still points into the old tree.
+
+        Deriving here rather than with literal defaults is what lets overriding
+        `home_dir` alone relocate the whole tree — which makes the legacy
+        migration safe to key off a single setting, and lets tests isolate
+        their state with one env var.
+
+        The re-homing exists because the `OCTOPUS_*` fallback is whole-field:
+        a deployment that set `OCTOPUS_ATTACHMENTS_DIR=~/.octopus/attachments`
+        would otherwise keep reading and writing the tree the migration just
+        emptied, forking its state in two (Snape review). A legacy value that
+        points somewhere ELSE entirely (`/mnt/data/attachments`) is deliberate
+        configuration and is left exactly as it is.
+        """
         home = self.home_dir.rstrip("/") or "~/.owlery"
-        for field, leaf in (
-            ("attachments_dir", "attachments"),
-            ("large_prompts_dir", "large-prompts"),
-            ("codex_home_dir", "codex"),
-            ("agents_dir", "agents"),
-            ("fork_dir", "fork"),
-            ("research_dir", "research"),
-        ):
-            if not getattr(self, field):
+        legacy_home = (self.legacy_home_dir or "").rstrip("/")
+
+        for field, leaf in _STATE_DIRS:
+            value = getattr(self, field)
+            if not value:
                 object.__setattr__(self, field, f"{home}/{leaf}")
+                continue
+            rehomed = _rehome_legacy_dir(value, legacy_home, home)
+            if rehomed != value:
+                logger.warning(
+                    "Owlery: %s pointed into the pre-rename tree (%s); using %s "
+                    "instead. Update the setting to silence this.",
+                    field, value, rehomed,
+                )
+                object.__setattr__(self, field, rehomed)
         return self
 
     @property

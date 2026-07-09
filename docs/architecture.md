@@ -451,15 +451,29 @@ Fernet key guarding stored credentials — falling back to the default would mak
 every stored secret undecryptable. A deprecation warning names any legacy var
 still doing work.
 
+Because that fallback is whole-field, a legacy state dir (`OCTOPUS_AGENTS_DIR=
+~/.octopus/agents`) would otherwise keep pointing into the tree the migration
+just emptied. Any state dir resolving *under* `legacy_home_dir` is therefore
+re-homed onto `home_dir`, preserving `~`-relative style so expansion still
+happens at use time. A dir pointing anywhere else (`/mnt/data/attachments`) is
+deliberate configuration and is left alone, as is a sibling like
+`~/.octopus-backup`.
+
 ### Octopus → Owlery migration
 
 On first boot of the renamed build (`server/legacy_rename.py`, invoked from the
 lifespan before anything opens the DB):
 
-1. `~/.octopus` moves to `~/.owlery` and `octopus.db{,-wal,-shm}` to
-   `owlery.db{,-wal,-shm}`; a `.migrated-from-octopus` marker lands in the new
-   home. If both homes exist and are non-empty, nothing moves and a warning
-   fires — we never guess which tree is live.
+1. `octopus.db` moves to `owlery.db` and `~/.octopus` to `~/.owlery`; a
+   `.migrated-from-octopus` marker lands in the new home. The two moves are
+   **independent** — an install that never used attachments, forks or research
+   has no `~/.octopus` (it is created lazily) yet its `octopus.db` holds every
+   session, so gating one on the other would strand that history. The WAL is
+   checkpointed into the main DB file before the move and its sidecars dropped,
+   rather than renamed alongside: three separate renames are not crash-safe.
+   If both homes exist and are non-empty, startup **aborts** with
+   `AmbiguousLegacyStateError` — booting would open a database against one of
+   them and fork the install in two.
 2. Every stored absolute path pointing into the old home is rewritten: fork
    `working_dir`s, the JSON blobs hanging off them (`fork_metadata`,
    `fork_revert_record`), `bg_tasks.working_dir`, `research_jobs.report_path`.

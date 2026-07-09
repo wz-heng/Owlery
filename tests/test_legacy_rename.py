@@ -7,6 +7,7 @@ path the DB stored into the old tree is rewritten to the new one.
 
 import json
 import os
+import sqlite3
 
 import pytest
 
@@ -14,6 +15,7 @@ from server.config import Settings
 from server.database import Database
 from server.legacy_rename import (
     MARKER_NAME,
+    AmbiguousLegacyStateError,
     migrate_legacy_state,
     rewrite_legacy_paths,
 )
@@ -58,19 +60,66 @@ def test_moves_home_dir_and_marks_it(tmp_path):
     ) == "# hi"
 
 
-def test_moves_db_file_with_wal_and_shm(tmp_path):
+def _legacy_db_with_uncheckpointed_write(path) -> "sqlite3.Connection":
+    """A WAL-mode DB whose newest committed rows still live in the `-wal` file.
+
+    Returns the still-OPEN connection: closing it would checkpoint the WAL away
+    and destroy the very condition under test. The caller closes it.
+    """
+    conn = sqlite3.connect(str(path))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE hist (msg TEXT)")
+    conn.execute("INSERT INTO hist VALUES ('precious')")
+    conn.execute("INSERT INTO hist VALUES ('also precious')")
+    conn.commit()
+    return conn
+
+
+def test_moves_db_and_folds_in_the_wal(tmp_path):
+    """Moving `-wal`/`-shm` as separate renames isn't crash-safe. Checkpoint
+    into the main file, move that, and drop the sidecars — no committed
+    transaction may be lost."""
     _populate_old_home(tmp_path)
-    for suffix in ("", "-wal", "-shm"):
-        (tmp_path / f"octopus.db{suffix}").write_text(suffix or "main", encoding="utf-8")
+    writer = _legacy_db_with_uncheckpointed_write(tmp_path / "octopus.db")
+    assert (tmp_path / "octopus.db-wal").exists()  # precondition
+    writer.close()
     s = _settings(tmp_path)
 
     migrate_legacy_state(s)
 
-    for suffix in ("", "-wal", "-shm"):
+    assert not (tmp_path / "octopus.db").exists()
+    for suffix in ("-wal", "-shm"):
         assert not (tmp_path / f"octopus.db{suffix}").exists()
-        assert (tmp_path / f"owlery.db{suffix}").read_text(encoding="utf-8") == (
-            suffix or "main"
-        )
+
+    conn = sqlite3.connect(str(tmp_path / "owlery.db"))
+    rows = {r[0] for r in conn.execute("SELECT msg FROM hist")}
+    conn.close()
+    assert rows == {"precious", "also precious"}
+
+
+def test_moves_db_even_when_the_old_home_never_existed(tmp_path):
+    """An install that never used attachments/forks/research has no
+    `~/.octopus` — it's created lazily — but its `octopus.db` holds every
+    session. Gating the DB move on the home dir would strand that history and
+    boot the user into an empty database (Snape review, blocker #1)."""
+    (tmp_path / "octopus.db").write_text("PRECIOUS HISTORY", encoding="utf-8")
+    s = _settings(tmp_path)
+    assert not (tmp_path / "old").exists()  # precondition
+
+    migrate_legacy_state(s)
+
+    assert not (tmp_path / "octopus.db").exists()
+    assert (tmp_path / "owlery.db").read_text(encoding="utf-8") == "PRECIOUS HISTORY"
+
+
+def test_db_move_is_idempotent_without_an_old_home(tmp_path):
+    (tmp_path / "octopus.db").write_text("hist", encoding="utf-8")
+    s = _settings(tmp_path)
+
+    migrate_legacy_state(s)
+    migrate_legacy_state(s)  # second boot: nothing left to move
+
+    assert (tmp_path / "owlery.db").read_text(encoding="utf-8") == "hist"
 
 
 def test_is_idempotent(tmp_path):
@@ -101,17 +150,35 @@ def test_idempotent_when_old_home_reappears(tmp_path):
     assert (tmp_path / "old").is_dir()  # left alone for the user to delete
 
 
-def test_refuses_when_both_homes_are_populated(tmp_path):
-    """Ambiguous state: never guess which tree is live."""
+def test_aborts_startup_when_both_homes_are_populated(tmp_path):
+    """Ambiguous state: never guess which tree is live, and never BOOT — that
+    would open a database against one of them and fork the install in two."""
     _populate_old_home(tmp_path)
     (tmp_path / "new").mkdir()
     (tmp_path / "new" / "mine.txt").write_text("live", encoding="utf-8")
     s = _settings(tmp_path)
 
-    assert migrate_legacy_state(s) is False
+    with pytest.raises(AmbiguousLegacyStateError, match="which holds your live state"):
+        migrate_legacy_state(s)
+
+    # Nothing touched: the user merges by hand.
     assert (tmp_path / "old").is_dir()
     assert not (tmp_path / "new" / MARKER_NAME).exists()
     assert (tmp_path / "new" / "mine.txt").read_text(encoding="utf-8") == "live"
+
+
+async def test_ambiguous_state_stops_the_lifespan_before_the_db_opens(tmp_path):
+    """The abort must happen before `Database.initialize` can create a fresh
+    (empty) owlery.db next to the two homes."""
+    _populate_old_home(tmp_path)
+    (tmp_path / "new").mkdir()
+    (tmp_path / "new" / "mine.txt").write_text("live", encoding="utf-8")
+    s = _settings(tmp_path)
+
+    with pytest.raises(AmbiguousLegacyStateError):
+        migrate_legacy_state(s)
+
+    assert not os.path.exists(s.db_path)
 
 
 def test_migrates_into_an_empty_new_home(tmp_path):
@@ -417,3 +484,91 @@ def test_new_env_prefix_wins_over_legacy(monkeypatch):
     monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "legacy-secret")
 
     assert Settings(_env_file=None).auth_token == "new-secret"
+
+
+# ------------------------------------------- legacy state dirs get re-homed
+
+
+def _enable_legacy_home(monkeypatch) -> None:
+    """conftest disables the migration globally (it must never fire against the
+    developer's real ~), which also disables re-homing. Turn it back on for the
+    tests that exercise re-homing, and clear the state dirs conftest pins."""
+    monkeypatch.setenv("OWLERY_LEGACY_HOME_DIR", "~/.octopus")
+    monkeypatch.delenv("OWLERY_AGENTS_DIR", raising=False)
+    monkeypatch.delenv("OWLERY_RESEARCH_DIR", raising=False)
+
+
+@pytest.mark.parametrize(
+    "env_var, field",
+    [
+        ("OCTOPUS_ATTACHMENTS_DIR", "attachments_dir"),
+        ("OCTOPUS_AGENTS_DIR", "agents_dir"),
+        ("OCTOPUS_CODEX_HOME_DIR", "codex_home_dir"),
+        ("OCTOPUS_LARGE_PROMPTS_DIR", "large_prompts_dir"),
+    ],
+)
+def test_legacy_state_dir_env_is_rehomed(monkeypatch, env_var, field):
+    """The OCTOPUS_* fallback is whole-field, so a deployment that pinned a
+    state dir would keep reading the tree the migration just emptied — forking
+    its state in two (Snape review). Re-home anything under the old default."""
+    _enable_legacy_home(monkeypatch)
+    leaf = field.replace("_dir", "").replace("codex_home", "codex")
+    monkeypatch.setenv(env_var, f"~/.octopus/{leaf}")
+
+    s = Settings(_env_file=None)
+
+    assert getattr(s, field) == f"~/.owlery/{leaf}"
+
+
+def test_legacy_dir_pointing_outside_the_old_tree_is_respected(monkeypatch):
+    """`/mnt/data/attachments` is deliberate configuration, not a stale
+    default. Never move a path the user chose."""
+    _enable_legacy_home(monkeypatch)
+    monkeypatch.setenv("OCTOPUS_ATTACHMENTS_DIR", "/mnt/data/attachments")
+
+    assert Settings(_env_file=None).attachments_dir == "/mnt/data/attachments"
+
+
+def test_rehoming_does_not_match_a_sibling_of_the_old_home(monkeypatch):
+    """`~/.octopus-backup` shares a string prefix without being under the tree."""
+    _enable_legacy_home(monkeypatch)
+    monkeypatch.setenv("OCTOPUS_ATTACHMENTS_DIR", "~/.octopus-backup/attachments")
+
+    s = Settings(_env_file=None)
+
+    assert s.attachments_dir == "~/.octopus-backup/attachments"
+
+
+def test_rehomed_dir_stays_tilde_relative(monkeypatch, tmp_path):
+    """Re-homing must not eagerly expand `~`: expansion happens at use time so
+    a $HOME monkeypatch still relocates the tree."""
+    _enable_legacy_home(monkeypatch)
+    monkeypatch.setenv("OCTOPUS_RESEARCH_DIR", "~/.octopus/research")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    s = Settings(_env_file=None)
+
+    assert s.research_dir == "~/.owlery/research"
+    assert s.resolved_research_dir == str(tmp_path / "home" / ".owlery" / "research")
+
+
+def test_expanded_legacy_dir_is_rehomed_too(monkeypatch, tmp_path):
+    """A config written with an absolute path (`/home/u/.octopus/agents`) must
+    match the same way a `~`-relative one does."""
+    _enable_legacy_home(monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("OCTOPUS_AGENTS_DIR", str(tmp_path / "home" / ".octopus" / "agents"))
+
+    s = Settings(_env_file=None)
+
+    # Rebuilt on the unexpanded new home, so `~` still resolves at use time.
+    assert s.agents_dir == "~/.owlery/agents"
+
+
+def test_rehoming_is_disabled_with_the_migration(monkeypatch):
+    """`OWLERY_LEGACY_HOME_DIR=""` means "the old tree is not mine" — a dir
+    pointing there is then just an ordinary custom path."""
+    monkeypatch.setenv("OWLERY_LEGACY_HOME_DIR", "")
+    monkeypatch.setenv("OCTOPUS_ATTACHMENTS_DIR", "~/.octopus/attachments")
+
+    assert Settings(_env_file=None).attachments_dir == "~/.octopus/attachments"

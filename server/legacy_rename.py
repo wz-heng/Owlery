@@ -4,10 +4,12 @@ The app used to keep its state in `~/.octopus` and its database in
 `octopus.db`. Both were renamed. An existing install must cross over
 losslessly on the first boot of the renamed build, so this module:
 
-1. Moves `~/.octopus` → `~/.owlery` and `octopus.db{,-wal,-shm}` →
-   `owlery.db{,-wal,-shm}` (`migrate_legacy_state`, called *before* anything
-   opens the DB or provisions agent dirs), dropping a marker file in the new
-   home to record that the move happened.
+1. Moves `octopus.db` → `owlery.db` and `~/.octopus` → `~/.owlery`
+   (`migrate_legacy_state`, called *before* anything opens the DB or provisions
+   agent dirs), dropping a marker file in the new home to record that the home
+   move happened. The two moves are INDEPENDENT: an install that never used
+   attachments, forks or research has no `~/.octopus` (it's created lazily) but
+   still has an `octopus.db` holding every session.
 2. Rewrites the absolute paths the DB stores into the old tree — fork working
    dirs, the JSON blobs hanging off them, bg-task working dirs, research
    report paths — plus the Claude project directories those fork working dirs
@@ -17,8 +19,9 @@ Both steps are idempotent: once the old tree is gone and no stored path
 carries the old prefix, re-running them does nothing.
 
 The marker gates step 2. If a user somehow has BOTH a populated `~/.owlery`
-and a `~/.octopus`, we refuse to guess which one is live: no move, no marker,
-no rewrite, one loud warning.
+and a `~/.octopus`, we cannot tell which is live — and booting would pick one
+and fork the install in two, so `AmbiguousLegacyStateError` aborts startup and
+asks for a manual merge.
 
 **Message transcripts are deliberately left alone.** `messages.content` /
 `tool_input` are a verbatim record of what was said in a past turn, not live
@@ -34,6 +37,7 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -104,12 +108,26 @@ def _legacy_db_path(db_path: str) -> str | None:
 # --------------------------------------------------------------- step 1: files
 
 
+class AmbiguousLegacyStateError(RuntimeError):
+    """Both homes hold live state. Raised rather than logged: continuing would
+    boot against one of them and silently fork the user's install in two."""
+
+
 def migrate_legacy_state(settings) -> bool:
     """Move the pre-rename home directory and database file into place.
 
+    The two moves are INDEPENDENT. An install that never used attachments,
+    forks or research has no `~/.octopus` at all — its home dir is created
+    lazily — yet its `octopus.db` holds every session. Gating the database
+    move on the home dir existing would strand that history and boot the user
+    into an empty database (Snape review, blocker #1).
+
     Returns True iff the new home now carries the migration marker — i.e. the
-    move ran, now or on an earlier boot — which is what `rewrite_legacy_paths`
-    keys off. Must run before anything opens the DB or provisions agent dirs.
+    home move ran, now or on an earlier boot — which is what
+    `rewrite_legacy_paths` keys off. Must run before anything opens the DB or
+    provisions agent dirs.
+
+    Raises `AmbiguousLegacyStateError` when both homes hold live state.
     """
     if not settings.legacy_home_dir:
         return False
@@ -119,10 +137,13 @@ def migrate_legacy_state(settings) -> bool:
     if old_home == new_home:
         return False
 
+    # The database moves on its own terms, whatever the home dirs look like.
+    _migrate_db_file(settings.db_path)
+
     marker = new_home / MARKER_NAME
 
     if not old_home.is_dir():
-        # Nothing to migrate. A marker from a previous boot still licenses the
+        # No old home to move. A marker from a previous boot still licenses the
         # (idempotent) path rewrite.
         return marker.exists()
 
@@ -135,13 +156,16 @@ def migrate_legacy_state(settings) -> bool:
         return True
 
     if new_home.exists() and not _is_empty_dir(new_home):
-        logger.warning(
-            "Owlery: both %s and %s exist and neither is empty — refusing to "
-            "guess which holds live state. No migration performed. Merge them "
-            "by hand, or set OWLERY_LEGACY_HOME_DIR='' to silence this.",
-            old_home, new_home,
+        # Refuse to guess which tree is live — and refuse to BOOT, because
+        # continuing would open a database against one of them and fork the
+        # install in two (Snape review, blocker #2).
+        raise AmbiguousLegacyStateError(
+            f"Both {old_home} and {new_home} exist and neither is empty. "
+            f"Owlery cannot tell which holds your live state, and starting "
+            f"would silently pick one. Merge them by hand, then remove "
+            f"{old_home}. To skip this check entirely, set "
+            f"OWLERY_LEGACY_HOME_DIR='' (the old tree is then ignored)."
         )
-        return False
 
     if new_home.exists():
         new_home.rmdir()  # empty placeholder — get out of `move`'s way
@@ -155,22 +179,45 @@ def migrate_legacy_state(settings) -> bool:
         encoding="utf-8",
     )
     logger.info("Owlery: migrated app home %s -> %s", old_home, new_home)
-
-    _migrate_db_file(settings.db_path)
     return True
 
 
 def _migrate_db_file(db_path: str) -> None:
-    """Rename `octopus.db` → `owlery.db`, WAL and shared-memory sidecars
-    included. Skipped when the destination already exists — a live DB is never
-    clobbered."""
+    """Rename `octopus.db` → `owlery.db`. Skipped when the destination already
+    exists — a live DB is never clobbered.
+
+    The WAL is folded back into the main file first, then the sidecars are
+    dropped. Moving `-wal`/`-shm` alongside the main file as three separate
+    renames is not crash-safe: a crash after the main file lands but before its
+    WAL does would silently discard every committed-but-uncheckpointed
+    transaction. `TRUNCATE` forces a full checkpoint, after which the main file
+    is self-contained and the sidecars carry nothing (SQLite recreates them on
+    next open).
+    """
     legacy = _legacy_db_path(db_path)
     if legacy is None or not os.path.isfile(legacy) or os.path.exists(db_path):
         return
-    for suffix in ("", "-wal", "-shm"):
-        src, dest = legacy + suffix, db_path + suffix
-        if os.path.exists(src):
-            os.replace(src, dest)
+
+    try:
+        conn = sqlite3.connect(legacy)
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        # Not a WAL database, or an unreadable one. Either way the sidecars
+        # below are dealt with the same; a corrupt file is the user's to fix.
+        logger.exception("Owlery: could not checkpoint %s before migrating", legacy)
+
+    os.replace(legacy, db_path)
+    for suffix in ("-wal", "-shm"):
+        # Post-checkpoint these are empty/stale. Leaving a `-wal` next to the
+        # OLD name is harmless; leaving one that SQLite would pair with the new
+        # name is not, so remove rather than move.
+        try:
+            os.unlink(legacy + suffix)
+        except FileNotFoundError:
+            pass
     logger.info("Owlery: migrated database %s -> %s", legacy, db_path)
 
 
