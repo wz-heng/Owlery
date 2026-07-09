@@ -8,7 +8,7 @@ import { join } from "path";
 // run `/fork copy`, and assert a NEW session appears + becomes active with the
 // "full copy" banner while the ORIGINAL session stays put (not archived).
 //
-// /fork triggers a real backend copytree into ~/.octopus/fork/, so afterAll
+// /fork triggers a real backend copytree into ~/.owlery/fork/, so afterAll
 // deletes both sessions and removes the copied + source dirs.
 
 const TOKEN = "changeme";
@@ -33,7 +33,7 @@ test.afterAll(async ({ request }) => {
         await res.json();
       for (const s of sessions) {
         if (!OWNED.has(s.name)) continue;
-        if (s.working_dir?.includes("/.octopus/fork/")) cleanupDirs.push(s.working_dir);
+        if (s.working_dir?.includes("/.owlery/fork/")) cleanupDirs.push(s.working_dir);
         await request
           .delete(`${API}/sessions/${s.id}`, {
             headers: { Authorization: `Bearer ${TOKEN}` },

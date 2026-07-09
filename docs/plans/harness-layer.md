@@ -11,7 +11,7 @@ tests + 64 frontend (vitest) + tsc + 62 e2e (Playwright).
 
 ## 0. Why this exists
 
-Octopus has a good *per-turn* backend abstraction (`BackendBase` in
+Owlery has a good *per-turn* backend abstraction (`BackendBase` in
 `server/backends/`), but model/runtime interaction as a whole is **not**
 a single architectural boundary. Concretely, today:
 
@@ -37,7 +37,7 @@ a single architectural boundary. Concretely, today:
   JSONL schema; nothing declares that Codex has no equivalent.
 - **The two turn adapters duplicate context assembly.** Each of
   `claude_code.py` and `codex.py` independently composes the system
-  prompt (persona + Octopus-tools blurb + connector blurb), selects the
+  prompt (persona + Owlery-tools blurb + connector blurb), selects the
   in-app MCP set from `{viewer,bg,ask}`, and builds `callback_env`. Only
   the *rendering* (JSON `--mcp-config` vs `-c mcp_servers.*` TOML) is
   genuinely backend-specific.
@@ -218,9 +218,9 @@ the neutral pieces passed into `build_turn_argv` via `TurnContext`:
   landed with [`agent-collaboration.md`](agent-collaboration.md)),
 - merging connector MCP entries (`mcp_entry`, already neutral),
 - composing the system prompt = `persona + profile.tools_prompt
-  + render_connectors_blurb(connectors)`. The Octopus-tools blurb stays
-  per-framework *text* (`profile.tools_prompt`: `_OCTOPUS_SYSTEM_PROMPT`
-  vs `_OCTOPUS_SYSTEM_PROMPT_CODEX`) but the *composition* is shared, so
+  + render_connectors_blurb(connectors)`. The Owlery-tools blurb stays
+  per-framework *text* (`profile.tools_prompt`: `_OWLERY_SYSTEM_PROMPT`
+  vs `_OWLERY_SYSTEM_PROMPT_CODEX`) but the *composition* is shared, so
   only the blurb wording differs.
 
 **Rendered per profile** (`build_turn_argv`, the only backend-specific part):
@@ -372,7 +372,7 @@ since it's the wire contract serialized to `contracts.ts`.)
 Codex gets `oneshot` (via non-interactive `codex exec --json`, text
 extracted from its event stream) and therefore `schedule_parse`. So
 natural-language `/schedule` works on Codex agents in this refactor.
-`run_oneshot` is a **lean** invocation (no MCP, no Octopus-tools blurb,
+`run_oneshot` is a **lean** invocation (no MCP, no Owlery-tools blurb,
 no connectors) — distinct from a full turn run. The Codex credential
 (home dir) is applied for the oneshot exactly as for a turn. New
 Codex-oneshot tests (fake + real-CLI-gated) are added alongside the

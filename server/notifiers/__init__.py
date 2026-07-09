@@ -1,6 +1,6 @@
 """Async notification targets — webhook, browser-push, email, etc.
 
-A `Notifier` is a destination Octopus can poke when something happens
+A `Notifier` is a destination Owlery can poke when something happens
 in the background (a session goes idle, an AskUserQuestion is pending,
 a schedule fails). The framework is small on purpose: NotifierBase
 defines the one method each target implements (`send`), and the

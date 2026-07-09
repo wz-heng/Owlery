@@ -6,9 +6,9 @@
  * code-block treatment) — the plugin is the base layer. */
 @plugin "@tailwindcss/typography";
 
-/* Octopus design tokens — stolen wholesale from vm0's globals.css.
+/* Owlery design tokens — stolen wholesale from vm0's globals.css.
  *
- * Light theme, orange primary, cool-gray neutrals. Octopus used to be
+ * Light theme, orange primary, cool-gray neutrals. Owlery used to be
  * dark; this is the deliberate flip to vm0's look. All values are
  * `H S% L%` triplets so they compose with Tailwind's alpha syntax
  * (`bg-background/80`). */

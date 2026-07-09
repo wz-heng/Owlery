@@ -1,7 +1,7 @@
 """GitHub connector MCP server (connectors.md Phase B / §6).
 
 Spawned as `python -m server.mcp_servers.connectors.github` with the shared
-callback env + OCTOPUS_INSTALLATION_ID. Each tool fetches the installation's
+callback env + OWLERY_INSTALLATION_ID. Each tool fetches the installation's
 token from the host, calls the GitHub REST API, projects the response to the
 fields the model needs, and caps the result size. 401 → mark the installation
 needs-reconnect and tell the model to ask the user; 429/5xx → bounded retry.
@@ -38,7 +38,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("octopus-github")
+mcp = FastMCP("owlery-github")
 ctx = ConnectorContext()
 
 _API = "https://api.github.com"
@@ -48,7 +48,7 @@ _GH_HEADERS = {
 }
 _RECONNECT_MSG = (
     "Error: GitHub token expired or revoked — ask the user to reconnect "
-    "GitHub in Octopus's sidebar."
+    "GitHub in Owlery's sidebar."
 )
 
 
@@ -57,7 +57,7 @@ def _gh(method: str, path: str, **kw: Any) -> tuple[Any | None, str | None]:
     (None, error_message) — the error string is itself a fine tool result."""
     token = ctx.access_token()
     if token is None:
-        return None, "Error: connector unavailable — reconnect GitHub in Octopus."
+        return None, "Error: connector unavailable — reconnect GitHub in Owlery."
     headers = {**_GH_HEADERS, "Authorization": f"Bearer {token}"}
     url = path if path.startswith("http") else f"{_API}{path}"
     for attempt in range(3):

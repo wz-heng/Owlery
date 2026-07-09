@@ -8,6 +8,10 @@ web/test-results/
 test-results/
 .claude/
 .pytest_cache/
+owlery.db*
+owlery-dev.db*
+# Pre-rename database files (docs/plans/rename-owlery.md) — still ignored so a
+# checkout that hasn't yet booted the renamed build can't commit one.
 octopus.db*
 octopus-dev.db*
 *.egg-info/

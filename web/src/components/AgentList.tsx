@@ -3,6 +3,7 @@ import { IconChevronRight, IconPlus } from "@tabler/icons-react";
 import { fetchInstallations } from "../api/connectors";
 import { useSessionStore, type Agent, type SessionInfo } from "../stores/sessionStore";
 import { SessionList } from "./SessionList";
+import { DEFAULT_AGENT_AVATAR } from "../lib/agentAvatar";
 
 const API = window.location.origin;
 
@@ -134,7 +135,7 @@ export function AgentList({ onCreateAgent }: { onCreateAgent: () => void }) {
                   }`}
                 />
                 <span className="agent-avatar shrink-0 text-base leading-none w-5 text-center">
-                  {a.avatar || "🐙"}
+                  {a.avatar || DEFAULT_AGENT_AVATAR}
                 </span>
                 <span
                   className={`agent-name truncate text-sm flex-1 ${

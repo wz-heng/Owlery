@@ -13,6 +13,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "./ui/dialog";
+import { DEFAULT_AGENT_AVATAR } from "../lib/agentAvatar";
 
 interface Props {
   open: boolean;
@@ -102,7 +103,7 @@ export function SchedulesDialog({ open, onOpenChange }: Props) {
               >
                 <div className="schedule-agent-header flex items-center gap-1.5 px-1 pb-1.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
                   <span className="text-sm leading-none">
-                    {agent?.avatar || "🐙"}
+                    {agent?.avatar || DEFAULT_AGENT_AVATAR}
                   </span>
                   <span className="truncate">
                     {agent?.name ?? "Unknown agent"}

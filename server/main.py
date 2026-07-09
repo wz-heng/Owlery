@@ -21,6 +21,7 @@ from .bridges.manager import BridgeManager
 from .config import settings
 from .tunnel import CloudflareTunnel
 from .database import Database
+from .legacy_rename import migrate_legacy_state, rewrite_legacy_paths
 from .notifiers import notifier_manager
 from .agent_manager import AgentManager
 from .connector_manager import ConnectorManager
@@ -37,8 +38,15 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Octopus → Owlery (rename-owlery.md §3). Moves ~/.octopus and octopus.db
+    # into place BEFORE anything opens the DB or provisions agent dirs; the
+    # stored-path rewrite then needs the open connection. Both are no-ops once
+    # the migration has run.
+    migrate_legacy_state(settings)
+
     db = Database(settings.db_path)
     await db.initialize()
+    await rewrite_legacy_paths(db, settings)
     await session_manager.initialize(db)
 
     # Initialize bridge manager
@@ -127,7 +135,7 @@ async def lifespan(app: FastAPI):
     await db.close()
 
 
-app = FastAPI(title="Octopus", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Owlery", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

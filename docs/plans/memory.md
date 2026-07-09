@@ -7,14 +7,14 @@ The Agent is the durable entity that owns sessions and schedules
 accrues**, and it must survive across sessions and — as much as
 possible — across a backend switch.
 
-This plan supersedes the earlier "Octopus-owned memory store" design
+This plan supersedes the earlier "Owlery-owned memory store" design
 (DB rows + a dedicated memory MCP server + injection of the index every
 turn). That approach was built and then **reverted** on the user's
 decision. The reason it was rejected:
 
 > If we don't use the native memory, it raises a new risk: the harness
 > will *sometimes* use its own native memory anyway. Claude Code's
-> native memory is always on; running a second, Octopus-owned store next
+> native memory is always on; running a second, Owlery-owned store next
 > to it means two memory systems fighting. Use the native memory.
 > Changing an agent's harness is a low-frequency operation, so we accept
 > that the memory format may be mixed on a backend switch.
@@ -38,7 +38,7 @@ async-consolidation dependency.
 ## 1. Empirical grounding (verified in real CLI runtimes, not assumed)
 
 Everything below was confirmed by running the real `claude` / `codex`
-CLIs headlessly (the same mode Octopus spawns), not against fakes:
+CLIs headlessly (the same mode Owlery spawns), not against fakes:
 
 - **Claude reads native memory in `--print`.** Seeded a project's
   `memory/MEMORY.md` + a fact file; `claude --print` recalled the facts.
@@ -77,7 +77,7 @@ CLIs headlessly (the same mode Octopus spawns), not against fakes:
       <topic>.md           #   frontmatter fact files
 ```
 
-`agents_dir` defaults to `~/.octopus/agents` (new setting). The canonical
+`agents_dir` defaults to `~/.owlery/agents` (new setting). The canonical
 `memory/` dir is the single source of truth; both harnesses point at it by
 absolute path. Nothing else lives under the agent dir — memory is decoupled
 from each harness's config/auth dirs, so `CLAUDE_CONFIG_DIR` and `CODEX_HOME`

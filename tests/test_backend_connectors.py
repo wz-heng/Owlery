@@ -55,9 +55,9 @@ def test_claude_merges_connector_mcp_entry():
     assert key in cfg
     assert cfg[key]["args"] == ["-m", "server.mcp_servers.connectors.dummy"]
     # Token env: shared callback vars + the installation id.
-    assert cfg[key]["env"]["OCTOPUS_INSTALLATION_ID"] == inst.id
-    assert cfg[key]["env"]["OCTOPUS_API_BASE"].startswith("http://127.0.0.1:")
-    assert cfg[key]["env"]["OCTOPUS_SESSION_ID"] == "s1"
+    assert cfg[key]["env"]["OWLERY_INSTALLATION_ID"] == inst.id
+    assert cfg[key]["env"]["OWLERY_API_BASE"].startswith("http://127.0.0.1:")
+    assert cfg[key]["env"]["OWLERY_SESSION_ID"] == "s1"
     # Built-ins still present.
     assert {"bg", "ask"} <= set(cfg)
 
@@ -97,7 +97,7 @@ def test_codex_merges_connector_overrides_and_blurb():
 
     assert f"mcp_servers.{key}.command=" in joined
     assert any(
-        a.startswith(f"mcp_servers.{key}.env.OCTOPUS_INSTALLATION_ID=") for a in argv
+        a.startswith(f"mcp_servers.{key}.env.OWLERY_INSTALLATION_ID=") for a in argv
     )
     # Developer-instructions blurb is injected via -c developer_instructions=…
     assert "== Connectors ==" in joined

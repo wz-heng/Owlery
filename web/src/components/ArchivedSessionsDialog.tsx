@@ -12,6 +12,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "./ui/dialog";
+import { DEFAULT_AGENT_AVATAR } from "../lib/agentAvatar";
 
 const API_URL = window.location.origin;
 
@@ -149,7 +150,7 @@ export function ArchivedSessionsDialog({ open, onOpenChange }: Props) {
               >
                 <div className="archived-agent-header flex items-center gap-1.5 px-1 pb-1.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
                   <span className="text-sm leading-none">
-                    {agent?.avatar || "🐙"}
+                    {agent?.avatar || DEFAULT_AGENT_AVATAR}
                   </span>
                   <span className="truncate">
                     {agent?.name ?? "Unknown agent"}

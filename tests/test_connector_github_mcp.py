@@ -36,9 +36,9 @@ def test_truncate_caps_and_marks():
 
 
 def test_context_token_fetch_and_cache(monkeypatch):
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://host")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "tok")
-    monkeypatch.setenv("OCTOPUS_INSTALLATION_ID", "i-1")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://host")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "tok")
+    monkeypatch.setenv("OWLERY_INSTALLATION_ID", "i-1")
     calls = {"n": 0}
 
     def fake_get(url, headers=None, timeout=None):
@@ -54,22 +54,22 @@ def test_context_token_fetch_and_cache(monkeypatch):
 
 
 def test_context_token_401_returns_none(monkeypatch):
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://host")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "tok")
-    monkeypatch.setenv("OCTOPUS_INSTALLATION_ID", "i-1")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://host")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "tok")
+    monkeypatch.setenv("OWLERY_INSTALLATION_ID", "i-1")
     monkeypatch.setattr(_shared.httpx, "get", lambda *a, **k: FakeResp(status=401))
     assert _shared.ConnectorContext().access_token() is None
 
 
 def test_context_not_ready_returns_none(monkeypatch):
-    monkeypatch.delenv("OCTOPUS_INSTALLATION_ID", raising=False)
+    monkeypatch.delenv("OWLERY_INSTALLATION_ID", raising=False)
     assert _shared.ConnectorContext().access_token() is None
 
 
 def test_mark_needs_reconnect_posts_and_clears_cache(monkeypatch):
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://host")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "tok")
-    monkeypatch.setenv("OCTOPUS_INSTALLATION_ID", "i-1")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://host")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "tok")
+    monkeypatch.setenv("OWLERY_INSTALLATION_ID", "i-1")
     cap = {}
 
     def fake_post(url, params=None, headers=None, timeout=None):

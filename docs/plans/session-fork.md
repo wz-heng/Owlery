@@ -14,7 +14,7 @@ throwaway copy of the project without disturbing the original.
 - New session under the same agent/backend/credential, **renamed** (`/fork
   <name>`, default `"<parent name> (fork)"`).
 - Working dir = a **literal full copy** of the parent's working dir at
-  `~/.octopus/fork/<basename>-<forkid>/` (incl. .git/node_modules/.venv — the
+  `~/.owlery/fork/<basename>-<forkid>/` (incl. .git/node_modules/.venv — the
   user chose the literal copy; created with `mkdir -p`).
 - **History carried over (native-copy)**: the fork **resumes the parent's real
   conversation**, not a replay. `harness.prepare_fork_copy` copies the backend's
@@ -33,7 +33,7 @@ throwaway copy of the project without disturbing the original.
   This replaced the original whole-history *replay*, which dumped the entire
   transcript into the first prompt — for a large session that spilled to a file
   the model then mis-read as a task list and went off doing the wrong thing.
-- The **Octopus `messages` table** (UI history) is copied independently
+- The **Owlery `messages` table** (UI history) is copied independently
   (`create_fork_session`) and is unrelated to the native transcript: the DB
   feeds the sidebar/chat, the transcript feeds the model. Both are snapshotted
   at fork time and evolve per-session afterward — the same two stores every
@@ -81,7 +81,7 @@ throwaway copy of the project without disturbing the original.
 
 ## 4. Crash safety / limits
 
-A crash mid-copytree leaves a partial dir under `~/.octopus/fork/` — harmless
+A crash mid-copytree leaves a partial dir under `~/.owlery/fork/` — harmless
 junk (a future cleanup can sweep stale fork dirs whose session row is gone).
 The fork-saga's existing `initializing`/`ready` + prepare_fork compensation
 still applies. Literal copy is the user's explicit choice; document the size

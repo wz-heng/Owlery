@@ -1,7 +1,7 @@
 import { IconPlus } from "@tabler/icons-react";
 
 /** Sidebar "Applications" section. Houses applications managed by this
- * Octopus instance. The + button opens the add-application flow (wired up
+ * Owlery instance. The + button opens the add-application flow (wired up
  * by the parent via `onAdd`). */
 export function ApplicationList({ onAdd }: { onAdd: () => void }) {
   return (

@@ -46,12 +46,12 @@ def build_callback_env(session_id: str | None) -> dict[str, str]:
     from ..config import settings as _settings  # local import: avoid cycle at load
 
     env: dict[str, str] = {
-        "OCTOPUS_API_BASE": f"http://127.0.0.1:{_settings.port}",
-        "OCTOPUS_AUTH_TOKEN": _settings.auth_token,
+        "OWLERY_API_BASE": f"http://127.0.0.1:{_settings.port}",
+        "OWLERY_AUTH_TOKEN": _settings.auth_token,
         "PYTHONPATH": _REPO_ROOT,
     }
     if session_id:
-        env["OCTOPUS_SESSION_ID"] = session_id
+        env["OWLERY_SESSION_ID"] = session_id
     return env
 
 

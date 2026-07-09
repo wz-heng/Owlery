@@ -15,7 +15,7 @@ the short forms ``ask`` / ``cancel`` / ``answer`` / ``list``.
     her in-session transcript across rounds — review iterations,
     "now apply that same review to file Y"). Exactly one of the two
     ids must be set. Returns a `delegation_id` immediately and ends
-    the current turn; when the other agent finishes, Octopus
+    the current turn; when the other agent finishes, Owlery
     auto-fires a follow-up turn into this session prefixed
     `[agent-reply:<name> delegation=<id>]` carrying the other
     agent's reply. The two modes were originally separate `ask` and
@@ -35,13 +35,13 @@ the short forms ``ask`` / ``cancel`` / ``answer`` / ``list``.
     concurrent delegations by id.
 
 Channel: this process is a child of the harness CLI (claude / codex),
-NOT of Octopus's FastAPI server. We can't reach the DelegationManager
-singleton directly — we have to go over HTTP. The parent Octopus
+NOT of Owlery's FastAPI server. We can't reach the DelegationManager
+singleton directly — we have to go over HTTP. The parent Owlery
 process injects three env vars when spawning us:
 
-  OCTOPUS_API_BASE     e.g. "http://127.0.0.1:8000"
-  OCTOPUS_AUTH_TOKEN   the same bearer token everything else uses
-  OCTOPUS_SESSION_ID   the parent session this CLI invocation is bound
+  OWLERY_API_BASE     e.g. "http://127.0.0.1:8000"
+  OWLERY_AUTH_TOKEN   the same bearer token everything else uses
+  OWLERY_SESSION_ID   the parent session this CLI invocation is bound
                        to (the delegation will be hung off this id)
 
 The session id scopes "this delegation belongs to this chat" — we
@@ -78,7 +78,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-mcp = FastMCP("octopus-ask-agent")
+mcp = FastMCP("owlery-ask-agent")
 
 
 def _required_env(name: str) -> str | None:
@@ -89,15 +89,15 @@ def _required_env(name: str) -> str | None:
 
 
 def _api_base() -> str | None:
-    return _required_env("OCTOPUS_API_BASE")
+    return _required_env("OWLERY_API_BASE")
 
 
 def _session_id() -> str | None:
-    return _required_env("OCTOPUS_SESSION_ID")
+    return _required_env("OWLERY_SESSION_ID")
 
 
 def _headers() -> dict[str, str] | None:
-    tok = _required_env("OCTOPUS_AUTH_TOKEN")
+    tok = _required_env("OWLERY_AUTH_TOKEN")
     if not tok:
         return None
     return {"Authorization": f"Bearer {tok}"}
@@ -195,7 +195,7 @@ def ask_agent(
             r = httpx.post(url, json=body, headers=hdrs, timeout=10.0)
         except httpx.HTTPError as e:
             return (
-                f"Error: failed to reach Octopus to continue "
+                f"Error: failed to reach Owlery to continue "
                 f"delegation {delegation_id}: {e}"
             )
         if r.status_code == 404:
@@ -237,14 +237,14 @@ def ask_agent(
     try:
         r = httpx.post(url, json=body, headers=hdrs, timeout=10.0)
     except httpx.HTTPError as e:
-        return f"Error: failed to reach Octopus to start the delegation: {e}"
+        return f"Error: failed to reach Owlery to start the delegation: {e}"
     if r.status_code == 404:
         return f"No agent named {name!r}, and no parent session match."
     if r.status_code == 409:
         return f"Cannot delegate: {r.text[:300]}"
     if r.status_code != 201:
         return (
-            f"Error: Octopus rejected the delegation "
+            f"Error: Owlery rejected the delegation "
             f"({r.status_code}): {r.text[:300]}"
         )
     data = r.json()
@@ -287,7 +287,7 @@ def cancel_agent_task(delegation_id: str, reason: str | None = None) -> str:
     try:
         r = httpx.post(url, json=body, headers=hdrs, timeout=10.0)
     except httpx.HTTPError as e:
-        return f"Error: failed to reach Octopus to cancel {delegation_id}: {e}"
+        return f"Error: failed to reach Owlery to cancel {delegation_id}: {e}"
     if r.status_code == 404:
         return f"No delegation `{delegation_id}` for this session."
     if r.status_code != 200:
@@ -348,7 +348,7 @@ def answer_agent_question(delegation_id: str, choice: str) -> str:
     try:
         r = httpx.post(url, json=body, headers=hdrs, timeout=10.0)
     except httpx.HTTPError as e:
-        return f"Error: failed to reach Octopus to answer {delegation_id}: {e}"
+        return f"Error: failed to reach Owlery to answer {delegation_id}: {e}"
     if r.status_code == 404:
         return (
             f"No delegation `{delegation_id}` for this session "
@@ -390,7 +390,7 @@ def list_agent_tasks() -> str:
     try:
         r = httpx.get(url, headers=hdrs, timeout=10.0)
     except httpx.HTTPError as e:
-        return f"Error: failed to reach Octopus to list delegations: {e}"
+        return f"Error: failed to reach Owlery to list delegations: {e}"
     if r.status_code != 200:
         return f"Error listing delegations ({r.status_code}): {r.text[:300]}"
     items = r.json()

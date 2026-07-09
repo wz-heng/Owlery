@@ -13,12 +13,10 @@ import {
 } from "./ui/dialog";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
+import { AVATAR_CHOICES, DEFAULT_AGENT_AVATAR } from "../lib/agentAvatar";
 
 const API = `${window.location.origin}/api/agents`;
 const BUILTIN_MCP = ["ask", "bg"] as const;
-// A small role-themed palette to pick an agent icon from (the field still
-// accepts any custom emoji). 🐙 is the Octopus default.
-const AVATAR_CHOICES = ["🐙", "🤖", "🧠", "🔬", "🛠️", "✍️", "📊", "🦉"] as const;
 
 interface Props {
   open: boolean;
@@ -285,7 +283,7 @@ export function AgentSettings({ open, onOpenChange, initialAgentId }: Props) {
                 title={a.name}
               >
                 <span className="shrink-0 text-base leading-none">
-                  {a.avatar || "🐙"}
+                  {a.avatar || DEFAULT_AGENT_AVATAR}
                 </span>
                 <span className="truncate">{a.name}</span>
               </button>
@@ -330,7 +328,7 @@ export function AgentSettings({ open, onOpenChange, initialAgentId }: Props) {
                   id="agent-avatar"
                   value={avatar}
                   onChange={(e) => setAvatar(e.target.value)}
-                  placeholder="🐙"
+                  placeholder={DEFAULT_AGENT_AVATAR}
                   aria-label="Custom icon"
                   className="h-9 w-14 text-center"
                 />

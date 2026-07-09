@@ -1,12 +1,12 @@
-# Octopus
+# Owlery
 
-**Octopus is a personal agent platform.** It turns **Claude Code** and **Codex**
+**Owlery is a personal agent platform.** It turns **Claude Code** and **Codex**
 into durable, always-on AI agents that run on your own machine and work for you
 around the clock — reachable from your phone, any browser, or Telegram.
 
 Each agent keeps its own persistent setup (prompt, model, tools, schedules,
 connectors), keeps work running in the background across turns, and can reach
-real third-party APIs. Octopus drives the `claude` / `codex` CLIs directly via
+real third-party APIs. Owlery drives the `claude` / `codex` CLIs directly via
 their stream protocols, so there's **no extra API cost** — it uses your existing
 Claude and ChatGPT subscriptions (or an API key you attach).
 
@@ -38,7 +38,7 @@ Phone / Browser / Telegram
   rest (Fernet), and attach them per agent; falls back to the CLI's own login
   (`claude login` / `codex login`) when none is attached.
 - **Run from anywhere** — One command serves the API and web UI on a single
-  port; reach it from any browser or phone. `octopus serve --tunnel` gives
+  port; reach it from any browser or phone. `owlery serve --tunnel` gives
   instant public HTTPS via Cloudflare Tunnel. Token auth; HTTPS/WSS behind
   tunnels and reverse proxies.
 - **Telegram** — Drive agents from a Telegram bot: each chat binds to an agent
@@ -77,7 +77,7 @@ Phone / Browser / Telegram
     the reply when it lands, and a question that travelled back to you
     — and the sidebar surfaces hidden delegation sessions on demand.
   - Design: [`docs/plans/agent-collaboration.md`](docs/plans/agent-collaboration.md).
-- **In-app tools** — Every agent gets MCP tools Octopus injects: a
+- **In-app tools** — Every agent gets MCP tools Owlery injects: a
   **background runner**, a structured **ask-the-user** prompt rendered as
   a multiple-choice form in the UI, and the agent-to-agent **delegation**
   tools described in the previous bullet.
@@ -109,16 +109,16 @@ Phone / Browser / Telegram
     [`docs/plans/session-fork.md`](docs/plans/session-fork.md).
 - **Native deep research** — `/research <question>` (or the
   `mcp__research__deep_research` MCP tool, which agents can call themselves)
-  starts a multi-phase Octopus-orchestrated research job: scope decompose →
+  starts a multi-phase Owlery-orchestrated research job: scope decompose →
   parallel web-search sub-turns per angle → dedup + rank → adversarial verify →
-  final synthesis into a cited report. Octopus owns the fan-out,
+  final synthesis into a cited report. Owlery owns the fan-out,
   concurrency limits, cancellation, and persistence; web access comes from the
   harness's own native tools (`WebSearch`/`WebFetch` for Claude; `web_search` for
   Codex). A `ResearchCard` in the chat tracks phase progress and exposes a cancel
   button; the final report arrives as a follow-up turn the agent can act on.
   Design: [`docs/plans/native-deep-research.md`](docs/plans/native-deep-research.md).
-- **Local handoff** — `octopus handoff` imports local Claude Code sessions;
-  `octopus pull` exports a session as JSONL for local `claude --resume`.
+- **Local handoff** — `owlery handoff` imports local Claude Code sessions;
+  `owlery pull` exports a session as JSONL for local `claude --resume`.
 - **Persistence** — SQLite (WAL, batched commits per turn); sessions, messages,
   agents, credentials, connectors, and schedules survive restarts.
 
@@ -126,19 +126,19 @@ Phone / Browser / Telegram
 
 ```bash
 # Clone and set up
-git clone https://github.com/archeryue/Octopus.git && cd Octopus
+git clone https://github.com/wz-heng/Owlery.git && cd Owlery
 python3 -m venv .venv && .venv/bin/pip install -e "."
-cp .env.example .env          # edit OCTOPUS_AUTH_TOKEN
+cp .env.example .env          # edit OWLERY_AUTH_TOKEN
 
 # Build the frontend (the server serves web/dist/)
 cd web && bun install && bun run build && cd ..
 
 # Run (API + UI on port 8000)
-octopus serve
+owlery serve
 ```
 
 Open `http://localhost:8000`, enter your token, pick the default **Octo** agent,
-create a session, and start chatting. For phone access, `octopus serve --tunnel`
+create a session, and start chatting. For phone access, `owlery serve --tunnel`
 gives you a public HTTPS URL.
 
 Auth for the agent's backend uses your existing CLI login (`claude login` /
@@ -160,10 +160,10 @@ Open `http://localhost:5173` for the hot-reloading dev server.
 ## CLI
 
 ```bash
-octopus serve                  # Start server (API + UI on port 8000)
-octopus serve --tunnel         # ... with a public Cloudflare Tunnel (HTTPS)
-octopus handoff                # Import a local Claude Code session
-octopus pull <session-id>      # Export an Octopus session as local JSONL
+owlery serve                  # Start server (API + UI on port 8000)
+owlery serve --tunnel         # ... with a public Cloudflare Tunnel (HTTPS)
+owlery handoff                # Import a local Claude Code session
+owlery pull <session-id>      # Export an Owlery session as local JSONL
 ```
 
 ## Tech Stack

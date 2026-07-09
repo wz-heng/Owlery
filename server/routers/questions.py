@@ -5,7 +5,7 @@ Three endpoints:
   POST /api/sessions/{id}/questions
       Called by the `ask` MCP server (server/mcp_servers/ask.py) when
       the model invokes `mcp__ask__user`. Body: `{questions: [...]}`.
-      Octopus generates a question_id, persists the question into the
+      Owlery generates a question_id, persists the question into the
       session's chat history (so reload re-renders the form), and
       broadcasts the `question_request` WS event to the frontend.
       Returns `{question_id: "..."}`.
@@ -24,7 +24,7 @@ Three endpoints:
       broadcasts the question_answer WS event.
 
 Auth: same bearer-token model as every other API surface. The MCP
-server holds OCTOPUS_AUTH_TOKEN; the frontend sends the user's
+server holds OWLERY_AUTH_TOKEN; the frontend sends the user's
 bearer.
 
 This replaces the previous CLI control-protocol path

@@ -1,6 +1,6 @@
 """Symmetric encryption for at-rest secrets (backend credentials).
 
-Uses Fernet with a key derived from `OCTOPUS_AUTH_TOKEN` via PBKDF2.
+Uses Fernet with a key derived from `OWLERY_AUTH_TOKEN` via PBKDF2.
 This is intentionally lightweight — the threat model is "another local
 user reading the SQLite file", not a determined attacker. Anyone with
 the auth token can decrypt regardless of mechanism.
@@ -14,9 +14,9 @@ import hashlib
 
 from cryptography.fernet import Fernet, InvalidToken
 
-# Static salt — fine here because the input (OCTOPUS_AUTH_TOKEN) already
+# Static salt — fine here because the input (OWLERY_AUTH_TOKEN) already
 # has user-controlled entropy. PBKDF2 only protects against weak tokens.
-_SALT = b"octopus-credentials-v1"
+_SALT = b"owlery-credentials-v1"
 _ITERATIONS = 200_000
 
 

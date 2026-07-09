@@ -31,7 +31,7 @@ for _d in [
     if _d and _d not in os.environ.get("PATH", "").split(os.pathsep):
         os.environ["PATH"] = _d + os.pathsep + os.environ.get("PATH", "")
 
-CODENAME = "BLUEOCTOPUS7723"
+CODENAME = "BLUEOWLERY7723"
 
 
 def _seed(agent_id: str) -> None:

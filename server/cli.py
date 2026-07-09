@@ -1,4 +1,4 @@
-"""CLI entry point for Octopus: serve (default) and handoff subcommands."""
+"""CLI entry point for Owlery: serve (default) and handoff subcommands."""
 
 from __future__ import annotations
 
@@ -148,15 +148,15 @@ def do_handoff(args: argparse.Namespace) -> None:
         sys.exit(1)
     except urllib.error.URLError as e:
         print(f"Error: Could not connect to {server}", file=sys.stderr)
-        print(f"  Is the Octopus server running? Start it with:", file=sys.stderr)
-        print(f"    octopus serve", file=sys.stderr)
+        print(f"  Is the Owlery server running? Start it with:", file=sys.stderr)
+        print(f"    owlery serve", file=sys.stderr)
         print(f"  Or with Cloudflare Tunnel:", file=sys.stderr)
-        print(f"    octopus serve --tunnel", file=sys.stderr)
+        print(f"    owlery serve --tunnel", file=sys.stderr)
         sys.exit(1)
 
 
 def do_pull(args: argparse.Namespace) -> None:
-    """Execute the pull subcommand — fetch a session from Octopus and write as JSONL."""
+    """Execute the pull subcommand — fetch a session from Owlery and write as JSONL."""
     from .harness import get_harness
     from .models import MessageContent
 
@@ -235,7 +235,7 @@ def do_serve(args: argparse.Namespace) -> None:
     # uvicorn's reload, which re-imports the module and creates a fresh Settings().
     if getattr(args, "tunnel", None) is not None:
         import os
-        os.environ["OCTOPUS_ENABLE_TUNNEL"] = str(args.tunnel).lower()
+        os.environ["OWLERY_ENABLE_TUNNEL"] = str(args.tunnel).lower()
 
     from .main import run
     run()
@@ -244,13 +244,13 @@ def do_serve(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser."""
     parser = argparse.ArgumentParser(
-        prog="octopus",
-        description="Octopus — remote Claude Code controller",
+        prog="owlery",
+        description="Owlery — remote Claude Code controller",
     )
     subparsers = parser.add_subparsers(dest="command")
 
     # serve (default)
-    serve_parser = subparsers.add_parser("serve", help="Start the Octopus server")
+    serve_parser = subparsers.add_parser("serve", help="Start the Owlery server")
     serve_parser.add_argument(
         "--tunnel",
         action="store_true",
@@ -273,12 +273,12 @@ def build_parser() -> argparse.ArgumentParser:
     handoff_parser.add_argument(
         "--server",
         default="http://localhost:8000",
-        help="Octopus server URL (default: http://localhost:8000)",
+        help="Owlery server URL (default: http://localhost:8000)",
     )
     handoff_parser.add_argument(
         "--token",
         default="changeme",
-        help="Auth token for the Octopus server",
+        help="Auth token for the Owlery server",
     )
     handoff_parser.add_argument(
         "--name",
@@ -287,21 +287,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     # pull
     pull_parser = subparsers.add_parser(
-        "pull", help="Pull a session from Octopus and write as Claude Code JSONL"
+        "pull", help="Pull a session from Owlery and write as Claude Code JSONL"
     )
     pull_parser.add_argument(
         "session_id",
-        help="Octopus session ID to pull",
+        help="Owlery session ID to pull",
     )
     pull_parser.add_argument(
         "--server",
         default="http://localhost:8000",
-        help="Octopus server URL (default: http://localhost:8000)",
+        help="Owlery server URL (default: http://localhost:8000)",
     )
     pull_parser.add_argument(
         "--token",
         default="changeme",
-        help="Auth token for the Octopus server",
+        help="Auth token for the Owlery server",
     )
     pull_parser.add_argument(
         "--project-dir",

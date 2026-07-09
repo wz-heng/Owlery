@@ -37,13 +37,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("octopus-gmail")
+mcp = FastMCP("owlery-gmail")
 ctx = ConnectorContext()
 
 _API = "https://gmail.googleapis.com/gmail/v1"
 _RECONNECT_MSG = (
     "Error: Gmail token expired or revoked — ask the user to reconnect "
-    "Gmail in Octopus's sidebar."
+    "Gmail in Owlery's sidebar."
 )
 
 
@@ -51,7 +51,7 @@ def _api(method: str, path: str, **kw: Any) -> tuple[Any | None, str | None]:
     """Authenticated Gmail call. Returns (parsed_body, None) or (None, error)."""
     token = ctx.access_token()
     if token is None:
-        return None, "Error: connector unavailable — reconnect Gmail in Octopus."
+        return None, "Error: connector unavailable — reconnect Gmail in Owlery."
     headers = {"Authorization": f"Bearer {token}"}
     url = path if path.startswith("http") else f"{_API}{path}"
     for attempt in range(3):

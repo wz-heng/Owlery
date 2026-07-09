@@ -922,10 +922,10 @@ async def test_make_run_applies_agent_config(manager):
 
     # model
     assert "--model" in argv and "claude-opus-4-7" in argv
-    # agent persona is appended ahead of the Octopus tools section
+    # agent persona is appended ahead of the Owlery tools section
     ap = argv[argv.index("--append-system-prompt") + 1]
     assert "You are a pirate." in ap
-    assert "Octopus in-app tools" in ap
+    assert "Owlery in-app tools" in ap
     # deny = always-on AskUserQuestion + agent deny; allow = agent allow
     dis = argv[argv.index("--disallowedTools") + 1]
     assert "AskUserQuestion" in dis and "Bash" in dis

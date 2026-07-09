@@ -6,7 +6,7 @@
 
 ## 0. What we're building, and the mental model
 
-Today an Octopus session has one human on the outside and one agent on
+Today an Owlery session has one human on the outside and one agent on
 the inside. We want **agents to call each other**: from inside Octo's
 session you say "ask Vera to review the code", Octo dispatches the
 request to Vera, Vera works in her own session with her own
@@ -39,10 +39,10 @@ That's the whole feature. It means:
   (recursing one hop up), or fail the delegation. No special-case
   cross-session UX; it's just the model's normal tool-use loop.
 
-We piggy-back on Octopus's existing **bg-task pattern** for the
+We piggy-back on Owlery's existing **bg-task pattern** for the
 async plumbing. `mcp__ask_agent__ask` returns a delegation id
 immediately, the agent's turn ends, and when the child session
-produces a reply (or question, or terminal error) Octopus injects a
+produces a reply (or question, or terminal error) Owlery injects a
 follow-up turn into the parent session. No new long-poll
 infrastructure, no blocking subprocesses, parallel fan-out for free.
 
@@ -194,7 +194,7 @@ Python functions keep the longer names
 `ask_agent` / `answer_agent_question` / `cancel_agent_task` /
 `list_agent_tasks`; the decorators expose the short MCP names
 (`server/mcp_servers/ask_agent.py:3`). Env injection
-(`OCTOPUS_API_BASE`, `OCTOPUS_AUTH_TOKEN`, `OCTOPUS_SESSION_ID`)
+(`OWLERY_API_BASE`, `OWLERY_AUTH_TOKEN`, `OWLERY_SESSION_ID`)
 matches the existing pattern; the server is a thin HTTP shim to
 FastAPI routes.
 

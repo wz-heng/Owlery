@@ -125,7 +125,7 @@ async function getSessionByName(
 const tempDirs: string[] = [];
 
 function makeTempDir(): string {
-  const dir = mkdtempSync(join(tmpdir(), "octopus-e2e-"));
+  const dir = mkdtempSync(join(tmpdir(), "owlery-e2e-"));
   tempDirs.push(dir);
   return dir;
 }

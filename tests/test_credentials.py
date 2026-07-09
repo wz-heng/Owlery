@@ -16,7 +16,7 @@ from server.database import Database
 
 
 def test_roundtrip():
-    secret = "octopus-token"
+    secret = "owlery-token"
     enc = encrypt("sk-ant-12345", secret)
     assert enc != "sk-ant-12345"
     assert decrypt(enc, secret) == "sk-ant-12345"

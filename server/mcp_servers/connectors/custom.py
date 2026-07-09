@@ -36,17 +36,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("octopus-custom-connector")
+mcp = FastMCP("owlery-custom-connector")
 ctx = ConnectorContext()
 
 _RECONNECT = (
     "Error: token expired or revoked — ask the user to reconnect this "
-    "connector in Octopus's sidebar."
+    "connector in Owlery's sidebar."
 )
 
 
 def _api_base() -> str:
-    return (os.environ.get("OCTOPUS_CONNECTOR_API_BASE") or "").rstrip("/")
+    return (os.environ.get("OWLERY_CONNECTOR_API_BASE") or "").rstrip("/")
 
 
 @mcp.tool(name="request")
@@ -60,7 +60,7 @@ def request(
     """
     token = ctx.access_token()
     if token is None:
-        return "Error: connector unavailable — reconnect it in Octopus."
+        return "Error: connector unavailable — reconnect it in Owlery."
     api_base = _api_base()
     if not api_base:
         return "Error: connector misconfigured (no API base)."

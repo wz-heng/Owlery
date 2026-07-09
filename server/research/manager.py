@@ -48,7 +48,7 @@ def _now() -> str:
 
 
 def _research_dir() -> str:
-    d = os.path.expanduser(os.path.join("~", ".octopus", "research"))
+    d = settings.resolved_research_dir
     os.makedirs(d, exist_ok=True)
     return d
 

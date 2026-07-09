@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fake `claude` CLI for ClaudeCodeBackend tests.
 
-Mirrors the VM0-shape `claude --print` flow that Octopus now uses:
+Mirrors the VM0-shape `claude --print` flow that Owlery now uses:
 the prompt is passed as a positional argv (we ignore it; the mode
 arg drives the scripted output), and **no stdin protocol** is read
 or driven. We just emit scripted JSONL events on stdout and exit.

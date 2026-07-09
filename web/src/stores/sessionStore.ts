@@ -1,4 +1,10 @@
 import { create } from "zustand";
+
+import {
+  SHOW_DELEGATIONS_KEY,
+  TOKEN_KEY,
+  readStored,
+} from "../lib/storage";
 import type {
   AgentRead as ApiAgentRead,
   AttachmentMetadata as ApiAttachmentMetadata,
@@ -247,9 +253,9 @@ export interface Delegation {
 }
 
 export const useSessionStore = create<SessionStore>((set) => ({
-  token: localStorage.getItem("octopus_token") || "",
+  token: readStored(TOKEN_KEY) || "",
   setToken: (t) => {
-    localStorage.setItem("octopus_token", t);
+    localStorage.setItem(TOKEN_KEY, t);
     set({ token: t });
   },
 
@@ -485,10 +491,10 @@ export const useSessionStore = create<SessionStore>((set) => ({
       delegations: { ...s.delegations, [parentSessionId]: ds },
     })),
 
-  showDelegations: localStorage.getItem("octopus_show_delegations") === "true",
+  showDelegations: readStored(SHOW_DELEGATIONS_KEY) === "true",
   setShowDelegations: (v) => {
-    if (v) localStorage.setItem("octopus_show_delegations", "true");
-    else localStorage.removeItem("octopus_show_delegations");
+    if (v) localStorage.setItem(SHOW_DELEGATIONS_KEY, "true");
+    else localStorage.removeItem(SHOW_DELEGATIONS_KEY);
     set({ showDelegations: v });
   },
 }));

@@ -30,7 +30,7 @@ def authed(monkeypatch):
     monkeypatch.setattr(
         cu.ctx, "mark_needs_reconnect", lambda code="invalid_grant": recon.append(code)
     )
-    monkeypatch.setenv("OCTOPUS_CONNECTOR_API_BASE", "https://api.x.com")
+    monkeypatch.setenv("OWLERY_CONNECTOR_API_BASE", "https://api.x.com")
     return recon
 
 
@@ -71,7 +71,7 @@ def test_request_401_marks_reconnect(monkeypatch, authed):
 
 def test_request_no_api_base(monkeypatch):
     monkeypatch.setattr(cu.ctx, "access_token", lambda: "tok")
-    monkeypatch.delenv("OCTOPUS_CONNECTOR_API_BASE", raising=False)
+    monkeypatch.delenv("OWLERY_CONNECTOR_API_BASE", raising=False)
     assert "misconfigured" in cu.request(method="get", path="/x").lower()
 
 

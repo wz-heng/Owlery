@@ -3,7 +3,7 @@
 Connectors let an agent call third-party accounts (GitHub, Gmail, or any
 OAuth2 API you define) as tools. Everything here is doable **from the browser**
 — no server shell, env, or filesystem access required — so it works when you
-reach Octopus remotely (e.g. via a tunnel).
+reach Owlery remotely (e.g. via a tunnel).
 
 The one unavoidable step is registering an OAuth app with the provider to get a
 **client id + secret** — but that's done in your browser too. (A hosted SaaS
@@ -78,12 +78,12 @@ If you run the server yourself, you can pre-seed client creds via env instead
 of the Set up dialog (the in-app config takes precedence when both exist):
 
 ```bash
-OCTOPUS_GITHUB_OAUTH_CLIENT_ID=...     OCTOPUS_GITHUB_OAUTH_CLIENT_SECRET=...
-OCTOPUS_GMAIL_OAUTH_CLIENT_ID=...      OCTOPUS_GMAIL_OAUTH_CLIENT_SECRET=...
+OWLERY_GITHUB_OAUTH_CLIENT_ID=...     OWLERY_GITHUB_OAUTH_CLIENT_SECRET=...
+OWLERY_GMAIL_OAUTH_CLIENT_ID=...      OWLERY_GMAIL_OAUTH_CLIENT_SECRET=...
 # Only needed if the request-derived redirect URI is ever wrong for your setup:
-OCTOPUS_PUBLIC_BASE_URL=https://your-stable-host
+OWLERY_PUBLIC_BASE_URL=https://your-stable-host
 ```
 
 Secrets (client secrets and connector tokens) are encrypted at rest with
-Fernet, keyed by `OCTOPUS_AUTH_TOKEN`; tokens are only ever read by the
+Fernet, keyed by `OWLERY_AUTH_TOKEN`; tokens are only ever read by the
 connector's MCP subprocess at tool-call time.

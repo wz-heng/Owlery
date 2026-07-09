@@ -326,7 +326,7 @@ test.describe("Message Queue & Interrupt @llm", () => {
       .filter((m) => m.role === "user")
       .map((m) => (typeof m.content === "string" ? m.content : ""))
       // The model may legitimately route the `sleep` commands through
-      // mcp__bg__run (the Octopus system prompt tells it to use bg_run for
+      // mcp__bg__run (the Owlery system prompt tells it to use bg_run for
       // sleeps). When that bg task finishes it injects a *synthesized*
       // `[bg-task-result]` user-role message — not user-typed input — so
       // exclude it from the typed-prompt count to keep this deterministic.
@@ -719,7 +719,7 @@ test.describe("AskUserQuestion rendering @llm", () => {
 // ---------------------------------------------------------------------------
 //
 // These hit the real model. Costs ~$0.01-0.05 per run. They run last and
-// are skipped if the Octopus server can't reach claude on PATH (the assert
+// are skipped if the Owlery server can't reach claude on PATH (the assert
 // below catches that). Both also have generous timeouts since real API
 // latency varies.
 
@@ -738,7 +738,7 @@ test.describe("Real CLI end-to-end @llm", () => {
       .click();
     await expect(page.locator(".chat-header h3")).toHaveText("Real Q Session");
 
-    // The built-in AskUserQuestion is disabled in Octopus (--disallowedTools
+    // The built-in AskUserQuestion is disabled in Owlery (--disallowedTools
     // in claude_code.py). Nudge the model toward the MCP replacement
     // explicitly. The frontend / WS / question-state machinery on the
     // host side is the same as the legacy flow — the change is purely
@@ -800,7 +800,7 @@ test.describe("Real CLI end-to-end @llm", () => {
         backend: "claude-code",
         label: "Bad Key (E2E)",
         auth_type: "api_key",
-        secret: "sk-ant-bogus-octopus-e2e",
+        secret: "sk-ant-bogus-owlery-e2e",
       },
     });
     expect(credRes.ok()).toBeTruthy();
@@ -913,7 +913,7 @@ test.describe("Real CLI end-to-end @llm", () => {
 //      timeout that silently swallowed the failure, leaving the lock
 //      held and the UI soft-locked.
 //   3. (new feature) if no human answers within
-//      OCTOPUS_ASK_USER_QUESTION_TIMEOUT_SECONDS, the server should
+//      OWLERY_ASK_USER_QUESTION_TIMEOUT_SECONDS, the server should
 //      synthesize an "act autonomously" reply so async-driven sessions
 //      (bridges, schedules) can't wedge forever.
 //
@@ -1067,7 +1067,7 @@ test.describe("AskUserQuestion edge cases (real CLI) @llm", () => {
     const form = page.locator(".msg-question:not(.msg-question-done)");
     await expect(form).toBeVisible({ timeout: 90_000 });
 
-    // OCTOPUS_ASK_USER_QUESTION_TIMEOUT_SECONDS is 12s in the e2e env
+    // OWLERY_ASK_USER_QUESTION_TIMEOUT_SECONDS is 12s in the e2e env
     // (see playwright.config.ts). After it elapses the server should
     // synthesize the autonomy-mode answer and broadcast it as a
     // question_answer event — which the UI renders as a
@@ -1836,7 +1836,7 @@ test.describe("Cross-turn bg tasks @llm", () => {
   }) => {
     // Per-test tmpdir for the session's working_dir. The bg subprocess
     // runs there; the chip should pick up its exit + output regardless.
-    const wd = fs.mkdtempSync(path.join(os.tmpdir(), "octopus-bg-e2e-"));
+    const wd = fs.mkdtempSync(path.join(os.tmpdir(), "owlery-bg-e2e-"));
     const SENTINEL = "BG-E2E-OK-58231";
     try {
       const sessRes = await request.post(`${API}/sessions`, {
@@ -1910,7 +1910,7 @@ test.describe("Cross-turn bg tasks @llm", () => {
     //      any other), so the synthesized [bg-task-result] turn lands and
     //      the model gets a chance to react. Without this, a user-cancel
     //      would leave the conversation hanging mid-thought.
-    const wd = fs.mkdtempSync(path.join(os.tmpdir(), "octopus-bg-cancel-"));
+    const wd = fs.mkdtempSync(path.join(os.tmpdir(), "owlery-bg-cancel-"));
     const REPLY_SENTINEL = "CANCEL-HANDLED-71920";
     try {
       const sessRes = await request.post(`${API}/sessions`, {
@@ -1991,7 +1991,7 @@ test.describe("Cross-turn bg tasks @llm", () => {
 // Bg-task pipeline hardening (2026-05-18 work). Three things to prove end-
 // to-end against the real Claude CLI + real bg worker:
 //   * A bg task whose captured output exceeds the spill threshold
-//     (~100 KB) is delivered to the model as an [octopus-large-prompt]
+//     (~100 KB) is delivered to the model as an [owlery-large-prompt]
 //     pointer, NOT inline — so execve never sees an oversized argv.
 //   * A bg task that produces output and then goes silent past the idle
 //     watchdog threshold lands with status=`interrupted` (chip label
@@ -2008,7 +2008,7 @@ test.describe("Bg-task pipeline hardening @llm", () => {
     page,
     request,
   }) => {
-    const wd = fs.mkdtempSync(path.join(os.tmpdir(), "octopus-bg-spill-"));
+    const wd = fs.mkdtempSync(path.join(os.tmpdir(), "owlery-bg-spill-"));
     // Sentinel small enough that, if the model echoes it back, we
     // know it actually Read the spilled file (the pointer prompt
     // itself doesn't contain the sentinel).
@@ -2087,10 +2087,10 @@ test.describe("File viewer (/showme) @llm", () => {
     // running on the box. tmpdir is on the same filesystem as the
     // server since both share this host, so path sandbox checks work
     // as in production.
-    const wd = fs.mkdtempSync(path.join(os.tmpdir(), "octopus-viewer-e2e-"));
+    const wd = fs.mkdtempSync(path.join(os.tmpdir(), "owlery-viewer-e2e-"));
     fs.writeFileSync(
       path.join(wd, "intro.md"),
-      "# Octopus Viewer\n\nThis is the **intro** doc rendered live.\n"
+      "# Owlery Viewer\n\nThis is the **intro** doc rendered live.\n"
     );
 
     try {
@@ -2135,7 +2135,7 @@ test.describe("File viewer (/showme) @llm", () => {
       // body (not e.g. the plain-text fallback) and that the file
       // bytes actually rendered.
       await expect(
-        dialog.locator("h1", { hasText: "Octopus Viewer" })
+        dialog.locator("h1", { hasText: "Owlery Viewer" })
       ).toBeVisible({ timeout: 15_000 });
       await expect(dialog.locator("strong", { hasText: "intro" })).toBeVisible();
 

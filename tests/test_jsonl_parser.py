@@ -1,4 +1,4 @@
-"""Tests for the JSONL parser that converts Claude Code sessions to Octopus format."""
+"""Tests for the JSONL parser that converts Claude Code sessions to Owlery format."""
 
 import json
 import tempfile

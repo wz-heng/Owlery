@@ -174,7 +174,7 @@ async def test_real_tool_use_then_tool_result():
 # built-in AUQ disabled via --disallowedTools), AUQ no longer flows
 # through the CLI control protocol. The model uses the
 # `mcp__ask__user` MCP tool instead, which calls back into the
-# Octopus FastAPI process over HTTP. Verifying that round-trip needs
+# Owlery FastAPI process over HTTP. Verifying that round-trip needs
 # a live uvicorn + REST + frontend submission; it's covered by the
 # Playwright e2e (`web/e2e/new-features.spec.ts`), not by a backend
 # unit test. Keeping a unit test here would just mock the entire
@@ -290,7 +290,7 @@ async def test_real_credential_with_bad_key_yields_auth_error():
     bad_cred = HarnessCredential(
         backend="claude-code",
         auth_type="api_key",
-        secret="sk-ant-bogus-key-octopus-test",
+        secret="sk-ant-bogus-key-owlery-test",
     )
     await backend.start("Reply with: HI", CWD, credential=bad_cred)
     try:

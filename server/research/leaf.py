@@ -31,7 +31,7 @@ from ..harness import (
 
 logger = logging.getLogger(__name__)
 
-# Minimal persona for a web leaf — it has no Octopus in-app tools, just the
+# Minimal persona for a web leaf — it has no Owlery in-app tools, just the
 # backend's web tools; the per-leaf user prompt carries the real instruction.
 _LEAF_SYSTEM = (
     "You are a focused web-research worker. Use ONLY your web tools to do what "

@@ -26,7 +26,7 @@ in `docs/connectors-setup.md`.
 >    agent authenticated HTTP to the kind's API base. Routes:
 >    `POST /api/connectors/custom`, `DELETE /api/connectors/custom/{kind}`.
 > 4. **Redirect URI is derived from the browser request** (`X-Forwarded-Proto`/
->    `Host`), not `OCTOPUS_PUBLIC_BASE_URL` — works behind a tunnel with zero
+>    `Host`), not `OWLERY_PUBLIC_BASE_URL` — works behind a tunnel with zero
 >    server config (env var remains an override).
 > 5. **Provider methods take client_id/client_secret explicitly** (resolved per
 >    request) rather than reading settings, so DB-stored creds work.
@@ -60,8 +60,8 @@ in `docs/connectors-setup.md`.
 >    don't expire (like Notion's did), so the refresh path stays dead code
 >    unless we adopt GitHub-App expiring tokens. The exact tool list + names
 >    (under the 60-char cap, §5.3) get pinned down at implementation.
-> 4. **Env vars (§7): `OCTOPUS_NOTION_OAUTH_*` → `OCTOPUS_GITHUB_OAUTH_*`;**
->    `OCTOPUS_GMAIL_OAUTH_*` stays. `docs/connectors-setup.md` documents
+> 4. **Env vars (§7): `OWLERY_NOTION_OAUTH_*` → `OWLERY_GITHUB_OAUTH_*`;**
+>    `OWLERY_GMAIL_OAUTH_*` stays. `docs/connectors-setup.md` documents
 >    GitHub OAuth-app registration instead of Notion.
 
 > ## ⚠️ REVISION — connectors are AGENT-scoped (2026-05-19)
@@ -125,7 +125,7 @@ so the same connector code works for both engines without duplication.
   connector exports. (VM0 has a per-scope firewall — out of scope here
   until we have a real second user who needs it.)
 - **No shared / org-wide installations.** Each installation belongs to
-  the running Octopus instance. Multi-user / multi-org is future work.
+  the running Owlery instance. Multi-user / multi-org is future work.
 - **No connector-driven inbound events.** Connectors are
   outbound-only (session → external). Inbound (external → session) is
   what `server/bridges/` already does; the two layers stay separate.
@@ -240,7 +240,7 @@ class ConnectorBase(abc.ABC):
         self,
         installation: ConnectorInstallation,
     ) -> str:
-        """Short paragraph appended to _OCTOPUS_SYSTEM_PROMPT so the
+        """Short paragraph appended to _OWLERY_SYSTEM_PROMPT so the
         model knows the tool exists and when to call it."""
 
     async def fetch_external_identity(
@@ -300,11 +300,11 @@ but not flows.
 Each connector ships its own stdio MCP server under
 `server/mcp_servers/connectors/<kind>.py`. The server follows the
 shape of `server/mcp_servers/ask.py` (the closest existing template
-— it long-polls Octopus over HTTP from inside an MCP-subprocess).
+— it long-polls Owlery over HTTP from inside an MCP-subprocess).
 Concretely:
 
-- Reads `OCTOPUS_API_BASE`, `OCTOPUS_AUTH_TOKEN`,
-  `OCTOPUS_SESSION_ID`, and `OCTOPUS_INSTALLATION_ID` from env
+- Reads `OWLERY_API_BASE`, `OWLERY_AUTH_TOKEN`,
+  `OWLERY_SESSION_ID`, and `OWLERY_INSTALLATION_ID` from env
   (compare `server/mcp_servers/ask.py:107-114`).
 - On each tool call, fetches a fresh access token from
   `GET /api/connectors/{installation_id}/token` (with retry on a
@@ -322,7 +322,7 @@ Concretely:
   paginate]` marker.
 - On 401, POSTs `/api/connectors/{id}/mark-needs-reconnect` and
   returns a one-line "Token expired — ask the user to reconnect
-  <Kind> via Octopus's sidebar."
+  <Kind> via Owlery's sidebar."
 - On rate-limit (429) or transient 5xx: respect `Retry-After`, retry
   up to 3× with exponential backoff inside the same tool call (the
   agent should not have to know about transient failures).
@@ -386,7 +386,7 @@ CREATE INDEX IF NOT EXISTS idx_session_connectors_session
 ```
 
 `secret_encrypted` is a Fernet-encrypted (via `server/crypto.py`,
-key derived from `OCTOPUS_AUTH_TOKEN`) JSON blob:
+key derived from `OWLERY_AUTH_TOKEN`) JSON blob:
 
 ```json
 {
@@ -413,7 +413,7 @@ duplicate).
 ### 5.5 API routes
 
 Add a new router `server/routers/connectors.py`. All routes are
-bearer-authenticated with `OCTOPUS_AUTH_TOKEN` *except* the OAuth
+bearer-authenticated with `OWLERY_AUTH_TOKEN` *except* the OAuth
 callback (it's bounced into from the third party's browser redirect
 — it can't carry our bearer; it carries the OAuth `state` + `code`
 instead, and the `state` is the trust anchor).
@@ -458,9 +458,9 @@ hitting an expired token at the same time refresh once.
 
 ### 5.5.5 OAuth flow (install a connector)
 
-This is structurally different from Octopus's existing
+This is structurally different from Owlery's existing
 `OAuthLoginManager` paste flow (`server/oauth_login.py`), so worth
-spelling out. Octopus runs locally on `127.0.0.1:<port>` (or behind
+spelling out. Owlery runs locally on `127.0.0.1:<port>` (or behind
 a Cloudflare quick-tunnel; see `server/tunnel.py`); whichever it is,
 the public base URL needs to match what the user registered as the
 redirect URI with the third party.
@@ -474,7 +474,7 @@ redirect URI with the third party.
     - resolves `notion` from KIND_REGISTRY
     - mints login_id (uuid4 hex[:16]), state (32 bytes b64url),
       pkce verifier+challenge
-    - reads OCTOPUS_PUBLIC_BASE_URL from settings (defaults to
+    - reads OWLERY_PUBLIC_BASE_URL from settings (defaults to
       f"http://127.0.0.1:{settings.port}" when unset; surfaced as
       a clear config error if the user is behind a tunnel and
       didn't set it)
@@ -556,10 +556,10 @@ inline (`server/backends/claude_code.py:251-274`). Three changes:
    merge into the `mcpServers` dict with key
    `f"{kind}_{install.id[:6]}"` so two installations of the same
    kind don't collide. Each entry includes
-   `OCTOPUS_INSTALLATION_ID = install.id` in its env (on top of the
+   `OWLERY_INSTALLATION_ID = install.id` in its env (on top of the
    shared callback env).
 
-Then a fourth change: extend `_OCTOPUS_SYSTEM_PROMPT`. The constant
+Then a fourth change: extend `_OWLERY_SYSTEM_PROMPT`. The constant
 in `claude_code.py:37-110` is built at import time; we instead build
 it dynamically in `build_args` by appending a
 `== Connectors ==` section composed of each connector's
@@ -581,10 +581,10 @@ servers declared as:
 command = "/.../python"
 args = ["-m", "server.mcp_servers.connectors.notion"]
 [mcp_servers.notion_4a2f.env]
-OCTOPUS_API_BASE = "http://127.0.0.1:8765"
-OCTOPUS_AUTH_TOKEN = "..."
-OCTOPUS_SESSION_ID = "..."
-OCTOPUS_INSTALLATION_ID = "..."
+OWLERY_API_BASE = "http://127.0.0.1:8765"
+OWLERY_AUTH_TOKEN = "..."
+OWLERY_SESSION_ID = "..."
+OWLERY_INSTALLATION_ID = "..."
 PYTHONPATH = "..."
 ```
 
@@ -675,7 +675,7 @@ Before calling `send_draft`, ALWAYS show the drafted message in your
 reply and call `mcp__ask__user` with a yes/no question. Never send
 without an explicit user OK in the same conversation turn.
 
-[notion / Octopus Workspace]
+[notion / Owlery Workspace]
   mcp__notion_8c1e__search(query, filter?)
   mcp__notion_8c1e__fetch(id)                    — page or database
   mcp__notion_8c1e__create_page(parent_id, title, content_blocks)
@@ -769,25 +769,25 @@ Per kind, the OAuth client_id and (when needed) client_secret come
 from env vars read at `server.config.settings` load time:
 
 ```
-OCTOPUS_PUBLIC_BASE_URL                # required if behind a tunnel; defaults to http://127.0.0.1:<port>
-OCTOPUS_NOTION_OAUTH_CLIENT_ID
-OCTOPUS_NOTION_OAUTH_CLIENT_SECRET
-OCTOPUS_GMAIL_OAUTH_CLIENT_ID
-OCTOPUS_GMAIL_OAUTH_CLIENT_SECRET
+OWLERY_PUBLIC_BASE_URL                # required if behind a tunnel; defaults to http://127.0.0.1:<port>
+OWLERY_NOTION_OAUTH_CLIENT_ID
+OWLERY_NOTION_OAUTH_CLIENT_SECRET
+OWLERY_GMAIL_OAUTH_CLIENT_ID
+OWLERY_GMAIL_OAUTH_CLIENT_SECRET
 ```
 
 The catalog endpoint surfaces a per-kind `available: bool` flag
 computed from whether the env vars are set, and the catalog picker
 shows unavailable kinds disabled with a tooltip ("set
-`OCTOPUS_GMAIL_OAUTH_CLIENT_ID` and `_CLIENT_SECRET` in env to
+`OWLERY_GMAIL_OAUTH_CLIENT_ID` and `_CLIENT_SECRET` in env to
 enable; see docs/connectors-setup.md").
 
 A new doc `docs/connectors-setup.md` (created in Phase A) walks the
 user through registering an OAuth client at Google Cloud Console
 and Notion Integration settings, what redirect URI to enter
-(matching `OCTOPUS_PUBLIC_BASE_URL`), and which scopes to grant.
+(matching `OWLERY_PUBLIC_BASE_URL`), and which scopes to grant.
 
-Multi-tenant hosted deployments (different Octopus instances sharing
+Multi-tenant hosted deployments (different Owlery instances sharing
 one OAuth client) are out of scope for v1. Each developer / installer
 registers their own OAuth client with the third party.
 
@@ -876,12 +876,12 @@ behind. If we don't have time for a phase, it doesn't start.
    the change is isolated to `CodexBackend.build_args` — connector
    modules are unaffected.
 
-2. **`OCTOPUS_PUBLIC_BASE_URL` resolution when behind a tunnel.**
-   `server/tunnel.py` lets Octopus expose itself via Cloudflare
+2. **`OWLERY_PUBLIC_BASE_URL` resolution when behind a tunnel.**
+   `server/tunnel.py` lets Owlery expose itself via Cloudflare
    quick-tunnel. The OAuth redirect URI must match what the user
    registered with the third party. Two options:
    - **Static config**: require the user to set
-     `OCTOPUS_PUBLIC_BASE_URL` when behind a tunnel, error clearly
+     `OWLERY_PUBLIC_BASE_URL` when behind a tunnel, error clearly
      at install time if it's missing. Simplest, most explicit.
    - **Dynamic**: read `X-Forwarded-Host` from the OAuth-start
      request and use that as the redirect base. Works without
@@ -969,7 +969,7 @@ the designs diverge, here's the reasoning.
   `WebFetch` and never sees a "Gmail tool." This is the right call
   for VM0's actual goal — multi-tenant sandbox isolation, hundreds
   of services as URL rewrite rules — but it's the wrong fit for
-  Octopus: we're local and single-user; the agent benefits more
+  Owlery: we're local and single-user; the agent benefits more
   from typed, named tools than from transparent network rewrites;
   and we'd inherit CA-cert-trust complexity. We use MCP servers
   instead — visible `mcp__notion__search` tool calls in the chat
@@ -1006,7 +1006,7 @@ tools instead of opaque HTTP. For v1 with 2 connectors, the price
 is right; if we ever ship 50+, we should revisit and consider a
 codegen layer that turns OpenAPI specs into MCP modules.
 
-## 12. Interactions with existing Octopus surfaces
+## 12. Interactions with existing Owlery surfaces
 
 Found while researching. Calling these out so we don't break them.
 
@@ -1014,7 +1014,7 @@ Found while researching. Calling these out so we don't break them.
   enables a tunnel, the OAuth callback runs against the tunnel URL,
   not localhost. The user must register their tunnel URL as the
   redirect URI with each OAuth provider and set
-  `OCTOPUS_PUBLIC_BASE_URL` accordingly. See Open Question §10.2 —
+  `OWLERY_PUBLIC_BASE_URL` accordingly. See Open Question §10.2 —
   this means quick-tunnel ephemeral URLs don't compose well with
   connectors; document that users wanting connectors-over-tunnel
   need a stable named tunnel.
@@ -1063,14 +1063,14 @@ implementation.
   workspace-id field name when implementing.
 - **Google OAuth's PKCE support for installed apps.** Plan enables
   PKCE; confirm Google honors `code_challenge` for the
-  `client_secret`-bearing flow Octopus uses (vs the PKCE-only
+  `client_secret`-bearing flow Owlery uses (vs the PKCE-only
   "installed application" flow which has different consent UX).
 - **`notion-client` SDK supports MCP-compatible streaming**. Plan
   assumes synchronous calls; if any operation requires SSE the MCP
   server has to bridge it. Likely fine for our tool set.
 - **`mcp__viewer__show_file` env injection doesn't collide.** Our
-  MCP servers all share a callback env (`OCTOPUS_API_BASE`,
-  `OCTOPUS_AUTH_TOKEN`, `OCTOPUS_SESSION_ID`). Adding
-  `OCTOPUS_INSTALLATION_ID` for connectors should be fine but
+  MCP servers all share a callback env (`OWLERY_API_BASE`,
+  `OWLERY_AUTH_TOKEN`, `OWLERY_SESSION_ID`). Adding
+  `OWLERY_INSTALLATION_ID` for connectors should be fine but
   verify that the viewer server doesn't read it and fail closed if
   it sees an unexpected env var.

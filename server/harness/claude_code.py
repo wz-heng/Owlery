@@ -41,16 +41,16 @@ logger = logging.getLogger(__name__)
 # System-prompt addendum teaching the model about our in-process MCP tools
 # (bg + ask). Appended via --append-system-prompt every turn so it survives
 # --resume.
-_OCTOPUS_SYSTEM_PROMPT = """\
-== Octopus in-app tools ==
+_OWLERY_SYSTEM_PROMPT = """\
+== Owlery in-app tools ==
 
-You have access to extra tools injected by the Octopus controller. \
+You have access to extra tools injected by the Owlery controller. \
 They are first-class — call them whenever appropriate, not as a \
 fallback.
 
 [1] `mcp__bg__run(command, description?)` — fire-and-forget a shell \
 command that runs in the BACKGROUND across turns. Returns a task_id \
-immediately. When the bg task finishes, Octopus injects a follow-up \
+immediately. When the bg task finishes, Owlery injects a follow-up \
 turn into this session with the captured output, and you respond \
 then.
 
@@ -108,14 +108,14 @@ verify from the codebase. Don't use it as a substitute for \
 ExitPlanMode.
 
 [3] `mcp__ask_agent__ask(request, name=…, delegation_id=…, files=…)` \
-— delegate work to another Octopus agent. Bimodal: pass `name` to \
+— delegate work to another Owlery agent. Bimodal: pass `name` to \
 start a fresh delegation under a target agent, or pass \
 `delegation_id` (from a prior reply) to continue a previous \
 delegation in the same child session — exactly one of the two must \
 be set. Use a fresh delegation when another agent is better placed \
 for the job (different skills, different tool access, a fresh \
 context). Returns a `delegation_id` IMMEDIATELY; the other agent \
-runs in the background and Octopus auto-injects a follow-up turn \
+runs in the background and Owlery auto-injects a follow-up turn \
 here when they reply — prefixed `[agent-reply:<name> delegation=<id>]` \
 for a normal reply, `[agent-question:<name> delegation=<id> \
 question_id=<qid>]` if they need an answer, or `[agent-error:<name> \
@@ -242,7 +242,7 @@ def build_turn_argv(ctx: TurnContext) -> tuple[list[str], dict[str, Any]]:
         env["CLAUDE_COWORK_MEMORY_PATH_OVERRIDE"] = ctx.memory_dir
     else:
         # No agent memory for this run: strip any override inherited from the
-        # parent process (e.g. Octopus itself launched from inside a Claude
+        # parent process (e.g. Owlery itself launched from inside a Claude
         # Code session), or the child would write its memories there.
         env.pop("CLAUDE_COWORK_MEMORY_PATH_OVERRIDE", None)
     return argv, {"cwd": ctx.working_dir, "env": env}
@@ -458,7 +458,7 @@ def _claude_project_dir(working_dir: str) -> Path:
     ``~/.claude/projects/<cwd-slug>/<session_id>.jsonl``, where the slug is the
     absolute cwd with EVERY non-alphanumeric character replaced by ``-`` —
     verified against the real CLI: ``/`` ``\\`` ``.`` ``_`` etc. all map to ``-``
-    (``/home/u/.octopus/fork/my_proj`` -> ``-home-u--octopus-fork-my-proj``),
+    (``/home/u/.owlery/fork/my_proj`` -> ``-home-u--owlery-fork-my-proj``),
     with no run-collapsing. Honors CLAUDE_CONFIG_DIR if set, else ~/.claude."""
     slug = re.sub(r"[^A-Za-z0-9]", "-", working_dir)
     cfg = os.environ.get("CLAUDE_CONFIG_DIR")
@@ -636,7 +636,7 @@ _CLAUDE_TRANSIENT_ERROR_PATTERNS = (
 CLAUDE_CODE = RuntimeProfile(
     backend="claude-code",
     binary="claude",
-    tools_prompt=_OCTOPUS_SYSTEM_PROMPT,
+    tools_prompt=_OWLERY_SYSTEM_PROMPT,
     credential_style="env_secret",
     premature_exit_recovery=True,
     auth_error_patterns=_CLAUDE_AUTH_ERROR_PATTERNS,

@@ -29,8 +29,8 @@ def test_claude_project_slug_matches_cli(monkeypatch, tmp_path):
         "/tmp/pytest-of-x/pytest-99/test_claude_native_copy_re0/src":
             "-tmp-pytest-of-x-pytest-99-test-claude-native-copy-re0-src",
         # dotfile dir -> double dash, case preserved, no collapse
-        "/home/u/.octopus/fork/Octopus-a0434":
-            "-home-u--octopus-fork-Octopus-a0434",
+        "/home/u/.owlery/fork/Owlery-a0434":
+            "-home-u--owlery-fork-Owlery-a0434",
     }
     for wd, slug in cases.items():
         assert cc._claude_project_dir(wd) == base / slug
@@ -54,7 +54,7 @@ def _write_claude_transcript(base_home, working_dir, sid):
 async def test_claude_fork_copy_rewrites_and_resumes(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-    parent_wd, dest_wd = "/proj/parent", "/home/u/.octopus/fork/parent-abc"
+    parent_wd, dest_wd = "/proj/parent", "/home/u/.owlery/fork/parent-abc"
     _write_claude_transcript(tmp_path, parent_wd, "pid-1")
 
     art = await cc._fork_copy(
@@ -108,7 +108,7 @@ async def test_claude_fork_cleanup_reraises_on_oserror(tmp_path, monkeypatch):
 async def test_claude_fork_cleanup_removes_copy(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-    dest_wd = "/home/u/.octopus/fork/x-1"
+    dest_wd = "/home/u/.owlery/fork/x-1"
     d = cc._claude_project_dir(dest_wd)
     d.mkdir(parents=True, exist_ok=True)
     (d / "nid.jsonl").write_text("{}\n")

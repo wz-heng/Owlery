@@ -109,8 +109,8 @@ class ConnectorBase(abc.ABC):
     ) -> dict[str, Any]:
         """Backend-neutral spawn spec for this installation's MCP server.
 
-        `callback_env` is the shared MCP env (OCTOPUS_API_BASE / _AUTH_TOKEN /
-        _SESSION_ID / PYTHONPATH); we add OCTOPUS_INSTALLATION_ID so the server
+        `callback_env` is the shared MCP env (OWLERY_API_BASE / _AUTH_TOKEN /
+        _SESSION_ID / PYTHONPATH); we add OWLERY_INSTALLATION_ID so the server
         knows which installation's token to fetch.
         """
         return {
@@ -118,7 +118,7 @@ class ConnectorBase(abc.ABC):
             "args": ["-m", self.mcp_module],
             "env": {
                 **callback_env,
-                "OCTOPUS_INSTALLATION_ID": installation.id,
+                "OWLERY_INSTALLATION_ID": installation.id,
             },
         }
 

@@ -89,13 +89,13 @@ async def test_claude_native_copy_resume_recalls_context(tmp_path):
 
 def _codex_home_with_auth() -> str | None:
     """A signed-in CODEX_HOME: the host default if it has auth.json, else any
-    Octopus per-credential dir (~/.octopus/codex/<id>/auth.json). None if none.
+    Owlery per-credential dir (~/.owlery/codex/<id>/auth.json). None if none.
     (Presence only — a revoked token still passes here but the env-failure skip
     below catches it at call time.)"""
     host = os.path.expanduser("~/.codex")
     if os.path.exists(os.path.join(host, "auth.json")):
         return host
-    for p in glob.glob(os.path.expanduser("~/.octopus/codex/*/auth.json")):
+    for p in glob.glob(os.path.expanduser("~/.owlery/codex/*/auth.json")):
         return os.path.dirname(p)
     return None
 

@@ -656,25 +656,25 @@ def _call(name: str, **kwargs):
 
 
 def test_mcp_bg_run_misconfigured(monkeypatch):
-    monkeypatch.delenv("OCTOPUS_API_BASE", raising=False)
-    monkeypatch.delenv("OCTOPUS_SESSION_ID", raising=False)
-    monkeypatch.delenv("OCTOPUS_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("OWLERY_API_BASE", raising=False)
+    monkeypatch.delenv("OWLERY_SESSION_ID", raising=False)
+    monkeypatch.delenv("OWLERY_AUTH_TOKEN", raising=False)
     out = _call("bg_run", command="echo hi")
     assert "misconfigured" in out.lower()
 
 
 def test_mcp_bg_run_rejects_empty(monkeypatch):
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://x")
-    monkeypatch.setenv("OCTOPUS_SESSION_ID", "s")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "t")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://x")
+    monkeypatch.setenv("OWLERY_SESSION_ID", "s")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
     out = _call("bg_run", command="   ")
     assert "non-empty" in out
 
 
 def test_mcp_bg_run_success(monkeypatch):
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://x")
-    monkeypatch.setenv("OCTOPUS_SESSION_ID", "s")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "t")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://x")
+    monkeypatch.setenv("OWLERY_SESSION_ID", "s")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
     posted: dict = {}
 
     class FakeResp:
@@ -701,9 +701,9 @@ def test_mcp_bg_run_success(monkeypatch):
 
 
 def test_mcp_bg_cancel_handles_404(monkeypatch):
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://x")
-    monkeypatch.setenv("OCTOPUS_SESSION_ID", "s")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "t")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://x")
+    monkeypatch.setenv("OWLERY_SESSION_ID", "s")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
 
     class R:
         status_code = 404
@@ -717,9 +717,9 @@ def test_mcp_bg_cancel_handles_404(monkeypatch):
 
 
 def test_mcp_bg_list_empty(monkeypatch):
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://x")
-    monkeypatch.setenv("OCTOPUS_SESSION_ID", "s")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "t")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://x")
+    monkeypatch.setenv("OWLERY_SESSION_ID", "s")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
 
     class R:
         status_code = 200
@@ -735,9 +735,9 @@ def test_mcp_bg_list_empty(monkeypatch):
 
 
 def test_mcp_bg_list_summary(monkeypatch):
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://x")
-    monkeypatch.setenv("OCTOPUS_SESSION_ID", "s")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "t")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://x")
+    monkeypatch.setenv("OWLERY_SESSION_ID", "s")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
 
     class R:
         status_code = 200
@@ -782,9 +782,9 @@ def test_build_args_registers_bg_mcp_with_session_env(tmp_path):
     cfg = json.loads(argv[cfg_idx])
     assert "bg" in cfg["mcpServers"]
     env = cfg["mcpServers"]["bg"]["env"]
-    assert env["OCTOPUS_SESSION_ID"] == "sess-xyz"
-    assert "OCTOPUS_API_BASE" in env
-    assert "OCTOPUS_AUTH_TOKEN" in env
+    assert env["OWLERY_SESSION_ID"] == "sess-xyz"
+    assert "OWLERY_API_BASE" in env
+    assert "OWLERY_AUTH_TOKEN" in env
 
 
 def test_build_args_omits_session_env_when_none(tmp_path):
@@ -796,7 +796,7 @@ def test_build_args_omits_session_env_when_none(tmp_path):
     )
     cfg = json.loads(argv[argv.index("--mcp-config") + 1])
     env = cfg["mcpServers"]["bg"]["env"]
-    assert "OCTOPUS_SESSION_ID" not in env
+    assert "OWLERY_SESSION_ID" not in env
 
 
 def test_build_args_system_prompt_teaches_bg_usage(tmp_path):

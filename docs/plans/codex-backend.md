@@ -45,7 +45,7 @@ anything still marked unverified.
 - A user with `codex` installed, logged into their **own ChatGPT
   subscription**, can create a Codex session and chat with it exactly
   like a Claude session.
-- The three Octopus MCP tools (`viewer`, `bg`, `ask`) work inside Codex
+- The three Owlery MCP tools (`viewer`, `bg`, `ask`) work inside Codex
   sessions with no feature loss. (VM0 does *not* do this; it's our work.)
 - Claude sessions are **byte-for-byte unchanged** — every existing test
   stays green and the Claude path grows no new branches.
@@ -63,11 +63,11 @@ anything still marked unverified.
   reaches the frontend and `ToolApproval` simply never fires for Codex —
   zero UI change.
 - **Codex's `features.memories` / cloud features.** VM0 enables
-  `-c features.memories=true`; Octopus has its own memory story and
+  `-c features.memories=true`; Owlery has its own memory story and
   won't opt in for v1.
 - **Multi-account VM0-style token injection.** The placeholder-JWT +
   egress-firewall mechanism (`vm0/.../codex_auth.rs`) is a multi-tenant
-  microVM trick; single-user local Octopus uses a real on-disk login.
+  microVM trick; single-user local Owlery uses a real on-disk login.
 
 ## 3. The real starting state (correcting the early sketch)
 
@@ -129,10 +129,10 @@ Codex session must not run on a Claude credential.
 ### 4.3 Generalize `claude_session_id` → `backend_session_id`
 
 The field now holds either a Claude session id or a Codex `thread_id`.
-**Recommendation: rename end-to-end** (Octopus is pre-1.0, single-user;
+**Recommendation: rename end-to-end** (Owlery is pre-1.0, single-user;
 the contract churn is worth the honesty). DB column (copy-forward in
 `_apply_migrations`), `Session` field, `SessionInfo`,
-`update_session_field`, the `_run_backend` capture sites. `octopus
+`update_session_field`, the `_run_backend` capture sites. `owlery
 pull` / `handoff` / `jsonl_writer.py` are inherently Claude-JSONL and
 stay gated to `backend == "claude-code"`. Regenerate TS contracts.
 (Fallback if we won't touch the API: keep the name, document it generic
@@ -161,7 +161,7 @@ codex exec --json \
      --dangerously-bypass-approvals-and-sandbox \   # §5.6
      --skip-git-repo-check \
      -C <abs_working_dir> \
-     -c developer_instructions="<octopus addendum, TOML-quoted>" \   # §5.4
+     -c developer_instructions="<owlery addendum, TOML-quoted>" \   # §5.4
      <MCP config: §5.3> \
      [-m <model>] \
      [resume <backend_session_id>] \
@@ -201,7 +201,7 @@ Lifecycle is identical to Claude (one invocation per turn, `result`
 ends it, `_close_stream` releases the iterator) — **no
 `SubprocessJsonlBackend` changes needed.**
 
-### 5.3 MCP tool injection — Octopus-specific (VM0 gives no help here)
+### 5.3 MCP tool injection — Owlery-specific (VM0 gives no help here)
 
 > **Post-implementation drift on the built-in set.** When this plan
 > was written the set was `{viewer, bg, ask}`. Today it's
@@ -215,8 +215,8 @@ ends it, `_close_stream` releases the iterator) — **no
 `/showme`, `bg_run`, `ask_user` are MCP tools. Claude gets them via
 `--mcp-config <inline JSON>` (`claude_code.py:264-317`) registering three
 stdio servers (`python -m server.mcp_servers.{viewer,bg,ask}`) with a
-callback env (`OCTOPUS_API_BASE`, `OCTOPUS_AUTH_TOKEN`,
-`OCTOPUS_SESSION_ID`, `PYTHONPATH`; viewer also `OCTOPUS_WORKING_DIR`).
+callback env (`OWLERY_API_BASE`, `OWLERY_AUTH_TOKEN`,
+`OWLERY_SESSION_ID`, `PYTHONPATH`; viewer also `OWLERY_WORKING_DIR`).
 
 **VM0 registers no MCP servers into Codex**, so this is novel work built
 on Codex's own MCP support (`codex mcp add`, and `[mcp_servers.<name>]`
@@ -228,10 +228,10 @@ registering the identical three stdio servers + env:
 [mcp_servers.viewer]
 command = "<sys.executable>"
 args = ["-m", "server.mcp_servers.viewer"]
-env = { OCTOPUS_WORKING_DIR = "…", PYTHONPATH = "…" }
+env = { OWLERY_WORKING_DIR = "…", PYTHONPATH = "…" }
 # bg, ask likewise with the callback env
 ```
-This avoids the awkward `-c mcp_servers.bg.env.OCTOPUS_…=…` nested-table
+This avoids the awkward `-c mcp_servers.bg.env.OWLERY_…=…` nested-table
 override path. **Confirm in Phase C:** (a) `codex exec` honors
 `config.toml` MCP servers, (b) the tool name it exposes to the model
 (Claude shows `mcp__<server>__<tool>`; our `developer_instructions` text
@@ -244,10 +244,10 @@ Codex's analog of `--append-system-prompt` is
 `command.rs:build_codex_developer_instructions_config`). No AGENTS.md or
 instructions-file needed.
 
-The text needs a **Codex variant**: the current `_OCTOPUS_SYSTEM_PROMPT`
+The text needs a **Codex variant**: the current `_OWLERY_SYSTEM_PROMPT`
 bg-vs-Bash section is Claude-specific ("the Claude Code harness will
 auto-background long Bash commands…") — false for Codex. Refactor
-`_OCTOPUS_SYSTEM_PROMPT` (`claude_code.py:37`) into a **shared
+`_OWLERY_SYSTEM_PROMPT` (`claude_code.py:37`) into a **shared
 tool-description core** + a **per-backend execution-model addendum**, so
 the `/showme` / `ask_user` descriptions live once and only the shell/bg
 paragraph diverges.
@@ -266,11 +266,11 @@ def _make_backend(self, session: Session) -> BackendBase:
 ### 5.6 Headless sandbox + backend-agnostic recovery loop
 
 - **Sandbox/approval.** VM0's guest runs `--sandbox danger-full-access`
-  because it's *already* inside a microVM. Octopus runs on the user's
+  because it's *already* inside a microVM. Owlery runs on the user's
   own machine with no outer sandbox, so the Claude-parity choice is
   `--dangerously-bypass-approvals-and-sandbox` (the direct analog of
   Claude's `--dangerously-skip-permissions`, justified identically:
-  Octopus is the only thing spawning these on the trusting user's
+  Owlery is the only thing spawning these on the trusting user's
   behalf). Plus `--skip-git-repo-check` so non-repo working dirs run.
   Consequence: no approval round-trips → no `tool_approval_request`
   events → frontend approval path dormant for Codex, zero UI change.
@@ -331,10 +331,10 @@ JWT fabrication + egress-firewall token swap (`codex_auth.rs`) — that's
 a multi-tenant microVM mechanism with no analog in a single-user local
 app, where a real on-disk login is simpler and correct.
 
-**Octopus model:** a Codex credential = a **directory-backed** identity:
-Octopus owns a per-credential dir (e.g. `~/.octopus/codex/<credential_id>/`)
+**Owlery model:** a Codex credential = a **directory-backed** identity:
+Owlery owns a per-credential dir (e.g. `~/.owlery/codex/<credential_id>/`)
 used as `CODEX_HOME`; `codex login` writes `auth.json` there; session
-spawn sets `CODEX_HOME` to it. **No secret is stored in Octopus's DB** —
+spawn sets `CODEX_HOME` to it. **No secret is stored in Owlery's DB** —
 Codex manages the token and its refresh inside that dir. This diverges
 from the Claude credential (encrypted `sk-ant-` string in
 `credential_secrets`); the `backend_credentials` row for Codex stores
@@ -344,12 +344,12 @@ surface the account/plan and reject free-tier.
 
 **The remaining product decision (§10):**
 - **A — host login.** User runs `codex login` once on the host;
-  Octopus inherits `~/.codex`. Zero credential UI. Simplest; fine if you
-  only ever drive Octopus from the host.
-- **B — in-app device-auth login.** Octopus runs `codex login
+  Owlery inherits `~/.codex`. Zero credential UI. Simplest; fine if you
+  only ever drive Owlery from the host.
+- **B — in-app device-auth login.** Owlery runs `codex login
   --device-auth` against a fresh per-credential `CODEX_HOME` (in a PTY),
   scrapes the URL+code, shows them in the UI; the user completes it on
-  any device. Fits Octopus's remote-control premise; reuses the
+  any device. Fits Owlery's remote-control premise; reuses the
   per-credential-`CODEX_HOME` model and the credential UI. Recommended.
 
 ---

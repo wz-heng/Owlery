@@ -1,20 +1,20 @@
 #!/bin/bash
 set -e
 
-# Create octopus service
-sudo tee /etc/systemd/system/octopus.service > /dev/null << 'EOF'
+# Create owlery service
+sudo tee /etc/systemd/system/owlery.service > /dev/null << 'EOF'
 [Unit]
-Description=Octopus Server
+Description=Owlery Server
 After=network.target
 
 [Service]
 Type=simple
 User=start-up
 WorkingDirectory=/home/start-up
-EnvironmentFile=/home/start-up/Octopus/.env
+EnvironmentFile=/home/start-up/Owlery/.env
 # systemd's default PATH excludes ~/.local/bin where `claude` is installed.
 Environment=PATH=/home/start-up/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=/home/start-up/Octopus/.venv/bin/octopus serve
+ExecStart=/home/start-up/Owlery/.venv/bin/owlery serve
 Restart=always
 RestartSec=5
 
@@ -31,7 +31,7 @@ After=network.target
 [Service]
 Type=simple
 User=start-up
-ExecStart=/home/start-up/.local/bin/cloudflared tunnel run octopus
+ExecStart=/home/start-up/.local/bin/cloudflared tunnel run owlery
 Restart=always
 RestartSec=5
 
@@ -41,8 +41,8 @@ EOF
 
 # Enable and start
 sudo systemctl daemon-reload
-sudo systemctl enable octopus cloudflared
-sudo systemctl start octopus cloudflared
+sudo systemctl enable owlery cloudflared
+sudo systemctl start owlery cloudflared
 
 echo "Done! Checking status..."
-sudo systemctl status octopus cloudflared --no-pager
+sudo systemctl status owlery cloudflared --no-pager

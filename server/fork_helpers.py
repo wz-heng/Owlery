@@ -30,7 +30,7 @@ _READONLY_TOOLS = {
     "Read", "Grep", "Glob", "LS", "WebSearch", "WebFetch", "NotebookRead",
     "TodoWrite", "Task", "BashOutput", "KillBash",
 }
-# Internal Octopus MCP servers that aren't world-changing side effects.
+# Internal Owlery MCP servers that aren't world-changing side effects.
 # (bg is surfaced separately via the bg_tasks join.)
 _INTERNAL_MCP_PREFIXES = ("mcp__ask__", "mcp__ask_agent__")
 
@@ -291,7 +291,7 @@ def wrap_for_fork_replay(prompt: str, parent_messages: list[MessageContent]) -> 
     """Wrap a fork's first-turn user prompt with the parent transcript, in the
     USER-MESSAGE channel with strict transcript-not-instructions framing
     (session-rewind.md §3.5, §5.3.2). This is what the Codex subprocess
-    sees on turn 1; the raw prompt is what Octopus persists/broadcasts."""
+    sees on turn 1; the raw prompt is what Owlery persists/broadcasts."""
     body = render_replay_history(parent_messages)
     block = (
         '<fork-history origin="parent-session" '
@@ -452,7 +452,7 @@ async def safe_revert_files(
             "error": None,
         }
     top = await _git_toplevel(working_dir) or working_dir
-    stash_msg = f"octopus: pre-fork stash {fork_id}"
+    stash_msg = f"owlery: pre-fork stash {fork_id}"
     # `git stash push -u -- <paths>` both saves the agent's changes AND
     # restores the working tree to HEAD for those paths: tracked modifications
     # revert, untracked files (added by the agent) are removed. That alone

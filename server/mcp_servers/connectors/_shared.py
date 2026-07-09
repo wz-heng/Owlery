@@ -38,15 +38,15 @@ class ConnectorContext:
 
     @property
     def api_base(self) -> str | None:
-        return os.environ.get("OCTOPUS_API_BASE")
+        return os.environ.get("OWLERY_API_BASE")
 
     @property
     def auth_token(self) -> str | None:
-        return os.environ.get("OCTOPUS_AUTH_TOKEN")
+        return os.environ.get("OWLERY_AUTH_TOKEN")
 
     @property
     def installation_id(self) -> str | None:
-        return os.environ.get("OCTOPUS_INSTALLATION_ID")
+        return os.environ.get("OWLERY_INSTALLATION_ID")
 
     def ready(self) -> bool:
         return bool(self.api_base and self.auth_token and self.installation_id)

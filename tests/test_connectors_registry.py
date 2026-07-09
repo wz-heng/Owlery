@@ -83,19 +83,19 @@ def test_mcp_entry_shape():
     c = DummyConnector()
     inst = _install()
     callback_env = {
-        "OCTOPUS_API_BASE": "http://127.0.0.1:8765",
-        "OCTOPUS_AUTH_TOKEN": "tok",
-        "OCTOPUS_SESSION_ID": "sess",
+        "OWLERY_API_BASE": "http://127.0.0.1:8765",
+        "OWLERY_AUTH_TOKEN": "tok",
+        "OWLERY_SESSION_ID": "sess",
         "PYTHONPATH": "/repo",
     }
     entry = c.mcp_entry(inst, callback_env)
     assert entry["command"] == sys.executable
     assert entry["args"] == ["-m", "server.mcp_servers.connectors.dummy"]
     # Shared callback env is preserved and the installation id is injected.
-    assert entry["env"]["OCTOPUS_API_BASE"] == "http://127.0.0.1:8765"
-    assert entry["env"]["OCTOPUS_INSTALLATION_ID"] == inst.id
+    assert entry["env"]["OWLERY_API_BASE"] == "http://127.0.0.1:8765"
+    assert entry["env"]["OWLERY_INSTALLATION_ID"] == inst.id
     # We didn't mutate the caller's env dict.
-    assert "OCTOPUS_INSTALLATION_ID" not in callback_env
+    assert "OWLERY_INSTALLATION_ID" not in callback_env
 
 
 def test_system_prompt_blurb_lists_tools():

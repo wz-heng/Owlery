@@ -7,7 +7,7 @@ def test_settings_defaults():
     """Config loads with sensible defaults."""
     # Clear any env overrides for isolated test
     env_backup = {}
-    for key in ("OCTOPUS_AUTH_TOKEN", "OCTOPUS_HOST", "OCTOPUS_PORT"):
+    for key in ("OWLERY_AUTH_TOKEN", "OWLERY_HOST", "OWLERY_PORT"):
         if key in os.environ:
             env_backup[key] = os.environ.pop(key)
 
@@ -26,8 +26,8 @@ def test_settings_defaults():
 
 def test_settings_from_env(monkeypatch):
     """Config reads from environment variables."""
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "my-secret")
-    monkeypatch.setenv("OCTOPUS_PORT", "9000")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "my-secret")
+    monkeypatch.setenv("OWLERY_PORT", "9000")
 
     from server.config import Settings
 

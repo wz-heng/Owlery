@@ -259,6 +259,6 @@ async def test_claude_fork_safe_revert_real_repo(tmp_path, monkeypatch):
         assert not (repo / "notes.txt").exists(), "revert didn't restore the tree"
         stash = subprocess.run(["git", "stash", "list"], cwd=repo,
                                capture_output=True, text=True).stdout
-        assert f"octopus: pre-fork stash {fork.id}" in stash
+        assert f"owlery: pre-fork stash {fork.id}" in stash
     finally:
         await db.close()

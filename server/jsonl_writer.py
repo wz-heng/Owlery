@@ -1,4 +1,4 @@
-"""Write Octopus sessions back to Claude Code JSONL format for local resumption."""
+"""Write Owlery sessions back to Claude Code JSONL format for local resumption."""
 
 from __future__ import annotations
 

@@ -4,7 +4,7 @@
 
 A session ("stock") ran a long, tool-heavy operation (the `/deep-research`
 skill) and the turn **hung forever with no output until the user interrupted**.
-Root cause, two Octopus gaps (independent of deep research):
+Root cause, two Owlery gaps (independent of deep research):
 
 1. **No per-turn timeout.** The stream consumer blocks on
    `await self._event_queue.get()` (`run.py`) and `_run_backend`'s

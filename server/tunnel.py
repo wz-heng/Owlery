@@ -1,4 +1,4 @@
-"""Cloudflare Tunnel subprocess manager for Octopus."""
+"""Cloudflare Tunnel subprocess manager for Owlery."""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ class CloudflareTunnel:
                 "cloudflared is not installed. "
                 "Install it from https://developers.cloudflare.com/cloudflare-one/"
                 "connections/connect-networks/downloads/ "
-                "or disable the tunnel with OCTOPUS_ENABLE_TUNNEL=false"
+                "or disable the tunnel with OWLERY_ENABLE_TUNNEL=false"
             )
             return None
 

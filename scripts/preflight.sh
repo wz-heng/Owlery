@@ -37,12 +37,12 @@ case "${no_proxy:-}${NO_PROXY:-}" in
   *) check "no_proxy covers localhost" FAIL "MCP callbacks to 127.0.0.1 will be hijacked (502)";;
 esac
 
-# 3. Server reachable (skip silently if OCTOPUS_API_BASE unset and :8000 down).
-base="${OCTOPUS_API_BASE:-http://127.0.0.1:8000}"
+# 3. Server reachable (skip silently if OWLERY_API_BASE unset and :8000 down).
+base="${OWLERY_API_BASE:-http://127.0.0.1:8000}"
 if curl -sf -o /dev/null --max-time 5 "$base/docs" 2>/dev/null; then
   check "server at $base" ok
 else
-  check "server at $base" FAIL "octopus serve not reachable"
+  check "server at $base" FAIL "owlery serve not reachable"
 fi
 
 # 4. Git state — on a work branch with a clean-enough tree.

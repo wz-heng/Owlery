@@ -33,17 +33,17 @@ def _call(tool: str, **kwargs):
 
 
 def test_ask_agent_misconfigured(monkeypatch):
-    monkeypatch.delenv("OCTOPUS_API_BASE", raising=False)
-    monkeypatch.delenv("OCTOPUS_SESSION_ID", raising=False)
-    monkeypatch.delenv("OCTOPUS_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("OWLERY_API_BASE", raising=False)
+    monkeypatch.delenv("OWLERY_SESSION_ID", raising=False)
+    monkeypatch.delenv("OWLERY_AUTH_TOKEN", raising=False)
     out = _call("ask_agent", name="Vera", request="r")
     assert "misconfigured" in out.lower()
 
 
 def test_ask_agent_rejects_empty_request(monkeypatch):
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://x")
-    monkeypatch.setenv("OCTOPUS_SESSION_ID", "s")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "t")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://x")
+    monkeypatch.setenv("OWLERY_SESSION_ID", "s")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
     out = _call("ask_agent", name="Vera", request="   ")
     assert "request" in out.lower() and "non-empty" in out.lower()
 
@@ -51,9 +51,9 @@ def test_ask_agent_rejects_empty_request(monkeypatch):
 def test_ask_agent_rejects_when_neither_id_provided(monkeypatch):
     """The merged `ask` tool requires exactly one of `name` or
     `delegation_id`. Neither set is an error."""
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://x")
-    monkeypatch.setenv("OCTOPUS_SESSION_ID", "s")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "t")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://x")
+    monkeypatch.setenv("OWLERY_SESSION_ID", "s")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
     out = _call("ask_agent", request="r")
     assert "exactly one" in out.lower()
     # Whitespace-only ids count as not-set.
@@ -64,17 +64,17 @@ def test_ask_agent_rejects_when_neither_id_provided(monkeypatch):
 def test_ask_agent_rejects_when_both_ids_provided(monkeypatch):
     """Both set is also an error — can't simultaneously start fresh
     and continue the same delegation."""
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://x")
-    monkeypatch.setenv("OCTOPUS_SESSION_ID", "s")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "t")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://x")
+    monkeypatch.setenv("OWLERY_SESSION_ID", "s")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
     out = _call("ask_agent", name="Vera", delegation_id="d1", request="r")
     assert "exactly one" in out.lower()
 
 
 def test_ask_agent_success(monkeypatch):
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://x")
-    monkeypatch.setenv("OCTOPUS_SESSION_ID", "s")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "t")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://x")
+    monkeypatch.setenv("OWLERY_SESSION_ID", "s")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
     posted: dict = {}
 
     class FakeResp:
@@ -106,7 +106,7 @@ def test_ask_agent_success(monkeypatch):
         files=["a.tsx", "b.tsx"],
     )
     # Request shape goes to /sessions/{sid}/delegations under the
-    # OCTOPUS_SESSION_ID env, with auth header.
+    # OWLERY_SESSION_ID env, with auth header.
     assert posted["url"].endswith("/api/sessions/s/delegations")
     assert posted["body"] == {
         "agent_name": "vera",
@@ -122,9 +122,9 @@ def test_ask_agent_success(monkeypatch):
 
 
 def test_ask_agent_omits_files_when_none(monkeypatch):
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://x")
-    monkeypatch.setenv("OCTOPUS_SESSION_ID", "s")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "t")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://x")
+    monkeypatch.setenv("OWLERY_SESSION_ID", "s")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
     posted: dict = {}
 
     class FakeResp:
@@ -148,9 +148,9 @@ def test_ask_agent_omits_files_when_none(monkeypatch):
 
 
 def test_ask_agent_404_passes_through(monkeypatch):
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://x")
-    monkeypatch.setenv("OCTOPUS_SESSION_ID", "s")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "t")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://x")
+    monkeypatch.setenv("OWLERY_SESSION_ID", "s")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
 
     class R:
         status_code = 404
@@ -170,9 +170,9 @@ def test_ask_agent_409_surfaced_with_reason(monkeypatch):
     """Cycle/depth/self errors come back as 409 with a server-side
     explanation — the tool should pass the reason through so the
     model can decide what to do next."""
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://x")
-    monkeypatch.setenv("OCTOPUS_SESSION_ID", "s")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "t")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://x")
+    monkeypatch.setenv("OWLERY_SESSION_ID", "s")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
 
     class R:
         status_code = 409
@@ -189,9 +189,9 @@ def test_ask_agent_409_surfaced_with_reason(monkeypatch):
 
 
 def test_ask_agent_http_error(monkeypatch):
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://x")
-    monkeypatch.setenv("OCTOPUS_SESSION_ID", "s")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "t")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://x")
+    monkeypatch.setenv("OWLERY_SESSION_ID", "s")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
 
     import httpx
 
@@ -200,7 +200,7 @@ def test_ask_agent_http_error(monkeypatch):
 
     monkeypatch.setattr(httpx, "post", boom)
     out = _call("ask_agent", name="Vera", request="r")
-    assert "failed to reach Octopus" in out
+    assert "failed to reach Owlery" in out
 
 
 # ---------------------------------------------------------------------------
@@ -209,9 +209,9 @@ def test_ask_agent_http_error(monkeypatch):
 
 
 def test_cancel_agent_task_404(monkeypatch):
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://x")
-    monkeypatch.setenv("OCTOPUS_SESSION_ID", "s")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "t")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://x")
+    monkeypatch.setenv("OWLERY_SESSION_ID", "s")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
 
     class R:
         status_code = 404
@@ -225,9 +225,9 @@ def test_cancel_agent_task_404(monkeypatch):
 
 
 def test_cancel_agent_task_success(monkeypatch):
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://x")
-    monkeypatch.setenv("OCTOPUS_SESSION_ID", "s")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "t")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://x")
+    monkeypatch.setenv("OWLERY_SESSION_ID", "s")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
     posted: dict = {}
 
     class R:
@@ -260,9 +260,9 @@ def test_cancel_agent_task_success(monkeypatch):
 
 
 def test_list_agent_tasks_empty(monkeypatch):
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://x")
-    monkeypatch.setenv("OCTOPUS_SESSION_ID", "s")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "t")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://x")
+    monkeypatch.setenv("OWLERY_SESSION_ID", "s")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
 
     class R:
         status_code = 200
@@ -286,9 +286,9 @@ def test_ask_agent_continue_routes_to_follow_up_endpoint(monkeypatch):
     """When `delegation_id` is set (and `name` is not), `ask` posts
     to the /follow-up endpoint and frames the return text as a
     continuation."""
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://x")
-    monkeypatch.setenv("OCTOPUS_SESSION_ID", "s")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "t")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://x")
+    monkeypatch.setenv("OWLERY_SESSION_ID", "s")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
     posted: dict = {}
 
     class R:
@@ -329,9 +329,9 @@ def test_ask_agent_continue_routes_to_follow_up_endpoint(monkeypatch):
 
 
 def test_ask_agent_continue_404_nudges_to_fresh(monkeypatch):
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://x")
-    monkeypatch.setenv("OCTOPUS_SESSION_ID", "s")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "t")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://x")
+    monkeypatch.setenv("OWLERY_SESSION_ID", "s")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
 
     class R:
         status_code = 404
@@ -350,9 +350,9 @@ def test_ask_agent_continue_404_nudges_to_fresh(monkeypatch):
 
 
 def test_ask_agent_continue_409_still_running(monkeypatch):
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://x")
-    monkeypatch.setenv("OCTOPUS_SESSION_ID", "s")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "t")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://x")
+    monkeypatch.setenv("OWLERY_SESSION_ID", "s")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
 
     class R:
         status_code = 409
@@ -369,9 +369,9 @@ def test_ask_agent_continue_409_still_running(monkeypatch):
 
 
 def test_ask_agent_continue_misconfigured(monkeypatch):
-    monkeypatch.delenv("OCTOPUS_API_BASE", raising=False)
-    monkeypatch.delenv("OCTOPUS_SESSION_ID", raising=False)
-    monkeypatch.delenv("OCTOPUS_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("OWLERY_API_BASE", raising=False)
+    monkeypatch.delenv("OWLERY_SESSION_ID", raising=False)
+    monkeypatch.delenv("OWLERY_AUTH_TOKEN", raising=False)
     out = _call("ask_agent", delegation_id="d1", request="round 2")
     assert "misconfigured" in out.lower()
 
@@ -382,9 +382,9 @@ def test_ask_agent_continue_misconfigured(monkeypatch):
 
 
 def test_answer_agent_question_misconfigured(monkeypatch):
-    monkeypatch.delenv("OCTOPUS_API_BASE", raising=False)
-    monkeypatch.delenv("OCTOPUS_SESSION_ID", raising=False)
-    monkeypatch.delenv("OCTOPUS_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("OWLERY_API_BASE", raising=False)
+    monkeypatch.delenv("OWLERY_SESSION_ID", raising=False)
+    monkeypatch.delenv("OWLERY_AUTH_TOKEN", raising=False)
     out = _call(
         "answer_agent_question", delegation_id="d1", choice="A"
     )
@@ -392,9 +392,9 @@ def test_answer_agent_question_misconfigured(monkeypatch):
 
 
 def test_answer_agent_question_rejects_empty(monkeypatch):
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://x")
-    monkeypatch.setenv("OCTOPUS_SESSION_ID", "s")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "t")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://x")
+    monkeypatch.setenv("OWLERY_SESSION_ID", "s")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
     assert "non-empty" in _call(
         "answer_agent_question", delegation_id="   ", choice="A"
     )
@@ -404,9 +404,9 @@ def test_answer_agent_question_rejects_empty(monkeypatch):
 
 
 def test_answer_agent_question_success(monkeypatch):
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://x")
-    monkeypatch.setenv("OCTOPUS_SESSION_ID", "s")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "t")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://x")
+    monkeypatch.setenv("OWLERY_SESSION_ID", "s")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
     posted: dict = {}
 
     class R:
@@ -435,9 +435,9 @@ def test_answer_agent_question_success(monkeypatch):
 
 
 def test_answer_agent_question_404(monkeypatch):
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://x")
-    monkeypatch.setenv("OCTOPUS_SESSION_ID", "s")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "t")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://x")
+    monkeypatch.setenv("OWLERY_SESSION_ID", "s")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
 
     class R:
         status_code = 404
@@ -455,9 +455,9 @@ def test_answer_agent_question_404(monkeypatch):
 def test_answer_agent_question_409(monkeypatch):
     """No pending question / human raced: 409 with reason text passes
     through so the parent's model can choose to give up or retry."""
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://x")
-    monkeypatch.setenv("OCTOPUS_SESSION_ID", "s")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "t")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://x")
+    monkeypatch.setenv("OWLERY_SESSION_ID", "s")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
 
     class R:
         status_code = 409
@@ -474,9 +474,9 @@ def test_answer_agent_question_409(monkeypatch):
 
 
 def test_list_agent_tasks_summary(monkeypatch):
-    monkeypatch.setenv("OCTOPUS_API_BASE", "http://x")
-    monkeypatch.setenv("OCTOPUS_SESSION_ID", "s")
-    monkeypatch.setenv("OCTOPUS_AUTH_TOKEN", "t")
+    monkeypatch.setenv("OWLERY_API_BASE", "http://x")
+    monkeypatch.setenv("OWLERY_SESSION_ID", "s")
+    monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
 
     class R:
         status_code = 200

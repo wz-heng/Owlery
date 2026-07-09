@@ -12,7 +12,7 @@ import { CredentialList } from "./components/CredentialList";
 // SessionList is rendered inside AgentList (nested under the active agent),
 // not as its own sidebar section — sessions belong to an agent.
 import { FileViewerDialog } from "./components/FileViewerDialog";
-import { OctopusLogo } from "./components/OctopusLogo";
+import { OwleryLogo } from "./components/OwleryLogo";
 import { ScheduleList } from "./components/ScheduleList";
 import { SchedulesDialog } from "./components/SchedulesDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
@@ -39,7 +39,7 @@ function App() {
         <div className="w-full max-w-sm rounded-2xl border-[0.7px] border-border bg-card p-8 shadow-[0_8px_40px_-12px_rgba(20,23,29,0.12)]">
           <div className="space-y-1.5 mb-6">
             <h1 className="text-2xl font-bold tracking-tight text-foreground">
-              Octopus
+              Owlery
             </h1>
             <p className="text-sm text-muted-foreground leading-relaxed">
               Enter your access token to continue.
@@ -130,9 +130,9 @@ function AuthenticatedApp({
         {/* Wordmark — vm0 has an org switcher here; we just brand it. */}
         <div className="shrink-0 flex items-center justify-between gap-2 px-3 pt-3 pb-2">
           <div className="flex items-center gap-2 min-w-0">
-            <OctopusLogo size={22} className="text-primary shrink-0" />
+            <OwleryLogo size={22} className="text-primary shrink-0" />
             <span className="truncate text-base font-bold text-sidebar-foreground">
-              Octopus
+              Owlery
             </span>
           </div>
           <div className="flex items-center gap-0.5 shrink-0">

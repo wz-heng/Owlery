@@ -2,7 +2,7 @@
 
 ## 0. What we're building, and why this shape
 
-Every turn Octopus runs today reports its consumption — Claude in USD +
+Every turn Owlery runs today reports its consumption — Claude in USD +
 tokens, Codex in tokens — and we throw almost all of it away: the only
 number that survives is `cost` on the per-turn `result` message row.
 Tokens never leave the parser's `raw` dict; nothing carries a timestamp;

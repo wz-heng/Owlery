@@ -108,7 +108,7 @@ const server = createServer(async (req, res) => {
         id: 123456789,
         is_bot: true,
         first_name: "TestBot",
-        username: "octopus_test_bot",
+        username: "owlery_test_bot",
       },
     });
   }

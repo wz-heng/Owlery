@@ -1,4 +1,4 @@
-# Octopus-native deep research
+# Owlery-native deep research
 
 > **Implementation status: SHIPPED.** The full pipeline described in this plan
 > is implemented and running: `server/research/` (manager, orchestrator, leaf
@@ -14,10 +14,10 @@
 The Claude Code `/deep-research` skill is a background, multi-agent
 **Workflow** that fans out dozens of subagents and relies on the interactive
 Claude harness's workflow runtime + completion-notification. Run inside
-Octopus's one-shot headless `claude --print` turn it (a) never streams a
+Owlery's one-shot headless `claude --print` turn it (a) never streams a
 terminal result so the turn hangs, and (b) is Claude-only — Codex has no
-equivalent. Octopus is a **harness-agnostic** agent platform, so research
-orchestration belongs at the Octopus layer, the same way connectors,
+equivalent. Owlery is a **harness-agnostic** agent platform, so research
+orchestration belongs at the Owlery layer, the same way connectors,
 schedules, bg-tasks and delegations do. We own the fan-out, the limits, the
 progress, the cancellation, and the persistence — and it works identically on
 claude-code and codex.
@@ -47,7 +47,7 @@ Two harness-layer concerns were addressed before research shipped:
 We do NOT build web search/fetch — that's a product in itself (ranking,
 freshness, anti-bot, JS rendering, extraction) and a maintenance sink. Web
 access comes from the **harness's own native web tools** (Claude
-`WebSearch`/`WebFetch`; whatever a future backend exposes). Octopus owns only
+`WebSearch`/`WebFetch`; whatever a future backend exposes). Owlery owns only
 the part that was actually missing: **orchestration** — driving the fan-out as
 many small, bounded sub-turns instead of one giant uncontrolled turn, with
 progress, limits, cancellation, and persistence.
@@ -57,8 +57,8 @@ progress, limits, cancellation, and persistence.
 | Web search + fetch | **the harness** | its native `WebSearch`/`WebFetch`, used inside a scoped sub-turn — §4 |
 | Per-leaf work (search-an-angle / extract-claims / verify-a-claim) | a scoped harness **sub-turn** | a normal `HarnessRun` turn with `tool_allow` = web (+read-only) and a focused prompt — §5 |
 | Pure reasoning leaves (scope decompose, final synthesize) | harness, agnostic | `harness.run_oneshot` (tool-free) — §5 |
-| Orchestration (phases, fan-out, bounded concurrency, timeout, cancel, persist) | **Octopus (asyncio)** | `ResearchManager` + a pipeline — §6 |
-| Invocation + progress + result delivery | Octopus | a built-in MCP tool + session injection, like bg/delegations — §7 |
+| Orchestration (phases, fan-out, bounded concurrency, timeout, cancel, persist) | **Owlery (asyncio)** | `ResearchManager` + a pipeline — §6 |
+| Invocation + progress + result delivery | Owlery | a built-in MCP tool + session injection, like bg/delegations — §7 |
 
 Architecturally backend-neutral (no `if backend ==`; the orchestration only
 ever calls `run_oneshot` and the generic `HarnessRun` turn API). Web
@@ -89,8 +89,8 @@ did. Each phase reports progress (§7).
 ## 4. Web access — from the harness, never built here
 
 Web search/fetch is the harness's job. A "leaf" that needs the web is a normal
-Octopus `HarnessRun` turn (the same engine a chat turn uses), run in a
-throwaway scratch context — not the user's session. Octopus reads the turn's
+Owlery `HarnessRun` turn (the same engine a chat turn uses), run in a
+throwaway scratch context — not the user's session. Owlery reads the turn's
 final text (JSON findings) and discards the sub-turn.
 
 - **A dedicated leaf executor, NOT delegation child sessions** (Vera). Reusing

@@ -7,6 +7,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "./ui/dialog";
+import { DEFAULT_AGENT_AVATAR } from "../lib/agentAvatar";
 
 const API_URL = window.location.origin;
 
@@ -104,7 +105,7 @@ export function UsageDialog({ open, onOpenChange }: Props) {
     if (key == null) return "(none)";
     if (groupBy === "agent") {
       const agent = agents.find((a) => a.id === key);
-      return agent ? `${agent.avatar || "🐙"} ${agent.name}` : `${key.slice(0, 8)}…`;
+      return agent ? `${agent.avatar || DEFAULT_AGENT_AVATAR} ${agent.name}` : `${key.slice(0, 8)}…`;
     }
     if (groupBy === "session") {
       const s =

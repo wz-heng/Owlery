@@ -143,10 +143,10 @@ def test_custom_connector_shape():
     assert c.is_custom is True and c.tools == ("request",)
     assert c.mcp_module == "server.mcp_servers.connectors.custom"
     inst = ConnectorInstallation(id="abcdef123456", kind="linear", label="Linear")
-    entry = c.mcp_entry(inst, {"OCTOPUS_API_BASE": "x", "PYTHONPATH": "p"})
+    entry = c.mcp_entry(inst, {"OWLERY_API_BASE": "x", "PYTHONPATH": "p"})
     assert entry["args"] == ["-m", "server.mcp_servers.connectors.custom"]
-    assert entry["env"]["OCTOPUS_INSTALLATION_ID"] == "abcdef123456"
-    assert entry["env"]["OCTOPUS_CONNECTOR_API_BASE"] == "https://api.linear.app/graphql"
+    assert entry["env"]["OWLERY_INSTALLATION_ID"] == "abcdef123456"
+    assert entry["env"]["OWLERY_CONNECTOR_API_BASE"] == "https://api.linear.app/graphql"
     assert c.mcp_key(inst) == "linear_abcdef"
 
 

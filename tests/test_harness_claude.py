@@ -11,7 +11,7 @@ import pytest
 
 from server.harness import assembly
 from server.harness.claude_code import (
-    _OCTOPUS_SYSTEM_PROMPT,
+    _OWLERY_SYSTEM_PROMPT,
     ClaudeEventParser,
     build_oneshot_argv,
     build_turn_argv,
@@ -29,7 +29,7 @@ def _assemble_ctx(
     abs_wd = str(Path(wd).resolve())
     cb = assembly.build_callback_env(session_id)
     entries = assembly.select_mcp_servers(mcp_servers, list(connectors), cb)
-    sysp = assembly.compose_system_prompt(persona, _OCTOPUS_SYSTEM_PROMPT, list(connectors))
+    sysp = assembly.compose_system_prompt(persona, _OWLERY_SYSTEM_PROMPT, list(connectors))
     return TurnContext(
         prompt=prompt, working_dir=abs_wd, resume_id=resume, system_prompt=sysp,
         model=model, tool_allow=tool_allow, tool_deny=tool_deny,
@@ -75,7 +75,7 @@ def test_turn_argv_full_config(tmp_path):
     cfg = json.loads(argv[argv.index("--mcp-config") + 1])["mcpServers"]
     assert set(cfg) == {"bg", "ask"}  # only the selected built-ins
     ap = argv[argv.index("--append-system-prompt") + 1]
-    assert ap.startswith("PERSONA") and "Octopus in-app tools" in ap
+    assert ap.startswith("PERSONA") and "Owlery in-app tools" in ap
     assert kw["cwd"] == str(tmp_path)
     assert kw["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "tok-xyz"
 

@@ -1,7 +1,7 @@
 """Real end-to-end deep research against a signed-in harness CREDENTIAL.
 
 Unlike the bare-CLI *_real tests (which use host ambient auth), deep research
-runs through an Octopus credential. The codex credential is directory-backed
+runs through an Owlery credential. The codex credential is directory-backed
 (its own CODEX_HOME with auth.json), so we discover a usable one on disk and
 bind a session to its id — no DB credential row needed, since codex resolution
 is purely path-based. Gated + skipped when no usable codex credential exists.

@@ -19,7 +19,7 @@
 > NATIVE_TRANSCRIPT.** Real-CLI testing showed `claude --resume` of an
 > externally-synthesized JSONL is unreliable through the production
 > spawn path: the CLI resolves the resume id against a session-discovery
-> path that does NOT dependably see a transcript Octopus wrote, failing
+> path that does NOT dependably see a transcript Owlery wrote, failing
 > ~all the time with "No conversation found" and silently starting a
 > fresh empty session (it resumes its OWN sessions fine). So BOTH
 > backends now use HISTORY_REPLAY: the fork's first turn replays the
@@ -33,7 +33,7 @@
 
 ## 0. What we're building, and the mental model
 
-Today an Octopus session is a single linear chain: each user turn
+Today an Owlery session is a single linear chain: each user turn
 appends a new message; the agent reads the whole history every turn
 via the CLI's `--resume` mechanism. If a turn goes off the rails
 the user has two options — keep correcting in the same thread
@@ -75,7 +75,7 @@ server. We piggy-back on three primitives that already exist:
    spawnable in this backend's resume model". Returns a
    `ForkArtifact`; Claude implements it by synthesizing a
    resumable JSONL on disk (reusing
-   `jsonl_writer.write_jsonl_file` from `octopus pull`); Codex
+   `jsonl_writer.write_jsonl_file` from `owlery pull`); Codex
    implements it by signalling history-replay on the first turn;
    future agents pick whichever strategy fits.
 2. **`session_manager.create_session`** — already takes a
@@ -166,7 +166,7 @@ can_fork: bool                       # derived predicate, surfaced via registry
 # Harness (engine)
 async def prepare_fork(
     self,
-    messages: list[dict],            # Octopus DB-shape rows up to fork-point
+    messages: list[dict],            # Owlery DB-shape rows up to fork-point
     working_dir: str,
     resume_id_hint: str | None,      # caller-pre-minted id (round-5)
 ) -> ForkArtifact:
@@ -224,7 +224,7 @@ async def cleanup_incomplete_fork_artifacts(
     self,
     working_dir: str,
     resume_id_hint: str | None,    # the pre-minted id from step 5
-    fork_id: str,                  # the Octopus fork session id
+    fork_id: str,                  # the Owlery fork session id
 ) -> None:
     """Sweep any backend-specific files prepare_fork may have left
     behind when the saga didn't complete. Claude: rm
@@ -255,7 +255,7 @@ touching `SessionManager`, the routers, or the frontend.
 
 | Backend | `can_fork` | Strategy | Implementation |
 |---|---|---|---|
-| **Claude Code** | `True` (v1) | `NATIVE_TRANSCRIPT` | Reuse `server/jsonl_writer.py:write_jsonl_file` (already the basis of `octopus pull`); write into `~/.claude/projects/<cwd-mangled>/<resume_id>.jsonl`. The CLI's `--resume <id>` reads exactly this. `prepare_fork` returns `ForkArtifact(resume_id=<minted>, needs_replay=False)`. |
+| **Claude Code** | `True` (v1) | `NATIVE_TRANSCRIPT` | Reuse `server/jsonl_writer.py:write_jsonl_file` (already the basis of `owlery pull`); write into `~/.claude/projects/<cwd-mangled>/<resume_id>.jsonl`. The CLI's `--resume <id>` reads exactly this. `prepare_fork` returns `ForkArtifact(resume_id=<minted>, needs_replay=False)`. |
 | **Codex** | `True` (v1) | `HISTORY_REPLAY` | Codex's resume state is internal to the binary and we have no transcript codec for it (`server/harness/codex.py:9`). Instead `prepare_fork` returns `ForkArtifact(resume_id=None, needs_replay=True)`. On the first fork turn, the **user prompt** the harness sends is wrapped: `<fork-history>…</fork-history>\n\n<continue-from-here>{user's actual prompt}</continue-from-here>`. The replay block lives in the user-message channel — not `developer_instructions` — so it (a) persists in Codex's thread as real conversation history surviving native resume on turn 2+, and (b) does not upgrade transcript text to developer-channel priority. `thread.started` captures the fresh `thread_id` on turn 1; from turn 2 onward the session uses normal Codex resume with `fork_needs_replay=False`. |
 | **Future agent X** | implementer's call | either strategy, or a new one | The contract is the single `prepare_fork` method returning a `ForkArtifact`. Backends with cloud-side conversation ids can implement a third strategy (e.g. POST a continuation to the provider) inside the same method without disturbing callers. |
 
@@ -624,7 +624,7 @@ Backend (`SessionManager.fork_session`):
 - **Codex (any M, including `M=0`):** spawn without `resume`.
   Wrapping happens in `SessionManager.send_message` and is
   **dispatch-only: the wrapped prompt goes to the backend, the
-  raw user text is persisted to the Octopus DB / broadcast to
+  raw user text is persisted to the Owlery DB / broadcast to
   the UI** (Vera round-2 fresh F4). This preserves the existing
   invariant — sidebar previews, exports, and pull all see the
   unwrapped text. For `M=0` the `<fork-history>` block is empty
@@ -665,7 +665,7 @@ routers, frontend) is unaware of the strategy in use.
 `prepare_fork` writes a synthesized JSONL into
 `~/.claude/projects/<cwd-mangled>/<minted_resume_id>.jsonl` using
 `server/jsonl_writer.py:write_jsonl_file` (same writer that
-powers `octopus pull`). Returns
+powers `owlery pull`). Returns
 `ForkArtifact(resume_id=<minted>, needs_replay=False)`. The first
 fork turn spawns `claude --resume <minted>` and reads the
 synthesized JSONL as if it were a normal prior session.
@@ -711,13 +711,13 @@ fork turn flows like this:
    ```
    **Wrapping is dispatch-only** (Vera round-2 fresh F4). The
    wrap is applied to the prompt the backend subprocess sees —
-   NOT to the row Octopus persists in `messages`, NOT to what
+   NOT to the row Owlery persists in `messages`, NOT to what
    the WebSocket broadcasts to the chat UI. The existing
    `send_message` flow already separates these: the raw user
    text is persisted/broadcast first (`session_manager.py:882`),
    then a dispatch prompt is built for the backend. Fork replay
    inserts the wrap at the dispatch-build step only. Result:
-   sidebar previews, chat scrollback, `octopus pull`, and any
+   sidebar previews, chat scrollback, `owlery pull`, and any
    other history consumer all see the raw text. The wrapping
    markup never appears in the user's view of the conversation.
    The wrapping happens at this same `send_message` chokepoint so
@@ -729,7 +729,7 @@ fork turn flows like this:
    user prompt, not a `-c` argv element.
 3. **Spawn Codex with no `resume` argument** — fresh thread from
    Codex's perspective. `developer_instructions` carries only the
-   normal Octopus system prompt + the §5.6.4 fork-context note
+   normal Owlery system prompt + the §5.6.4 fork-context note
    (framing, not transcript) — see §3.5 for why the replay block
    does NOT go here.
 4. **`thread.started` captures a fresh `thread_id`** into the
@@ -769,7 +769,7 @@ text above is the v1 wording.
   reach ~50K tokens. Beyond `LARGE_PROMPT_THRESHOLD_BYTES`
   (`docs/post-mortems/2026-05-18-bg-pipeline-hardening.md` §1),
   `spill_if_large` writes the wrapped prompt to
-  `~/.octopus/large-prompts/<session>/<uuid>.txt` and replaces it
+  `~/.owlery/large-prompts/<session>/<uuid>.txt` and replaces it
   with a pointer message telling the model to `Read` the file.
   Identical to bg-task-result delivery — no new spill primitive,
   no new wording.
@@ -862,7 +862,7 @@ removing the parent's attachment dir, walk the
 `forked_from_session_id` chain forward to find every
 descendant fork at ANY depth, and for each attachment file the
 fork references in its `messages.attachments` metadata, copy
-the file into the fork's own `~/.octopus/attachments/<fork_id>/`
+the file into the fork's own `~/.owlery/attachments/<fork_id>/`
 dir. After the blit, the parent's dir is safe to remove.
 
 The walk is **uncapped in depth** and uses a **visited-set cycle
@@ -1024,7 +1024,7 @@ If all four hold and the user opts in, `fork_session` runs
 (via `subprocess` in `working_dir`):
 
 ```bash
-git stash push -u -m "octopus: pre-fork stash $FORK_ID" -- <files>
+git stash push -u -m "owlery: pre-fork stash $FORK_ID" -- <files>
 git checkout HEAD -- <files>
 ```
 
@@ -1163,7 +1163,7 @@ as `'ready'`, silently losing the post-crash unknown-disk-state):
 | `fork_status` | Meaning | Startup recovery action |
 |---|---|---|
 | `'initializing'` | Crashed before step 7 stamped `fork_metadata`. No resume artifact or metadata; possibly an orphan resume artifact on disk. | **PURGE in this exact order** (Vera round-8 fresh SHOULD-FIX — the row holds the `resume_id_hint` / `fork_id` anchors the cleanup hook needs): (1) Call `harness.cleanup_incomplete_fork_artifacts(working_dir, resume_id_hint, fork_id)` — for Claude it removes `<cwd>/<resume_id>.jsonl` and `<cwd>/.<fork_id>.tmp` at exact paths; for Codex it's a no-op (Vera round-6 fresh SHOULD-FIX #1). If cleanup fails, **leave the row as `'initializing'`** and log — next boot will retry idempotently. (2) Only after cleanup succeeds, delete the row + its copied messages. The user re-creates the fork. |
-| `'reverting'` | Step 7 completed (fork is durable) but step 8's git ops were in progress when crash happened. Working tree state is unknown — git stash may or may not exist; checkout may or may not have run. | **FINALIZE.** Do NOT purge — the fork DB state is valid. Set `fork_revert_record.status = "unknown_post_crash"` (the **durable** revert slot — Vera round-6 fresh SHOULD-FIX #2; NOT inside `fork_metadata`, which gets cleared after first turn) with a note instructing the user to manually inspect `git status` and `git stash list` for `octopus: pre-fork stash <fork_id>`. Promote `fork_status` to `'ready'`. The fork is then usable; the revert outcome is surfaced as "interrupted — check working tree." |
+| `'reverting'` | Step 7 completed (fork is durable) but step 8's git ops were in progress when crash happened. Working tree state is unknown — git stash may or may not exist; checkout may or may not have run. | **FINALIZE.** Do NOT purge — the fork DB state is valid. Set `fork_revert_record.status = "unknown_post_crash"` (the **durable** revert slot — Vera round-6 fresh SHOULD-FIX #2; NOT inside `fork_metadata`, which gets cleared after first turn) with a note instructing the user to manually inspect `git status` and `git stash list` for `owlery: pre-fork stash <fork_id>`. Promote `fork_status` to `'ready'`. The fork is then usable; the revert outcome is surfaced as "interrupted — check working tree." |
 | `'ready'` | Fork fully durable. | No-op. |
 
 The startup sweep runs ONE query and dispatches on `fork_status`:
@@ -1450,7 +1450,7 @@ Five phases, each ends with the full verification suite green.
 - **`_safe_revert_files(working_dir, agent_touched_paths,
   fork_head, fork_id)`** in `server/session_manager.py` — runs
   the 4-check §5.6.3 preflight (incl. the new clean-tree-at-fork
-  check), then `git stash push -u -m "octopus: pre-fork stash
+  check), then `git stash push -u -m "owlery: pre-fork stash
   $FORK_ID"` + `git checkout HEAD -- <files>`. Returns a result
   tuple capturing files restored and the stash ref so the
   caller can write it to **`fork_revert_record`** (the durable

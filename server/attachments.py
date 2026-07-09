@@ -3,8 +3,8 @@
 Files live at:
     <attachments_root>/<session_id>/<attachment_id>__<sanitized_filename>
 
-`attachments_root` defaults to `~/.octopus/attachments` and is configurable
-via `OCTOPUS_ATTACHMENTS_DIR`. Filenames keep the original extension (so
+`attachments_root` defaults to `~/.owlery/attachments` and is configurable
+via `OWLERY_ATTACHMENTS_DIR`. Filenames keep the original extension (so
 the agent's `Read` tool picks the right handler), prefixed with a short
 unique id so two uploads of `screenshot.png` don't collide.
 

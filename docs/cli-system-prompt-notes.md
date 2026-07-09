@@ -7,14 +7,14 @@ the model, with different scopes and reload semantics:
 
 | Layer | How it reaches the model | Scope | When to use |
 |---|---|---|---|
-| `--append-system-prompt` (CLI argv) | Octopus's `harness/claude_code.py` sets it on every spawn (`_OCTOPUS_SYSTEM_PROMPT`) | Every CLI invocation Octopus makes, for every user, every session | Rules about how to use Octopus's *own* tools (`mcp__bg__run`, `mcp__ask__user`, `mcp__ask_agent__ask`); behaviors the agent must follow regardless of which human is driving |
+| `--append-system-prompt` (CLI argv) | Owlery's `harness/claude_code.py` sets it on every spawn (`_OWLERY_SYSTEM_PROMPT`) | Every CLI invocation Owlery makes, for every user, every session | Rules about how to use Owlery's *own* tools (`mcp__bg__run`, `mcp__ask__user`, `mcp__ask_agent__ask`); behaviors the agent must follow regardless of which human is driving |
 | Auto-memory (`~/.claude/projects/<repo>/memory/`) | Loaded by the harness as conversation context | Per-user, per-repo. A teammate cloning the repo starts with empty memory | Personal preferences, feedback corrections, things the *user* discovered they want the agent to remember |
 | `CLAUDE.md` (in the repo) | Loaded by the harness, checked into git | Per-repo, per-clone | Project conventions: commands, test layout, conventions everyone working on this repo should know |
 
 ## How `--append-system-prompt` is wired
 
 `server/harness/claude_code.py` builds a long Python string
-(`_OCTOPUS_SYSTEM_PROMPT`) describing the MCP tools Octopus injects
+(`_OWLERY_SYSTEM_PROMPT`) describing the MCP tools Owlery injects
 (`bg`, `ask`, `ask_agent`), and how to use each. The string is then passed as a
 positional argv element on every CLI spawn:
 
@@ -23,7 +23,7 @@ argv = [
     self.binary,
     "--print",
     ...
-    "--append-system-prompt", _OCTOPUS_SYSTEM_PROMPT,
+    "--append-system-prompt", _OWLERY_SYSTEM_PROMPT,
     ...
 ]
 ```
@@ -36,17 +36,17 @@ model about controller-specific tools.
 ## Why the bg-vs-Bash rule moved here
 
 It used to live only as a `feedback` memory in my auto-memory. That
-covered me — but a fresh user opening Octopus would not see the
+covered me — but a fresh user opening Owlery would not see the
 rule, so the model would happily reach for Bash on a test suite and
 hit the auto-backgrounding-then-killed trap we kept stepping on.
 Moving the rule into `--append-system-prompt` means:
 
-- Every spawn of the `claude` CLI from Octopus carries the rule.
+- Every spawn of the `claude` CLI from Owlery carries the rule.
 - A new user / new machine gets the same behavior on day one.
 - The auto-memory copy is now redundant for *new* sessions, but
   remains valid as a per-user reinforcement.
 
-The actual text of the rule (see `_OCTOPUS_SYSTEM_PROMPT` in
+The actual text of the rule (see `_OWLERY_SYSTEM_PROMPT` in
 `server/harness/claude_code.py`) is intentionally strict: "use
 bg_run unconditionally for any test suite / build / install /
 sleep / network fetch". That's framed as a bright line because
@@ -58,9 +58,9 @@ thought would be quick.
 
 A candidate belongs in `--append-system-prompt` when it is:
 
-- **Universal**: applies to every user driving Octopus, not just
+- **Universal**: applies to every user driving Owlery, not just
   one person's preference.
-- **About Octopus's own tools or runtime quirks**, not about a
+- **About Owlery's own tools or runtime quirks**, not about a
   specific project's code or commands.
 - **A safety/correctness invariant**, not a stylistic preference.
 

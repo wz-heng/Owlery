@@ -1,4 +1,4 @@
-"""Parse Claude Code JSONL session files into Octopus MessageContent format."""
+"""Parse Claude Code JSONL session files into Owlery MessageContent format."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ class ParsedSession:
 
 
 def _convert_line(data: dict[str, Any]) -> list[MessageContent] | None:
-    """Convert a single JSONL line to Octopus MessageContent list.
+    """Convert a single JSONL line to Owlery MessageContent list.
 
     Returns None for lines that should be skipped.
     """

@@ -27,7 +27,7 @@ claude --print \
        --dangerously-skip-permissions \
        --disallowedTools AskUserQuestion \
        --mcp-config '<inline JSON>' \
-       --append-system-prompt '<Octopus addendum>' \
+       --append-system-prompt '<Owlery addendum>' \
        [--resume <session-id>] \
        [--include-partial-messages] \
        -- \
@@ -44,7 +44,7 @@ Notes per flag:
 - `--verbose`: **required** alongside `--output-format=stream-json`
   under `--print` (CLI errors otherwise).
 - `--dangerously-skip-permissions`: bypass per-tool permission checks.
-  This is intentionally permissive — Octopus is the only thing
+  This is intentionally permissive — Owlery is the only thing
   spawning these subprocesses on the user's behalf, so the user
   already trusts the call. The previous shape
   (`--permission-prompt-tool=stdio` + host callback) gave us nothing
@@ -59,7 +59,7 @@ Notes per flag:
   string; we use inline.
 - `--append-system-prompt <text>`: short addendum teaching the model
   about `bg_run` and `ask_user`. The full text lives in
-  `claude_code.py:_OCTOPUS_SYSTEM_PROMPT`.
+  `claude_code.py:_OWLERY_SYSTEM_PROMPT`.
 - `--resume <session-id>`: continue an existing conversation.
 - `--`: terminator for option parsing. The single positional
   argument that follows is the user prompt.
@@ -81,9 +81,9 @@ What we **do not** set, and why:
 - All events share a `type` field; many also carry `session_id` and `uuid`.
 - **stderr** is used for warnings and fatal errors (not used for
   events in normal operation).
-- **stdin** is **not used** by Octopus under the VM0 shape. The prompt
+- **stdin** is **not used** by Owlery under the VM0 shape. The prompt
   is on argv; control responses don't exist (no control protocol).
-  Octopus's `claude_code.py:send_initial_prompt` is a no-op for
+  Owlery's `claude_code.py:send_initial_prompt` is a no-op for
   exactly this reason.
 
 ## Event types observed on stdout
@@ -134,7 +134,7 @@ itself — no host involvement. We only see the `tool_use` and
 CLI as its own subprocess (children of `claude`, grandchildren of the
 FastAPI process). The model sees them as `mcp__<server-key>__<tool-fn>`:
 
-| MCP tool | Purpose | How it talks to Octopus |
+| MCP tool | Purpose | How it talks to Owlery |
 |---|---|---|
 | `mcp__bg__run(command, description?)` / `cancel` / `list` | Fire-and-forget shell commands that outlive the per-turn `claude --print` | POSTs to `/api/sessions/{id}/bg-tasks`; FastAPI's `BgTaskManager` owns the subprocess and injects a follow-up turn on completion. |
 | `mcp__ask__user(questions)` | Replaces the built-in `AskUserQuestion` | POSTs to `/api/sessions/{id}/questions` and HTTP-long-polls the answer. Frontend renders the QuestionPrompt form; user's submit sets an `asyncio.Event` that unblocks the long-poll. |
@@ -148,9 +148,9 @@ endpoint (`server/showme_ai.py`).
 Each MCP subprocess gets these env vars from `build_args`:
 
 ```
-OCTOPUS_API_BASE     http://127.0.0.1:{settings.port}
-OCTOPUS_AUTH_TOKEN   the bearer the rest of the API uses
-OCTOPUS_SESSION_ID   so callbacks attribute to the right session
+OWLERY_API_BASE     http://127.0.0.1:{settings.port}
+OWLERY_AUTH_TOKEN   the bearer the rest of the API uses
+OWLERY_SESSION_ID   so callbacks attribute to the right session
 PYTHONPATH           = repo root, so the MCP server's `from server.…` imports resolve
 ```
 
@@ -162,7 +162,7 @@ emits a new `system.init` event but keeps the same `session_id`.
 Confirmed: the new turn has full context from the prior conversation.
 
 We mint our own session id by capturing the first `system.init`'s
-`session_id` and storing it on the Octopus session row as
+`session_id` and storing it on the Owlery session row as
 `claude_session_id`.
 
 `--continue` resumes the most recent conversation for the current
@@ -186,7 +186,7 @@ context and for some tool-result shapes (we have observed it on text
 results > 50 KB, and reliably on image results at ~900K input
 tokens), the CLI runs the tool, persists the result to its private
 jsonl at `~/.claude/projects/...`, but **never emits the
-corresponding `user` event on stdout**. Octopus's stdout reader hits
+corresponding `user` event on stdout**. Owlery's stdout reader hits
 EOF and treats the turn as ended; the user sees the chat go silent
 with the tool's result missing.
 
@@ -196,7 +196,7 @@ The post-mortem and the mitigation that shipped live in
 - Independent of the input-format / permission-prompt path (the
   VM0-shape refactor reduced frequency but did not eliminate).
 - Worth filing upstream with Anthropic.
-- Octopus-side mitigation: `session_manager._run_backend` is a loop
+- Owlery-side mitigation: `session_manager._run_backend` is a loop
   that tracks `saw_result` / `saw_tool_use` across the event
   stream. If the stream ends without a `result` after a `tool_use`
   AND we have a resume id, it respawns the CLI once with prompt
@@ -270,15 +270,15 @@ Key functions in the bundled JS:
 
 After OAuth completes in the browser, the redirect lands the user at `MANUAL_REDIRECT_URL` (`console.anthropic.com/oauth/code/callback`) which displays an auth code. The user copies it back to the CLI input prompt. The CLI then POSTs the code to `TOKEN_URL` and gets back an access token.
 
-### Implications for Octopus
+### Implications for Owlery
 
 Most pragmatic path for in-app login:
 1. Spawn `claude setup-token` in a PTY (Ink TUI needs a TTY) with `HOME` pointed at a fresh per-credential dir.
 2. Read stdout, regex-extract the authorize URL (matches `https://claude.ai/oauth/authorize?...` or `https://console.anthropic.com/oauth/authorize?...`).
 3. Surface URL to UI → user opens in browser → completes login → copies code from `oauth/code/callback`.
-4. UI sends the code back to Octopus; Octopus writes it to the subprocess stdin (the CLI's prompt expects exactly the pasted code).
+4. UI sends the code back to Owlery; Owlery writes it to the subprocess stdin (the CLI's prompt expects exactly the pasted code).
 5. CLI completes token exchange, prints `sk-ant-…` token, exits.
-6. Octopus captures the token from stdout, stores it as a credential (the existing encrypted-API-key storage works as-is — the OAuth token IS an API key, just long-lived).
+6. Owlery captures the token from stdout, stores it as a credential (the existing encrypted-API-key storage works as-is — the OAuth token IS an API key, just long-lived).
 7. Session spawn unchanged: `ANTHROPIC_API_KEY=<token>` on the subprocess env.
 
 ### What's still unverified

@@ -1,10 +1,10 @@
-# Tech Plan: Introduce first-class Agents into Octopus
+# Tech Plan: Introduce first-class Agents into Owlery
 
-Reference design: vm0 (`/home/start-up/vm0`), which cleanly splits **Agent (definition) ↔ Session (continuation) ↔ Run (execution)**. Octopus today only has `Session`. We adopt vm0's split *partially* (YAGNI), with a path to the full split later.
+Reference design: vm0 (`/home/start-up/vm0`), which cleanly splits **Agent (definition) ↔ Session (continuation) ↔ Run (execution)**. Owlery today only has `Session`. We adopt vm0's split *partially* (YAGNI), with a path to the full split later.
 
 ## 0. Why this exists, and the shape of this refactor
 
-**The north star is memory.** Sessions are ephemeral — we archive them when a task is done. Octopus today has nowhere to store knowledge, identity, or recurring intent that *outlives* a session. The end goal is an Agent that remembers things across sessions, carries its own configured system prompt and tool/skill set, and can be scheduled to do work regularly.
+**The north star is memory.** Sessions are ephemeral — we archive them when a task is done. Owlery today has nowhere to store knowledge, identity, or recurring intent that *outlives* a session. The end goal is an Agent that remembers things across sessions, carries its own configured system prompt and tool/skill set, and can be scheduled to do work regularly.
 
 **This refactor makes the Agent a first-class, durable entity — and gets the ownership architecture fully right in one pass.** Everything that conceptually belongs to "an assistant that persists" moves onto the Agent now: config, schedules, and bridge bindings. It does **not** build memory. Memory is a separate, harder design that hangs off the Agent later (its own table + an MCP `recall`/`remember` tool + system-prompt injection). We build the durable Agent first because memory needs something durable to key off; there is no lock-in risk, since memory only needs an `agent_id`.
 
@@ -35,7 +35,7 @@ Reference design: vm0 (`/home/start-up/vm0`), which cleanly splits **Agent (defi
 
 - **No memory store.** It's the reason the Agent exists, but it's designed and built separately, after this lands. The durable Agent here is its foundation.
 - **No connectors built here.** Outbound third-party tools (`docs/plans/connectors.md`) are a separate future feature. This refactor only records the ownership decision (agent-scoped, separate from bridges — §5.8) so the connectors plan slots in without a schema redo.
-- No multi-tenant / org model. Octopus stays single-user.
+- No multi-tenant / org model. Owlery stays single-user.
 - No content-addressed agent versioning (vm0's `agentComposeVersions`). Track agent edits in-place; revisit later.
 - No separate `Run` table. A "send_message turn" stays implicit inside a session; lift it only if/when we need per-turn billing, snapshots, or A2A triggers.
 - ~~No multi-agent orchestration (A2A). Single agent per session.~~ —
@@ -47,9 +47,9 @@ Reference design: vm0 (`/home/start-up/vm0`), which cleanly splits **Agent (defi
   we got there without one. A delegation child is still a single-agent
   session; the multi-agent shape is built from the chain of sessions.
 
-## 3. Reference mapping vm0 → Octopus
+## 3. Reference mapping vm0 → Owlery
 
-| vm0 | Octopus today | Octopus after this refactor |
+| vm0 | Owlery today | Owlery after this refactor |
 |---|---|---|
 | `zero_agents` (definition) | *missing* | **new** `agents` table |
 | `agentComposeVersions` (snapshots) | *missing* | *skipped* |
@@ -60,7 +60,7 @@ Reference design: vm0 (`/home/start-up/vm0`), which cleanly splits **Agent (defi
 | `customSkills` | none | `agents.mcp_servers` (curated built-in MCP set per agent) |
 | `modelProviderId` / `selectedModel` | `sessions.credential_id` only | `agents.credential_id` + `agents.model` |
 | bridge mappings | `bridge_mappings` (FK → session) | `bridge_mappings` (FK → **agent**, + sticky nullable `session_id`) |
-| (no analogue — Octopus-specific) | none | *future* `agent_memory` (the north star, **not this refactor**) |
+| (no analogue — Owlery-specific) | none | *future* `agent_memory` (the north star, **not this refactor**) |
 
 ## 4. Data model changes
 
@@ -76,7 +76,7 @@ CREATE TABLE agents (
   model TEXT,                             -- e.g. "claude-opus-4-7"; null = backend default
   credential_id TEXT REFERENCES backend_credentials(id) ON DELETE SET NULL,
   mcp_servers TEXT NOT NULL DEFAULT '["ask","bg","viewer"]',
-                                          -- JSON array of *built-in* Octopus MCP server ids.
+                                          -- JSON array of *built-in* Owlery MCP server ids.
                                           -- Opaque to SQL: read whole, parsed in Python.
   tool_allow TEXT NOT NULL DEFAULT '',    -- newline-separated tool/MCP names; empty = allow all
   tool_deny  TEXT NOT NULL DEFAULT '',    -- newline-separated; deny takes precedence over allow
@@ -88,7 +88,7 @@ CREATE TABLE agents (
 CREATE UNIQUE INDEX agents_name_unique ON agents(name) WHERE archived = 0;
 ```
 
-**On the list-shaped columns.** None of these are ever queried *inside* with `json_extract` — we always load the whole agent row and parse in Python. So the storage format is pure serialization. `mcp_servers` is a small closed set of identifiers, kept as a JSON array (matches existing Octopus convention). `tool_allow` / `tool_deny` are open-ended name lists kept as newline-separated TEXT — two columns, so "allow" and "deny" are first-class and readable, never a nested `{"allow":[...],"deny":[...]}` blob. Empty `tool_allow` means "no allowlist restriction"; `tool_deny` always wins on conflict.
+**On the list-shaped columns.** None of these are ever queried *inside* with `json_extract` — we always load the whole agent row and parse in Python. So the storage format is pure serialization. `mcp_servers` is a small closed set of identifiers, kept as a JSON array (matches existing Owlery convention). `tool_allow` / `tool_deny` are open-ended name lists kept as newline-separated TEXT — two columns, so "allow" and "deny" are first-class and readable, never a nested `{"allow":[...],"deny":[...]}` blob. Empty `tool_allow` means "no allowlist restriction"; `tool_deny` always wins on conflict.
 
 ### 4.2 `sessions` changes
 
@@ -130,7 +130,7 @@ ALTER TABLE bridge_mappings ADD COLUMN agent_id TEXT REFERENCES agents(id) ON DE
 
 ### 4.5 Migration & backfill
 
-Stick with Octopus's existing additive-SQL migration style (`server/database.py:_apply_migrations`, try/except per statement). No Alembic. Order matters — Agents and `sessions.agent_id` must be populated before schedule/bridge backfill, since those derive their `agent_id` through the session.
+Stick with Owlery's existing additive-SQL migration style (`server/database.py:_apply_migrations`, try/except per statement). No Alembic. Order matters — Agents and `sessions.agent_id` must be populated before schedule/bridge backfill, since those derive their `agent_id` through the session.
 
 **Backfill** (one-time, idempotent, runs on every boot):
 
@@ -232,7 +232,7 @@ A session with `origin='schedule'` **auto-archives when it next goes idle** (hoo
 
 ### 5.8 Bridges vs Connectors — the inbound/outbound boundary
 
-Octopus has two third-party-integration surfaces, and they must stay **separate concepts**, not be merged into one "integration" object — even when they involve the same vendor (e.g. Slack). The distinction is **direction**:
+Owlery has two third-party-integration surfaces, and they must stay **separate concepts**, not be merged into one "integration" object — even when they involve the same vendor (e.g. Slack). The distinction is **direction**:
 
 | | **Bridge** (inbound) | **Connector** (outbound) |
 |---|---|---|
@@ -309,6 +309,6 @@ P2 needs P1; P3 needs P2.
 
 - **No memory in this refactor.** It is the goal, but it's a harder design (storage shape, injection strategy, growth/eviction) that deserves its own spec. The durable Agent built here — owning config, schedules, and bridges — is its foundation.
 - **No `Run` table.** Per-turn execution is well-contained in `SessionManager`; a Run table would force every turn into a DB lifecycle. Add it when we actually need per-turn billing, A2A triggers (turned out we *didn't* need it — A2A shipped via [`agent-collaboration.md`](agent-collaboration.md) without a Run table), or persistent execution logs separate from messages.
-- **No compose versioning.** Editing an agent changes its row. vm0's "snapshot at run time" guarantee is valuable for reproducibility but irrelevant until Octopus has scheduled fleets or external triggers that race with edits.
-- **No firewall/proxy.** Octopus runs `claude` as a local subprocess on the user's machine. There is no untrusted egress to police. vm0's mitmproxy story doesn't translate.
+- **No compose versioning.** Editing an agent changes its row. vm0's "snapshot at run time" guarantee is valuable for reproducibility but irrelevant until Owlery has scheduled fleets or external triggers that race with edits.
+- **No firewall/proxy.** Owlery runs `claude` as a local subprocess on the user's machine. There is no untrusted egress to police. vm0's mitmproxy story doesn't translate.
 - **No org/visibility model.** Single user.

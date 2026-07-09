@@ -5,7 +5,7 @@ code, Codex auth is *directory-backed* (codex-backend.md §7): we run
 `codex login --device-auth` against a fresh per-credential `CODEX_HOME`, scrape
 the verification URL + one-time code it prints, and show them in the UI. Codex
 itself polls the device endpoint; when the user authorizes in their browser it
-writes `auth.json` into that dir and exits 0. No secret is stored in Octopus —
+writes `auth.json` into that dir and exits 0. No secret is stored in Owlery —
 the credential *is* the dir, and Codex manages the token + its refresh there.
 
 Lifecycle: `start(label)` → spawn + scrape (returns url+code) → caller polls

@@ -1,7 +1,7 @@
 """Spill oversize prompts to disk and hand the backend a pointer.
 
 Linux's `MAX_ARG_STRLEN` ceiling (~128 KB / 32 pages) means `execve`
-fails with `E2BIG` if any single argv element is larger. Octopus
+fails with `E2BIG` if any single argv element is larger. Owlery
 passes the user prompt to `claude` as a positional argv after `--`
 (the VM0 shape — see `docs/post-mortems/2026-05-18-bg-pipeline-hardening.md` §2),
 so any prompt over the ceiling is unspawnable.
@@ -44,7 +44,7 @@ LARGE_PROMPT_THRESHOLD_BYTES = 100 * 1024
 # starts with one of these, the pointer prompt carries it forward
 # at the front so downstream consumers that key off the marker
 # (e.g. the frontend's "auto" badge for bg-task-result) keep working.
-_PRESERVED_MARKERS = ("[bg-task-result]", "[octopus-large-prompt]")
+_PRESERVED_MARKERS = ("[bg-task-result]", "[owlery-large-prompt]")
 
 
 def _large_prompts_root() -> Path:
@@ -110,7 +110,7 @@ def spill_if_large(session_id: str, prompt: str) -> str:
     marker = _extract_preserved_marker(prompt)
     prefix = f"{marker} " if marker else ""
     pointer = (
-        f"{prefix}[octopus-large-prompt] The actual user message is "
+        f"{prefix}[owlery-large-prompt] The actual user message is "
         f"{byte_size:,} bytes — too large to deliver inline. "
         f"It's saved at {abs_path}. Read that file in full to see the "
         f"message, then respond to it. Use Read with offset/limit and "

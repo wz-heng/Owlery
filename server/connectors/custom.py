@@ -162,7 +162,7 @@ class CustomConnector(ConnectorBase):
     def mcp_entry(self, installation, callback_env):
         entry = super().mcp_entry(installation, callback_env)
         # The generic server needs the API base to call.
-        entry["env"]["OCTOPUS_CONNECTOR_API_BASE"] = self.api_base
+        entry["env"]["OWLERY_CONNECTOR_API_BASE"] = self.api_base
         return entry
 
     async def fetch_external_identity(self, token_set):

@@ -5,7 +5,7 @@ the `/api/sessions/{sid}/research` route in front of `ResearchManager`. Like
 bg/ask_agent, this process is a child of the harness CLI (not FastAPI), so it
 calls back over HTTP using the injected env:
 
-  OCTOPUS_API_BASE / OCTOPUS_AUTH_TOKEN / OCTOPUS_SESSION_ID
+  OWLERY_API_BASE / OWLERY_AUTH_TOKEN / OWLERY_SESSION_ID
 
 The job runs in the background; its final cited report is injected into THIS
 session as a follow-up turn prefixed `[deep-research:<id>]`. So the tool
@@ -33,7 +33,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("octopus-research")
+mcp = FastMCP("owlery-research")
 
 
 def _env(name: str) -> str | None:
@@ -48,7 +48,7 @@ def deep_research(question: str) -> str:
     """Run a deep, multi-source, fact-checked web-research job and get a cited
     report back — asynchronously.
 
-    Octopus fans the work out itself (scope → parallel web searches → claim
+    Owlery fans the work out itself (scope → parallel web searches → claim
     extraction → adversarial verification → synthesis) using THIS backend's
     own web tools, bounded and cancellable. The job runs in the background:
     this tool returns immediately with a research id, and when it finishes the
@@ -68,8 +68,8 @@ def deep_research(question: str) -> str:
         A short string with the research id; the cited report follows later
         as an injected turn.
     """
-    api, sid = _env("OCTOPUS_API_BASE"), _env("OCTOPUS_SESSION_ID")
-    tok = _env("OCTOPUS_AUTH_TOKEN")
+    api, sid = _env("OWLERY_API_BASE"), _env("OWLERY_SESSION_ID")
+    tok = _env("OWLERY_AUTH_TOKEN")
     if not (api and sid and tok):
         return "Error: research server is misconfigured (env vars missing)."
     if not (question or "").strip():
@@ -84,7 +84,7 @@ def deep_research(question: str) -> str:
             timeout=15.0,
         )
     except httpx.HTTPError as e:
-        return f"Error: failed to reach Octopus to start research: {e}"
+        return f"Error: failed to reach Owlery to start research: {e}"
     if r.status_code == 409:
         return (
             "Deep research isn't available on this backend (no web tools): "

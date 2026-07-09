@@ -65,7 +65,7 @@ def test_oversize_prompt_is_spilled(spill_root):
     result = spill_if_large("sess-big", prompt)
 
     assert result != prompt
-    assert "[octopus-large-prompt]" in result
+    assert "[owlery-large-prompt]" in result
     # The pointer must cite an absolute path the model's Read tool
     # can open without working_dir confusion.
     assert str(spill_root / "sess-big") in result
@@ -112,12 +112,12 @@ def test_bg_task_result_marker_is_preserved_at_front(spill_root):
 
 def test_plain_user_prompt_has_no_artificial_marker(spill_root):
     """If the original prompt had no recognized marker, the pointer
-    shouldn't invent one — only `[octopus-large-prompt]` should
+    shouldn't invent one — only `[owlery-large-prompt]` should
     appear, and the file content stays unmarked."""
     prompt = "x" * (LARGE_PROMPT_THRESHOLD_BYTES + 1)
     result = spill_if_large("sess-plain", prompt)
     assert not result.startswith("[bg-task-result]")
-    assert result.startswith("[octopus-large-prompt]")
+    assert result.startswith("[owlery-large-prompt]")
     # The spilled file is verbatim — no marker prepended to disk.
     files = list((spill_root / "sess-plain").glob("*.txt"))
     assert files[0].read_text(encoding="utf-8") == prompt
@@ -237,7 +237,7 @@ async def test_send_message_hands_backend_pointer_for_huge_prompt(
         # property that makes the whole feature load-bearing for E2BIG.
         assert len(received_prompts) == 1
         backend_prompt = received_prompts[0]
-        assert "[octopus-large-prompt]" in backend_prompt
+        assert "[owlery-large-prompt]" in backend_prompt
         assert len(backend_prompt.encode("utf-8")) < LARGE_PROMPT_THRESHOLD_BYTES
 
         # The DB message row should hold the original prompt verbatim so

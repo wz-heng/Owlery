@@ -192,10 +192,10 @@ async def test_engine_resolves_binary_from_fallback_dir(tmp_path, monkeypatch):
 
 def test_callback_env_has_session_id_when_present():
     env = assembly.build_callback_env("sess-123")
-    assert env["OCTOPUS_SESSION_ID"] == "sess-123"
-    assert env["OCTOPUS_API_BASE"].startswith("http://127.0.0.1:")
-    assert "OCTOPUS_AUTH_TOKEN" in env
-    assert "OCTOPUS_SESSION_ID" not in assembly.build_callback_env(None)
+    assert env["OWLERY_SESSION_ID"] == "sess-123"
+    assert env["OWLERY_API_BASE"].startswith("http://127.0.0.1:")
+    assert "OWLERY_AUTH_TOKEN" in env
+    assert "OWLERY_SESSION_ID" not in assembly.build_callback_env(None)
 
 
 def test_select_mcp_servers_all_by_default():
@@ -203,9 +203,9 @@ def test_select_mcp_servers_all_by_default():
     entries = assembly.select_mcp_servers(None, [], env)
     assert [e.key for e in entries] == ["bg", "ask", "ask_agent", "research"]
     bg = next(e for e in entries if e.key == "bg")
-    assert bg.env["OCTOPUS_SESSION_ID"] == "s"
+    assert bg.env["OWLERY_SESSION_ID"] == "s"
     ask_agent_entry = next(e for e in entries if e.key == "ask_agent")
-    assert ask_agent_entry.env["OCTOPUS_SESSION_ID"] == "s"
+    assert ask_agent_entry.env["OWLERY_SESSION_ID"] == "s"
     assert ask_agent_entry.args[-1] == "server.mcp_servers.ask_agent"
 
 
@@ -230,12 +230,12 @@ def test_select_mcp_servers_merges_connectors():
             return f"github_{inst}"
 
         def mcp_entry(self, inst, callback_env):
-            return {"command": "py", "args": ["-m", "x"], "env": {**callback_env, "OCTOPUS_INSTALLATION_ID": inst}}
+            return {"command": "py", "args": ["-m", "x"], "env": {**callback_env, "OWLERY_INSTALLATION_ID": inst}}
 
     env = assembly.build_callback_env("s")
     entries = assembly.select_mcp_servers(["bg"], [(_FakeConnector(), "abc123")], env)
     assert [e.key for e in entries] == ["bg", "github_abc123"]
-    assert entries[1].env["OCTOPUS_INSTALLATION_ID"] == "abc123"
+    assert entries[1].env["OWLERY_INSTALLATION_ID"] == "abc123"
 
 
 def test_compose_system_prompt_orders_persona_then_tools():

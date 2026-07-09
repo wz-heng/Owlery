@@ -28,6 +28,7 @@ import {
 } from "./SlashCommandMenu";
 import { Button } from "./ui/button";
 import { isSessionBusy } from "../lib/deferredFork";
+import { DEFAULT_AGENT_AVATAR } from "../lib/agentAvatar";
 
 const EMPTY_MESSAGES: Message[] = [];
 
@@ -629,7 +630,7 @@ export function ChatView({
       return;
     }
 
-    // /research command — kick off an Octopus-native deep-research job
+    // /research command — kick off an Owlery-native deep-research job
     // (native-deep-research.md §7). Returns immediately with a job id; the
     // progress shows in a ResearchCard and the cited report arrives as a turn.
     if (lower === "/research" || lower.startsWith("/research ")) {
@@ -926,7 +927,7 @@ export function ChatView({
               title={`Agent: ${activeAgent.name}`}
             >
               <span aria-hidden className="text-base leading-none">
-                {activeAgent.avatar || "🐙"}
+                {activeAgent.avatar || DEFAULT_AGENT_AVATAR}
               </span>
               <span className="hidden sm:inline truncate max-w-[10rem]">
                 {activeAgent.name}
@@ -1278,7 +1279,7 @@ export function ChatView({
         {header}
         {delegationBanner}
         <div className="chat-empty flex-1 flex flex-col items-center justify-center text-muted-foreground gap-3">
-          <h2 className="text-3xl font-bold text-primary tracking-tight">Octopus</h2>
+          <h2 className="text-3xl font-bold text-primary tracking-tight">Owlery</h2>
           <p className="text-sm leading-relaxed">Create or select a session to start.</p>
         </div>
       </div>
@@ -1392,7 +1393,7 @@ export function ChatView({
           )}
           {/* Rounded card containing chips + textarea + bottom action row.
               Layout copied from VM0 (zero-composer) but tuned shorter
-              for Octopus' chat panel: the textarea auto-grows with
+              for Owlery' chat panel: the textarea auto-grows with
               content (field-sizing-content) so the empty composer is a
               single comfortable line, not a hero-sized block. */}
           <div className="zero-composer overflow-hidden rounded-xl border-[0.7px] border-gray-400 bg-card shadow-sm focus-within:border-primary/70 focus-within:ring-[3px] focus-within:ring-primary/10 transition-colors">

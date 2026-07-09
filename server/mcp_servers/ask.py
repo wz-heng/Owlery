@@ -1,7 +1,7 @@
 """MCP stdio server exposing one tool: `user` (presented to the model
 as `mcp__ask__user`).
 
-Replaces the built-in `AskUserQuestion` tool, which Octopus formerly
+Replaces the built-in `AskUserQuestion` tool, which Owlery formerly
 intercepted via the CLI control protocol over stdio
 (`--permission-prompt-tool=stdio` + a deny-channel hack to inject the
 user's answer). That path was load-bearing for AUQ but exposed us to
@@ -16,7 +16,7 @@ Flow:
   1. Model calls `mcp__ask__user(questions=[...])`.
   2. This MCP server POSTs the questions to
      `/api/sessions/{id}/questions`, gets back a `question_id`.
-  3. Octopus broadcasts a `question_request` WS event so the
+  3. Owlery broadcasts a `question_request` WS event so the
      frontend renders the form (no shape change vs. the legacy
      path).
   4. This server long-polls
@@ -34,9 +34,9 @@ validates and the frontend renders whatever it gets.
 
 Spawned by the harness as a child MCP server. Env injected by the harness
 assembly (`server/harness/assembly.py:build_callback_env`):
-  OCTOPUS_API_BASE     http://127.0.0.1:{settings.port}
-  OCTOPUS_AUTH_TOKEN   the bearer token
-  OCTOPUS_SESSION_ID   the session this CLI invocation belongs to
+  OWLERY_API_BASE     http://127.0.0.1:{settings.port}
+  OWLERY_AUTH_TOKEN   the bearer token
+  OWLERY_SESSION_ID   the session this CLI invocation belongs to
 """
 
 from __future__ import annotations
@@ -64,7 +64,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-mcp = FastMCP("octopus-ask")
+mcp = FastMCP("owlery-ask")
 
 
 def _env_or_log(name: str) -> str | None:
@@ -99,14 +99,14 @@ def ask_user(questions: list[dict[str, Any]]) -> str:
                      free-text, which the UI provides automatically)
 
     Returns the user's answer(s) as a single text string, formatted
-    by Octopus (something like
+    by Owlery (something like
     `Q: <question>\\nA: <selected label> (<notes>)`). On session-level
     auto-answer timeout, returns a synthesized "act autonomously"
     instruction the model should follow.
     """
-    api = _env_or_log("OCTOPUS_API_BASE")
-    sid = _env_or_log("OCTOPUS_SESSION_ID")
-    tok = _env_or_log("OCTOPUS_AUTH_TOKEN")
+    api = _env_or_log("OWLERY_API_BASE")
+    sid = _env_or_log("OWLERY_SESSION_ID")
+    tok = _env_or_log("OWLERY_AUTH_TOKEN")
     if not (api and sid and tok):
         return (
             "Error: ask server is misconfigured (env vars missing). "
@@ -126,12 +126,12 @@ def ask_user(questions: list[dict[str, Any]]) -> str:
             timeout=10.0,
         )
     except httpx.HTTPError as e:
-        return f"Error: failed to reach Octopus to create question: {e}"
+        return f"Error: failed to reach Owlery to create question: {e}"
     if r.status_code != 201:
-        return f"Error: Octopus rejected the question ({r.status_code}): {r.text[:300]}"
+        return f"Error: Owlery rejected the question ({r.status_code}): {r.text[:300]}"
     qid = r.json().get("question_id")
     if not qid:
-        return f"Error: Octopus didn't return a question_id: {r.text[:300]}"
+        return f"Error: Owlery didn't return a question_id: {r.text[:300]}"
     logger.info("created question %s", qid)
 
     # Step 2: long-poll for the answer, looping per-call timeouts

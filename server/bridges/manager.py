@@ -405,7 +405,7 @@ class BridgeManager:
             await bridge.send_text(
                 chat_id,
                 "/showme only works in the browser — the in-app file viewer "
-                "can't render in Telegram. Open Octopus in a web session to "
+                "can't render in Telegram. Open Owlery in a web session to "
                 "use it.",
             )
 
@@ -416,7 +416,7 @@ class BridgeManager:
             await bridge.send_text(
                 chat_id,
                 "/fork only works in the browser — rewinding to a past "
-                "message needs the picker + confirm dialog. Open Octopus in a "
+                "message needs the picker + confirm dialog. Open Owlery in a "
                 "web session to fork.",
             )
 

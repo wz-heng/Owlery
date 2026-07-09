@@ -241,13 +241,13 @@ class TestCliTunnelFlag:
         assert args.tunnel is None
 
     def test_tunnel_flag_sets_env_var(self, monkeypatch):
-        """--tunnel sets OCTOPUS_ENABLE_TUNNEL env var so it survives uvicorn reload."""
+        """--tunnel sets OWLERY_ENABLE_TUNNEL env var so it survives uvicorn reload."""
         import os
         from unittest.mock import patch as _patch
 
         from server.cli import build_parser, do_serve
 
-        monkeypatch.delenv("OCTOPUS_ENABLE_TUNNEL", raising=False)
+        monkeypatch.delenv("OWLERY_ENABLE_TUNNEL", raising=False)
 
         parser = build_parser()
         args = parser.parse_args(["serve", "--tunnel"])
@@ -257,15 +257,15 @@ class TestCliTunnelFlag:
             with _patch("server.main.run"):
                 do_serve(args)
 
-        assert os.environ.get("OCTOPUS_ENABLE_TUNNEL") == "true"
+        assert os.environ.get("OWLERY_ENABLE_TUNNEL") == "true"
 
         # Cleanup
-        monkeypatch.delenv("OCTOPUS_ENABLE_TUNNEL", raising=False)
+        monkeypatch.delenv("OWLERY_ENABLE_TUNNEL", raising=False)
 
 
 class TestConfigEnableTunnel:
     def test_default_is_false(self, monkeypatch):
-        monkeypatch.delenv("OCTOPUS_ENABLE_TUNNEL", raising=False)
+        monkeypatch.delenv("OWLERY_ENABLE_TUNNEL", raising=False)
         from server.config import Settings
 
         s = Settings(auth_token="test")

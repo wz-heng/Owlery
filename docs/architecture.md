@@ -1,6 +1,6 @@
-# Octopus Architecture
+# Owlery Architecture
 
-**Octopus is a personal agent platform.** It turns the local **Claude Code**
+**Owlery is a personal agent platform.** It turns the local **Claude Code**
 and **Codex** CLIs into durable, always-on agents you reach from a browser,
 your phone, or Telegram. It drives the `claude` / `codex` CLIs directly via
 their stream-JSON protocols — there is **no `claude-code-sdk` dependency** and
@@ -45,7 +45,7 @@ the data model — this doc describes it conceptually rather than pasting SQL.
 
 ### Single-port serving
 
-In production `octopus serve` serves everything from one port (default 8000):
+In production `owlery serve` serves everything from one port (default 8000):
 
 - API routes (`/api/*`, `/ws`, `/health`) are FastAPI routers, registered first.
 - Every other path serves the built SPA from `web/dist/` via
@@ -82,9 +82,9 @@ their Sessions, Schedules, and bridge bindings. A protected **Default Agent**
 | File | Purpose |
 |---|---|
 | `main.py` | FastAPI app + lifespan. Clears the `CLAUDECODE` env var so a nested `claude` subprocess behaves normally. Wires DB, SessionManager, BridgeManager, ScheduleRunner, ConnectorManager, AgentManager, optional CloudflareTunnel. Registers routers, `GET /api/backends`, `GET /health`, and the SPA static mount. |
-| `config.py` | Pydantic settings from `.env` (prefix `OCTOPUS_`) — see **Configuration** below. |
+| `config.py` | Pydantic settings from `.env` (prefix `OWLERY_`) — see **Configuration** below. |
 | `auth.py` | Bearer-token check for REST (`Authorization`) and WebSocket (`?token=`). |
-| `crypto.py` | Fernet encryption (keyed off `OCTOPUS_AUTH_TOKEN`) for secrets at rest. |
+| `crypto.py` | Fernet encryption (keyed off `OWLERY_AUTH_TOKEN`) for secrets at rest. |
 | `models.py` | Pydantic request/response models + enums (`SessionStatus`, `MessageRole`, agent/schedule/connector/credential DTOs). |
 | `session_manager.py` | Core turn engine. Owns in-memory `Session` objects, drives each turn through the **Harness**, persists + broadcasts events to WebSocket clients and bridges, runs tool-result forwarding, interactive questions, mid-turn interrupt, the per-session message queue, premature-exit auto-respawn, and large-prompt spill. |
 | `harness/` | The single boundary for all model/runtime interaction (see below). |
@@ -94,7 +94,7 @@ their Sessions, Schedules, and bridge bindings. A protected **Default Agent**
 | `scheduler.py` | `ScheduleRunner` — APScheduler runner for recurring prompts, **interval and cron**, fired per agent into fresh auto-archiving sessions. |
 | `schedule_ai.py` | Natural-language `/schedule` parsing — turns "every weekday at 9am" into a cron/interval spec via the agent's own harness (backend-agnostic). |
 | `database.py` | SQLite (`aiosqlite`, WAL, FK cascade). `_SCHEMA` defines all tables; idempotent `_apply_migrations` / `_migrate_*` evolve existing DBs additively. |
-| `jsonl_parser.py` / `jsonl_writer.py` | Read/write Claude Code JSONL session files for `octopus handoff` (import) and `octopus pull` (export → local `claude --resume`). |
+| `jsonl_parser.py` / `jsonl_writer.py` | Read/write Claude Code JSONL session files for `owlery handoff` (import) and `owlery pull` (export → local `claude --resume`). |
 | `bg_tasks.py` | Cross-turn background shell tasks: spawn, stream capture (bounded), idle watchdog, cancel, persistence in `bg_tasks`. |
 | `large_prompts.py` | Spills any synthesized prompt over ~100 KB to a file and hands the model a small `Read` pointer (avoids `E2BIG` on argv). |
 | `attachments.py` / `file_viewer.py` | Per-session upload cache; working-dir-scoped file reads for the viewer. |
@@ -104,7 +104,7 @@ their Sessions, Schedules, and bridge bindings. A protected **Default Agent**
 | `notifiers/` | Notification destinations (webhook), pluggable. |
 | `fork_helpers.py` | Pure helpers for `/rewind`: git-anchor capture at turn-start, side-effect classification over parent rows, safe-revert preflight + git-stash execution. |
 | `research/` | Native deep research orchestration (see below). |
-| `cli.py` | `octopus serve` (`--tunnel`), `octopus handoff`, `octopus pull`. |
+| `cli.py` | `owlery serve` (`--tunnel`), `owlery handoff`, `owlery pull`. |
 
 ### Harness layer (`server/harness/`)
 
@@ -188,7 +188,7 @@ React 19 + TypeScript (strict) + Vite + zustand + Tailwind v4 + Radix.
 
 | Area | Files |
 |---|---|
-| Shell | `App.tsx`, `components/AccountDropdown.tsx`, `OctopusLogo.tsx`, `SettingsDialog.tsx` |
+| Shell | `App.tsx`, `components/AccountDropdown.tsx`, `OwleryLogo.tsx`, `SettingsDialog.tsx` |
 | Agents | `AgentList.tsx` (two-pane sidebar: pick agent → see its sessions), `AgentSettings.tsx` (prompt/model/backend/credential/tools/connectors) |
 | Sessions & chat | `SessionList.tsx` (sidebar with fork-tree disclosure; forks nest under root sessions), `ChatView.tsx` (virtualized via `react-virtuoso`, Enter-to-send, Esc-interrupt, queued-message badge, waiting-for-answer hint, per-user-message "Fork from here" button), `MessageBubble.tsx`, `SlashCommandMenu.tsx` (`/schedule`, `/remember`, `/research`, `/showme`, `/rewind`, `/fork`, `/archive`, `/reset` slash commands), `ForkDialog.tsx` (message picker + confirm popover with side-effect summary + optional git-revert checkbox), `ArchivedSessionsDialog.tsx` |
 | In-app tools | `FileViewerDialog.tsx` (viewer), `BgTaskChip.tsx` (bg task status), `QuestionPrompt.tsx` (ask form), `ToolApproval.tsx` (approval prompt), `AgentDelegationRequestCard.tsx` (live status next to a `mcp__ask_agent__ask` tool_use), `AgentDelegationEventCard.tsx` (renders the `[agent-reply|question|error:…]` injected turns as collapsible cards with deep-links into the child session) |
@@ -254,18 +254,18 @@ by default and gate sensitive actions through `ask`/connector confirms instead.)
 ### Cross-turn background work
 
 `mcp__bg__run` spawns a detached shell task (`bg_tasks.py`) that survives across
-turns; when it exits, Octopus injects a follow-up turn carrying the captured
+turns; when it exits, Owlery injects a follow-up turn carrying the captured
 output (spilled to a file first if large). An idle watchdog SIGTERMs tasks that
 go silent after producing output. Details: [`post-mortems/2026-05-18-bg-pipeline-hardening.md`](post-mortems/2026-05-18-bg-pipeline-hardening.md).
 
 ### Native Deep Research (`server/research/`)
 
 `/research <question>` (or the `mcp__research__deep_research` MCP tool) starts a
-multi-phase orchestrated research job managed entirely by Octopus — no dependence
+multi-phase orchestrated research job managed entirely by Owlery — no dependence
 on the Claude Code `/deep-research` workflow skill (which hangs inside a headless
 turn). Design: [`plans/native-deep-research.md`](plans/native-deep-research.md).
 
-**Pipeline phases (asyncio, all within Octopus):**
+**Pipeline phases (asyncio, all within Owlery):**
 
 1. **Scope** — `run_oneshot` (tool-free) decomposes the question into 3–6 angles.
 2. **Search + gather** — one scoped harness sub-turn per angle (parallel,
@@ -426,15 +426,17 @@ by both backends (design: [`plans/memory.md`](plans/memory.md)):
 Memory is decoupled from both harnesses' config/auth dirs. The dir is
 provisioned on agent create, kept on archive, removed on hard delete.
 
-## Configuration (`OCTOPUS_*`)
+## Configuration (`OWLERY_*`)
 
 | Setting | Default | Purpose |
 |---|---|---|
 | `auth_token` | — | Bearer token for all API/WS calls + Fernet key. |
 | `host` / `port` | `0.0.0.0` / `8000` | Bind address. |
 | `default_working_dir` | `.` | Working dir for new sessions. |
-| `db_path` | `octopus.db` | SQLite file. |
-| `attachments_dir` / `large_prompts_dir` / `agents_dir` / `codex_home_dir` | under `~/.octopus/` | Upload cache · large-prompt spill · agent memory roots · per-credential Codex auth. |
+| `db_path` | `owlery.db` | SQLite file. |
+| `home_dir` | `~/.owlery` | Root of all durable state; every dir below derives from it. |
+| `legacy_home_dir` | `~/.octopus` | Pre-rename home, migrated on first boot. `""` disables (see below). |
+| `attachments_dir` / `large_prompts_dir` / `agents_dir` / `codex_home_dir` | under `home_dir` | Upload cache · large-prompt spill · agent memory roots · per-credential Codex auth. |
 | `enable_tunnel` | `false` | Start a Cloudflare Tunnel. |
 | `telegram_bot_token` / `telegram_allowed_chat_ids` / `telegram_api_base_url` | — | Telegram bridge (enabled when token set). |
 | `ask_user_question_timeout_seconds` | `1800` | Auto-answer an unanswered question (so headless sessions don't wedge). |
@@ -442,12 +444,39 @@ provisioned on agent create, kept on archive, removed on hard delete.
 | `gmail_/github_oauth_client_id`/`_secret` | — | Optional env fallback for connector OAuth clients (in-app config takes precedence). |
 | `research_max_concurrent_jobs` | `2` | Max simultaneous deep-research jobs across all sessions. |
 
+Settings also read the pre-rename `OCTOPUS_*` environment names as a
+lower-priority fallback, so an existing `.env` or systemd `EnvironmentFile`
+keeps working. That matters most for `auth_token`, whose *value* derives the
+Fernet key guarding stored credentials — falling back to the default would make
+every stored secret undecryptable. A deprecation warning names any legacy var
+still doing work.
+
+### Octopus → Owlery migration
+
+On first boot of the renamed build (`server/legacy_rename.py`, invoked from the
+lifespan before anything opens the DB):
+
+1. `~/.octopus` moves to `~/.owlery` and `octopus.db{,-wal,-shm}` to
+   `owlery.db{,-wal,-shm}`; a `.migrated-from-octopus` marker lands in the new
+   home. If both homes exist and are non-empty, nothing moves and a warning
+   fires — we never guess which tree is live.
+2. Every stored absolute path pointing into the old home is rewritten: fork
+   `working_dir`s, the JSON blobs hanging off them (`fork_metadata`,
+   `fork_revert_record`), `bg_tasks.working_dir`, `research_jobs.report_path`.
+   The Claude project directories those fork dirs are keyed by are re-keyed too,
+   `cwd` rewritten line by line, or the fork would resume into an empty session.
+
+Both steps are idempotent. Message transcripts are deliberately left alone:
+they record what was said in a past turn, not live pointers. Set
+`OWLERY_LEGACY_HOME_DIR=""` to disable the migration (the test + e2e configs
+do, since they boot the real lifespan against the developer's real `$HOME`).
+
 ## Key design decisions
 
 - **One harness, profiles not subclasses.** All model interaction goes through a
   single `Harness` + `HarnessRun` engine parameterized by a `RuntimeProfile`
   value per backend. Adding a backend is a new profile, not a new class tree.
-- **CLIs, not an SDK.** Octopus spawns `claude --print` / `codex exec --json`
+- **CLIs, not an SDK.** Owlery spawns `claude --print` / `codex exec --json`
   and parses their stream-JSON itself (`harness/run.py`), so there's no
   `claude-code-sdk` dependency and behavior tracks the CLIs directly.
 - **Agent-centric data model.** Sessions, schedules, and bridge bindings all
@@ -503,20 +532,20 @@ provisioned on agent create, kept on archive, removed on hard delete.
 ```bash
 # Production (single command)
 cd web && bun run build && cd ..    # build the SPA (once)
-octopus serve                       # API + UI on :8000
-octopus serve --tunnel              # + public HTTPS via Cloudflare Tunnel
+owlery serve                       # API + UI on :8000
+owlery serve --tunnel              # + public HTTPS via Cloudflare Tunnel
 
-# With the Telegram bridge — add to .env, then `octopus serve`:
-#   OCTOPUS_TELEGRAM_BOT_TOKEN=...
-#   OCTOPUS_TELEGRAM_ALLOWED_CHAT_IDS=123,456     # optional access control
+# With the Telegram bridge — add to .env, then `owlery serve`:
+#   OWLERY_TELEGRAM_BOT_TOKEN=...
+#   OWLERY_TELEGRAM_ALLOWED_CHAT_IDS=123,456     # optional access control
 
 # Development (hot reload)
 .venv/bin/uvicorn server.main:app --host 0.0.0.0 --port 8000 --reload   # backend
 cd web && bun dev                                                        # frontend :5173
 
 # CLI
-octopus handoff [--session-id ID] [--name N]   # import a local Claude Code session
-octopus pull SESSION_ID [--cwd DIR]            # export a session to local JSONL
+owlery handoff [--session-id ID] [--name N]   # import a local Claude Code session
+owlery pull SESSION_ID [--cwd DIR]            # export a session to local JSONL
 ```
 
 ## Tech stack

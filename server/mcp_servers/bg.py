@@ -6,7 +6,7 @@ The `bg` server exposes three tools to the model:
     returns task_id immediately. Use this for anything that may take
     longer than ~30 seconds (long build, test suite, npm install) so
     the user's turn can end while the work proceeds. When the task
-    finishes, Octopus auto-fires a follow-up turn into this session
+    finishes, Owlery auto-fires a follow-up turn into this session
     with the captured output.
 
   - `bg_cancel(task_id)` — SIGTERM a running bg task.
@@ -15,14 +15,14 @@ The `bg` server exposes three tools to the model:
     Useful on a resumed turn if the model needs to check the state of
     something it queued before.
 
-Channel: this process is a child of the `claude` CLI, NOT of Octopus's
+Channel: this process is a child of the `claude` CLI, NOT of Owlery's
 FastAPI server. We can't reach the BgTaskManager singleton directly —
-we have to go over HTTP. The parent Octopus process injects three env
+we have to go over HTTP. The parent Owlery process injects three env
 vars when spawning us:
 
-  OCTOPUS_API_BASE     e.g. "http://127.0.0.1:8000"
-  OCTOPUS_AUTH_TOKEN   the same bearer token everything else uses
-  OCTOPUS_SESSION_ID   the session this CLI invocation is bound to
+  OWLERY_API_BASE     e.g. "http://127.0.0.1:8000"
+  OWLERY_AUTH_TOKEN   the same bearer token everything else uses
+  OWLERY_SESSION_ID   the session this CLI invocation is bound to
 
 The session id is what scopes "this bg task belongs to that chat" — we
 don't trust the model to pass it correctly, so it's not a tool
@@ -54,7 +54,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-mcp = FastMCP("octopus-bg")
+mcp = FastMCP("owlery-bg")
 
 
 def _required_env(name: str) -> str | None:
@@ -65,15 +65,15 @@ def _required_env(name: str) -> str | None:
 
 
 def _api_base() -> str | None:
-    return _required_env("OCTOPUS_API_BASE")
+    return _required_env("OWLERY_API_BASE")
 
 
 def _session_id() -> str | None:
-    return _required_env("OCTOPUS_SESSION_ID")
+    return _required_env("OWLERY_SESSION_ID")
 
 
 def _headers() -> dict[str, str] | None:
-    tok = _required_env("OCTOPUS_AUTH_TOKEN")
+    tok = _required_env("OWLERY_AUTH_TOKEN")
     if not tok:
         return None
     return {"Authorization": f"Bearer {tok}"}
@@ -83,7 +83,7 @@ def _headers() -> dict[str, str] | None:
 def bg_run(command: str, description: str | None = None) -> str:
     """Start a background shell command in this session's working
     directory. Returns immediately with a task id; the command runs
-    asynchronously and Octopus will inject a follow-up turn into this
+    asynchronously and Owlery will inject a follow-up turn into this
     session with the captured stdout/stderr when it finishes.
 
     Use this for commands that may take longer than ~30 seconds (long
@@ -117,9 +117,9 @@ def bg_run(command: str, description: str | None = None) -> str:
     try:
         r = httpx.post(url, json=body, headers=hdrs, timeout=10.0)
     except httpx.HTTPError as e:
-        return f"Error: failed to reach Octopus to start bg task: {e}"
+        return f"Error: failed to reach Owlery to start bg task: {e}"
     if r.status_code != 201:
-        return f"Error: Octopus rejected the bg task ({r.status_code}): {r.text[:300]}"
+        return f"Error: Owlery rejected the bg task ({r.status_code}): {r.text[:300]}"
     data = r.json()
     task_id = data.get("id", "?")
     desc = data.get("description")
@@ -154,7 +154,7 @@ def bg_cancel(task_id: str) -> str:
     try:
         r = httpx.post(url, headers=hdrs, timeout=10.0)
     except httpx.HTTPError as e:
-        return f"Error: failed to reach Octopus to cancel bg task {task_id}: {e}"
+        return f"Error: failed to reach Owlery to cancel bg task {task_id}: {e}"
     if r.status_code == 404:
         return f"No bg task `{task_id}` in this session."
     if r.status_code != 200:
@@ -190,7 +190,7 @@ def bg_list() -> str:
     try:
         r = httpx.get(url, headers=hdrs, timeout=10.0)
     except httpx.HTTPError as e:
-        return f"Error: failed to reach Octopus to list bg tasks: {e}"
+        return f"Error: failed to reach Owlery to list bg tasks: {e}"
     if r.status_code != 200:
         return f"Error listing bg tasks ({r.status_code}): {r.text[:300]}"
     items = r.json()

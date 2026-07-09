@@ -50,7 +50,7 @@ async function friendlyErrorMessage(
   }
   if (res.status === 502 || res.status === 504) {
     return (
-      `Could not ${action} — the Octopus backend didn't respond in time ` +
+      `Could not ${action} — the Owlery backend didn't respond in time ` +
       `(${res.status} from gateway). Check the server logs for details.`
     );
   }
@@ -443,8 +443,8 @@ export function CredentialList() {
                 : flow.kind === "codex_label" ||
                   flow.kind === "codex_starting" ||
                   flow.kind === "codex_device"
-                ? "Authorize Octopus with your ChatGPT account on any device."
-                : "Octopus stores the resulting long-lived API key encrypted at rest."}
+                ? "Authorize Owlery with your ChatGPT account on any device."
+                : "Owlery stores the resulting long-lived API key encrypted at rest."}
             </DialogDescription>
           </DialogHeader>
 

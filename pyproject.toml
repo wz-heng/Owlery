@@ -1,5 +1,5 @@
 [project]
-name = "octopus"
+name = "owlery"
 version = "0.1.0"
 description = "Remote Claude Code controller"
 requires-python = ">=3.12"
@@ -23,7 +23,7 @@ test = [
 ]
 
 [project.scripts]
-octopus = "server.cli:main"
+owlery = "server.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["server*"]

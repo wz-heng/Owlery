@@ -1,4 +1,4 @@
-# Octopus docs
+# Owlery docs
 
 Three kinds of docs live here. **Start with `architecture.md`** for how the
 system works today; the rest is design history and reference.
@@ -42,7 +42,7 @@ design rationale. **Code comments cite these by filename + section** (e.g.
   bounded automatic retry on transient backend errors (5xx / overloaded /
   dropped stream), distinct from auth failures and quota errors.
 - **[plans/native-deep-research.md](plans/native-deep-research.md)** —
-  Octopus-orchestrated deep research: harness-agnostic fan-out of scoped
+  Owlery-orchestrated deep research: harness-agnostic fan-out of scoped
   web-search sub-turns with progress, cancellation, and synthesis.
 
 ## Reference notes

@@ -177,7 +177,7 @@ class Harness:
 
     async def run_oneshot(self, ctx: OneShotContext, *, timeout: float = 90.0) -> str:
         """A lean, non-interactive, tool-free single model call. No MCP, no
-        Octopus-tools blurb, no connectors — distinct from a full turn run.
+        Owlery-tools blurb, no connectors — distinct from a full turn run.
         Returns the model's text. Raises `HarnessOneshotError` (with a stable
         `.code`) on failure; the caller maps it to a domain message.
 

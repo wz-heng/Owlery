@@ -70,7 +70,7 @@ def _expires_iso(epoch: float) -> str | None:
 
 def _env_client_creds(kind: str) -> tuple[str, str] | None:
     """OAuth client creds for a kind from env (the fallback when nothing is
-    set in-app): OCTOPUS_<KIND>_OAUTH_CLIENT_ID / _SECRET."""
+    set in-app): OWLERY_<KIND>_OAUTH_CLIENT_ID / _SECRET."""
     cid = getattr(settings, f"{kind}_oauth_client_id", None)
     csec = getattr(settings, f"{kind}_oauth_client_secret", None)
     return (cid, csec) if cid and csec else None

@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS agents (
     credential_id TEXT REFERENCES backend_credentials(id) ON DELETE SET NULL,
     backend TEXT NOT NULL DEFAULT 'claude-code',  -- default harness for new sessions
     mcp_servers TEXT NOT NULL DEFAULT '["ask","bg","ask_agent","research"]',
-                                            -- JSON array of built-in Octopus MCP server ids.
+                                            -- JSON array of built-in Owlery MCP server ids.
     tool_allow TEXT NOT NULL DEFAULT '',    -- newline-separated tool/MCP names; empty = allow all
     tool_deny  TEXT NOT NULL DEFAULT '',    -- newline-separated; deny takes precedence over allow
     is_system INTEGER NOT NULL DEFAULT 0,   -- 1 = the protected Default Agent (cannot be deleted)
@@ -246,7 +246,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_connectors_agent
 -- Per-kind OAuth *client* credentials (the app registered with the provider),
 -- set in-app so a connector works without editing env + restarting. client_id
 -- is not secret; the secret is encrypted like connector tokens. When there's
--- no row, resolution falls back to env (OCTOPUS_<KIND>_OAUTH_CLIENT_ID/_SECRET).
+-- no row, resolution falls back to env (OWLERY_<KIND>_OAUTH_CLIENT_ID/_SECRET).
 CREATE TABLE IF NOT EXISTS connector_oauth_clients (
     kind TEXT PRIMARY KEY,                 -- 'github' | 'gmail' | …
     client_id TEXT NOT NULL,
@@ -272,7 +272,7 @@ CREATE TABLE IF NOT EXISTS custom_connectors (
 );
 
 -- Async notification targets. Each row is one
--- destination Octopus can poke when a session transitions to idle
+-- destination Owlery can poke when a session transitions to idle
 -- (and, later, when an AskUserQuestion is pending / a schedule fails).
 -- `config` is a JSON blob whose shape depends on `type` (e.g. for
 -- type='webhook': {"url": "https://…"}).

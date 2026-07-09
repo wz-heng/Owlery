@@ -39,15 +39,15 @@ logger = logging.getLogger(__name__)
 # Codex variant of the in-app-tools system prompt (same builtins as Claude;
 # phrased for Codex's execution model). Injected via
 # `-c developer_instructions=...` every turn.
-_OCTOPUS_SYSTEM_PROMPT_CODEX = """\
-== Octopus in-app tools ==
+_OWLERY_SYSTEM_PROMPT_CODEX = """\
+== Owlery in-app tools ==
 
-You have access to extra tools injected by the Octopus controller. They are \
+You have access to extra tools injected by the Owlery controller. They are \
 first-class — call them whenever appropriate, not as a fallback.
 
 [1] `mcp__bg__run(command, description?)` — fire-and-forget a shell command \
 that runs in the BACKGROUND across turns. Returns a task_id immediately; when \
-the bg task finishes, Octopus injects a follow-up turn with the captured \
+the bg task finishes, Owlery injects a follow-up turn with the captured \
 output. Use it for anything long-running or unbounded — test suites, builds, \
 package installs, sleeps, large fetches. Start it, tell the user briefly what \
 you started, then end your turn; a new turn arrives with the result \
@@ -60,7 +60,7 @@ there isn't an obviously right answer; don't use it for things you can decide \
 yourself or verify from the workspace.
 
 [3] `mcp__ask_agent__ask(name, request, files?)` — delegate to another \
-Octopus agent by display name. When the user says "ask <name> to …", \
+Owlery agent by display name. When the user says "ask <name> to …", \
 "delegate this to <name>", or "have <name> review …", that is a direct \
 call to invoke this tool — don't paraphrase, just call it with a \
 self-contained `request` (the other agent never sees this transcript). \
@@ -685,7 +685,7 @@ _CODEX_TRANSIENT_ERROR_PATTERNS = (
 CODEX = RuntimeProfile(
     backend="codex",
     binary="codex",
-    tools_prompt=_OCTOPUS_SYSTEM_PROMPT_CODEX,
+    tools_prompt=_OWLERY_SYSTEM_PROMPT_CODEX,
     credential_style="home_dir",
     premature_exit_recovery=False,
     auth_error_patterns=_CODEX_AUTH_ERROR_PATTERNS,

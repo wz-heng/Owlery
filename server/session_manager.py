@@ -65,7 +65,7 @@ def resolve_working_dir(working_dir: str | None) -> str:
 
     A session's conversation + memory live under a path Claude derives from
     its working directory (``projects/<cwd-slug>/``). If we stored the dir
-    relative (``.``, ``Octopus``), the slug would be re-resolved against the
+    relative (``.``, ``Owlery``), the slug would be re-resolved against the
     *server process's* cwd on every turn — so the storage location would
     depend on where/how the server happens to be launched. That ambient
     coupling silently relocates (and orphans) a session's history whenever
@@ -381,7 +381,7 @@ class SessionManager:
                 await self.db.delete_session(fork_id)
                 self.sessions.pop(fork_id, None)
                 # A /fork duplicate owns a private working-dir copy under
-                # ~/.octopus/fork/ — remove it too so an abandoned saga doesn't
+                # ~/.owlery/fork/ — remove it too so an abandoned saga doesn't
                 # leak the copied tree (session-fork.md). A /rewind fork
                 # shares the parent's dir, which `_is_fork_copy_dir` excludes.
                 if self._is_fork_copy_dir(row["working_dir"]):
@@ -404,7 +404,7 @@ class SessionManager:
                 rec["error"] = (
                     "Server crashed during fork file-revert. Inspect `git "
                     "status` and `git stash list` for "
-                    f"'octopus: pre-fork stash {fork_id}'."
+                    f"'pre-fork stash {fork_id}'."
                 )
                 await self.db.update_session_field(
                     fork_id,
@@ -745,11 +745,11 @@ class SessionManager:
     @staticmethod
     def _fork_copy_base() -> str:
         """Base dir holding every /fork working-dir copy (session-fork.md)."""
-        return os.path.expanduser(os.path.join("~", ".octopus", "fork"))
+        return settings.resolved_fork_dir
 
     @staticmethod
     def _fork_copy_dest(src_working_dir: str, fork_id: str) -> str:
-        """Destination for a /fork working-dir copy: ~/.octopus/fork/<name>-<id>
+        """Destination for a /fork working-dir copy: ~/.owlery/fork/<name>-<id>
         (session-fork.md). Keeps the project basename for readability +
         the fork id for uniqueness. Creates the base dir."""
         base = SessionManager._fork_copy_base()
@@ -764,7 +764,7 @@ class SessionManager:
         parent's dir, which must never be removed."""
         if not working_dir:
             return False
-        # Normalize both sides (expanduser + abspath) so a `~/.octopus/fork/...`
+        # Normalize both sides (expanduser + abspath) so a `~/.owlery/fork/...`
         # style row still classifies — otherwise it would leak rather than be
         # swept (Vera review hardening).
         norm = lambda p: os.path.normpath(os.path.abspath(os.path.expanduser(p)))

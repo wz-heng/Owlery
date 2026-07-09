@@ -13,6 +13,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "./ui/dropdown-menu";
+import { TOKEN_KEY, readStored } from "../lib/storage";
 
 /** vm0-style account block pinned to the bottom of the sidebar.
  *
@@ -38,9 +39,9 @@ export function AccountDropdown({
   // than the trigger row can fit.
   const token =
     typeof localStorage !== "undefined"
-      ? localStorage.getItem("octopus_token") || ""
+      ? readStored(TOKEN_KEY) || ""
       : "";
-  const display = token || "Octopus";
+  const display = token || "Owlery";
   const initial = (token[0] || "O").toUpperCase();
 
   return (
@@ -56,7 +57,7 @@ export function AccountDropdown({
           </span>
           <span className="flex-1 min-w-0">
             <span className="block text-sm font-medium leading-tight truncate text-sidebar-foreground">
-              Octopus
+              Owlery
             </span>
             <span className="block text-xs leading-tight truncate mt-0.5 text-sidebar-foreground/70 font-mono">
               {display}
@@ -72,7 +73,7 @@ export function AccountDropdown({
             </span>
             <div className="flex-1 min-w-0">
               <div className="text-sm font-medium text-foreground truncate">
-                Octopus
+                Owlery
               </div>
               <div className="text-xs text-muted-foreground truncate font-mono mt-0.5">
                 {display}

@@ -236,7 +236,7 @@ async def test_safe_revert_runs_when_clean_and_head_matches(git_repo):
     # The agent edit is recoverable in a stash.
     out = subprocess.run(["git", "stash", "list"], cwd=git_repo,
                          capture_output=True, text=True).stdout
-    assert "octopus: pre-fork stash fork123" in out
+    assert "owlery: pre-fork stash fork123" in out
 
 
 @pytest.mark.asyncio
@@ -252,7 +252,7 @@ async def test_safe_revert_removes_untracked_agent_file(git_repo):
     assert not (git_repo / "notes.txt").exists()  # removed → fork-point state
     out = subprocess.run(["git", "stash", "list"], cwd=git_repo,
                          capture_output=True, text=True).stdout
-    assert "octopus: pre-fork stash fork-unt" in out
+    assert "owlery: pre-fork stash fork-unt" in out
 
 
 @pytest.mark.asyncio

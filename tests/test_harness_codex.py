@@ -10,7 +10,7 @@ from pathlib import Path
 
 from server.harness import assembly
 from server.harness.codex import (
-    _OCTOPUS_SYSTEM_PROMPT_CODEX,
+    _OWLERY_SYSTEM_PROMPT_CODEX,
     CodexEventParser,
     build_oneshot_argv,
     build_turn_argv,
@@ -24,7 +24,7 @@ def _assemble_ctx(*, prompt, wd, resume, credential, model=None, mcp_servers=Non
     abs_wd = str(Path(wd).resolve())
     cb = assembly.build_callback_env(session_id)
     entries = assembly.select_mcp_servers(mcp_servers, [], cb)
-    sysp = assembly.compose_system_prompt(persona, _OCTOPUS_SYSTEM_PROMPT_CODEX, [])
+    sysp = assembly.compose_system_prompt(persona, _OWLERY_SYSTEM_PROMPT_CODEX, [])
     return TurnContext(
         prompt=prompt, working_dir=abs_wd, resume_id=resume, system_prompt=sysp,
         model=model, tool_allow=None, tool_deny=None, mcp_servers=entries,
@@ -65,7 +65,7 @@ def test_turn_argv_full_config(tmp_path):
     assert "--dangerously-bypass-approvals-and-sandbox" in argv
     assert argv[argv.index("-C") + 1] == str(tmp_path)
     di = next(a for a in argv if a.startswith("developer_instructions="))
-    assert "PERSONA" in di and "Octopus in-app tools" in di
+    assert "PERSONA" in di and "Owlery in-app tools" in di
     # Only the selected built-ins are rendered as -c overrides.
     assert "mcp_servers.ask.command=" in joined
     assert "mcp_servers.bg.command=" not in joined

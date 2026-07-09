@@ -23,6 +23,7 @@ import {
   parseDelegationEvent,
 } from "./AgentDelegationEventCard";
 import { AgentDelegationRequestCard } from "./AgentDelegationRequestCard";
+import { DEFAULT_AGENT_AVATAR } from "../lib/agentAvatar";
 
 // Marker the backend prepends to the synthesized user message it
 // injects when a bg task completes. Used to render those messages
@@ -114,8 +115,8 @@ export function MessageBubble({
 }: MessageBubbleProps) {
   const assistantLabel = agentName || "Assistant";
   // Mirror the header's avatar treatment: show the agent's emoji, falling
-  // back to the default octopus when an agent exists but set no avatar.
-  const assistantAvatar = agentName ? agentAvatar || "🐙" : null;
+  // back to the default owlery when an agent exists but set no avatar.
+  const assistantAvatar = agentName ? agentAvatar || DEFAULT_AGENT_AVATAR : null;
   switch (message.type) {
     case "text":
       if (message.role === "user") {

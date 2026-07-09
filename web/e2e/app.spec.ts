@@ -43,7 +43,7 @@ test.afterAll(async ({ request }) => {
 test.describe("Login", () => {
   test("shows login screen when no token", async ({ page }) => {
     await page.goto("/");
-    await expect(page.locator("h1")).toHaveText("Octopus");
+    await expect(page.locator("h1")).toHaveText("Owlery");
     await expect(page.locator('input[type="password"]')).toBeVisible();
   });
 
@@ -52,7 +52,7 @@ test.describe("Login", () => {
     const btn = page.locator("button.btn-login");
     await btn.click();
     // Should still be on login screen
-    await expect(page.locator("h1")).toHaveText("Octopus");
+    await expect(page.locator("h1")).toHaveText("Owlery");
   });
 
   test("logs in with valid token", async ({ page }) => {
@@ -93,7 +93,7 @@ test.describe("Session Management", () => {
   });
 
   test("shows empty chat view when no session selected", async ({ page }) => {
-    await expect(page.locator(".chat-empty h2")).toHaveText("Octopus");
+    await expect(page.locator(".chat-empty h2")).toHaveText("Owlery");
   });
 
   test("deletes a session", async ({ page }) => {
