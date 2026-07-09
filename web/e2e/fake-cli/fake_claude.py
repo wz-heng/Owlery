@@ -252,13 +252,29 @@ def run_bg_result_turn(prompt: str, state: dict) -> None:
 
     spill = _SPILL_PATH_RE.search(prompt)
     if spill:
-        # The pointer prompt replaced the payload. Read the spill file, the way
-        # the pointer instructs — that read is what the test is really proving.
+        # The pointer prompt replaced the payload. Follow it the way a real
+        # model does: emit a `Read` tool_use naming the file, then the matching
+        # tool_result carrying what came back, and answer only from that.
+        #
+        # Deliberately NOT a bare `read_text()` short-circuit. The claim under
+        # test is the whole pointer round-trip — the model is handed a pointer,
+        # ISSUES A READ, receives the content, answers from it. Reading the file
+        # privately inside this shim and jumping straight to the answer would
+        # still surface the sentinel while skipping the tool-call leg, so a
+        # backend that spilled the file but never surfaced a usable pointer
+        # would sail through. Emitting the real tool_use/tool_result pair keeps
+        # the stream-json parser, the transcript and the event stream on exactly
+        # the path a real turn takes.
+        path = spill.group(1)
+        tool_use_id = "toolu_fake_spill_read"
+        _emit_tool_use(tool_use_id, "Read", {"file_path": path})
         try:
-            body = pathlib.Path(spill.group(1)).read_text()
+            body = pathlib.Path(path).read_text()
         except OSError as e:
+            _emit_tool_result(tool_use_id, f"Error reading {path}: {e}", is_error=True)
             _emit_text(f"Could not read the spilled prompt: {e}")
             return
+        _emit_tool_result(tool_use_id, body)
         haystack = body
     else:
         haystack = prompt

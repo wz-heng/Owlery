@@ -24,6 +24,15 @@ their signal that a real fake `codex` now has a consumer and is worth building
 `is_available()` only checks that the binary resolves on PATH, so this shim
 keeps `/api/backends` reporting codex as available — the create-session
 harness selector still renders, as the codex smoke's assertions require.
+
+That cuts both ways, and it is why `/api/backends` must NOT be used to decide
+whether the codex smoke can run. This shim satisfies the PATH probe on every
+host, including one with no real `codex` installed, so the backend reports
+codex available there too; the smoke would then not skip, and would die at
+`exec_real_codex()` (exit 127) instead. A spec deciding whether the real binary
+exists has to look for the real binary — see `realCodexInstalled()` in
+`web/e2e/fake-cli.ts`, which resolves it the way this shim does, skipping
+its own dir.
 """
 
 from __future__ import annotations

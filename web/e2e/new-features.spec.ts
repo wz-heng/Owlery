@@ -1175,6 +1175,28 @@ test.describe("agent-name message labels", () => {
 // Slash-command autocomplete in the composer
 // ---------------------------------------------------------------------------
 
+/**
+ * Wait out the frame in which `completeSlash` moves the caret.
+ *
+ * Completing a command (Enter) calls `setInput(name + " ")` and then schedules
+ * a `requestAnimationFrame` that focuses the textarea and does
+ * `setSelectionRange(end, end)`. A `fill()` issued before that frame runs is
+ * not atomic: it selects the existing text, then inserts. If the rAF lands
+ * between those two steps it collapses the selection to the end, so the insert
+ * APPENDS instead of replacing — the composer becomes `"/remember /re"`, whose
+ * space makes `slashQuery()` return null, and the menu never opens.
+ *
+ * That is a `fill()` artifact, not a product bug: real keystrokes cannot land
+ * inside `fill()`'s internal steps, and the caret write is what the composer
+ * should do. Reproduced deterministically at ~1/80 iterations of the raw
+ * sequence and 0/80 with this barrier, which is why the fix lives here rather
+ * than in `ChatView`.
+ */
+const settleCaret = (page: Page) =>
+  page.evaluate(
+    () => new Promise((resolve) => requestAnimationFrame(() => resolve(null)))
+  );
+
 test.describe("slash-command autocomplete", () => {
   test("/ opens the menu; filter, complete on Enter, dismiss on Esc", async ({
     page,
@@ -1208,6 +1230,7 @@ test.describe("slash-command autocomplete", () => {
     await expect(input).toHaveValue("/schedule ");
     await expect(menu).toBeHidden();
     await expect(page.locator(".msg-user .msg-content")).toHaveCount(0);
+    await settleCaret(page);
 
     // /remember is offered and completes the same way.
     await input.fill("/rem");
@@ -1216,6 +1239,7 @@ test.describe("slash-command autocomplete", () => {
     await input.press("Enter");
     await expect(input).toHaveValue("/remember ");
     await expect(menu).toBeHidden();
+    await settleCaret(page);
 
     // Re-open with a different prefix, then Escape dismisses the menu while
     // leaving the typed text untouched.

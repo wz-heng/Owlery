@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { test, expect, type Page } from "@playwright/test";
 
-import { realCliDir } from "./fake-cli";
+import { realCliDir, realCodexInstalled } from "./fake-cli";
 
 // SMOKE (1 of 3 quota burners, docs/plans/e2e-slim.md §2). Full-stack Codex
 // proof: the backend selector appears when codex is available, a Codex session
@@ -61,14 +61,12 @@ test("create a Codex session via the UI and get a real response @llm", async ({
   page,
   request,
 }) => {
-  const be = await request.get(`${API}/backends`, {
-    headers: { Authorization: `Bearer ${TOKEN}` },
-  });
-  const available: string[] = be.ok() ? (await be.json()).available : [];
-  test.skip(
-    !available.includes("codex"),
-    "codex backend not available on this host"
-  );
+  // Skip on the REAL binary, never on `/api/backends`. The tripwire shim sits
+  // first on the backend's PATH and `is_available()` probes only PATH, so the
+  // backend answers "codex available" even on a host with no codex installed.
+  // Trusting it there would run this test to the shim's `exec_real_codex()`,
+  // which exits 127 — a hard failure where a skip was meant.
+  test.skip(!realCodexInstalled(), "no real `codex` binary on this host");
 
   await page.goto("/");
   await page.locator('input[type="password"]').fill(TOKEN);

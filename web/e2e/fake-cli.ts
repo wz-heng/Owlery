@@ -12,8 +12,10 @@
  * with `realCliDir()` and keeps its `@llm` tag.
  */
 
-import { writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { accessSync, constants, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { delimiter, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /** One scripted step of a fake turn. Mirrors the ops in `fake_claude.py`. */
 export type FakeOp =
@@ -59,4 +61,35 @@ export function fake(...ops: FakeOp[]): string {
 export function realCliDir(dir: string): string {
   writeFileSync(join(dir, ".owlery-real-cli"), "");
   return dir;
+}
+
+const FAKE_CLI_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "fake-cli");
+
+/**
+ * Is a REAL `codex` binary installed on this host?
+ *
+ * Do not ask `/api/backends` this question. The tripwire `codex` shim resolves
+ * on PATH, and `Harness.is_available()` probes nothing but PATH — so the
+ * backend reports codex "available" on every host, shim included. A smoke that
+ * trusted that answer would fail to skip where no real codex exists, and die
+ * at the shim's `exec_real_codex()` (exit 127) instead of skipping cleanly.
+ *
+ * So resolve the binary the way the shim itself does: walk PATH with our own
+ * dir removed (or we'd find the shim), plus `~/.local/bin`, which the config
+ * appends to the backend's PATH and a non-interactive shell often omits.
+ */
+export function realCodexInstalled(): boolean {
+  const dirs = [
+    ...(process.env.PATH ?? "").split(delimiter),
+    join(homedir(), ".local/bin"),
+  ].filter((d) => d && resolve(d) !== FAKE_CLI_DIR);
+
+  return dirs.some((d) => {
+    try {
+      accessSync(join(d, "codex"), constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  });
 }

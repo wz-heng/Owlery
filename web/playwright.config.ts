@@ -28,9 +28,18 @@ export const E2E_FAKE_STATE_DIR = path.join(os.tmpdir(), "owlery-e2e-fake-cli");
 // E2E_FAKE_STATE_DIR on purpose: teardown deletes that tree, so a log written
 // inside it would be destroyed before it could be read — a breach would
 // register as a silent pass. (That false negative bit us while auditing.)
+//
+// Unique per run, not a fixed name. Two concurrent runs sharing one path have
+// each clearing the other's evidence — global-setup unlinks it, the shim
+// appends to it, global-teardown reads and unlinks it — so run A's teardown
+// can delete the breach run B just recorded, and B passes green. The failure
+// mode lands precisely under concurrency, which is where a quota-burn breach
+// is most likely and least watched. The pid keeps the two runs disjoint; both
+// still resolve their own path through OWLERY_FAKE_TRIPWIRE_LOG, which is the
+// only channel the shim reads.
 export const E2E_TRIPWIRE_LOG = path.join(
   os.tmpdir(),
-  "owlery-e2e-codex-tripwire.log"
+  `owlery-e2e-codex-tripwire.${process.pid}.log`
 );
 
 // Dir holding the fake `claude` + tripwire `codex` shims, prepended to the
@@ -69,7 +78,22 @@ export default defineConfig({
       command:
         "cd .. && .venv/bin/uvicorn server.main:app --host 0.0.0.0 --port 8765",
       port: 8765,
-      reuseExistingServer: true,
+      // NEVER reuse this one. Every guarantee the fast suite rests on — the
+      // fake `claude`, the tripwire `codex`, the isolated state dirs — is
+      // carried in the `env` below, and `env` only reaches a backend that
+      // Playwright *starts*. Reusing a listener on 8765 that someone launched
+      // by hand (`uvicorn server.main:app`, an `owlery serve`) silently hands
+      // all 66 converted tests a backend with the developer's real PATH: the
+      // shims lose the PATH race, every turn resolves the REAL `claude` /
+      // `codex`, and the tripwire never fires because its env var is unset.
+      // The suite still passes — against real models, burning real quota.
+      //
+      // `false` makes that unreachable: a busy port aborts the run instead. The
+      // cost is that a hand-started backend must be stopped first, which is the
+      // correct trade — this failure is loud, the other one is silent. (It is
+      // not hypothetical: two "reruns" during the audit of this suite reused a
+      // stale backend and were mistaken for cold starts.)
+      reuseExistingServer: false,
       timeout: 10_000,
       env: {
         ...process.env,
