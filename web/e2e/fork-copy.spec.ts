@@ -3,6 +3,8 @@ import { mkdtempSync, writeFileSync, rmSync, existsSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
+import { fake } from "./fake-cli";
+
 // Pure-UI e2e for the /fork copy-dir duplicate (session-fork.md). No real
 // LLM turn: we import a parent session pointing at a SMALL temp working dir,
 // run `/fork copy`, and assert a NEW session appears + becomes active with the
@@ -135,10 +137,10 @@ async function createSessionWithDir(
 }
 
 // Deferred /fork: typing /fork while a turn is running must NOT refuse — it
-// queues the fork and fires it once the session goes idle. Real LLM turn, so
-// it carries @llm (excluded from the :fast bucket).
-test.describe("Deferred /fork @llm", () => {
-  test.describe.configure({ timeout: 180_000 });
+// queues the fork and fires it once the session goes idle. The turn is driven
+// by the fake CLI, so "still running" is a real subprocess, deterministically.
+test.describe("Deferred /fork", () => {
+  test.describe.configure({ timeout: 60_000 });
 
   test("/fork while running queues, then fires when the session goes idle", async ({
     page,
@@ -156,16 +158,16 @@ test.describe("Deferred /fork @llm", () => {
     await expect(page.locator(".chat-header h3")).toHaveText("Deferred Fork Parent");
 
     const input = page.locator(".chat-input-bar textarea");
-    // Force a tool-use turn with sleeps so the run is genuinely still going
+    // Force a tool-use turn with a sleep so the run is genuinely still going
     // when we type /fork (a plain text prompt finishes too fast to catch).
     await input.fill(
-      "Use the Bash tool to run `sleep 5`, then say: done forking test"
+      `run a slow tool ${fake({ t: "bash", cmd: "sleep 5" }, { t: "text", v: "done forking test" })}`
     );
     await page.locator("button.btn-send").click();
 
-    // Wait for the run to start (cold-start a real CLI can be slow under load).
+    // Wait for the run to start.
     await expect(page.locator(".status-badge.status-running")).toBeVisible({
-      timeout: 60_000,
+      timeout: 20_000,
     });
 
     // Type /fork WHILE running → it must queue, not error.
@@ -181,9 +183,9 @@ test.describe("Deferred /fork @llm", () => {
 
     // Once the turn finishes and the session is idle, the deferred fork fires
     // and (we're still on the parent) switches us into it with the full-copy
-    // banner. Generous timeout: the sleep turn + a possible bg follow-up.
+    // banner. Timeout covers the 5 s sleep plus the copytree.
     await expect(page.locator('[data-testid="fork-banner"]')).toBeVisible({
-      timeout: 120_000,
+      timeout: 30_000,
     });
     await expect(page.locator('[data-testid="fork-banner"]')).toContainText(
       "full copy of the working dir"

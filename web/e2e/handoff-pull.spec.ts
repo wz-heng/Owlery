@@ -12,6 +12,8 @@ import { join, dirname } from "path";
 import { tmpdir } from "os";
 import { fileURLToPath } from "url";
 
+import { fake } from "./fake-cli";
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
@@ -185,7 +187,10 @@ test.afterAll(async ({ request }) => {
 // Tests
 // ---------------------------------------------------------------------------
 
-test.describe("Handoff & Pull CLI @llm", () => {
+// The turns below exist only to put an assistant message in the transcript so
+// there's something to export; the JSONL codec is what's under test, not the
+// model. The fake CLI supplies the reply.
+test.describe("Handoff & Pull CLI", () => {
   test("handoff — imports a local JSONL session into the web UI", async ({
     page,
     request,
@@ -280,7 +285,7 @@ test.describe("Handoff & Pull CLI @llm", () => {
     page,
     request,
   }) => {
-    test.setTimeout(90_000);
+    test.setTimeout(60_000);
 
     await login(page);
 
@@ -296,12 +301,12 @@ test.describe("Handoff & Pull CLI @llm", () => {
     await expect(page.locator(".chat-header h3")).toHaveText("Pull Test");
 
     const input = page.locator(".chat-input-bar textarea");
-    await input.fill("What is 2+2? Reply with just the number.");
+    await input.fill(`What is 2+2? ${fake({ t: "text", v: "4" })}`);
     await page.locator("button.btn-send").click();
 
     // Wait for result badge (indicates response complete)
     await expect(page.locator(".result-badge")).toBeVisible({
-      timeout: 60_000,
+      timeout: 30_000,
     });
 
     // Get session ID via API
@@ -357,7 +362,7 @@ test.describe("Handoff & Pull CLI @llm", () => {
     page,
     request,
   }) => {
-    test.setTimeout(120_000);
+    test.setTimeout(60_000);
 
     await login(page);
 
@@ -375,11 +380,11 @@ test.describe("Handoff & Pull CLI @llm", () => {
     );
 
     const input = page.locator(".chat-input-bar textarea");
-    await input.fill("What is 3+3? Reply with just the number.");
+    await input.fill(`What is 3+3? ${fake({ t: "text", v: "6" })}`);
     await page.locator("button.btn-send").click();
 
     await expect(page.locator(".result-badge")).toBeVisible({
-      timeout: 60_000,
+      timeout: 30_000,
     });
 
     // Pull to local JSONL
