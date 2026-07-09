@@ -33,6 +33,34 @@ class HarnessCredential:
 
 
 @dataclass
+class TokenUsage:
+    """Normalized per-turn token consumption (usage-tracking.md §2).
+
+    Backend-neutral vocabulary; each parser maps its CLI's native shape
+    into it. `input_tokens` is FRESH input, excluding cache reads —
+    Claude reports it that way natively, Codex reports a cache-inclusive
+    `input_tokens` the parser subtracts `cached_input_tokens` from.
+    `reasoning_tokens` (Codex only) is an informational subset of
+    `output_tokens`, never added on top.
+    """
+
+    input_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+
+    @property
+    def total_tokens(self) -> int:
+        return (
+            self.input_tokens
+            + self.cache_read_tokens
+            + self.cache_creation_tokens
+            + self.output_tokens
+        )
+
+
+@dataclass
 class HarnessEvent:
     """Normalized event emitted by any harness run.
 
@@ -50,6 +78,11 @@ class HarnessEvent:
     session_id: str | None = None  # backend's resume id (carried on `result`)
     duration_ms: int | None = None
     num_turns: int | None = None
+    usage: TokenUsage | None = None  # normalized tokens (carried on `result`)
+    # Claude's per-model `modelUsage` dict, verbatim (None for Codex / when
+    # absent). Persisted as JSON so per-model attribution can be built later
+    # without committing to its key names today (usage-tracking.md §8).
+    model_usage: dict[str, Any] | None = None
     raw: dict[str, Any] | None = field(default=None, repr=False)
 
 

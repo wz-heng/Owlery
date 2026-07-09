@@ -22,7 +22,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .events import HarnessCredential, HarnessEvent, HarnessOneshotError
+from .events import HarnessCredential, HarnessEvent, HarnessOneshotError, TokenUsage
 from .harness import Harness
 from .login import LoginMethod
 from .profile import (
@@ -337,6 +337,7 @@ class ClaudeEventParser(EventParser):
 
     def _result(self, obj: dict[str, Any]) -> HarnessEvent:
         sid = obj.get("session_id") or self._captured_session_id
+        model_usage = obj.get("modelUsage")
         return HarnessEvent(
             type="result",
             session_id=sid,
@@ -344,8 +345,31 @@ class ClaudeEventParser(EventParser):
             duration_ms=obj.get("duration_ms"),
             num_turns=obj.get("num_turns"),
             is_error=bool(obj.get("is_error")),
+            usage=_normalize_usage(obj.get("usage")),
+            model_usage=model_usage if isinstance(model_usage, dict) and model_usage else None,
             raw=obj,
         )
+
+
+def _normalize_usage(usage: Any) -> TokenUsage | None:
+    """Claude `result.usage` → normalized TokenUsage (usage-tracking.md §2).
+
+    Claude's `input_tokens` is already fresh-only (cache reads/writes are
+    reported separately), so the mapping is direct. Every key is optional —
+    error results carry a zeroed/partial usage object."""
+    if not isinstance(usage, dict):
+        return None
+
+    def _n(key: str) -> int:
+        v = usage.get(key)
+        return v if isinstance(v, int) and v > 0 else 0
+
+    return TokenUsage(
+        input_tokens=_n("input_tokens"),
+        cache_read_tokens=_n("cache_read_input_tokens"),
+        cache_creation_tokens=_n("cache_creation_input_tokens"),
+        output_tokens=_n("output_tokens"),
+    )
 
 
 # ------------------------------------------------------------------ one-shot

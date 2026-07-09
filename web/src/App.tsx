@@ -4,6 +4,7 @@ import { AccountDropdown } from "./components/AccountDropdown";
 import { AgentList } from "./components/AgentList";
 import { AgentSettings } from "./components/AgentSettings";
 import { ArchivedSessionsDialog } from "./components/ArchivedSessionsDialog";
+import { UsageDialog } from "./components/UsageDialog";
 import { ChatView } from "./components/ChatView";
 import { ApplicationList } from "./components/ApplicationList";
 import { ConnectorList } from "./components/ConnectorList";
@@ -97,6 +98,7 @@ function AuthenticatedApp({
   // also opened from chat (bare `/schedule`), so ChatView gets the opener too.
   const [schedulesOpen, setSchedulesOpen] = useState(false);
   const [archivedOpen, setArchivedOpen] = useState(false);
+  const [usageOpen, setUsageOpen] = useState(false);
 
   const signOut = () => {
     setToken("");
@@ -163,6 +165,7 @@ function AuthenticatedApp({
             onOpenSettings={() => setSettingsOpen(true)}
             onOpenAgentSettings={openActiveAgentSettings}
             onOpenArchivedSessions={() => setArchivedOpen(true)}
+            onOpenUsage={() => setUsageOpen(true)}
           />
         </div>
       </aside>
@@ -198,6 +201,7 @@ function AuthenticatedApp({
         open={archivedOpen}
         onOpenChange={setArchivedOpen}
       />
+      <UsageDialog open={usageOpen} onOpenChange={setUsageOpen} />
       <FileViewerDialog />
     </div>
   );

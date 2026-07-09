@@ -2169,6 +2169,12 @@ class SessionManager:
                                 await self.db.update_session_field(
                                     session.id, claude_session_id=event.session_id
                                 )
+                        # Consumption ledger (usage-tracking.md §4): every
+                        # result — error ones included — appends a turn_usage
+                        # row. Recording must never fail the turn.
+                        await self._record_turn_usage(
+                            session, agent.get("model") if agent else None, event
+                        )
                         # First fork turn produced a result: drop the ephemeral
                         # fork state so turn 2+ behaves like a normal resumed
                         # session (session-rewind.md §5.3.2/§5.6.5).
@@ -2885,6 +2891,38 @@ class SessionManager:
 
     # ------------------------------------------------------------------ event translation
 
+    async def _record_turn_usage(
+        self, session: Session, model: str | None, event: HarnessEvent
+    ) -> None:
+        """Append this turn's consumption to the turn_usage ledger
+        (usage-tracking.md §4). Best-effort: a ledger failure is logged,
+        never propagated — it must not fail the turn."""
+        if self.db is None:
+            return
+        usage = event.usage
+        try:
+            await self.db.add_turn_usage(
+                created_at=datetime.now(timezone.utc).isoformat(),
+                session_id=session.id,
+                agent_id=session.agent_id,
+                backend=session.backend,
+                model=model or None,
+                cost=event.cost,
+                input_tokens=usage.input_tokens if usage else 0,
+                cache_read_tokens=usage.cache_read_tokens if usage else 0,
+                cache_creation_tokens=usage.cache_creation_tokens if usage else 0,
+                output_tokens=usage.output_tokens if usage else 0,
+                reasoning_tokens=usage.reasoning_tokens if usage else 0,
+                duration_ms=event.duration_ms,
+                is_error=event.is_error,
+                model_usage=event.model_usage,
+                origin="turn",
+            )
+        except Exception:
+            logger.exception(
+                "failed to record turn usage for session %s", session.id
+            )
+
     @staticmethod
     def _event_to_message_content(event: HarnessEvent) -> MessageContent | None:
         if event.type == "text":
@@ -2972,7 +3010,7 @@ class SessionManager:
                 "questions": (event.tool_input or {}).get("questions") or [],
             }
         if event.type == "result":
-            return {
+            ws: dict[str, Any] = {
                 "type": "result",
                 "session_id": session_id,
                 "claude_session_id": event.session_id,
@@ -2981,6 +3019,18 @@ class SessionManager:
                 "duration_ms": event.duration_ms,
                 "is_error": event.is_error,
             }
+            # Additive (usage-tracking.md §4): normalized tokens for a
+            # future live display; absent when the backend reported none.
+            if event.usage is not None:
+                ws["usage"] = {
+                    "input_tokens": event.usage.input_tokens,
+                    "cache_read_tokens": event.usage.cache_read_tokens,
+                    "cache_creation_tokens": event.usage.cache_creation_tokens,
+                    "output_tokens": event.usage.output_tokens,
+                    "reasoning_tokens": event.usage.reasoning_tokens,
+                    "total_tokens": event.usage.total_tokens,
+                }
+            return ws
         return None
 
     # ------------------------------------------------------------------ Q&A wiring

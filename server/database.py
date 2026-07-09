@@ -339,6 +339,36 @@ CREATE TABLE IF NOT EXISTS research_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_research_jobs_session
   ON research_jobs(session_id, created_at);
+
+-- Per-turn consumption ledger (usage-tracking.md §3). One row per completed
+-- turn ('turn') and one per finished deep-research job ('research'). No FK
+-- on session_id: rows must survive session deletion — the tokens were
+-- already spent, and the ledger feeds subscription-limit awareness later.
+-- New-table-only — CREATE IF NOT EXISTS is a no-op migration.
+CREATE TABLE IF NOT EXISTS turn_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,               -- ISO-8601 UTC, stamped at capture
+    origin TEXT NOT NULL DEFAULT 'turn',    -- 'turn' | 'research'
+    session_id TEXT NOT NULL,
+    agent_id TEXT,                          -- denormalized owner at capture time
+    backend TEXT NOT NULL,                  -- 'claude-code' | 'codex'
+    model TEXT,                             -- session's configured model; NULL = default
+    cost REAL,                              -- USD; NULL when the backend reports none (codex)
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    duration_ms INTEGER,
+    is_error INTEGER NOT NULL DEFAULT 0,
+    model_usage TEXT                        -- Claude modelUsage JSON; NULL otherwise
+);
+
+CREATE INDEX IF NOT EXISTS idx_turn_usage_agent_time
+  ON turn_usage(agent_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_turn_usage_session
+  ON turn_usage(session_id);
 """
 
 
@@ -2267,3 +2297,146 @@ class Database:
         )
         await self._conn.commit()
         return cursor.rowcount
+
+    # ------------------------------------------------------------------ turn usage
+
+    # The aggregate expressions every summarize_usage row/total carries.
+    # SUM(cost) is NULL-safe by SQL semantics (all-NULL group → NULL, which
+    # the mapper turns into None; mixed → sum of non-NULLs).
+    _USAGE_AGGREGATES = (
+        "COUNT(*), SUM(cost), SUM(input_tokens), SUM(cache_read_tokens), "
+        "SUM(cache_creation_tokens), SUM(output_tokens), SUM(reasoning_tokens), "
+        "SUM(total_tokens)"
+    )
+
+    _USAGE_GROUP_EXPRS = {
+        "agent": "agent_id",
+        "session": "session_id",
+        "backend": "backend",
+        "day": "substr(created_at, 1, 10)",  # ISO-8601 UTC → YYYY-MM-DD
+    }
+
+    async def add_turn_usage(
+        self,
+        *,
+        created_at: str,
+        session_id: str,
+        backend: str,
+        agent_id: str | None = None,
+        model: str | None = None,
+        cost: float | None = None,
+        input_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_creation_tokens: int = 0,
+        output_tokens: int = 0,
+        reasoning_tokens: int = 0,
+        duration_ms: int | None = None,
+        is_error: bool = False,
+        model_usage: dict[str, Any] | None = None,
+        origin: str = "turn",
+    ) -> None:
+        """Append one consumption row (usage-tracking.md §3). `total_tokens`
+        is denormalized here so window SUMs never re-derive it."""
+        await self._ensure_connected()
+        total = (
+            input_tokens + cache_read_tokens + cache_creation_tokens + output_tokens
+        )
+        await self._conn.execute(
+            "INSERT INTO turn_usage "
+            "(created_at, origin, session_id, agent_id, backend, model, cost, "
+            "input_tokens, cache_read_tokens, cache_creation_tokens, "
+            "output_tokens, reasoning_tokens, total_tokens, duration_ms, "
+            "is_error, model_usage) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                created_at,
+                origin,
+                session_id,
+                agent_id,
+                backend,
+                model,
+                cost,
+                input_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+                output_tokens,
+                reasoning_tokens,
+                total,
+                duration_ms,
+                int(is_error),
+                json.dumps(model_usage) if model_usage else None,
+            ),
+        )
+        await self._conn.commit()
+
+    async def summarize_usage(
+        self,
+        *,
+        group_by: str = "agent",
+        since: str | None = None,
+        until: str | None = None,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Window aggregation over turn_usage (usage-tracking.md §5).
+
+        `since` (inclusive) / `until` (exclusive) are ISO-8601 UTC strings —
+        plain TEXT compares are valid because created_at has a fixed layout.
+        Returns `{"group_by", "rows", "totals"}`; id-keyed groupings are
+        ordered by total_tokens DESC, `day` by key ASC."""
+        expr = self._USAGE_GROUP_EXPRS.get(group_by)
+        if expr is None:
+            raise ValueError(f"unknown group_by: {group_by!r}")
+        await self._ensure_connected()
+
+        where: list[str] = []
+        params: list[Any] = []
+        if since is not None:
+            where.append("created_at >= ?")
+            params.append(since)
+        if until is not None:
+            where.append("created_at < ?")
+            params.append(until)
+        if agent_id is not None:
+            where.append("agent_id = ?")
+            params.append(agent_id)
+        if session_id is not None:
+            where.append("session_id = ?")
+            params.append(session_id)
+        where_sql = f" WHERE {' AND '.join(where)}" if where else ""
+        order_sql = (
+            "ORDER BY 1 ASC" if group_by == "day" else "ORDER BY SUM(total_tokens) DESC"
+        )
+
+        cursor = await self._conn.execute(
+            f"SELECT {expr}, {self._USAGE_AGGREGATES} FROM turn_usage"
+            f"{where_sql} GROUP BY 1 {order_sql}",
+            params,
+        )
+        rows = [self._usage_row(r[0], r[1:]) for r in await cursor.fetchall()]
+
+        cursor = await self._conn.execute(
+            f"SELECT {self._USAGE_AGGREGATES} FROM turn_usage{where_sql}", params
+        )
+        total_row = await cursor.fetchone()
+        totals = self._usage_row(None, total_row)
+        del totals["key"]
+        if not rows:  # COUNT(*) is 0 but SUMs are NULL on an empty window
+            totals = {"turns": 0, "cost": None} | {
+                k: 0 for k in totals if k not in ("turns", "cost")
+            }
+        return {"group_by": group_by, "rows": rows, "totals": totals}
+
+    @staticmethod
+    def _usage_row(key: Any, agg: Any) -> dict[str, Any]:
+        return {
+            "key": key,
+            "turns": agg[0],
+            "cost": agg[1],
+            "input_tokens": agg[2] or 0,
+            "cache_read_tokens": agg[3] or 0,
+            "cache_creation_tokens": agg[4] or 0,
+            "output_tokens": agg[5] or 0,
+            "reasoning_tokens": agg[6] or 0,
+            "total_tokens": agg[7] or 0,
+        }

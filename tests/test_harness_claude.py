@@ -167,3 +167,46 @@ def test_oneshot_argv_and_parse(tmp_path):
     with pytest.raises(HarnessOneshotError) as ei:
         parse_oneshot_stdout("not json")
     assert ei.value.code == "bad_output"
+
+
+# --------------------------------------------------------------------------- #
+# result usage normalization (usage-tracking.md §2)
+
+
+def test_result_normalizes_usage_and_model_usage():
+    p = ClaudeEventParser()
+    # The probed real shape: input_tokens is fresh-only, cache reported apart.
+    out = p.parse({
+        "type": "result",
+        "total_cost_usd": 0.05,
+        "usage": {
+            "input_tokens": 7,
+            "cache_creation_input_tokens": 200,
+            "cache_read_input_tokens": 9000,
+            "output_tokens": 42,
+            "server_tool_use": {"web_search_requests": 0},
+            "service_tier": "standard",
+        },
+        "modelUsage": {"claude-opus-4-7": {"inputTokens": 7, "costUSD": 0.05}},
+    })
+    ev = out.events[0]
+    assert ev.usage is not None
+    assert ev.usage.input_tokens == 7
+    assert ev.usage.cache_read_tokens == 9000
+    assert ev.usage.cache_creation_tokens == 200
+    assert ev.usage.output_tokens == 42
+    assert ev.usage.reasoning_tokens == 0
+    assert ev.usage.total_tokens == 7 + 9000 + 200 + 42
+    assert ev.model_usage == {"claude-opus-4-7": {"inputTokens": 7, "costUSD": 0.05}}
+
+
+def test_result_usage_defensive_defaults():
+    p = ClaudeEventParser()
+    # Missing/partial/garbage usage keys → zeros; empty modelUsage → None.
+    ev = p.parse({"type": "result", "usage": {"output_tokens": 3, "input_tokens": "x"}, "modelUsage": {}}).events[0]
+    assert ev.usage is not None
+    assert ev.usage.input_tokens == 0 and ev.usage.output_tokens == 3
+    assert ev.model_usage is None
+
+    ev = p.parse({"type": "result"}).events[0]
+    assert ev.usage is None and ev.model_usage is None

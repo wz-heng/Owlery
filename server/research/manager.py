@@ -167,6 +167,27 @@ class ResearchManager:
                 job_id, status="completed", phase="done", cost=report.cost,
                 completed_at=_now(), report_path=report_path,
             )
+            # Consumption ledger (usage-tracking.md §4): one row per completed
+            # job — the same best-effort boundary as research_jobs.cost (failed
+            # / cancelled jobs lose their partial usage). Never fails the job.
+            try:
+                usage = report.usage
+                await self.db.add_turn_usage(
+                    created_at=_now(),
+                    session_id=session_id,
+                    agent_id=session.agent_id,
+                    backend=session.backend,
+                    model=model or None,
+                    cost=report.cost,
+                    input_tokens=usage.input_tokens if usage else 0,
+                    cache_read_tokens=usage.cache_read_tokens if usage else 0,
+                    cache_creation_tokens=usage.cache_creation_tokens if usage else 0,
+                    output_tokens=usage.output_tokens if usage else 0,
+                    reasoning_tokens=usage.reasoning_tokens if usage else 0,
+                    origin="research",
+                )
+            except Exception:
+                logger.exception("failed to record research usage for job %s", job_id)
             await self._broadcast({
                 "type": "research_completed",
                 "session_id": session_id,

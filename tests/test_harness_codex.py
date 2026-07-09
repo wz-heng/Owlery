@@ -163,3 +163,44 @@ def test_oneshot_extracts_agent_message():
     ])
     assert parse_oneshot_stdout(stream) == '{"name":"x"}'
     assert parse_oneshot_stdout("garbage\n{not json") == ""  # nothing extractable
+
+
+# --------------------------------------------------------------------------- #
+# result usage normalization (usage-tracking.md §2)
+
+
+def test_turn_completed_normalizes_usage():
+    p = CodexEventParser()
+    # The probed real shape: input_tokens INCLUDES cached_input_tokens.
+    ev = p.parse({
+        "type": "turn.completed",
+        "usage": {
+            "input_tokens": 11321,
+            "cached_input_tokens": 8064,
+            "output_tokens": 5,
+            "reasoning_output_tokens": 2,
+        },
+    }).events[0]
+    assert ev.usage is not None
+    assert ev.usage.input_tokens == 11321 - 8064  # fresh input after subtraction
+    assert ev.usage.cache_read_tokens == 8064
+    assert ev.usage.cache_creation_tokens == 0  # codex doesn't report it
+    assert ev.usage.output_tokens == 5
+    assert ev.usage.reasoning_tokens == 2
+    assert ev.usage.total_tokens == 11321 + 5  # reasoning not double-counted
+    assert ev.model_usage is None
+    assert ev.cost is None
+
+
+def test_turn_completed_usage_clamps_and_defaults():
+    p = CodexEventParser()
+    # cached > input (shouldn't happen, but never go negative) + empty usage.
+    ev = p.parse({
+        "type": "turn.completed",
+        "usage": {"input_tokens": 5, "cached_input_tokens": 9},
+    }).events[0]
+    assert ev.usage is not None
+    assert ev.usage.input_tokens == 0 and ev.usage.cache_read_tokens == 9
+
+    ev = p.parse({"type": "turn.completed", "usage": {}}).events[0]
+    assert ev.usage is not None and ev.usage.total_tokens == 0
