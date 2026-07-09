@@ -1,13 +1,19 @@
 /**
  * End-to-end coverage of agent-to-agent delegation (agent-collaboration.md).
  *
- * This is the deterministic counterpart to `tests/test_delegations_real.py`
- * — that suite verifies the chain primitive against the real `claude` CLI,
- * but its question-loop / 3-hop cases can't exercise the full MCP HTTP
- * shim because there's no live FastAPI in the unit-test process. This
- * spec runs against Playwright's auto-started backend (with the real
- * `claude` binary) so the `mcp__ask_agent__*` tools actually reach
- * the delegations routes.
+ * SMOKE (1 of 3 quota burners, docs/plans/e2e-slim.md §2) — the real
+ * delegation hop. It complements `tests/test_delegations_real.py`: that suite
+ * verifies the chain primitive against the real `claude` CLI, but its
+ * question-loop / 3-hop cases can't exercise the full MCP HTTP shim because
+ * there's no live FastAPI in the unit-test process. This spec runs against
+ * Playwright's auto-started backend so the `mcp__ask_agent__*` tools actually
+ * reach the delegations routes.
+ *
+ * The model must be real here: the whole claim is that a model, handed the
+ * tool, calls it and the chain lights up. So the parent's working dir carries
+ * the `.owlery-real-cli` marker, which the fake shim honours by exec'ing the
+ * real binary. The delegation child inherits that working dir, so both hops
+ * run real without the child needing to be marked.
  *
  * What this spec covers end-to-end:
  *   1. A real LLM call to `mcp__ask_agent__ask` spawns Vera's child
@@ -24,7 +30,13 @@
  *      `showDelegations=false` by default).
  */
 
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { test, expect, type Page, type APIRequestContext } from "@playwright/test";
+
+import { realCliDir } from "./fake-cli";
 
 const TOKEN = "changeme";
 const SERVER_URL = "http://localhost:8765";
@@ -120,6 +132,15 @@ test.describe("Agent-to-agent delegation @llm", () => {
   // duck without papering over a real defect.
   test.describe.configure({ retries: 1 });
 
+  // Marked for the real `claude`; the child inherits it (see the file header).
+  // A private temp dir, not /tmp, so the marker can't leak into other specs'
+  // sessions — they share this backend and would silently start burning quota.
+  let workingDir: string;
+  test.beforeAll(() => {
+    workingDir = realCliDir(mkdtempSync(join(tmpdir(), "owlery-real-deleg-")));
+  });
+  test.afterAll(() => rmSync(workingDir, { recursive: true, force: true }));
+
   test("ask_agent → reply card + Open child + Delegated-from banner", async ({
     page,
     request,
@@ -135,7 +156,7 @@ test.describe("Agent-to-agent delegation @llm", () => {
         Authorization: `Bearer ${TOKEN}`,
         "Content-Type": "application/json",
       },
-      data: { name: "Delegation E2E", working_dir: "/tmp" },
+      data: { name: "Delegation E2E", working_dir: workingDir },
     });
     expect(sessRes.ok()).toBeTruthy();
 
