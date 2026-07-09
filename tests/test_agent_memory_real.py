@@ -117,7 +117,13 @@ async def test_codex_reads_per_agent_memory(tmp_path, monkeypatch):
 async def test_claude_resume_survives_memory_override(tmp_path, monkeypatch):
     """With memory pointed at the per-agent dir, --resume must still find the
     session transcript (it lives under the untouched host CLAUDE_CONFIG_DIR).
-    Turn 1 states a fact; a fresh process RESUMES and recalls it."""
+    Turn 1 states a fact; a fresh process RESUMES and recalls it.
+
+    The carried fact is a neutral build codename, never a credential: asking the
+    model to echo back a "passphrase" makes it decline on credential-handling
+    grounds even when resume worked perfectly, which is indistinguishable here
+    from the transcript having been lost.
+    """
     monkeypatch.setattr(settings, "agents_dir", str(tmp_path / "agents"))
     aid = "memtest-resume"
     agent_memory.ensure_agent_dirs(aid)
@@ -127,7 +133,7 @@ async def test_claude_resume_survives_memory_override(tmp_path, monkeypatch):
 
     run1 = get_harness("claude-code").create_run(RunConfig(**cfg))
     await run1.start(
-        "Remember for this conversation: my passphrase is ZEPHYR-7. Reply with just OK.",
+        "Note for this conversation: the build codename is ZEPHYR-7. Reply with just OK.",
         wd, None, None,
     )
     try:
@@ -139,7 +145,8 @@ async def test_claude_resume_survives_memory_override(tmp_path, monkeypatch):
 
     run2 = get_harness("claude-code").create_run(RunConfig(**cfg))
     await run2.start(
-        "What passphrase did I tell you a moment ago? Reply with only the passphrase.",
+        "Earlier in this same conversation I gave you a build codename. "
+        "What was it? Reply with only that codename.",
         wd, sid, None,
     )
     try:
