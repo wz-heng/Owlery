@@ -32,79 +32,114 @@ shortcut. Do the real thing the first time.
 
 ## After Every Code Change
 
-Verification is tiered: cheap checks on every change, the full E2E suite
-once per task. Real-LLM tests burn real subscription quota — don't rerun
-them on every iteration.
+Run all four. They total well under two minutes — there is no cheap
+tier to fall back to, so don't skip one on the grounds that a change
+"only touched the frontend".
 
-**On every code change (iteration loop):**
+1. **Backend unit**: `.venv/bin/pytest tests/ -v` (967)
+2. **Frontend unit**: `cd web && bun run test` (95)
+3. **TypeScript**: `cd web && npx tsc --noEmit`
+4. **E2E**: `cd web && bun run test:e2e` (69, ~2 min, Playwright auto-starts
+   servers)
 
-1. **Backend unit tests**: `.venv/bin/pytest tests/ -v` (967 tests; the
-   real-CLI tests auto-skip unless their binary is on PATH —
-   `test_backend_claude_code_real.py` + `test_schedule_ai_real.py` +
-   `test_showme_ai_real.py` + the 2-hop / question-loop / 3-hop cases in
-   `test_delegations_real.py` need `claude`; `test_backend_codex_real.py` +
-   `test_codex_login_real.py` need `codex`; `test_agent_memory_real.py` +
-   the claude→codex case in `test_delegations_real.py` need **both** —
-   run with both binaries resolvable on PATH, see Conventions)
-2. **Frontend unit tests**: `cd web && bun run test` (95 tests)
-3. **TypeScript check**: `cd web && npx tsc --noEmit`
-4. **Fast E2E**: `cd web && bun run test:e2e:fast` (36 pure-UI tests, ~16 s —
-   login / sessions / dialogs / sidebar / virtualized chat / attachments /
-   etc.)
+**Zero test failures are acceptable.** All tests must pass before
+committing. If a test fails, investigate and fix it — never ignore, skip,
+or dismiss a failure as "flaky" or "pre-existing".
 
-**Once per task, before the final commit / requesting review:**
-
-5. **Full E2E**: `cd web && bun run test:e2e` (68 tests, ~3.5 min, Playwright
-   auto-starts servers). This includes `bun run test:e2e:llm` (32 real-LLM
-   tests, ~3 min — chat, /schedule, /showme, /archive, mcp__bg__run,
-   AskUserQuestion, agent-collaboration, notifier, codex sign-in,
-   handoff/pull), which drives real `claude` / `codex` turns. Run it once
-   when the task's code is final; rerun only if later fixes touch what it
-   covers. Anything that drives a real turn carries `@llm` in its describe
-   title; the `:fast` script uses `--grep-invert @llm`. Telegram bridge
-   tests have their own config and run via `test:e2e:bridge`.
-
-**Keep test output out of your context**: redirect suite output to a file
-(e.g. `.venv/bin/pytest tests/ > /tmp/pytest.log 2>&1`) and read back only
-the summary line and failure sections — never load a full passing run into
+**Keep test output out of your context**: redirect to a file (e.g.
+`.venv/bin/pytest tests/ > /tmp/pytest.log 2>&1`) and read back only the
+summary line and any failure sections — never load a full passing run into
 the conversation.
 
-**Zero test failures are acceptable.** All tests must pass before committing. If a test fails, investigate and fix it — do not ignore, skip, or dismiss any failure as "flaky" or "pre-existing".
+### Which tests hit a real model
+
+Almost none, by design (`docs/plans/e2e-slim.md`). A fake CLI on PATH emits
+canned output through the real spawn → stream-json → MCP path; only the
+model is canned.
+
+- **E2E**: 3 of the 69 burn real quota — claude chat, codex chat, 2-hop
+  delegation. They opt in by marking their working dir via `realCliDir()`;
+  everything else gets the fake. `bun run test:e2e:fast` (66, ~1.4 min) skips
+  them via `--grep-invert @llm` — fine while iterating, but run the full
+  suite before committing.
+- **Backend**: `test_*_real.py` auto-skip unless their CLI is on PATH.
+  `claude` for `test_backend_claude_code_real` / `test_schedule_ai_real` /
+  `test_showme_ai_real` / most of `test_delegations_real`; `codex` for
+  `test_backend_codex_real` / `test_codex_login_real`; **both** for
+  `test_agent_memory_real` and the claude→codex delegation case. They
+  *error* rather than skip if a binary is missing — see Conventions.
+- Telegram bridge e2e has its own config: `bun run test:e2e:bridge` (6). It
+  is **currently red on a dev box** and predates this suite's isolation work:
+  its config pins neither `OWLERY_AUTH_TOKEN` nor a private port, while the
+  spec hardcodes `changeme` and `localhost:8000`. So it 401s against any
+  backend whose token differs, and with `reuseExistingServer: true` it will
+  happily adopt a *running `owlery serve`* on :8000 instead of booting its
+  own. Fix the harness before trusting a red run here.
+
+Two traps. The `.owlery-real-cli` marker is a property of a *directory* and
+all specs share one backend, so never drop it in a shared dir (`/tmp`) —
+you'd route much of the suite to the real CLIs. And there is no fake
+`codex`, only a tripwire shim that fails the run if a codex turn spawns the
+real binary from an unmarked dir; if you need a canned codex turn, read
+`e2e-slim.md` §4 first.
 
 ## Test Coverage
 
-| Suite | Tool | Count | What it covers |
-|-------|------|-------|----------------|
-| Backend unit | pytest | 967 | Config, models, session manager, REST API (auth, CRUD, 404s, reset), database persistence (incl. credential storage split + refresh-error codes), JSONL parser/writer, CLI (handoff, pull), import API, schedules CRUD + scheduler runner (interval **and cron** triggers) + schedule-recurrence migration, **natural-language `/schedule` parsing** (`schedule_ai`: rigid fast-path, JSON extraction, cron/interval validation, `from_text` route — harness-agnostic, runs on the agent's own harness claude-code **or** codex, with fake + real-CLI AI), bridge base/manager/telegram (incl. **per-chat verbosity** — quiet by default, hiding tool/result/status events, `/quiet`+`/verbose` toggle persisted through `/agent` rebinds — and **session-switch via inline buttons**: `/sessions` renders a tappable picker, shared `switch_session` for the `switch:<id>` callback + `/switch` command), tunnel config, OAuth provider registry, agents (manager + routes), **harness layer** (`harness`: one `Harness` + one `HarnessRun` subprocess engine driven by a per-backend `RuntimeProfile` value — no per-framework subclasses; shared MCP/system-prompt assembly, registry + derived predicates, `run_oneshot` for both backends, claude + codex argv/parser snapshots, real-CLI for both when on PATH), **Codex in-app login** (`codex_login` device-auth orchestrator with a fake CLI: scrape URL+code, success/fail/cancel, per-credential `CODEX_HOME` resolution via `resolve_credential_by_id(style="home_dir")`, `/credentials/codex/*` routes; real-CLI start when `codex` on PATH), **connectors** (DB split-secret + agent-join, manager incl. token-refresh lifecycle + in-app OAuth-client config + custom-connector CRUD, OAuth providers, REST routes incl. OAuth flow, the github/gmail/generic MCP servers), **agent memory** (`agent_memory`: per-agent native-memory path derivation + idempotent provisioning; harness wiring giving Claude a `CLAUDE_COWORK_MEMORY_PATH_OVERRIDE` (never `CLAUDE_CONFIG_DIR` — resume-transcript regression guard) and Codex a memory-dir blurb in `developer_instructions` *without* enabling `features.memories`; agent-manager dir provision/cleanup; gated real-CLI read-back for both harnesses **plus a Claude `--resume`-survives-memory-override** check), **agent-to-agent collaboration** (`delegations` + `ask_agent` MCP server: parent_session_id schema + 'delegation' origin, DelegationManager registry / broadcast-subscriber / cycle+depth-3 guards, name-resolution case-insensitive + ambiguity/self-rejection, REST routes POST/GET/follow-up/cancel + caller-aware ask question routing, answer_agent_question helper + route, MCP-tool unit tests for bimodal ask/cancel/list/answer surface, and real-CLI 2-hop / question-loop / 3-hop chain plus claude→codex harness-agnostic gate), **usage tracking** (`usage_tracking` + parser cases in the harness test files: Claude/Codex `result` usage → normalized `TokenUsage` (fresh-input semantics, cached-subtraction + clamping, `modelUsage` passthrough), `turn_usage` ledger add + `summarize_usage` per group_by with window/agent/session filters + NULL-cost SUMs, session-manager capture that never fails the turn, WS `result` usage enrichment, `/api/usage/summary` auth/validation/happy paths, research `merge_usage` + per-job report summing), **Octopus→Owlery rename** (`legacy_rename`: DB move INDEPENDENT of the home move (a lazily-created home must not strand `octopus.db`), all refusals evaluated BEFORE the first mutation (an aborted migration renames nothing), WAL checkpointed into the main file rather than renamed alongside + `LegacyDatabaseBusyError` when `wal_checkpoint(TRUNCATE)` reports `busy=1` (it does not raise), marker gating, fail-fast `AmbiguousLegacyStateError` when both homes are populated, idempotency incl. a restored old home; stored-path rewrite over fork `working_dir` + nested JSON blobs + `bg_tasks` + `research_jobs`, sibling-prefix and non-JSON tolerance, Claude project-dir re-key with `cwd` rewrite + failure containment; `OCTOPUS_*` env fallback — the credential-encryption-key guard — plus re-homing of legacy state-dir env vars that still point into the emptied tree (symlink-resolved, sibling/mutual-prefix/nested-home safe), and home_dir-derived state dirs that expand `~` at use time) |
-| Frontend unit | vitest | 95 | Zustand store (token, sessions, messages, status, agents, connectors), useWebSocket, BgTaskChip, FileViewerDialog, SlashCommandMenu, **delegation cards** (AgentDelegationEventCard parser + reply/question/error variants with options-as-text + open-child resolving from both `sessions` and `archivedSessions`; AgentDelegationRequestCard with running/completed states + delegation_id-from-tool_result matching + open-child + cancel POST), **fork** (ForkDialog picker/confirm, deferredFork store helper), CredentialList, ResearchCard, **UsageDialog** (rows + totals rendering with agent-name resolution, null-cost em-dash, group-by/window refetch URLs, no fetch while closed), **storage** (`readStored` migrating the pre-rename `octopus_*` localStorage keys forward so the rename doesn't log existing users out) |
-| E2E | Playwright | 68 | Login, session CRUD, real Claude responses (incl. AskUserQuestion + resume), Enter to send, input/state while running, WebSocket reconnect, mobile layout, CLI handoff/pull + roundtrip + API cleanup, Telegram bridge (fake API server — quiet-mode octo replies, `/sessions` switch buttons, `/quiet`+`/verbose` toggles), schedules (`/schedule` command → all-agents overview dialog, toggle/delete), archived-sessions account-menu manage page (view read-only + unarchive), waiting-input hint, message queue + Esc interrupt, virtualized chat scrolling, OAuth dialog flow (Claude Code + **Codex device-code sign-in** via the Harness chooser), credential override, agents rail/settings, **connectors** (catalog + availability gating, in-app Set-up flips a built-in to connectable, add/remove a custom connector, per-agent toggles), `/research` deep-research, `/rewind` fork + deferred-fork while running, **usage manage page** (account-menu entry, group-by + window toggles) |
+What each suite covers; detail lives in the linked plan docs.
+
+**Backend unit** (pytest, 967) — config, models, session manager, REST API,
+DB persistence (credential split, refresh-error codes), JSONL parser/writer,
+CLI handoff/pull, import API, schedules CRUD + scheduler (interval + cron),
+NL `/schedule` parsing, telegram bridge (per-chat verbosity, `/sessions`
+picker), tunnel, OAuth registry, agents • harness layer
+(`harness-layer.md`) • Codex in-app login (`codex-backend.md`) • connectors
+(`connectors.md`) • agent memory (`memory.md`) • delegation
+(`agent-collaboration.md`) • usage tracking (`usage-tracking.md`) •
+Octopus→Owlery migration (`rename-owlery.md` §3).
+
+**Frontend unit** (vitest, 95) — zustand store, `useWebSocket`, BgTaskChip,
+FileViewerDialog, SlashCommandMenu, delegation cards, fork dialog +
+deferred-fork helper, CredentialList, ResearchCard, UsageDialog, `readStored`
+localStorage rename migration.
+
+**E2E** (Playwright, 69) — login, session CRUD, chat (send / Enter /
+disabled-while-running / AskUserQuestion / resume), WS reconnect, mobile
+layout, CLI handoff/pull + roundtrip, schedules, archived sessions, message
+queue + Esc interrupt, virtualized chat, OAuth + Codex device-code sign-in,
+credential override, agents rail/settings, connectors, `/research`,
+`/rewind` + deferred fork, usage page, cross-turn `mcp__bg__run` + spill
+pointer, `/showme`. Plus 6 telegram-bridge tests under their own config.
 
 ## Project Structure
 
-- `server/` — Python backend (FastAPI)
-- `server/cli.py` — CLI entry point (`serve`, `handoff`, `pull`)
-- `server/database.py` — SQLite persistence layer
-- `server/legacy_rename.py` — One-shot Octopus→Owlery first-boot migration (`docs/plans/rename-owlery.md` §3): moves `~/.octopus`→`~/.owlery` + `octopus.db`→`owlery.db`, then rewrites the absolute paths the DB stored into the old tree (fork `working_dir` + its JSON blobs, `bg_tasks.working_dir`, `research_jobs.report_path`) and re-keys the Claude project dirs those fork dirs address. Idempotent, marker-gated; disabled by `OWLERY_LEGACY_HOME_DIR=""` (tests + e2e do, since they boot the real lifespan against the real `$HOME`)
-- `server/scheduler.py` — APScheduler-based recurring task runner
-- `server/jsonl_parser.py` — Claude Code JSONL session parser
-- `server/jsonl_writer.py` — JSONL writer for session export
-- `server/routers/` — REST + WebSocket routers (`sessions`, `schedules`, `agents`, `credentials`, `connectors`, `delegations`, `research`, `usage`, `ws`)
-- `server/fork_helpers.py` — Pure helpers for session tree-rewind (`/rewind`): git-anchor capture at turn-start, side-effect classification over parent rows, safe-revert preflight + git-stash execution. Backend-agnostic and side-effect-contained.
-- `server/research/` — Native deep research orchestration (`docs/plans/native-deep-research.md`): `ResearchManager` (async job lifecycle, phase pipeline, concurrency cap, cancel + reap), `orchestrator` (scope → search → dedup → verify → synthesize phases), `leaf` (throwaway `HarnessRun` sub-turns for web-search leaves and `run_oneshot` for reasoning leaves), `schemas` (JSON schemas for scope/findings/synthesis). Agent-invoked via `mcp__research__deep_research`; user-invoked via `/research <question>`. Result injected as a follow-up turn; a `ResearchCard` tracks progress in the UI.
-- `server/mcp_servers/research.py` — Stdio MCP server exposing `mcp__research__deep_research(question)` to agents; thin HTTP shim to `/api/sessions/{sid}/research`. Returns `research_id` immediately so the model's turn ends cleanly.
-- `server/bridges/` — Messaging-platform integrations (`telegram`, base + manager). A chat binds to an agent with a sticky session and a per-chat `verbose` flag (quiet by default → only the agent's natural-language replies, errors and approval prompts reach the chat; `QUIET_SUPPRESSED_EVENTS` hides tool calls/results/cost/status; `/quiet`+`/verbose` toggle it, persisted in `bridge_mappings.verbose`). `/sessions` renders a tappable inline-button picker (`send_session_list`) whose `switch:<id>` callback shares `BridgeManager.switch_session` with the `/switch` command
-- `server/agent_manager.py` — Agent CRUD (durable assistant definitions that own sessions/schedules)
-- `server/agent_memory.py` — Per-agent native memory (`docs/plans/memory.md`): one canonical markdown dir per agent (`<agents_dir>/<id>/memory/`), shared by both harnesses. Claude points its auto-memory at it via `CLAUDE_COWORK_MEMORY_PATH_OVERRIDE`; Codex via an injected `developer_instructions` blurb naming the dir (its native `features.memories` pipeline is unused — it doesn't run in headless `exec`). Memory is decoupled from both harnesses' config/auth dirs — `CLAUDE_CONFIG_DIR` and `CODEX_HOME` are never touched, so auth and `--resume` transcripts are unaffected. Pure path helpers + idempotent provisioning.
-- `server/delegations.py` — Agent-to-agent delegation manager (`docs/plans/agent-collaboration.md`). Subscribes to the SessionManager broadcast bus; on a tracked child session's `assistant_text` / `result` / `error` / `question_request` events, captures + finalises and injects an `[agent-reply:<name> delegation=<id>]` (or `agent-question`, or `agent-error`) follow-up turn into the parent session via the same `start_message` path bg-task delivery uses. Cycle and depth-3 guards walk `parent_session_id`. `answer_pending_question(delegation_id, choice)` drains the child's oldest pending question on the parent's behalf — same Event-signal machinery the human UI uses (first to drain wins). The delegation id IS the child session id; no parallel id space, no new persistence table.
-- `server/mcp_servers/ask_agent.py` — Stdio MCP server exposing the four delegation tools to the model: `mcp__ask_agent__ask` / `cancel` / `answer` / `list` (the Python functions are `ask_agent` / `cancel_agent_task` / `answer_agent_question` / `list_agent_tasks`; the `@mcp.tool(name=…)` decorators expose the short forms). `ask(request, name=…, delegation_id=…, files=…)` is bimodal: `name` starts a fresh child session, `delegation_id` continues a prior one in the same child transcript; exactly one id is required. Same `OWLERY_API_BASE` / `OWLERY_SESSION_ID` env-injection pattern as the bg + ask built-ins; thin HTTP shim to the `/api/sessions/{sid}/delegations` routes, including continuation via `/follow-up`. Added to the default per-agent MCP set; the migration backfills it onto every pre-existing agent row.
-- `server/harness/` — Harness layer: the single boundary for all model/runtime interaction (`docs/plans/harness-layer.md`). One `Harness` class + one `HarnessRun` engine, configured by a `RuntimeProfile` *value* per backend kind (`claude_code`, `codex`) — no per-framework subclasses. Holds `assembly` (shared per-turn MCP/system-prompt assembly), `run` (subprocess+JSONL engine + PATH helpers), `registry` (`get_harness`/`available_backends`), `login` (LoginDriver protocol). Capabilities are derived from the profile; `run_oneshot` powers backend-agnostic `/schedule` parsing.
-- `server/connectors/` — Connector framework: `base` (ConnectorBase + backend-neutral MCP entry), `oauth` (provider protocol + redirect-URI login manager), `registry`, built-in `github`/`gmail`, and `custom` (user-defined kinds + generic OAuth provider + `resolve_connector`)
-- `server/connector_manager.py` — Connector business logic (install upsert, in-app OAuth-client config DB→env resolve, token-refresh lifecycle, custom-connector CRUD)
-- `server/mcp_servers/connectors/` — Per-kind stdio MCP servers (`github`, `gmail`, generic `custom`) + shared token/truncation helpers
-- `web/` — React frontend (Vite + TypeScript)
-- `tests/` — Backend tests (pytest)
-- `web/src/**/*.test.ts` — Frontend unit tests (vitest, colocated with source)
-- `web/e2e/` — End-to-end tests (Playwright, auto-cleanup after runs)
+- `server/` — FastAPI backend: `cli.py` (`serve`, `handoff`, `pull`),
+  `database.py` (SQLite), `scheduler.py` (APScheduler), `jsonl_parser.py` /
+  `jsonl_writer.py` (Claude Code JSONL codec), `fork_helpers.py` (`/rewind`
+  tree-rewind — `session-rewind.md`, `session-fork.md`)
+- `server/routers/` — REST + WS routers (`sessions`, `schedules`, `agents`,
+  `credentials`, `connectors`, `delegations`, `research`, `usage`, `ws`)
+- `server/harness/` — the single boundary for all model/runtime interaction:
+  one `Harness` + one `HarnessRun` engine driven by a per-backend
+  `RuntimeProfile` value, no per-framework subclasses (`harness-layer.md`)
+- `server/delegations.py` + `server/mcp_servers/ask_agent.py` — agent-to-agent
+  delegation; the delegation id IS the child session id
+  (`agent-collaboration.md`)
+- `server/agent_manager.py` / `server/agent_memory.py` — agent CRUD; per-agent
+  native memory dir shared by both harnesses, decoupled from their config/auth
+  dirs (`memory.md`)
+- `server/research/` + `server/mcp_servers/research.py` — deep research
+  (`native-deep-research.md`)
+- `server/connectors/` + `connector_manager.py` + `mcp_servers/connectors/` —
+  connector framework, business logic, per-kind stdio MCP servers
+  (`connectors.md`)
+- `server/bridges/` — messaging platforms (telegram); a chat binds to an agent
+  with a sticky session and a per-chat `verbose` flag
+- `server/legacy_rename.py` — one-shot Octopus→Owlery first-boot migration;
+  idempotent, marker-gated, disabled by `OWLERY_LEGACY_HOME_DIR=""`, which
+  tests and e2e set since they boot the real lifespan against the real `$HOME`
+  (`rename-owlery.md` §3)
+- `web/` — React frontend (Vite + TS); `tests/` — pytest;
+  `web/src/**/*.test.ts` — vitest, colocated; `web/e2e/` — Playwright
 
 ## Commands
 
@@ -125,7 +160,8 @@ cd web && bun run build                 # typecheck + build (refreshes web/dist/
 cd web && bun dev                       # live dev server on :5173
 
 # E2E (Playwright)
-cd web && bun run test:e2e              # run e2e tests (headless)
+cd web && bun run test:e2e              # full suite (headless)
+cd web && bun run test:e2e:fast         # skip the 3 real-model smokes
 cd web && bun run test:e2e:ui           # run e2e tests with Playwright UI
 cd web && npx playwright test --reporter=list  # verbose output
 ```
