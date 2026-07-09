@@ -143,28 +143,15 @@ def migrate_legacy_state(settings) -> bool:
     if old_home == new_home:
         return False
 
-    # The database moves on its own terms, whatever the home dirs look like.
-    _migrate_db_file(settings.db_path)
-
     marker = new_home / MARKER_NAME
+    home_needs_move = old_home.is_dir() and not marker.exists()
 
-    if not old_home.is_dir():
-        # No old home to move. A marker from a previous boot still licenses the
-        # (idempotent) path rewrite.
-        return marker.exists()
-
-    if marker.exists():
-        # Migrated already; `old_home` is a leftover the user can delete.
-        logger.info(
-            "Owlery: %s was migrated to %s previously; %s still exists and can "
-            "be removed.", old_home, new_home, old_home,
-        )
-        return True
-
-    if new_home.exists() and not _is_empty_dir(new_home):
-        # Refuse to guess which tree is live — and refuse to BOOT, because
-        # continuing would open a database against one of them and fork the
-        # install in two (Snape review, blocker #2).
+    # ---- Refusals first. Every check below is READ-ONLY, so a migration that
+    # aborts leaves the user's state exactly as it found it. Moving the
+    # database before deciding whether we may boot at all would rename
+    # `octopus.db` out from under an install we then refuse to start
+    # (Snape review, round 2).
+    if home_needs_move and new_home.exists() and not _is_empty_dir(new_home):
         raise AmbiguousLegacyStateError(
             f"Both {old_home} and {new_home} exist and neither is empty. "
             f"Owlery cannot tell which holds your live state, and starting "
@@ -172,6 +159,27 @@ def migrate_legacy_state(settings) -> bool:
             f"{old_home}. To skip this check entirely, set "
             f"OWLERY_LEGACY_HOME_DIR='' (the old tree is then ignored)."
         )
+    # Raises LegacyDatabaseBusyError if something still holds the legacy DB.
+    _check_legacy_db_migratable(settings.db_path)
+
+    # ---- Mutations. Nothing below may refuse.
+    #
+    # The database moves on its own terms: an install that never used
+    # attachments, forks or research has no `~/.octopus` (it's created lazily)
+    # yet its `octopus.db` holds every session, so gating one on the other
+    # would strand that history (Snape review, round 1).
+    _migrate_db_file(settings.db_path)
+
+    if not home_needs_move:
+        if old_home.is_dir():  # marker present: a leftover the user can delete
+            logger.info(
+                "Owlery: %s was migrated to %s previously; %s still exists and "
+                "can be removed.", old_home, new_home, old_home,
+            )
+            return True
+        # No old home. A marker from a previous boot still licenses the
+        # (idempotent) path rewrite.
+        return marker.exists()
 
     if new_home.exists():
         new_home.rmdir()  # empty placeholder — get out of `move`'s way
@@ -188,29 +196,38 @@ def migrate_legacy_state(settings) -> bool:
     return True
 
 
-def _migrate_db_file(db_path: str) -> None:
-    """Rename `octopus.db` → `owlery.db`. Skipped when the destination already
-    exists — a live DB is never clobbered.
+def _check_legacy_db_migratable(db_path: str) -> None:
+    """Fold the legacy database's WAL into its main file, or refuse.
 
-    The WAL is folded back into the main file first, then the sidecars are
-    dropped. Moving `-wal`/`-shm` alongside the main file as three separate
-    renames is not crash-safe: a crash after the main file lands but before its
-    WAL does would silently discard every committed-but-uncheckpointed
-    transaction. `TRUNCATE` forces a full checkpoint, after which the main file
-    is self-contained and the sidecars carry nothing (SQLite recreates them on
-    next open).
+    Called from the refusal phase, before anything is renamed. The checkpoint
+    itself writes — but only by moving committed frames from the `-wal` into the
+    main file, which is idempotent and lossless: if a later check aborts the
+    boot, the database is intact either way.
 
-    A checkpoint is NOT guaranteed to run. When another process holds a read
-    snapshot on the database — the old server still running — `TRUNCATE`
-    neither blocks nor raises: it returns `busy=1` having folded nothing in.
-    Moving the main file at that point would drop every WAL-resident commit on
-    the floor, so an incomplete checkpoint aborts startup instead.
+    Raises `LegacyDatabaseBusyError` when the WAL could not be folded in, which
+    in practice means another process still has the database open. Migrating
+    then would discard every WAL-resident commit.
     """
     legacy = _legacy_db_path(db_path)
     if legacy is None or not os.path.isfile(legacy) or os.path.exists(db_path):
         return
-
     _checkpoint_wal(legacy)
+
+
+def _migrate_db_file(db_path: str) -> None:
+    """Rename `octopus.db` → `owlery.db`, dropping the now-empty WAL sidecars.
+    Skipped when the destination already exists — a live DB is never clobbered.
+
+    Assumes `_check_legacy_db_migratable` has already folded the WAL in.
+    Renaming `.db` / `-wal` / `-shm` as three separate moves would not be
+    crash-safe: a crash after the main file lands but before its WAL does would
+    silently discard every committed-but-uncheckpointed transaction. Post
+    checkpoint the main file is self-contained and the sidecars carry nothing
+    (SQLite recreates them on next open).
+    """
+    legacy = _legacy_db_path(db_path)
+    if legacy is None or not os.path.isfile(legacy) or os.path.exists(db_path):
+        return
 
     os.replace(legacy, db_path)
     for suffix in ("-wal", "-shm"):

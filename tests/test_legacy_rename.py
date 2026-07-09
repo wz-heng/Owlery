@@ -13,7 +13,7 @@ import sys
 
 import pytest
 
-from server.config import Settings
+from server.config import Settings, _rehome_legacy_dir
 from server.database import Database
 from server.legacy_rename import (
     MARKER_NAME,
@@ -249,6 +249,52 @@ async def test_ambiguous_state_stops_the_lifespan_before_the_db_opens(tmp_path):
         migrate_legacy_state(s)
 
     assert not os.path.exists(s.db_path)
+
+
+def test_ambiguous_state_does_not_rename_the_database_first(tmp_path):
+    """Refusing to start must leave state exactly as it was found. Moving the
+    DB before deciding whether we may boot renamed `octopus.db` out from under
+    an install we then refused to start (Snape review, round 2)."""
+    _populate_old_home(tmp_path)
+    (tmp_path / "new").mkdir()
+    (tmp_path / "new" / "mine.txt").write_text("live", encoding="utf-8")
+    (tmp_path / "octopus.db").write_text("HISTORY", encoding="utf-8")
+    s = _settings(tmp_path)
+
+    with pytest.raises(AmbiguousLegacyStateError):
+        migrate_legacy_state(s)
+
+    assert (tmp_path / "octopus.db").read_text(encoding="utf-8") == "HISTORY"
+    assert not (tmp_path / "owlery.db").exists()
+    assert (tmp_path / "old").is_dir()
+
+
+def test_busy_database_does_not_move_the_home_first(tmp_path):
+    """The mirror of the above: a DB we may not migrate must not leave the home
+    dir moved. Every refusal happens before the first mutation."""
+    _populate_old_home(tmp_path)
+    db = tmp_path / "octopus.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE hist (msg TEXT)")
+    conn.commit()
+    reader = sqlite3.connect(str(db))
+    reader.execute("BEGIN")
+    reader.execute("SELECT * FROM hist").fetchall()
+    conn.execute("INSERT INTO hist VALUES ('only-in-wal')")
+    conn.commit()
+    conn.close()
+
+    s = _settings(tmp_path)
+    try:
+        with pytest.raises(LegacyDatabaseBusyError):
+            migrate_legacy_state(s)
+
+        assert (tmp_path / "old").is_dir()          # home not moved
+        assert not (tmp_path / "new").exists()      # nor created
+        assert db.exists()                          # nor DB renamed
+    finally:
+        reader.close()
 
 
 def test_migrates_into_an_empty_new_home(tmp_path):
@@ -633,6 +679,36 @@ def test_expanded_legacy_dir_is_rehomed_too(monkeypatch, tmp_path):
 
     # Rebuilt on the unexpanded new home, so `~` still resolves at use time.
     assert s.agents_dir == "~/.owlery/agents"
+
+
+def test_rehoming_resolves_symlinks(tmp_path):
+    """A config naming a symlinked `~/.octopus` and a state dir naming its
+    target (or the reverse) address the same tree — matching on the unresolved
+    strings would silently skip the re-homing that blocker #3 exists for."""
+    real, link = tmp_path / "real", tmp_path / "link"
+    (real / "agents").mkdir(parents=True)
+    link.symlink_to(real)
+
+    assert _rehome_legacy_dir(str(real / "agents"), str(link), "/new") == "/new/agents"
+    assert _rehome_legacy_dir(str(link / "agents"), str(real), "/new") == "/new/agents"
+
+
+def test_rehoming_leaves_a_home_nested_inside_the_legacy_tree_alone():
+    """`home_dir=~/.octopus/new` makes the old tree the new tree's ancestor.
+    Re-prefixing would duplicate the suffix (`~/.octopus/new/new/agents`)."""
+    got = _rehome_legacy_dir("~/.octopus/new/agents", "~/.octopus", "~/.octopus/new")
+    assert got == "~/.octopus/new/agents"
+
+
+def test_rehoming_does_not_confuse_a_mutual_prefix():
+    """`~/.owlery` starts with `~/.o` without being under it."""
+    assert _rehome_legacy_dir("~/.owlery/agents", "~/.o", "~/.owlery") == "~/.owlery/agents"
+    assert _rehome_legacy_dir("~/.o/agents", "~/.o", "~/.owlery") == "~/.owlery/agents"
+
+
+def test_rehoming_tolerates_trailing_slashes():
+    got = _rehome_legacy_dir("~/.octopus/agents/", "~/.octopus/", "~/.owlery/")
+    assert got == "~/.owlery/agents"
 
 
 def test_rehoming_is_disabled_with_the_migration(monkeypatch):

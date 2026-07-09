@@ -468,12 +468,18 @@ lifespan before anything opens the DB):
    `.migrated-from-octopus` marker lands in the new home. The two moves are
    **independent** — an install that never used attachments, forks or research
    has no `~/.octopus` (it is created lazily) yet its `octopus.db` holds every
-   session, so gating one on the other would strand that history. The WAL is
-   checkpointed into the main DB file before the move and its sidecars dropped,
-   rather than renamed alongside: three separate renames are not crash-safe.
-   If both homes exist and are non-empty, startup **aborts** with
-   `AmbiguousLegacyStateError` — booting would open a database against one of
-   them and fork the install in two.
+   session, so gating one on the other would strand that history.
+
+   Every refusal is evaluated **before the first mutation**, so an aborted
+   migration leaves state exactly as it found it. Startup aborts with
+   `AmbiguousLegacyStateError` when both homes exist and are non-empty (booting
+   would open a database against one and fork the install in two), and with
+   `LegacyDatabaseBusyError` when the legacy database's write-ahead log cannot
+   be folded in because another process still holds it — `PRAGMA
+   wal_checkpoint(TRUNCATE)` reports that by returning `busy=1` rather than
+   raising, and migrating anyway would discard every WAL-resident commit. The
+   WAL is checkpointed into the main file and its sidecars dropped rather than
+   renamed alongside it: three separate renames are not crash-safe.
 2. Every stored absolute path pointing into the old home is rewritten: fork
    `working_dir`s, the JSON blobs hanging off them (`fork_metadata`,
    `fork_revert_record`), `bg_tasks.working_dir`, `research_jobs.report_path`.

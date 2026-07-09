@@ -36,18 +36,29 @@ def _rehome_legacy_dir(value: str, legacy_home: str, home: str) -> str:
     """Re-point `value` from `legacy_home` to `home` when it sits inside the
     old tree; otherwise return it untouched.
 
-    Compares on expanded, normalized paths so `~/.octopus/x` and
-    `/home/u/.octopus/x` both match, but preserves the caller's `~`-relative
-    style in the result. A sibling like `~/.octopus-backup` shares a string
-    prefix without being *under* the tree, and must not match.
+    Compares on expanded, symlink-resolved, normalized paths, so `~/.octopus/x`,
+    `/home/u/.octopus/x` and a symlinked `~/.octopus` all match the same tree —
+    while preserving the caller's `~`-relative style in the result. Two paths
+    that merely share a string prefix do not match: `~/.octopus-backup` is not
+    under `~/.octopus`, and `~/.owlery` is not under `~/.o`.
+
+    Returns `value` unchanged when `home` lies inside `legacy_home` (a nested
+    configuration): the old tree is then the new tree's ancestor, so there is
+    nothing to move it out of, and re-prefixing would duplicate the suffix.
     """
     if not legacy_home or not value:
         return value
 
     def norm(p: str) -> str:
-        return os.path.normpath(os.path.expanduser(p))
+        # realpath resolves symlinks; a config naming the link and a value
+        # naming its target must land on the same string.
+        return os.path.realpath(os.path.expanduser(p))
 
     old, new, val = norm(legacy_home), norm(home), norm(value)
+    if old == new or new == val:
+        return value
+    if new == old or new.startswith(old + os.sep):
+        return value  # new home nested inside the old tree — see docstring
     if val != old and not val.startswith(old + os.sep):
         return value
     suffix = val[len(old) :]  # "" or "/attachments"
