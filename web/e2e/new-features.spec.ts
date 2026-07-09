@@ -4,9 +4,33 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { test, expect, type Page, type APIRequestContext } from "@playwright/test";
 
+import { fake } from "./fake-cli";
+
 const TOKEN = "changeme";
 const SERVER_URL = "http://localhost:8765";
 const API = `${SERVER_URL}/api`;
+
+/**
+ * Drives one `mcp__ask__user` call. The fake CLI is a real MCP client, so this
+ * reaches the real stdio `ask` server, which POSTs the question to the host and
+ * long-polls for the answer — the same round-trip the real model triggers.
+ * (The built-in AskUserQuestion is disabled via --disallowedTools; the MCP tool
+ * is its replacement.)
+ */
+const ASK_QUESTION_PROMPT = `I need your input ${fake({
+  t: "ask",
+  questions: [
+    {
+      question: "Pick a color",
+      header: "Choice",
+      multiSelect: false,
+      options: [
+        { label: "red", description: "the color red" },
+        { label: "blue", description: "the color blue" },
+      ],
+    },
+  ],
+})}`;
 
 /** Click the new-session "+" on the default "Octo" agent's row. The button is
  * per-agent, and specs share one in-memory backend DB, so a bare
@@ -107,7 +131,9 @@ async function importSessionApi(
 // Scheduled Tasks UI
 // ---------------------------------------------------------------------------
 
-test.describe("Scheduled Tasks UI @llm", () => {
+// No model involved: `/schedule 45m <prompt>` matches schedule_ai's rigid
+// fast path (`parse_rigid`), which returns before the one-shot AI call.
+test.describe("Scheduled Tasks UI", () => {
   test("the Schedules section opens the all-agents overview", async ({
     page,
   }) => {
@@ -246,9 +272,8 @@ test.describe("Interactive Input Hint", () => {
 // Message queue + interrupt
 // ---------------------------------------------------------------------------
 
-test.describe("Message Queue & Interrupt @llm", () => {
-  // Real Claude turns — give them time. Queue scenarios run two turns.
-  test.describe.configure({ timeout: 180_000 });
+test.describe("Message Queue & Interrupt", () => {
+  test.describe.configure({ timeout: 120_000 });
 
   test("send while running queues the message, which fires after current turn", async ({
     page,
@@ -268,15 +293,15 @@ test.describe("Message Queue & Interrupt @llm", () => {
     // is genuinely still running when we send the queued message. A plain
     // text prompt completes too fast to reliably catch with Playwright.
     await input.fill(
-      "Use the Bash tool to run `sleep 4`, then `sleep 4` again, " +
-      "then say: 100 * 200 = 20000"
+      `What is 100 * 200? ${fake(
+        { t: "bash", cmd: "sleep 4" },
+        { t: "bash", cmd: "sleep 4" },
+        { t: "text", v: "100 * 200 = 20000" }
+      )}`
     );
     await page.locator("button.btn-send").click();
 
-    // Wait for the run to start. The first turn cold-starts a real `claude`
-    // process; under full-suite parallel load (several workers each spawning
-    // claude) that can take well over 15s, so allow generous headroom — the
-    // describe budget is 180s.
+    // Wait for the run to start.
     await expect(
       page.locator(".status-badge.status-running")
     ).toBeVisible({ timeout: 60_000 });
@@ -291,7 +316,7 @@ test.describe("Message Queue & Interrupt @llm", () => {
     );
 
     // Queue a second message while the first is still running
-    await input.fill("And what is 50 * 50? Reply with just the number.");
+    await input.fill(`And what is 50 * 50? ${fake({ t: "text", v: "2500" })}`);
     await page.locator("button.btn-send").click();
 
     // Queue list should show one pending message
@@ -320,17 +345,13 @@ test.describe("Message Queue & Interrupt @llm", () => {
     });
     expect(detailRes.ok()).toBeTruthy();
     const detail = await detailRes.json();
+    // The fake runs the sleeps as literal Bash tool calls, so nothing
+    // synthesizes an extra user-role message — every row here was typed.
     const userMessages = (
       detail.messages as { role: string; content: unknown }[]
     )
       .filter((m) => m.role === "user")
-      .map((m) => (typeof m.content === "string" ? m.content : ""))
-      // The model may legitimately route the `sleep` commands through
-      // mcp__bg__run (the Owlery system prompt tells it to use bg_run for
-      // sleeps). When that bg task finishes it injects a *synthesized*
-      // `[bg-task-result]` user-role message — not user-typed input — so
-      // exclude it from the typed-prompt count to keep this deterministic.
-      .filter((c) => !c.includes("[bg-task-result]"));
+      .map((m) => (typeof m.content === "string" ? m.content : ""));
     expect(userMessages.length).toBe(2);
     expect(userMessages[0]).toContain("100 * 200");
     expect(userMessages[1]).toContain("50 * 50");
@@ -347,14 +368,14 @@ test.describe("Message Queue & Interrupt @llm", () => {
 
     const input = page.locator(".chat-input-bar textarea");
 
-    // Force a genuinely long-running tool call. We previously asked the
-    // model for three separate `sleep 3` invocations, but Claude tends to
-    // collapse those into a single `sleep 3 && sleep 3 && sleep 3` Bash
-    // call that finishes before Playwright presses Esc. A single explicit
-    // `sleep 30` gives us a wide window regardless of how the model
-    // chooses to compose tool calls.
+    // A long tool call gives Esc a wide window to land. The fake sleeps in
+    // slices, so the SIGTERM → SIGKILL escalation in `HarnessRun.stop()` is
+    // exercised for real against a live subprocess.
     await input.fill(
-      "Use the Bash tool to run exactly: sleep 30. Then say done."
+      `Run a slow command ${fake(
+        { t: "bash", cmd: "sleep 30" },
+        { t: "text", v: "done" }
+      )}`
     );
     await page.locator("button.btn-send").click();
 
@@ -660,7 +681,9 @@ test.describe("Credentials Panel", () => {
   });
 });
 
-test.describe("AskUserQuestion rendering @llm", () => {
+// No model involved: the session is imported with a question_request already
+// in its history; this asserts how that renders.
+test.describe("AskUserQuestion rendering", () => {
   test("imported question_request renders the asked-question summary", async ({
     page,
     request,
@@ -715,18 +738,18 @@ test.describe("AskUserQuestion rendering @llm", () => {
 });
 
 // ---------------------------------------------------------------------------
-// End-to-end against the real Claude CLI: AskUserQuestion + resume
+// End-to-end through the CLI spawn path: AskUserQuestion + resume
 // ---------------------------------------------------------------------------
 //
-// These hit the real model. Costs ~$0.01-0.05 per run. They run last and
-// are skipped if the Owlery server can't reach claude on PATH (the assert
-// below catches that). Both also have generous timeouts since real API
-// latency varies.
+// Driven by the fake CLI, which is a real MCP client: the `ask` op below
+// genuinely calls `mcp__ask__user` on the real stdio `ask` server, which
+// POSTs the question and long-polls for the answer. Everything except the
+// model's decision to call the tool is the production path.
 
-test.describe("Real CLI end-to-end @llm", () => {
+test.describe("CLI end-to-end", () => {
   test.setTimeout(120_000);
 
-  test("AskUserQuestion (via mcp__ask__user): real model → form → answer → reply", async ({
+  test("AskUserQuestion (via mcp__ask__user): tool call → form → answer → reply", async ({
     page,
     request,
   }) => {
@@ -738,21 +761,7 @@ test.describe("Real CLI end-to-end @llm", () => {
       .click();
     await expect(page.locator(".chat-header h3")).toHaveText("Real Q Session");
 
-    // The built-in AskUserQuestion is disabled in Owlery (--disallowedTools
-    // in claude_code.py). Nudge the model toward the MCP replacement
-    // explicitly. The frontend / WS / question-state machinery on the
-    // host side is the same as the legacy flow — the change is purely
-    // about which tool fires.
-    const prompt =
-      "Use the mcp__ask__user tool right now with this exact JSON for the questions argument: " +
-      '[{"question":"Pick a color","header":"Choice","multiSelect":false,' +
-      '"options":[' +
-      '{"label":"red","description":"the color red"},' +
-      '{"label":"blue","description":"the color blue"}' +
-      "]}]. " +
-      "Do not write any text before the tool call.";
-
-    await page.locator(".chat-input-bar textarea").fill(prompt);
+    await page.locator(".chat-input-bar textarea").fill(ASK_QUESTION_PROMPT);
     await page.locator("button.btn-send").click();
 
     // The QuestionPrompt form should appear (interactive, not the dashed
@@ -828,10 +837,11 @@ test.describe("Real CLI end-to-end @llm", () => {
 
     // Send a prompt — should fail because the bogus key overrides the
     // (otherwise-working) default OAuth, proving the env-var injection
-    // actually reaches the CLI.
+    // actually reaches the CLI. The directive asks for "HI"; the CLI must
+    // reject the credential before ever honouring it.
     await page
       .locator(".chat-input-bar textarea")
-      .fill("Reply with: HI");
+      .fill(`Reply with HI ${fake({ t: "text", v: "HI" })}`);
     await page.locator("button.btn-send").click();
 
     // We expect either an error bubble OR a result badge marking error
@@ -866,21 +876,22 @@ test.describe("Real CLI end-to-end @llm", () => {
       .click();
     await expect(page.locator(".chat-header h3")).toHaveText("Resume Session");
 
-    // Turn 1 — plant a fact, wait for the result badge.
+    // Turn 1 — plant a fact, wait for the result badge. The fake persists it
+    // under the session id the server captured from `system:init`.
     await page
       .locator(".chat-input-bar textarea")
-      .fill(
-        "Remember this exact word for later: PINEAPPLE. Reply only with OK."
-      );
+      .fill(`Remember PINEAPPLE ${fake({ t: "remember", v: "PINEAPPLE" })}`);
     await page.locator("button.btn-send").click();
     await expect(page.locator(".result-badge").first()).toBeVisible({
       timeout: 60_000,
     });
 
-    // Turn 2 — ask for the word. If resume works, the answer contains it.
+    // Turn 2 — ask for the word. `recall` reads the state file keyed by the
+    // id the server passes back via `--resume`; if resume regressed, turn 2
+    // gets a fresh id, finds no state, and answers "I don't remember."
     await page
       .locator(".chat-input-bar textarea")
-      .fill("What word did I ask you to remember? Reply only with that word.");
+      .fill(`What word? ${fake({ t: "recall" })}`);
     await page.locator("button.btn-send").click();
 
     // Wait for the second turn's result; the most recent assistant text
@@ -917,23 +928,13 @@ test.describe("Real CLI end-to-end @llm", () => {
 //      synthesize an "act autonomously" reply so async-driven sessions
 //      (bridges, schedules) can't wedge forever.
 //
-// Each test sends a deterministic prompt that nudges the real model to
-// invoke AskUserQuestion immediately — same trick the older
-// "AskUserQuestion: real model → form → answer → reply" test uses, so
-// timing/cost characteristics are similar (~$0.01-0.05 per test, up to
-// ~60s for the form to appear).
+// Each test drives one real `mcp__ask__user` round-trip via ASK_QUESTION_PROMPT
+// (defined at the top of this file), so the question machinery under test — the
+// long-poll, the pending-question store, the auto-answer timer — is the
+// production one; only the model's decision to call the tool is canned.
 
-const ASK_QUESTION_PROMPT =
-  "Use the AskUserQuestion tool right now with this exact JSON for the questions argument: " +
-  '[{"question":"Pick a color","header":"Choice","multiSelect":false,' +
-  '"options":[' +
-  '{"label":"red","description":"the color red"},' +
-  '{"label":"blue","description":"the color blue"}' +
-  "]}]. " +
-  "Do not write any text before the tool call.";
-
-test.describe("AskUserQuestion edge cases (real CLI) @llm", () => {
-  test.setTimeout(180_000);
+test.describe("AskUserQuestion edge cases", () => {
+  test.setTimeout(120_000);
 
   test("pending question form re-renders after switching sessions and back", async ({
     page,
@@ -1036,7 +1037,9 @@ test.describe("AskUserQuestion edge cases (real CLI) @llm", () => {
     // "Session ... is busy". We don't need the model to actually respond;
     // just that the request is accepted and the session goes back to
     // running. That alone proves the lock was released.
-    await page.locator(".chat-input-bar textarea").fill("Reply with the word DONE.");
+    await page
+      .locator(".chat-input-bar textarea")
+      .fill(`Say done ${fake({ t: "bash", cmd: "sleep 5" }, { t: "text", v: "DONE" })}`);
     await page.locator("button.btn-send").click();
     await expect(page.locator(".chat-header .status-running")).toBeVisible({
       timeout: 5_000,
@@ -1140,7 +1143,9 @@ test.describe("/reset slash command", () => {
 // Assistant messages are labeled with the owning agent's name (not "Claude")
 // ---------------------------------------------------------------------------
 
-test.describe("agent-name message labels @llm", () => {
+// No model involved: the session is imported with its assistant turn already
+// present; this asserts the label the UI renders for it.
+test.describe("agent-name message labels", () => {
   test("assistant turns are attributed to the owning agent", async ({
     page,
     request,
@@ -1269,7 +1274,9 @@ test.describe("Settings dialog", () => {
 // /archive command — fresh empty session under the same sidebar entry
 // ---------------------------------------------------------------------------
 
-test.describe("/archive command @llm", () => {
+// No model involved: `/archive` is intercepted client-side and the seeded
+// history arrives via the import API.
+test.describe("/archive command", () => {
   test("clears history client-side, keeps the same sidebar name", async ({
     page,
     request,
@@ -1432,7 +1439,7 @@ test.describe("Usage manage page", () => {
     await expect(
       page.locator(".usage-table, .usage-empty").first()
     ).toBeVisible();
-    // If the ledger has rows (an earlier @llm test ran a turn), the totals
+    // If the ledger has rows (an earlier test ran a turn), the totals
     // footer must be there; the empty state otherwise.
     const table = page.locator(".usage-table");
     if (await table.isVisible()) {
@@ -1464,15 +1471,7 @@ async function clearAllNotifiers(request: APIRequestContext): Promise<void> {
   }
 }
 
-test.describe("Notifier framework @llm", () => {
-  // The session-goes-idle webhook test depends on a real Claude turn
-  // landing the result event. Under full-suite load haiku occasionally
-  // hangs / produces a different shape, identical pattern to the
-  // agent-collaboration spec; one retry rides over that LLM
-  // non-determinism without masking a real defect (passes in
-  // isolation in ~8 s).
-  test.describe.configure({ retries: 1 });
-
+test.describe("Notifier framework", () => {
   test.beforeEach(async ({ request }) => {
     await clearAllNotifiers(request);
   });
@@ -1526,15 +1525,10 @@ test.describe("Notifier framework @llm", () => {
     expect(after.find((n) => n.label === "CRUD probe")).toBeUndefined();
   });
 
-  test("webhook fires when a real session goes idle (real-CLI)", async ({
+  test("webhook fires when a session goes idle", async ({
     page,
     request,
   }) => {
-    test.skip(
-      !process.env.CLAUDE_BIN && !process.env.PATH?.split(":").length,
-      "claude CLI required"
-    );
-
     // 1. Stand up a tiny HTTP listener on a random local port. The
     //    backend POSTs the session_idle payload here; we read it
     //    after the turn finishes.
@@ -1592,7 +1586,9 @@ test.describe("Notifier framework @llm", () => {
           hasText: "Webhook Fire Probe",
         })
         .click();
-      await page.locator(".chat-input-bar textarea").fill("Reply only with OK.");
+      await page
+        .locator(".chat-input-bar textarea")
+        .fill(`Say OK ${fake({ t: "text", v: "OK" })}`);
       await page.locator("button.btn-send").click();
       // Wait for the turn to complete (result badge appears).
       await expect(page.locator(".result-badge").first()).toBeVisible({
@@ -1827,8 +1823,8 @@ test.describe("File attachments", () => {
 // Validates the load-bearing claim of this feature: bg state survives a
 // per-turn `claude --print` death and the agent gets a follow-up turn.
 
-test.describe("Cross-turn bg tasks @llm", () => {
-  test.setTimeout(180_000);
+test.describe("Cross-turn bg tasks", () => {
+  test.setTimeout(120_000);
 
   test("mcp__bg__run: chip + auto follow-up turn round-trips", async ({
     page,
@@ -1854,16 +1850,18 @@ test.describe("Cross-turn bg tasks @llm", () => {
         .click();
       await expect(page.locator(".chat-header h3")).toHaveText("Bg Run E2E");
 
-      // Be explicit so the model actually calls bg_run rather than
-      // running the shell inline via the regular Bash tool. The system
-      // prompt addendum teaches it about bg_run for ≥30s tasks; with a
-      // 3s sleep we have to nudge it.
-      const prompt =
-        "Use the mcp__bg__run tool RIGHT NOW with command=" +
-        `'sleep 3 && echo ${SENTINEL}' and description='e2e probe'. ` +
-        "After calling it, say 'started' and end your turn. When the " +
-        "follow-up bg-task-result turn arrives, reply by echoing " +
-        `'${SENTINEL}' verbatim.`;
+      // `bg` really calls mcp__bg__run over MCP; `on_bg` is the rule the
+      // fake applies to the follow-up turn the server injects when the task
+      // finishes. `require` makes the reply conditional on the sentinel
+      // actually reaching the model, so this can't pass on a stubbed result.
+      const prompt = `Run a probe ${fake(
+        { t: "on_bg", v: SENTINEL, require: SENTINEL },
+        {
+          t: "bg",
+          command: `sleep 3 && echo ${SENTINEL}`,
+          description: "e2e probe",
+        }
+      )}`;
       await page.locator(".chat-input-bar textarea").fill(prompt);
       await page.locator("button.btn-send").click();
 
@@ -1934,15 +1932,13 @@ test.describe("Cross-turn bg tasks @llm", () => {
 
       // sleep 60 is long enough that the cancel always wins the race —
       // even on a slow Playwright worker the click lands well inside the
-      // first 5 s. The model's follow-up reply uses a sentinel so we can
-      // distinguish "the cancel path drove the model" from "the model
-      // already responded before cancel completed".
-      const prompt =
-        "Use the mcp__bg__run tool RIGHT NOW with " +
-        "command='sleep 60' and description='cancel probe'. " +
-        "After calling it, say 'started' and end your turn. When " +
-        "the follow-up bg-task-result arrives describing a cancelled " +
-        `task, reply with exactly '${REPLY_SENTINEL}' and nothing else.`;
+      // first 5 s. The follow-up reply is gated on the word `cancelled`
+      // appearing in the injected result, so it can only fire if the cancel
+      // path really drove a model turn.
+      const prompt = `Run a probe ${fake(
+        { t: "on_bg", v: REPLY_SENTINEL, require: "cancelled" },
+        { t: "bg", command: "sleep 60", description: "cancel probe" }
+      )}`;
       await page.locator(".chat-input-bar textarea").fill(prompt);
       await page.locator("button.btn-send").click();
 
@@ -2001,8 +1997,8 @@ test.describe("Cross-turn bg tasks @llm", () => {
 // real CLI within a test's wall-clock budget.
 // ---------------------------------------------------------------------------
 
-test.describe("Bg-task pipeline hardening @llm", () => {
-  test.setTimeout(180_000);
+test.describe("Bg-task pipeline hardening", () => {
+  test.setTimeout(120_000);
 
   test("large bg output is delivered to the model via spill pointer", async ({
     page,
@@ -2034,14 +2030,20 @@ test.describe("Bg-task pipeline hardening @llm", () => {
       // Python one-liner that prints ~120 KB of filler followed by the
       // sentinel. 120 KB > LARGE_PROMPT_THRESHOLD_BYTES (100 KB) so
       // the bg-task-result prompt MUST be spilled to a file.
-      const prompt =
-        "Use the mcp__bg__run tool RIGHT NOW with " +
-        "command='python3 -c \"print(\\\"X\\\"*120000); print(\\\"" +
-        SENTINEL +
-        "\\\")\"' and description='spill probe'. After calling it, " +
-        "say 'started' and end your turn. When the follow-up " +
-        "bg-task-result arrives, follow its instructions to Read the " +
-        `referenced file, then reply with the line containing '${SENTINEL}'.`;
+      //
+      // `require` is the sentinel, which the pointer prompt does NOT contain —
+      // it only names the spill file. So the fake can only satisfy the rule by
+      // following the pointer and reading that file, which is the claim under
+      // test: a >MAX_ARG_STRLEN prompt round-trips without E2BIG and the model
+      // still sees the captured output.
+      const prompt = `Run a probe ${fake(
+        { t: "on_bg", v: SENTINEL, require: SENTINEL },
+        {
+          t: "bg",
+          command: `python3 -c "print('X'*120000); print('${SENTINEL}')"`,
+          description: "spill probe",
+        }
+      )}`;
       await page.locator(".chat-input-bar textarea").fill(prompt);
       await page.locator("button.btn-send").click();
 
@@ -2075,8 +2077,11 @@ test.describe("Bg-task pipeline hardening @llm", () => {
   });
 });
 
-test.describe("File viewer (/showme) @llm", () => {
-  test.setTimeout(180_000);
+// No model involved: `/showme intro.md` names a file that exists in the
+// working dir, so showme_ai's layer-1 exact-path short-circuit returns before
+// the one-shot model call.
+test.describe("File viewer (/showme)", () => {
+  test.setTimeout(120_000);
 
   test("/showme on a markdown file opens the viewer with rendered content", async ({
     page,
