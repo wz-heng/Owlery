@@ -8,6 +8,8 @@ path the DB stored into the old tree is rewritten to the new one.
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 
 import pytest
 
@@ -16,6 +18,7 @@ from server.database import Database
 from server.legacy_rename import (
     MARKER_NAME,
     AmbiguousLegacyStateError,
+    LegacyDatabaseBusyError,
     migrate_legacy_state,
     rewrite_legacy_paths,
 )
@@ -60,19 +63,30 @@ def test_moves_home_dir_and_marks_it(tmp_path):
     ) == "# hi"
 
 
-def _legacy_db_with_uncheckpointed_write(path) -> "sqlite3.Connection":
-    """A WAL-mode DB whose newest committed rows still live in the `-wal` file.
+def _legacy_db_with_uncheckpointed_write(path) -> None:
+    """A WAL-mode DB whose committed rows live ONLY in its `-wal` file, with no
+    process holding it.
 
-    Returns the still-OPEN connection: closing it would checkpoint the WAL away
-    and destroy the very condition under test. The caller closes it.
+    Built in a subprocess that exits via `os._exit`, skipping SQLite's cleanup.
+    A normal `close()` checkpoints the WAL back and deletes it, which would
+    leave a plain database and make any test built on it vacuously pass —
+    exactly the false green this fixture exists to avoid. Verified: moving the
+    main file alone at this point yields `no such table`.
     """
-    conn = sqlite3.connect(str(path))
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("CREATE TABLE hist (msg TEXT)")
-    conn.execute("INSERT INTO hist VALUES ('precious')")
-    conn.execute("INSERT INTO hist VALUES ('also precious')")
-    conn.commit()
-    return conn
+    subprocess.run(
+        [
+            sys.executable, "-c",
+            "import sqlite3, os\n"
+            f"c = sqlite3.connect({str(path)!r})\n"
+            "c.execute('PRAGMA journal_mode=WAL')\n"
+            "c.execute('CREATE TABLE hist (msg TEXT)')\n"
+            "c.execute(\"INSERT INTO hist VALUES ('precious')\")\n"
+            "c.execute(\"INSERT INTO hist VALUES ('also precious')\")\n"
+            "c.commit()\n"
+            "os._exit(0)\n",
+        ],
+        check=True,
+    )
 
 
 def test_moves_db_and_folds_in_the_wal(tmp_path):
@@ -80,9 +94,8 @@ def test_moves_db_and_folds_in_the_wal(tmp_path):
     into the main file, move that, and drop the sidecars — no committed
     transaction may be lost."""
     _populate_old_home(tmp_path)
-    writer = _legacy_db_with_uncheckpointed_write(tmp_path / "octopus.db")
-    assert (tmp_path / "octopus.db-wal").exists()  # precondition
-    writer.close()
+    _legacy_db_with_uncheckpointed_write(tmp_path / "octopus.db")
+    assert (tmp_path / "octopus.db-wal").stat().st_size > 0  # precondition
     s = _settings(tmp_path)
 
     migrate_legacy_state(s)
@@ -90,6 +103,63 @@ def test_moves_db_and_folds_in_the_wal(tmp_path):
     assert not (tmp_path / "octopus.db").exists()
     for suffix in ("-wal", "-shm"):
         assert not (tmp_path / f"octopus.db{suffix}").exists()
+
+    conn = sqlite3.connect(str(tmp_path / "owlery.db"))
+    rows = {r[0] for r in conn.execute("SELECT msg FROM hist")}
+    conn.close()
+    assert rows == {"precious", "also precious"}
+
+
+def test_refuses_to_migrate_a_database_another_process_still_holds(tmp_path):
+    """`wal_checkpoint(TRUNCATE)` neither blocks nor raises when a reader holds
+    a snapshot — it returns busy=1 having folded nothing in. Moving the main
+    file then would silently discard every WAL-resident commit, so we abort and
+    ask the user to stop the old server."""
+    (tmp_path / "old").mkdir()
+    db = tmp_path / "octopus.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE hist (msg TEXT)")
+    conn.commit()
+
+    # A reader pinning the WAL, exactly as a still-running old server would.
+    reader = sqlite3.connect(str(db))
+    reader.execute("BEGIN")
+    reader.execute("SELECT * FROM hist").fetchall()
+
+    # A commit that now lives only in the -wal file.
+    conn.execute("INSERT INTO hist VALUES ('only-in-wal')")
+    conn.commit()
+    conn.close()
+    assert (tmp_path / "octopus.db-wal").stat().st_size > 0  # precondition
+
+    s = _settings(tmp_path)
+    try:
+        with pytest.raises(LegacyDatabaseBusyError, match="still in use"):
+            migrate_legacy_state(s)
+
+        # Nothing moved, and the WAL still holds the commit. Asserted while the
+        # reader is alive: closing it checkpoints the WAL away.
+        assert db.exists()
+        assert not (tmp_path / "owlery.db").exists()
+        assert (tmp_path / "octopus.db-wal").stat().st_size > 0
+    finally:
+        reader.close()
+
+    # And the commit really is recoverable once the holder lets go.
+    conn = sqlite3.connect(str(db))
+    rows = {r[0] for r in conn.execute("SELECT msg FROM hist")}
+    conn.close()
+    assert rows == {"only-in-wal"}
+
+
+def test_migrates_a_database_with_a_wal_no_one_holds(tmp_path):
+    """The same DB, once the holder has gone, migrates with its WAL folded in."""
+    (tmp_path / "old").mkdir()
+    _legacy_db_with_uncheckpointed_write(tmp_path / "octopus.db")
+    s = _settings(tmp_path)
+
+    migrate_legacy_state(s)
 
     conn = sqlite3.connect(str(tmp_path / "owlery.db"))
     rows = {r[0] for r in conn.execute("SELECT msg FROM hist")}

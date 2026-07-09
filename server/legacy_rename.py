@@ -113,6 +113,12 @@ class AmbiguousLegacyStateError(RuntimeError):
     boot against one of them and silently fork the user's install in two."""
 
 
+class LegacyDatabaseBusyError(RuntimeError):
+    """The legacy database's WAL could not be folded in, because something else
+    still holds the file. Migrating anyway would discard the transactions the
+    WAL is holding, so we stop and ask for the other process to be shut down."""
+
+
 def migrate_legacy_state(settings) -> bool:
     """Move the pre-rename home directory and database file into place.
 
@@ -193,21 +199,18 @@ def _migrate_db_file(db_path: str) -> None:
     transaction. `TRUNCATE` forces a full checkpoint, after which the main file
     is self-contained and the sidecars carry nothing (SQLite recreates them on
     next open).
+
+    A checkpoint is NOT guaranteed to run. When another process holds a read
+    snapshot on the database — the old server still running — `TRUNCATE`
+    neither blocks nor raises: it returns `busy=1` having folded nothing in.
+    Moving the main file at that point would drop every WAL-resident commit on
+    the floor, so an incomplete checkpoint aborts startup instead.
     """
     legacy = _legacy_db_path(db_path)
     if legacy is None or not os.path.isfile(legacy) or os.path.exists(db_path):
         return
 
-    try:
-        conn = sqlite3.connect(legacy)
-        try:
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        finally:
-            conn.close()
-    except sqlite3.Error:
-        # Not a WAL database, or an unreadable one. Either way the sidecars
-        # below are dealt with the same; a corrupt file is the user's to fix.
-        logger.exception("Owlery: could not checkpoint %s before migrating", legacy)
+    _checkpoint_wal(legacy)
 
     os.replace(legacy, db_path)
     for suffix in ("-wal", "-shm"):
@@ -219,6 +222,39 @@ def _migrate_db_file(db_path: str) -> None:
         except FileNotFoundError:
             pass
     logger.info("Owlery: migrated database %s -> %s", legacy, db_path)
+
+
+def _checkpoint_wal(legacy: str) -> None:
+    """Fold `legacy`'s WAL into the main database file.
+
+    Raises `LegacyDatabaseBusyError` when the checkpoint could not complete,
+    which in practice means another process still has the database open.
+    """
+    if not os.path.exists(legacy + "-wal"):
+        return  # no WAL: either not WAL-mode, or already checkpointed
+
+    try:
+        conn = sqlite3.connect(legacy)
+        try:
+            row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        raise LegacyDatabaseBusyError(
+            f"Could not checkpoint {legacy} before migrating it: {exc}. "
+            f"Stop any process still using the database and start Owlery again."
+        ) from exc
+
+    # (busy, log_frames, checkpointed_frames). busy=1 means a reader held a
+    # snapshot and NOTHING was folded in — see the docstring.
+    if row is None or row[0]:
+        raise LegacyDatabaseBusyError(
+            f"{legacy} is still in use by another process — its write-ahead log "
+            f"could not be folded into the database file, and migrating now "
+            f"would discard every transaction still held there. Stop the old "
+            f"Owlery/Octopus server (and any `sqlite3` shell on that file), "
+            f"then start Owlery again."
+        )
 
 
 # ----------------------------------------------------------------- step 2: DB
