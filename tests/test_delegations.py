@@ -738,7 +738,7 @@ async def test_reply_injection_on_result(dm, mgr, db, monkeypatch):
     injected.clear()
 
     cid = rec.delegation_id
-    await dm._on_broadcast({"type": "assistant_text", "session_id": cid, "content": "Reviewed. "})
+    await dm._on_broadcast({"type": "assistant_text", "session_id": cid, "content": "Reviewed."})
     await dm._on_broadcast({"type": "assistant_text", "session_id": cid, "content": "Looks good."})
     await dm._on_broadcast({"type": "result", "session_id": cid, "is_error": False})
 
@@ -748,7 +748,58 @@ async def test_reply_injection_on_result(dm, mgr, db, monkeypatch):
     target_sid, prompt = injected[0]
     assert target_sid == parent.id
     assert prompt.startswith(f"[agent-reply:Vera delegation={cid}]")
-    assert "Reviewed. Looks good." in prompt
+    # Blocks are paragraphs, not fragments of one sentence: they must be
+    # separated, never fused into "Reviewed.Looks good."
+    assert "Reviewed.\n\nLooks good." in prompt
+
+
+@pytest.mark.asyncio
+async def test_reply_blocks_are_not_fused_into_one_line(dm, mgr, db, monkeypatch):
+    """Multi-block replies stay multi-line.
+
+    Regression: `_inject_terminal` used `"".join(captured_text)`. Real
+    assistant text blocks end at a sentence boundary with NO trailing
+    newline, so every block got glued to the next ("...version.Crit...")
+    and the whole reply collapsed into one multi-thousand-character line,
+    which the parent's delegation card then rendered as a wall of text.
+    """
+    injected: list[tuple[str, str]] = []
+
+    async def capture(sid, prompt, attachment_ids=None):
+        injected.append((sid, prompt))
+
+    monkeypatch.setattr(mgr, "start_message", capture)
+    octo = await db.get_system_agent()
+    await _make_agent(db, "Vera")
+    parent = await _make_session(mgr, octo["id"], name="parent")
+    rec = await dm.start_delegation(
+        parent_session_id=parent.id, agent_name="vera", request="r",
+    )
+    injected.clear()
+    cid = rec.delegation_id
+
+    # Shape of a real reply: complete blocks, none ending in a newline.
+    blocks = [
+        "I fixed the sys.path bootstrap.",
+        "Now I'll introspect the constructor signature.",
+        "Decisive finding: get_custom_info() does not expose position.",
+    ]
+    for b in blocks:
+        await dm._on_broadcast(
+            {"type": "assistant_text", "session_id": cid, "content": b}
+        )
+    await dm._on_broadcast({"type": "result", "session_id": cid, "is_error": False})
+
+    _, prompt = injected[0]
+    body = prompt.split("\n", 1)[1]
+    # Every block survives intact, on its own line...
+    for b in blocks:
+        assert b in body
+    # ...and none is fused to its neighbour.
+    assert "bootstrap.Now" not in body
+    assert "signature.Decisive" not in body
+    # The longest line is a single block, not the whole reply.
+    assert max(len(line) for line in body.split("\n")) <= max(len(b) for b in blocks)
 
 
 @pytest.mark.asyncio

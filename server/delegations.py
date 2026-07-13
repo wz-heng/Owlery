@@ -911,7 +911,15 @@ class DelegationManager:
             return
         rec._terminal_injected = True
         if rec.state == "completed":
-            body = ("".join(rec.captured_text)).strip()
+            # Each captured entry is one COMPLETE assistant text block
+            # (session_manager broadcasts `assistant_text` per block, not
+            # per token), and blocks carry no trailing newline. Joining
+            # with "" therefore fused every block into one multi-thousand-
+            # character line — the parent's card renders the body as
+            # pre-wrap, so that one line wrapped into a wall of text.
+            # Blank-line separation is what the blocks are: paragraphs.
+            blocks = [t.strip() for t in rec.captured_text if t.strip()]
+            body = "\n\n".join(blocks)
             if not body:
                 body = "(child session ended without producing any text)"
             prompt = (
