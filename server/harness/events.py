@@ -95,3 +95,40 @@ class HarnessOneshotError(Exception):
     def __init__(self, code: str, message: str = "") -> None:
         super().__init__(message or code)
         self.code = code
+
+
+def join_text_blocks(blocks: list[str]) -> str:
+    """Join captured `text` events back into one body.
+
+    Every consumer that accumulates `text` events (delegation replies,
+    research leaves) must use this — NOT `"".join`.
+
+    A `text` event carries one COMPLETE assistant block: Claude ignores
+    `stream_event` and emits whole content blocks, and Codex only emits on
+    `item.completed`. Neither is a token delta. Blocks end at a sentence
+    boundary with no trailing newline, so `"".join` fuses them —
+    `...bootstrap.Now I'll...` — collapsing a whole reply into one
+    multi-thousand-character line.
+
+    We insert a separator ONLY where the boundary lacks one, and we never
+    rewrite a block's interior:
+
+    - Blocks are joined verbatim. Stripping each block would eat
+      *meaningful* leading whitespace — an indented Markdown code block
+      (`    print(1)`) or a list continuation line would be destroyed.
+    - The separator is a single `\\n`, not a blank line. A block boundary is
+      not necessarily a paragraph boundary: two blocks of `- first` /
+      `- second` are one tight list, and forcing a blank line between them
+      would render it as a loose list and change what the reading model sees.
+    - A block that already ends in a newline gets no extra separator.
+
+    Only the assembled body is trimmed at its outer edges.
+    """
+    out: list[str] = []
+    for block in blocks:
+        if not block:
+            continue
+        if out and not out[-1].endswith("\n") and not block.startswith("\n"):
+            out.append("\n")
+        out.append(block)
+    return "".join(out).strip()

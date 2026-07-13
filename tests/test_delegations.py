@@ -748,9 +748,8 @@ async def test_reply_injection_on_result(dm, mgr, db, monkeypatch):
     target_sid, prompt = injected[0]
     assert target_sid == parent.id
     assert prompt.startswith(f"[agent-reply:Vera delegation={cid}]")
-    # Blocks are paragraphs, not fragments of one sentence: they must be
-    # separated, never fused into "Reviewed.Looks good."
-    assert "Reviewed.\n\nLooks good." in prompt
+    # Blocks must be separated, never fused into "Reviewed.Looks good."
+    assert "Reviewed.\nLooks good." in prompt
 
 
 @pytest.mark.asyncio
@@ -800,6 +799,79 @@ async def test_reply_blocks_are_not_fused_into_one_line(dm, mgr, db, monkeypatch
     assert "signature.Decisive" not in body
     # The longest line is a single block, not the whole reply.
     assert max(len(line) for line in body.split("\n")) <= max(len(b) for b in blocks)
+
+
+@pytest.mark.asyncio
+async def test_reply_preserves_block_interior_whitespace(dm, mgr, db, monkeypatch):
+    """Joining must not rewrite a block's interior.
+
+    Regression on the FIX: stripping each block before joining would eat
+    meaningful leading whitespace — an indented Markdown code block comes
+    out dedented and stops being code. Blocks are joined verbatim; only the
+    assembled body is trimmed at its outer edges.
+    """
+    injected: list[tuple[str, str]] = []
+
+    async def capture(sid, prompt, attachment_ids=None):
+        injected.append((sid, prompt))
+
+    monkeypatch.setattr(mgr, "start_message", capture)
+    octo = await db.get_system_agent()
+    await _make_agent(db, "Vera")
+    parent = await _make_session(mgr, octo["id"], name="parent")
+    rec = await dm.start_delegation(
+        parent_session_id=parent.id, agent_name="vera", request="r",
+    )
+    injected.clear()
+    cid = rec.delegation_id
+
+    for content in ["Here's the repro:", "    print(1)", "That's the whole bug."]:
+        await dm._on_broadcast(
+            {"type": "assistant_text", "session_id": cid, "content": content}
+        )
+    await dm._on_broadcast({"type": "result", "session_id": cid, "is_error": False})
+
+    _, prompt = injected[0]
+    body = prompt.split("\n", 1)[1]
+    # The code block keeps its indent — it is still a code block.
+    assert "\n    print(1)\n" in body
+    assert "print(1)" in body.split("\n")[1]  # the line itself is indented
+    assert body.split("\n")[1].startswith("    ")
+
+
+@pytest.mark.asyncio
+async def test_reply_does_not_loosen_a_tight_list(dm, mgr, db, monkeypatch):
+    """A block boundary is not necessarily a paragraph boundary.
+
+    Regression on the FIX: joining with a BLANK line would turn two list-item
+    blocks into a loose list, changing both the Markdown rendering and what
+    the parent's model reads. A single newline is the right separator.
+    """
+    injected: list[tuple[str, str]] = []
+
+    async def capture(sid, prompt, attachment_ids=None):
+        injected.append((sid, prompt))
+
+    monkeypatch.setattr(mgr, "start_message", capture)
+    octo = await db.get_system_agent()
+    await _make_agent(db, "Vera")
+    parent = await _make_session(mgr, octo["id"], name="parent")
+    rec = await dm.start_delegation(
+        parent_session_id=parent.id, agent_name="vera", request="r",
+    )
+    injected.clear()
+    cid = rec.delegation_id
+
+    for content in ["- first", "- second"]:
+        await dm._on_broadcast(
+            {"type": "assistant_text", "session_id": cid, "content": content}
+        )
+    await dm._on_broadcast({"type": "result", "session_id": cid, "is_error": False})
+
+    _, prompt = injected[0]
+    body = prompt.split("\n", 1)[1]
+    assert body == "- first\n- second"
+    assert "\n\n" not in body  # tight list stays tight
 
 
 @pytest.mark.asyncio

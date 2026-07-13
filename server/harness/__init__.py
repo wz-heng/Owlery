@@ -9,7 +9,13 @@ Profiles self-register on import; importing this package wires them up
 
 from __future__ import annotations
 
-from .events import HarnessCredential, HarnessEvent, HarnessOneshotError, TokenUsage
+from .events import (
+    HarnessCredential,
+    HarnessEvent,
+    HarnessOneshotError,
+    TokenUsage,
+    join_text_blocks,
+)
 from .fork import (
     HISTORY_REPLAY,
     NATIVE_TRANSCRIPT,
@@ -43,6 +49,7 @@ __all__ = [
     "HarnessEvent",
     "HarnessOneshotError",
     "TokenUsage",
+    "join_text_blocks",
     "Harness",
     "HarnessRun",
     "RunConfig",

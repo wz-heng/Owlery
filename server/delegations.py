@@ -47,6 +47,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+from .harness import join_text_blocks
+
 if TYPE_CHECKING:
     from .database import Database
     from .session_manager import SessionManager
@@ -911,15 +913,12 @@ class DelegationManager:
             return
         rec._terminal_injected = True
         if rec.state == "completed":
-            # Each captured entry is one COMPLETE assistant text block
-            # (session_manager broadcasts `assistant_text` per block, not
-            # per token), and blocks carry no trailing newline. Joining
-            # with "" therefore fused every block into one multi-thousand-
-            # character line — the parent's card renders the body as
-            # pre-wrap, so that one line wrapped into a wall of text.
-            # Blank-line separation is what the blocks are: paragraphs.
-            blocks = [t.strip() for t in rec.captured_text if t.strip()]
-            body = "\n\n".join(blocks)
+            # Each captured entry is one COMPLETE assistant text block, and
+            # blocks carry no trailing newline — `"".join` would fuse them
+            # into one multi-thousand-character line, which the parent's
+            # card then renders as a wall of pre-wrap text. See
+            # `join_text_blocks`, which both this and the research leaf use.
+            body = join_text_blocks(rec.captured_text)
             if not body:
                 body = "(child session ended without producing any text)"
             prompt = (

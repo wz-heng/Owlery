@@ -24,6 +24,7 @@ from server.harness import (
     TurnContext,
     available_backends,
     get_harness,
+    join_text_blocks,
     register,
 )
 from server.harness import assembly
@@ -486,3 +487,46 @@ async def test_run_oneshot_reaps_group_on_cancel(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await task
     assert _signal.SIGKILL in calls
+
+
+# ---------------------------------------------------------------------------
+# join_text_blocks — the shared aggregator for captured `text` events
+# ---------------------------------------------------------------------------
+
+
+def test_join_text_blocks_separates_blocks_without_trailing_newline():
+    """The core bug: real blocks end at a sentence boundary with no newline,
+    so `"".join` fused them into one enormous line."""
+    assert join_text_blocks(["Fixed the bootstrap.", "Now the signature."]) == (
+        "Fixed the bootstrap.\nNow the signature."
+    )
+
+
+def test_join_text_blocks_preserves_interior_whitespace():
+    """Blocks are joined verbatim — stripping each would dedent a code block."""
+    body = join_text_blocks(["Repro:", "    print(1)", "Done."])
+    assert body == "Repro:\n    print(1)\nDone."
+
+
+def test_join_text_blocks_keeps_a_tight_list_tight():
+    """A block boundary is not a paragraph boundary: a blank-line separator
+    would turn a tight Markdown list into a loose one."""
+    assert join_text_blocks(["- first", "- second"]) == "- first\n- second"
+
+
+def test_join_text_blocks_does_not_double_up_existing_boundaries():
+    """A block that already ends in a newline gets no extra separator."""
+    assert join_text_blocks(["para one\n", "para two"]) == "para one\npara two"
+    assert join_text_blocks(["para one\n\n", "para two"]) == "para one\n\npara two"
+    assert join_text_blocks(["para one", "\npara two"]) == "para one\npara two"
+
+
+def test_join_text_blocks_trims_only_the_outer_edges():
+    body = join_text_blocks(["\n  leading kept inside  \n", "tail"])
+    assert body == "leading kept inside  \ntail"
+
+
+def test_join_text_blocks_skips_empty_blocks_and_handles_none():
+    assert join_text_blocks([]) == ""
+    assert join_text_blocks(["", "a", "", "b"]) == "a\nb"
+    assert join_text_blocks(["   "]) == ""
