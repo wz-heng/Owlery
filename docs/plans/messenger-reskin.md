@@ -98,7 +98,12 @@ Owl post. Warm light theme — parchment, ink, amber.
 - **No layout/DOM restructuring.** Sidebar, navigation, page
   composition all stay. If using the new skin surfaces a structural
   itch, that's a separate plan ("换骨" was explicitly deferred by
-  the owner).
+  the owner). *Clarified after review*: this bans rearranging or
+  removing existing structure, not adding nodes. The additive markup
+  that §3's brand moments and §4.5's empty states / skeletons
+  inherently require (a logo wrapper, an empty-state copy block,
+  skeleton elements) is in-scope by design — the tripwire for "went
+  too deep" remains the e2e suite passing unmodified.
 - **No dark theme.** Messenger is a light identity. The token
   consolidation (§4.2) leaves a dark theme as a future one-file
   addition, but it ships with a real need, not now.
