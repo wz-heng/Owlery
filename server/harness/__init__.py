@@ -26,6 +26,8 @@ from .profile import (
     RuntimeProfile,
     TranscriptCodec,
     TurnContext,
+    TurnFailure,
+    UsageLimitHit,
     WebCapability,
 )
 from .registry import (
@@ -48,6 +50,8 @@ __all__ = [
     "RunConfig",
     "RuntimeProfile",
     "TurnContext",
+    "TurnFailure",
+    "UsageLimitHit",
     "WebCapability",
     "OneShotContext",
     "McpServerEntry",

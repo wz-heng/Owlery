@@ -294,4 +294,19 @@ describe("sessionStore", () => {
     ).toEqual(["i2"]);
     expect(useSessionStore.getState().agentConnectorIds["a1"]).toEqual(["i2"]);
   });
+
+  // Usage-limit park (limit-auto-resume.md §4)
+  it("tracks a parked turn per session and clears it on resume", () => {
+    const { setParkedTurn, clearParkedTurn } = useSessionStore.getState();
+
+    setParkedTurn("s1", { resumeAt: "2026-07-14T22:00:00+00:00", limitKind: "five_hour" });
+    setParkedTurn("s2", { resumeAt: null });
+    expect(useSessionStore.getState().parkedTurns["s1"]?.limitKind).toBe("five_hour");
+    expect(useSessionStore.getState().parkedTurns["s2"]?.resumeAt).toBeNull();
+
+    // Clearing one session's park must not disturb another's.
+    clearParkedTurn("s1");
+    expect(useSessionStore.getState().parkedTurns["s1"]).toBeUndefined();
+    expect(useSessionStore.getState().parkedTurns["s2"]).toBeDefined();
+  });
 });

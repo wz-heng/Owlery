@@ -7,6 +7,10 @@ from ..session_manager import ForkError, fork_info_fields, session_manager
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
+# The ParkedTurnRunner, wired in by main.py's lifespan (like schedules._runner).
+# None outside a booted app — the cancel route 404s rather than exploding.
+_parked_turns = None
+
 
 def _fork_fields(s) -> dict:
     """The public fork fields for SessionInfo, from a live Session."""
@@ -285,6 +289,20 @@ async def reset_session(session_id: str, _: str = Depends(verify_token)):
     except ValueError:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Session not found")
     return {"status": "ok"}
+
+
+@router.delete("/{session_id}/parked-turn", status_code=status.HTTP_204_NO_CONTENT)
+async def cancel_parked_turn(session_id: str, _: str = Depends(verify_token)):
+    """Cancel a pending usage-limit auto-resume (limit-auto-resume.md §4).
+
+    Drops the record and its wake-up job, so the parked turn will not fire when
+    the limit resets. The queued prompts behind it are released to drain
+    normally — the user is taking the wheel back."""
+    if _parked_turns is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No parked turn")
+    if not await _parked_turns.cancel(session_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No parked turn")
+    await session_manager.release_parked_queue(session_id)
 
 
 @router.post(

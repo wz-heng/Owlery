@@ -369,6 +369,35 @@ CREATE INDEX IF NOT EXISTS idx_turn_usage_agent_time
   ON turn_usage(agent_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_turn_usage_session
   ON turn_usage(session_id);
+
+-- Parked turns awaiting a usage-limit reset (limit-auto-resume.md §4). A turn
+-- that failed on the USER'S OWN limit is persisted here, not slept on: the
+-- wait is multi-hour, so it must survive a restart — on boot these rows
+-- rebuild their APScheduler wake-up jobs. At most one park per session (the
+-- session is single-turn), so session_id is the PK and a re-park UPDATEs.
+-- New-table-only — CREATE IF NOT EXISTS is a no-op migration.
+CREATE TABLE IF NOT EXISTS parked_turns (
+    session_id TEXT PRIMARY KEY,
+    -- How to resume, decided at park time and reused verbatim from the
+    -- transient-retry two-mode recovery (harness-transient-retry.md §4):
+    --   'prompt'   → no output had streamed; re-run `payload` (the original
+    --                prompt) from resume_at, discarding the failed attempt's id
+    --   'continue' → output streamed and a resume id was captured; resume the
+    --                conversation so tools don't re-run and text can't dupe
+    resume_mode TEXT NOT NULL,             -- 'prompt' | 'continue'
+    payload TEXT NOT NULL,                 -- original prompt ('prompt') | 'continue'
+    resume_at_turn_start TEXT,             -- backend resume id as of turn start
+    limit_kind TEXT,                       -- backend's window name: five_hour | usage_limit | …
+    reset_at TEXT,                         -- ISO-8601 UTC; NULL ⇒ probe mode
+    wake_at TEXT NOT NULL,                 -- ISO-8601 UTC; reset_at + stagger, or the probe tick
+    attempts INTEGER NOT NULL DEFAULT 0,   -- consecutive parks with no progress (cap 3)
+    probes INTEGER NOT NULL DEFAULT 0,     -- consecutive probe ticks (cap 12)
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_parked_turns_wake
+  ON parked_turns(wake_at);
 """
 
 
@@ -2297,6 +2326,83 @@ class Database:
         )
         await self._conn.commit()
         return cursor.rowcount
+
+    # ------------------------------------------------------------------ parked turns
+
+    _PARKED_COLS = (
+        "session_id, resume_mode, payload, resume_at_turn_start, limit_kind, "
+        "reset_at, wake_at, attempts, probes, created_at"
+    )
+
+    @staticmethod
+    def _row_to_parked_turn(row: Any) -> dict[str, Any]:
+        return {
+            "session_id": row[0],
+            "resume_mode": row[1],
+            "payload": row[2],
+            "resume_at_turn_start": row[3],
+            "limit_kind": row[4],
+            "reset_at": row[5],
+            "wake_at": row[6],
+            "attempts": row[7],
+            "probes": row[8],
+            "created_at": row[9],
+        }
+
+    async def upsert_parked_turn(self, row: dict[str, Any]) -> None:
+        """Park a limit-failed turn, or re-park an existing one (the PK is the
+        session, so a re-park overwrites). limit-auto-resume.md §4."""
+        await self._ensure_connected()
+        await self._conn.execute(
+            "INSERT INTO parked_turns "
+            "(session_id, resume_mode, payload, resume_at_turn_start, limit_kind, "
+            " reset_at, wake_at, attempts, probes, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET "
+            "  resume_mode = excluded.resume_mode, "
+            "  payload = excluded.payload, "
+            "  resume_at_turn_start = excluded.resume_at_turn_start, "
+            "  limit_kind = excluded.limit_kind, "
+            "  reset_at = excluded.reset_at, "
+            "  wake_at = excluded.wake_at, "
+            "  attempts = excluded.attempts, "
+            "  probes = excluded.probes",
+            (
+                row["session_id"], row["resume_mode"], row["payload"],
+                row.get("resume_at_turn_start"), row.get("limit_kind"),
+                row.get("reset_at"), row["wake_at"],
+                row.get("attempts", 0), row.get("probes", 0), row["created_at"],
+            ),
+        )
+        await self._conn.commit()
+
+    async def get_parked_turn(self, session_id: str) -> dict[str, Any] | None:
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            f"SELECT {self._PARKED_COLS} FROM parked_turns WHERE session_id = ?",
+            (session_id,),
+        )
+        row = await cursor.fetchone()
+        return self._row_to_parked_turn(row) if row else None
+
+    async def list_parked_turns(self) -> list[dict[str, Any]]:
+        """Every pending park, oldest wake-up first — the boot rebuild reads
+        this to recreate the APScheduler jobs a restart destroyed."""
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            f"SELECT {self._PARKED_COLS} FROM parked_turns ORDER BY wake_at"
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_parked_turn(r) for r in rows]
+
+    async def delete_parked_turn(self, session_id: str) -> bool:
+        """Drop a park (it resumed, or the user cancelled it). True if a row went."""
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            "DELETE FROM parked_turns WHERE session_id = ?", (session_id,)
+        )
+        await self._conn.commit()
+        return cursor.rowcount > 0
 
     # ------------------------------------------------------------------ turn usage
 

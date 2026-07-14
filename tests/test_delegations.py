@@ -1894,3 +1894,66 @@ async def test_route_answer_409_when_no_pending(client, monkeypatch):
         headers=HEADERS,
     )
     assert r.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_parked_child_stays_pending_not_failed(dm, mgr, db, monkeypatch):
+    """A child parked on the user's usage limit is PENDING, not failed
+    (limit-auto-resume.md §4).
+
+    The park marker rides the `error` event shape, and the delegation handler
+    finalises on `error` — so without the `limit_paused` guard a parked child
+    would inject a bogus `[agent-error]` into its parent AND then resume hours
+    later to answer a delegation nobody is waiting on any more.
+    """
+    monkeypatch.setattr(mgr, "start_message", _noop_start_message)
+    octo = await db.get_system_agent()
+    await _make_agent(db, "Vera")
+    parent = await _make_session(mgr, octo["id"])
+    rec = await dm.start_delegation(
+        parent_session_id=parent.id, agent_name="vera", request="r",
+    )
+
+    await dm._on_broadcast({
+        "type": "error",
+        "code": "limit_paused",
+        "session_id": rec.delegation_id,
+        "message": "(usage limit reached — auto-resuming at 22:30)",
+    })
+
+    # Still running: the parent keeps waiting through the park.
+    assert rec.state == "running"
+    assert rec.error is None
+    # The child is alive — it has a turn to come back to.
+    assert mgr.get_session(rec.delegation_id) is not None
+
+    # The resumed turn ends the delegation for real.
+    await dm._on_broadcast({
+        "type": "result", "session_id": rec.delegation_id, "is_error": False,
+    })
+    assert rec.state == "completed"
+
+
+@pytest.mark.asyncio
+async def test_a_genuine_child_error_still_fails_the_delegation(
+    dm, mgr, db, monkeypatch
+):
+    """The park guard must be narrow: an ordinary error (and the terminal
+    'gave up after N resumes' marker) must still fail the delegation, or a
+    broken child would hang its parent forever."""
+    monkeypatch.setattr(mgr, "start_message", _noop_start_message)
+    octo = await db.get_system_agent()
+    await _make_agent(db, "Vera")
+    parent = await _make_session(mgr, octo["id"])
+    rec = await dm.start_delegation(
+        parent_session_id=parent.id, agent_name="vera", request="r",
+    )
+
+    await dm._on_broadcast({
+        "type": "error",
+        "code": "limit_exhausted",
+        "session_id": rec.delegation_id,
+        "message": "Still usage-limited after 3 automatic resumes.",
+    })
+
+    assert rec.state == "failed"

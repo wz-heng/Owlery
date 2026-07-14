@@ -34,6 +34,15 @@ export type AttachmentMetadata = ApiAttachmentMetadata;
 // rendering, not 1-to-1 with `MessageContent` from the contract (which has
 // `content: unknown` because tool_result can carry arbitrary JSON). Leave
 // hand-rolled.
+/** A turn parked until the user's usage limit resets (limit-auto-resume.md §4).
+ *  It resumes on its own — no user action needed — but the user can cancel it. */
+export interface ParkedTurn {
+  /** ISO-8601 UTC instant the parked turn will auto-resume. */
+  resumeAt: string | null;
+  /** The backend's name for the exhausted window ("five_hour", …). */
+  limitKind?: string | null;
+}
+
 export interface Message {
   role: "user" | "assistant" | "system" | "tool";
   type: string;
@@ -123,6 +132,13 @@ interface SessionStore {
 
   credentials: CredentialInfo[];
   setCredentials: (c: CredentialInfo[]) => void;
+
+  // Sessions parked on a usage limit, keyed by session id
+  // (limit-auto-resume.md §4). The turn auto-resumes at `resumeAt` with no
+  // user action; the banner exists so the wait is visible and cancellable.
+  parkedTurns: Record<string, ParkedTurn>;
+  setParkedTurn: (sessionId: string, p: ParkedTurn) => void;
+  clearParkedTurn: (sessionId: string) => void;
 
   // Connectors (connectors.md). Installations are global; the catalog lists
   // installable kinds. Per-agent enablement (which installations an agent may
@@ -318,6 +334,15 @@ export const useSessionStore = create<SessionStore>((set) => ({
 
   credentials: [],
   setCredentials: (credentials) => set({ credentials }),
+
+  parkedTurns: {},
+  setParkedTurn: (sessionId, parked) =>
+    set((s) => ({ parkedTurns: { ...s.parkedTurns, [sessionId]: parked } })),
+  clearParkedTurn: (sessionId) =>
+    set((s) => {
+      const { [sessionId]: _dropped, ...rest } = s.parkedTurns;
+      return { parkedTurns: rest };
+    }),
 
   connectorCatalog: [],
   setConnectorCatalog: (connectorCatalog) => set({ connectorCatalog }),

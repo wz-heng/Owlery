@@ -173,6 +173,19 @@ function handleWsMessage(data: Record<string, unknown>) {
         type: "error",
         content: data.message as string,
       });
+      // The turn hit the user's own usage limit and is parked until the window
+      // resets (limit-auto-resume.md §4). It comes back on its own — show the
+      // wait (and the cancel affordance) rather than leaving a dead session.
+      if (data.code === "limit_paused") {
+        getState().setParkedTurn(sessionId, {
+          resumeAt: (data.resume_at as string) ?? null,
+          limitKind: (data.limit_kind as string) ?? null,
+        });
+      }
+      // Auto-resume gave up after repeated limits — no longer pending.
+      if (data.code === "limit_exhausted") {
+        getState().clearParkedTurn(sessionId);
+      }
       // A mid-turn 401 flagged the bound credential needs_reconnect server-side
       // (harness-credential-reauth.md §6). Refetch credentials so the Harness
       // sidebar lights up its "Re-authorize" badge without a manual reload.
@@ -187,6 +200,11 @@ function handleWsMessage(data: Record<string, unknown>) {
             .catch(() => {});
         }
       }
+      break;
+
+    case "limit_resumed":
+      // The limit reset and the parked turn is running again — drop the banner.
+      getState().clearParkedTurn(sessionId);
       break;
 
     case "bg_started": {
