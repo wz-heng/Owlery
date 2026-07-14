@@ -102,7 +102,7 @@ export function AgentList({ onCreateAgent }: { onCreateAgent: () => void }) {
           Agents
         </h2>
         <button
-          className="btn-agent-add inline-flex h-6 w-6 items-center justify-center rounded-md text-sidebar-foreground/70 hover:bg-[hsl(var(--gray-200))] hover:text-sidebar-foreground transition-colors"
+          className="btn-agent-add inline-flex h-6 w-6 items-center justify-center rounded-md text-sidebar-foreground/70 hover:bg-sidebar-selected hover:text-sidebar-foreground transition-colors"
           onClick={onCreateAgent}
           title="New agent"
           aria-label="New agent"
@@ -120,7 +120,7 @@ export function AgentList({ onCreateAgent }: { onCreateAgent: () => void }) {
               <div
                 className={`agent-item group flex items-center gap-1.5 rounded-lg pl-1 pr-2 py-1.5 cursor-pointer transition-colors ${
                   isActive
-                    ? "active bg-[hsl(var(--gray-200))] text-foreground"
+                    ? "active bg-sidebar-selected text-foreground font-medium"
                     : "text-sidebar-foreground hover:bg-sidebar-accent"
                 }`}
                 onClick={() => {

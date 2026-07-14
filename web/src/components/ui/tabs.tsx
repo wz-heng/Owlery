@@ -3,12 +3,11 @@ import * as React from "react";
 
 import { cn } from "../../lib/utils";
 
-/** Radix-backed Tabs with vm0-style chrome.
+/** Radix-backed Tabs.
  *
- * Radix gives keyboard nav + ARIA for free; the className shape mirrors
- * vm0's custom Tabs so the visual stays consistent with our design
- * system (rounded-lg muted background, active state on bg-background
- * with shadow). */
+ * Radix gives keyboard nav + ARIA for free; the chrome is ours — a
+ * sunken parchment track with the active tab raised onto card, so the
+ * selected tab reads as the sheet on top of the pile. */
 
 const Tabs = TabsPrimitive.Root;
 
@@ -19,7 +18,7 @@ const TabsList = React.forwardRef<
   <TabsPrimitive.List
     ref={ref}
     className={cn(
-      "inline-flex h-9 items-center justify-center rounded-lg bg-muted p-1 text-muted-foreground",
+      "inline-flex h-9 items-center justify-center rounded-lg bg-ink-200 p-1 text-muted-foreground",
       className
     )}
     {...props}
@@ -34,7 +33,7 @@ const TabsTrigger = React.forwardRef<
   <TabsPrimitive.Trigger
     ref={ref}
     className={cn(
-      "inline-flex items-center justify-center whitespace-nowrap rounded-md px-3 py-1 text-sm font-medium ring-offset-background transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow text-muted-foreground hover:text-foreground",
+      "inline-flex items-center justify-center whitespace-nowrap rounded-md px-3 py-1 text-sm font-medium ring-offset-background transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 data-[state=active]:bg-card data-[state=active]:text-primary-700 data-[state=active]:shadow-sm text-muted-foreground hover:text-foreground",
       className
     )}
     {...props}

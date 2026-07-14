@@ -55,9 +55,9 @@ export function QuestionPrompt({ question, onSubmit }: Props) {
   };
 
   return (
-    <div className="msg msg-question rounded-lg border-[0.7px] border-primary/30 bg-card overflow-hidden">
-      <div className="question-header flex items-center gap-2.5 px-3 py-2 bg-primary-50 text-sm text-foreground">
-        <IconHelpCircle size={18} className="text-primary shrink-0" />
+    <div className="msg msg-question rounded-lg border-[0.7px] border-attention/35 bg-card overflow-hidden">
+      <div className="question-header flex items-center gap-2.5 px-3 py-2 bg-attention-surface text-sm text-foreground">
+        <IconHelpCircle size={18} className="text-attention shrink-0" />
         <strong>Claude is asking</strong>
       </div>
       <div className="question-body px-3 py-3 space-y-5">
@@ -83,7 +83,7 @@ export function QuestionPrompt({ question, onSubmit }: Props) {
                       className={`question-option flex items-start gap-3 px-4 py-3 rounded-lg border-[0.7px] cursor-pointer transition-colors ${
                         isSelected
                           ? "selected border-primary bg-primary-50"
-                          : "border-border hover:bg-accent"
+                          : "border-ink-300 hover:border-primary/40 hover:bg-primary-50/50"
                       }`}
                       key={j}
                     >

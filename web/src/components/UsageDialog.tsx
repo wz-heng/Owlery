@@ -8,6 +8,7 @@ import {
   DialogTitle,
 } from "./ui/dialog";
 import { DEFAULT_AGENT_AVATAR } from "../lib/agentAvatar";
+import { Skeleton } from "./ui/skeleton";
 
 const API_URL = window.location.origin;
 
@@ -66,6 +67,10 @@ export function UsageDialog({ open, onOpenChange }: Props) {
   const [windowDays, setWindowDays] = useState(30);
   const [data, setData] = useState<UsageSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Distinguishes "still fetching" from "fetched, and there is nothing".
+  // Without it the dialog claims "No usage recorded in this window" during
+  // the request — asserting an absence it hasn't confirmed yet.
+  const [loading, setLoading] = useState(false);
 
   // Abort the in-flight request whenever the controls change or the dialog
   // closes — a slow stale response must never land after a fresh one and
@@ -79,6 +84,7 @@ export function UsageDialog({ open, onOpenChange }: Props) {
       const since = new Date(Date.now() - windowDays * 86_400_000);
       params.set("since", since.toISOString());
     }
+    setLoading(true);
     (async () => {
       try {
         const res = await fetch(`${API_URL}/api/usage/summary?${params}`, {
@@ -96,6 +102,8 @@ export function UsageDialog({ open, onOpenChange }: Props) {
         setData(body);
       } catch {
         if (!ctrl.signal.aborted) setError("Failed to load usage");
+      } finally {
+        if (!ctrl.signal.aborted) setLoading(false);
       }
     })();
     return () => ctrl.abort();
@@ -163,16 +171,23 @@ export function UsageDialog({ open, onOpenChange }: Props) {
         </div>
 
         {error ? (
-          <div className="usage-error rounded-lg border border-dashed border-border bg-muted/30 px-4 py-8 text-center text-sm text-muted-foreground">
+          <div className="usage-error rounded-lg border border-dashed border-destructive/40 bg-destructive-surface px-4 py-10 text-center text-sm text-destructive">
             {error}
           </div>
+        ) : loading && !data ? (
+          <div className="usage-loading space-y-2" aria-busy="true">
+            <Skeleton className="h-9 w-full" />
+            {Array.from({ length: 5 }, (_, i) => (
+              <Skeleton key={i} className="h-8 w-full" />
+            ))}
+          </div>
         ) : !data || data.rows.length === 0 ? (
-          <div className="usage-empty rounded-lg border border-dashed border-border bg-muted/30 px-4 py-8 text-center text-sm text-muted-foreground">
+          <div className="usage-empty rounded-lg border border-dashed border-ink-400 bg-ink-100 px-4 py-10 text-center text-sm text-muted-foreground">
             No usage recorded in this window yet. Run a turn and it will show
             up here.
           </div>
         ) : (
-          <div className="usage-table max-h-[60vh] overflow-auto rounded-lg border border-border">
+          <div className="usage-table max-h-[60vh] overflow-auto rounded-lg border border-ink-300">
             <table className="w-full text-sm">
               <thead className="sticky top-0 bg-card text-xs uppercase tracking-wider text-muted-foreground">
                 <tr className="[&>th]:px-3 [&>th]:py-2 [&>th]:font-semibold">

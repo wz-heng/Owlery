@@ -251,7 +251,7 @@ export function ConnectorList() {
           Connectors
         </span>
         <button
-          className="btn-connector-add inline-flex h-6 w-6 items-center justify-center rounded-md text-sidebar-foreground/70 hover:bg-[hsl(var(--gray-200))] hover:text-sidebar-foreground transition-colors"
+          className="btn-connector-add inline-flex h-6 w-6 items-center justify-center rounded-md text-sidebar-foreground/70 hover:bg-sidebar-selected hover:text-sidebar-foreground transition-colors"
           onClick={() => {
             resetDialog();
             setOpen(true);

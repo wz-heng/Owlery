@@ -3,6 +3,7 @@ import { IconGitFork, IconX } from "@tabler/icons-react";
 import { useSessionStore, type SessionInfo } from "../stores/sessionStore";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
+import { Skeleton } from "./ui/skeleton";
 
 const API_URL = window.location.origin;
 
@@ -326,7 +327,7 @@ export function ForkDialog({
 
   return (
     <div
-      className="fork-dialog-overlay fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+      className="fork-dialog-overlay fixed inset-0 z-50 flex items-center justify-center bg-ink-950/50 p-4"
       onClick={onClose}
     >
       <div
@@ -380,7 +381,11 @@ export function ForkDialog({
         )}
 
         {inConfirm && !preview && !error && (
-          <p className="text-sm text-muted-foreground">Loading…</p>
+          <div className="fork-loading space-y-2" aria-busy="true">
+            <Skeleton className="h-4 w-2/3" />
+            <Skeleton className="h-20 w-full" />
+            <Skeleton className="h-4 w-1/3" />
+          </div>
         )}
 
         {inConfirm && preview && (

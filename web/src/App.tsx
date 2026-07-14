@@ -34,15 +34,21 @@ function App() {
     const submit = () => {
       if (tokenInput.trim()) setToken(tokenInput.trim());
     };
+    // Brand moment #1. The owl is the hero, not a favicon in the corner:
+    // it sits in a brass wax-seal disc above the wordmark, and the whole
+    // card reads as a sealed letter waiting to be opened.
     return (
       <div className="login-screen min-h-screen flex items-center justify-center bg-background p-6">
-        <div className="w-full max-w-sm rounded-2xl border-[0.7px] border-border bg-card p-8 shadow-[0_8px_40px_-12px_rgba(20,23,29,0.12)]">
-          <div className="space-y-1.5 mb-6">
-            <h1 className="text-2xl font-bold tracking-tight text-foreground">
+        <div className="w-full max-w-sm rounded-2xl border-[0.7px] border-border bg-card p-8 shadow-xl">
+          <div className="flex flex-col items-center text-center mb-7">
+            <span className="mb-4 inline-flex size-14 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-md">
+              <OwleryLogo size={30} />
+            </span>
+            <h1 className="font-brand text-3xl font-semibold tracking-tight text-foreground">
               Owlery
             </h1>
-            <p className="text-sm text-muted-foreground leading-relaxed">
-              Enter your access token to continue.
+            <p className="mt-1.5 text-sm text-muted-foreground leading-relaxed">
+              Your agents are waiting. Present your token to enter.
             </p>
           </div>
           <div className="space-y-4">
@@ -61,7 +67,7 @@ function App() {
               />
             </div>
             <Button className="btn-login w-full" onClick={submit}>
-              Connect
+              Enter the Owlery
             </Button>
           </div>
         </div>
@@ -127,11 +133,15 @@ function AuthenticatedApp({
         className={`sidebar ${sidebarOpen ? "open" : ""}`}
         aria-label="Sidebar"
       >
-        {/* Wordmark — vm0 has an org switcher here; we just brand it. */}
+        {/* Brand moment #2 — the wordmark lockup. Same brass seal as the
+         * login screen, scaled down: the mark the user just met at the
+         * door is the one that stays with them in the rail. */}
         <div className="shrink-0 flex items-center justify-between gap-2 px-3 pt-3 pb-2">
-          <div className="flex items-center gap-2 min-w-0">
-            <OwleryLogo size={22} className="text-primary shrink-0" />
-            <span className="truncate text-base font-bold text-sidebar-foreground">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <span className="inline-flex size-7 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-sm">
+              <OwleryLogo size={16} />
+            </span>
+            <span className="truncate font-brand text-lg font-semibold tracking-tight text-sidebar-foreground">
               Owlery
             </span>
           </div>

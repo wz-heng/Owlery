@@ -7,12 +7,11 @@
       content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
     />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      rel="stylesheet"
-      href="https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;500;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
-    />
+    <!-- No webfonts by design. The Messenger type stacks (tokens.css) are
+         system faces only, so there is no render-blocking <link> to Google
+         Fonts, no FOUT, and no third-party request on first paint. Don't
+         reintroduce one without checking that trade. -->
+    <meta name="theme-color" content="#faf7f0" />
     <title>Owlery</title>
   </head>
   <body>

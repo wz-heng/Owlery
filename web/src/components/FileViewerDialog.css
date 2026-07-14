@@ -1,34 +1,38 @@
-/* GitHub-flavored markdown styling for the FileViewerDialog body.
+/* Document styling for the FileViewerDialog body — the "Messenger"
+ * reading surface.
  *
  * Layered on top of @tailwindcss/typography (the .prose base class):
  * the plugin gives reasonable line-height, list indents, spacing, etc.;
- * we override the bits that matter for a GitHub-feel (heading scale +
- * bottom borders, table grid lines, code block container, inline code
- * background, blockquote styling).
+ * we override the bits that carry the identity (serif heading scale +
+ * hairline rules, table grid, code-block slab, inline code, blockquote).
  *
  * Selector strategy: scope everything under .md-github so it only
  * targets the viewer body and not, e.g., the assistant message bubbles
  * elsewhere in the chat that use `.markdown` for plain react-markdown.
+ * The class name predates this reskin and is load-bearing in the DOM;
+ * it now just means "the viewer's document body".
  *
- * Colors come from the project's CSS variables (see tokens.css) so the
- * styling tracks the rest of the app's theme.
+ * Every colour reads a token from tokens.css — no literals.
  */
 
 .md-github {
-  /* GitHub default body line height + font size feel. The prose-sm
-   * modifier already sets a 14px base; we just nudge line-height. */
-  line-height: 1.55;
+  /* A reading measure, not a UI density. The prose-sm modifier already
+   * sets a 14px base; we open the leading up for long-form. */
+  line-height: 1.65;
   color: hsl(var(--foreground));
 }
 
 /* ── Headings ─────────────────────────────────────────────────────── */
 
+/* Serif headings are the brand voice — this is a *document*, and it
+ * should look like one. Body stays on the sans. */
 .md-github h1,
 .md-github h2,
 .md-github h3,
 .md-github h4,
 .md-github h5,
 .md-github h6 {
+  font-family: var(--font-family-serif);
   font-weight: 600;
   line-height: 1.25;
   margin-top: 1.5em;
@@ -70,15 +74,18 @@
 
 .md-github strong { font-weight: 600; }
 
-/* ── Inline code (GitHub pink-on-gray look, but neutral) ───────── */
+/* ── Inline code ─────────────────────────────────────────────────── */
 
+/* Brass-on-tint, matching the chat's inline code exactly — an identifier
+ * mentioned in prose looks the same wherever it is rendered. */
 .md-github :not(pre) > code {
-  font-family: var(--font-family-mono, ui-monospace, "SF Mono", Menlo, monospace);
+  font-family: var(--font-family-mono);
   font-size: 0.88em;
   padding: 0.16em 0.36em;
   margin: 0;
-  background-color: hsl(var(--muted));
-  border-radius: 4px;
+  background-color: hsl(var(--primary-50));
+  color: hsl(var(--primary-700));
+  border-radius: var(--radius-sm);
   /* prose adds backticks around inline code via ::before/::after — kill */
 }
 .md-github :not(pre) > code::before,
@@ -86,24 +93,22 @@
 
 /* ── Block code (the container our custom MarkdownPreBlock wraps) ── */
 
-.md-github .md-codeblock { /* wrapper from MarkdownPreBlock */ }
-
 .md-github .md-codeblock pre {
-  /* White (card) background, matching GitHub's actual code-block
-   * rendering. The hljs github theme we ship (highlight.js's
-   * github.css) is calibrated for this exact background — its
-   * comment color is #6a737d (medium gray), which is readable on
-   * white but vanished against the prior muted-gray background.
-   * Page bg in this project is already slightly off-white, so the
-   * white code block stands out distinctly without needing a heavy
-   * border. */
-  background-color: hsl(var(--card));
-  border: 1px solid hsl(var(--border));
-  border-radius: 6px;
+  /* A sunken parchment well, not a white card: the dialog body is
+   * already the raised card surface, so a *lighter* code block would
+   * have nothing to sit on. Going one step darker (ink-100) makes the
+   * slab read as inset, and matches the chat's code-block treatment so
+   * the same snippet looks the same in both places.
+   *
+   * The parchment hljs theme (styles/highlight-parchment.css) is
+   * calibrated against this surface — every token clears AA on it. */
+  background-color: hsl(var(--ink-100));
+  border: 1px solid hsl(var(--ink-300));
+  border-radius: var(--radius-md);
   padding: 0.8rem 1rem;
   overflow-x: auto;
   font-size: 0.85em;
-  line-height: 1.5;
+  line-height: 1.55;
   margin: 0;
 }
 .md-github .md-codeblock pre code {
@@ -115,7 +120,7 @@
   color: hsl(var(--foreground));
 }
 
-/* ── Tables (GitHub grid look) ───────────────────────────────────── */
+/* ── Tables ──────────────────────────────────────────────────────── */
 
 .md-github table {
   display: block;
@@ -133,18 +138,22 @@
 }
 .md-github th {
   font-weight: 600;
-  background-color: hsl(var(--muted) / 0.4);
+  background-color: hsl(var(--ink-200));
 }
-.md-github tr:nth-child(2n) td { background-color: hsl(var(--muted) / 0.25); }
+.md-github tr:nth-child(2n) td { background-color: hsl(var(--ink-100) / 0.7); }
 
 /* ── Blockquote ──────────────────────────────────────────────────── */
 
+/* Brass rule on a faint tint — a quoted passage in a letter, marked in
+ * the margin. */
 .md-github blockquote {
   margin: 1em 0;
-  padding: 0 1em;
+  padding: 0.4em 1em;
   color: hsl(var(--muted-foreground));
-  border-left: 0.25em solid hsl(var(--border));
-  font-style: normal; /* prose italicizes; GitHub doesn't */
+  border-left: 3px solid hsl(var(--primary-300));
+  background: hsl(var(--primary-50) / 0.5);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  font-style: normal; /* prose italicizes; a quote isn't an aside */
 }
 .md-github blockquote > :first-child { margin-top: 0; }
 .md-github blockquote > :last-child { margin-bottom: 0; }
@@ -177,11 +186,18 @@
 
 .md-github img {
   max-width: 100%;
-  border-radius: 6px;
+  border-radius: var(--radius-md);
   background-color: hsl(var(--card));
 }
 
 /* ── KaTeX (math) ────────────────────────────────────────────────── */
+
+/* KaTeX ships no colour of its own — it inherits, which on parchment
+ * lands on ink. Pin it anyway so a future prose/plugin change can't
+ * leave formulas a different colour from the prose around them. */
+.md-github .katex {
+  color: hsl(var(--foreground));
+}
 
 /* Display-mode math centers and gets a bit of breathing room. */
 .md-github .katex-display {
@@ -190,7 +206,7 @@
   overflow-y: hidden;
 }
 
-/* ── Kill some prose defaults that fight GitHub feel ─────────────── */
+/* ── Kill some prose defaults that fight the document feel ───────── */
 
 /* prose adds quote marks around <q> and around blockquotes; nuke those */
 .md-github blockquote::before,

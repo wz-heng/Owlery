@@ -9,16 +9,18 @@ const buttonVariants = cva(
   {
     variants: {
       variant: {
+        // Filled brass — the one loud element on a page. `shadow-sm` gives
+        // it a hair of lift off the parchment; pressing flattens it.
         default:
-          "bg-primary text-primary-foreground hover:bg-primary/90 active:bg-primary/80",
+          "bg-primary text-primary-foreground shadow-sm hover:bg-primary-600 active:bg-primary-700 active:shadow-none",
         destructive:
-          "bg-destructive text-destructive-foreground hover:bg-destructive/90 active:bg-destructive/80",
+          "bg-destructive text-destructive-foreground shadow-sm hover:bg-destructive/90 active:bg-destructive/80 active:shadow-none",
         outline:
-          "border-[0.7px] border-gray-400 bg-background hover:bg-gray-50 active:bg-gray-100 text-foreground",
+          "border-[0.7px] border-ink-400 bg-card hover:bg-ink-100 hover:border-primary/50 active:bg-ink-200 text-foreground",
         secondary:
-          "bg-secondary text-secondary-foreground hover:bg-secondary/80 active:bg-secondary/70",
-        ghost: "text-primary hover:bg-accent active:bg-accent/80",
-        link: "text-primary underline-offset-4 hover:underline active:text-primary/80",
+          "bg-secondary text-secondary-foreground hover:bg-ink-300 active:bg-ink-300/80",
+        ghost: "text-primary hover:bg-primary-50 active:bg-primary-100",
+        link: "text-primary underline-offset-4 hover:underline active:text-primary-700",
       },
       size: {
         default: "h-10 px-4 py-2",

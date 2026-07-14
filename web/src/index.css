@@ -1,12 +1,12 @@
-/* All design tokens (colors, radius, sidebar surfaces) live in
- * tokens.css as `H S% L%` triplets wrapped by `hsl(var(--token))`.
- * This file used to carry a legacy unlayered `:root` palette
- * (--accent, --border, …) that silently broke those tokens: being
- * unlayered it beat tokens.css's layered values, and because it
- * stored *full* `hsl(...)` colors, `hsl(var(--accent))` resolved to
- * the invalid `hsl(hsl(...))` — killing every `bg-accent`/`border-border`
- * hover. The few selectors below that need those values now read the
- * gray scale from tokens.css directly. */
+/* Layout + global element styling. Every colour here reads a semantic
+ * token from tokens.css (`hsl(var(--…))`) — no literal colours live in
+ * this file, so a reskin (or a future dark theme) stays a one-file job.
+ *
+ * This file used to carry a legacy unlayered `:root` palette (--accent,
+ * --border, …) that silently broke those tokens: being unlayered it beat
+ * tokens.css's layered values, and because it stored *full* `hsl(...)`
+ * colors, `hsl(var(--accent))` resolved to the invalid `hsl(hsl(...))` —
+ * killing every `bg-accent`/`border-border` hover. Don't reintroduce one. */
 
 /* Universal reset. Wrapped in `@layer base` so Tailwind v4's utility
  * classes (which live in cascade layers) can still set padding/margin.
@@ -18,7 +18,7 @@
     padding: 0;
     box-sizing: border-box;
     scrollbar-width: thin;
-    scrollbar-color: hsl(var(--gray-300)) transparent;
+    scrollbar-color: hsl(var(--ink-400) / 0.5) transparent;
   }
 }
 
@@ -32,14 +32,14 @@
 }
 
 *::-webkit-scrollbar-thumb {
-  background: hsl(var(--gray-300));
+  background: hsl(var(--ink-400) / 0.5);
   border-radius: 5px;
   border: 2px solid transparent;
   background-clip: padding-box;
 }
 
 *::-webkit-scrollbar-thumb:hover {
-  background: hsl(var(--gray-500));
+  background: hsl(var(--ink-600) / 0.7);
   background-clip: padding-box;
   border: 2px solid transparent;
 }
@@ -62,6 +62,12 @@ body {
 
 #root {
   height: 100%;
+}
+
+/* Text selection picks up the brand rather than the browser's blue. */
+::selection {
+  background: hsl(var(--primary-200));
+  color: hsl(var(--ink-950));
 }
 
 /* Layout */
@@ -106,27 +112,33 @@ body {
 }
 
 /* Markdown nested output — react-markdown wraps assistant text in
- * .markdown; these selectors style its <pre>/<code>/<table> output. */
+ * .markdown; these selectors style its <pre>/<code>/<table> output.
+ * The chat's code blocks sit on a sunken parchment well with a hairline
+ * border, so they read as an inset slab rather than a grey rectangle. */
 .msg-assistant .markdown pre {
-  background: hsl(var(--gray-50));
-  padding: 0.6rem;
-  border-radius: var(--radius);
+  background: hsl(var(--ink-100));
+  border: 1px solid hsl(var(--ink-300));
+  padding: 0.7rem 0.85rem;
+  border-radius: var(--radius-md);
   overflow-x: auto;
   margin: 0.5rem 0;
   font-family: var(--font-family-mono);
   font-size: 0.85rem;
+  line-height: 1.55;
 }
 
 .msg-assistant .markdown code {
-  background: hsl(var(--gray-50));
-  padding: 0.1rem 0.3rem;
-  border-radius: 3px;
+  background: hsl(var(--primary-50));
+  color: hsl(var(--primary-700));
+  padding: 0.1rem 0.32rem;
+  border-radius: var(--radius-sm);
   font-size: 0.9em;
   font-family: var(--font-family-mono);
 }
 
 .msg-assistant .markdown pre code {
   background: none;
+  color: inherit;
   padding: 0;
 }
 
@@ -137,6 +149,39 @@ body {
 .msg-assistant .markdown ul, .msg-assistant .markdown ol {
   padding-left: 1.5rem;
   margin: 0.4rem 0;
+}
+
+/* Assistant headings take the brand serif — the one place the voice
+ * shows up inside the chat stream itself. */
+.msg-assistant .markdown h1,
+.msg-assistant .markdown h2,
+.msg-assistant .markdown h3 {
+  font-family: var(--font-family-serif);
+  font-weight: 600;
+  line-height: 1.3;
+  margin: 0.75rem 0 0.35rem;
+}
+
+.msg-assistant .markdown h1 { font-size: 1.35em; }
+.msg-assistant .markdown h2 { font-size: 1.2em; }
+.msg-assistant .markdown h3 { font-size: 1.08em; }
+
+.msg-assistant .markdown a {
+  color: hsl(var(--primary-700));
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-color: hsl(var(--primary-700) / 0.35);
+}
+
+.msg-assistant .markdown a:hover {
+  text-decoration-color: hsl(var(--primary-700));
+}
+
+.msg-assistant .markdown blockquote {
+  margin: 0.5rem 0;
+  padding: 0.1rem 0 0.1rem 0.85rem;
+  border-left: 3px solid hsl(var(--primary-300));
+  color: hsl(var(--muted-foreground));
 }
 
 .msg-assistant .markdown table {
@@ -150,19 +195,32 @@ body {
 
 .msg-assistant .markdown th,
 .msg-assistant .markdown td {
-  border: 1px solid hsl(var(--gray-200));
+  border: 1px solid hsl(var(--ink-300));
   padding: 0.4rem 0.7rem;
   text-align: left;
   white-space: nowrap;
 }
 
 .msg-assistant .markdown th {
-  background: hsl(var(--gray-50));
+  background: hsl(var(--ink-200));
   font-weight: 600;
 }
 
 .msg-assistant .markdown tr:nth-child(even) {
-  background: hsl(var(--gray-50));
+  background: hsl(var(--ink-100));
+}
+
+/* KaTeX inherits the body colour by default; on parchment that is the
+ * right ink, but the display-mode block gets breathing room and scrolls
+ * rather than overflowing the bubble. */
+.msg-assistant .markdown .katex {
+  color: hsl(var(--foreground));
+}
+
+.msg-assistant .markdown .katex-display {
+  margin: 0.75rem 0;
+  overflow-x: auto;
+  overflow-y: hidden;
 }
 
 /* Mobile responsive */
@@ -184,7 +242,7 @@ body {
     display: block;
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.4);
+    background: hsl(var(--ink-950) / 0.45);
     z-index: 99;
   }
 

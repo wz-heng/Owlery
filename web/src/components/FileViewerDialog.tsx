@@ -17,10 +17,8 @@
  * auth token in the query string (matches the attachments pattern,
  * required for <img src> and <iframe src>).
  *
- * Visual reference: VM0's AttachmentLightbox
- * (vm0/turbo/apps/platform/src/views/zero-page/zero-attachment-chips.tsx)
- * — centered modal, ~1100px wide pane, dark backdrop, header w/
- * filename + actions in the top-right.
+ * Layout: centered modal, ~1100px pane, dimmed backdrop, header with
+ * the filename plus actions in the top-right.
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -43,7 +41,7 @@ import rehypeHighlight from "rehype-highlight";
 import rehypeKatex from "rehype-katex";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 
-import "highlight.js/styles/github.css";
+import "../styles/highlight-parchment.css";
 import "katex/dist/katex.min.css";
 import "./FileViewerDialog.css";
 
@@ -145,7 +143,7 @@ export function FileViewerDialog() {
     <DialogPrimitive.Root open={open} onOpenChange={onOpenChange}>
       <DialogPrimitive.Portal>
         <DialogPrimitive.Overlay
-          className="fixed inset-0 z-[100] bg-black/70 backdrop-blur-sm data-[state=open]:animate-in data-[state=open]:fade-in-0"
+          className="fixed inset-0 z-[100] bg-ink-950/60 backdrop-blur-sm data-[state=open]:animate-in data-[state=open]:fade-in-0"
         />
         <DialogPrimitive.Content
           aria-describedby={undefined}
@@ -362,6 +360,9 @@ function ImageBody({ bytesUrl, alt }: { bytesUrl: string; alt: string }) {
             zoomed ? "max-h-none max-w-none cursor-zoom-out" : "max-h-[70vh] max-w-full object-contain cursor-zoom-in"
           )}
         />
+        {/* Literal black/white, not tokens: this badge floats over an
+         * arbitrary image, so it has to stay legible against content we
+         * don't control rather than against the app's parchment. */}
         <span className="absolute right-2 top-2 flex items-center justify-center size-7 rounded-full bg-black/50 text-white opacity-0 transition-opacity group-hover:opacity-100">
           {zoomed ? <IconZoomOut size={14} /> : <IconZoomIn size={14} />}
         </span>
@@ -378,6 +379,8 @@ function PdfBody({ bytesUrl }: { bytesUrl: string }) {
     <iframe
       src={bytesUrl}
       title="PDF preview"
+      // White, not parchment: this is the PDF's own page, and the
+      // browser's viewer draws its chrome assuming a white sheet.
       className="block h-full w-full border-0 bg-white"
       sandbox="allow-same-origin allow-scripts"
     />

@@ -164,7 +164,7 @@ export function SessionList({
         <div
           className={`session-item group flex items-center gap-2 rounded-lg px-2 py-1.5 cursor-pointer transition-colors ${
             s.id === activeSessionId
-              ? "active bg-[hsl(var(--gray-200))] text-foreground"
+              ? "active bg-sidebar-selected text-foreground font-medium"
               : "text-sidebar-foreground hover:bg-sidebar-accent"
           }`}
           onClick={() => selectSession(s.id)}
@@ -174,7 +174,7 @@ export function SessionList({
               s.status === "running"
                 ? "bg-primary animate-pulse"
                 : s.status === "waiting_approval"
-                ? "bg-yellow-500"
+                ? "bg-attention-solid"
                 : "bg-muted-foreground/40"
             }`}
           />
@@ -231,7 +231,7 @@ export function SessionList({
     <div className="session-list session-list-nested ml-3 mt-0.5 mb-1 pl-2 border-l border-sidebar-border/40">
       <div className="session-list-items flex flex-col gap-0">
         {agentSessions.length === 0 && !formOpen && (
-          <div className="text-[11px] italic text-sidebar-foreground/40 px-2 py-1">
+          <div className="text-[11px] italic text-sidebar-foreground/45 px-2 py-1">
             No sessions yet.
           </div>
         )}

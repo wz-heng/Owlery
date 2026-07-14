@@ -47,7 +47,7 @@ function StatusIcon({ status }: { status: BgTask["status"] }) {
     return <IconLoader2 size={14} className="animate-spin text-primary" />;
   }
   if (status === "completed") {
-    return <IconCheck size={14} className="text-green-700" />;
+    return <IconCheck size={14} className="text-success" />;
   }
   if (status === "cancelled" || status === "interrupted") {
     return <IconHandStop size={14} className="text-muted-foreground" />;
@@ -103,7 +103,7 @@ export function BgTaskChip({ sessionId, taskId }: Props) {
 
   if (!task) {
     return (
-      <div className="octo-bgtask-chip mt-2 inline-flex items-center gap-2 rounded-md border border-border bg-muted/40 px-2.5 py-1.5 text-xs text-muted-foreground">
+      <div className="octo-bgtask-chip mt-2 inline-flex items-center gap-2 rounded-md border border-ink-300 bg-ink-100 px-2.5 py-1.5 text-xs text-muted-foreground">
         <IconLoader2 size={12} className="animate-spin" />
         <span>Loading bg task {taskId}…</span>
       </div>
@@ -130,12 +130,12 @@ export function BgTaskChip({ sessionId, taskId }: Props) {
   };
 
   const headerStyle: Record<BgTask["status"], string> = {
-    pending: "border-border bg-muted/40",
-    running: "border-primary/40 bg-primary/5",
-    completed: "border-green-700/40 bg-green-50",
-    failed: "border-destructive/40 bg-destructive/5",
-    cancelled: "border-border bg-muted/40",
-    interrupted: "border-border bg-muted/40",
+    pending: "border-ink-300 bg-ink-100",
+    running: "border-primary/40 bg-primary-50",
+    completed: "border-success/40 bg-success-surface",
+    failed: "border-destructive/40 bg-destructive-surface",
+    cancelled: "border-ink-300 bg-ink-100",
+    interrupted: "border-ink-300 bg-ink-100",
   };
 
   const lastOut = lastLine(task.stdout) || lastLine(task.stderr);

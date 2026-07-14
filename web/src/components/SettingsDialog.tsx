@@ -99,7 +99,7 @@ export function SettingsDialog({ open, onOpenChange }: Props) {
                 Access token
               </div>
               <div className="flex items-center gap-2">
-                <div className="flex-1 text-sm text-foreground font-mono break-all rounded-lg border-[0.7px] border-gray-400 px-3 py-2 bg-input">
+                <div className="flex-1 text-sm text-foreground font-mono break-all rounded-lg border-[0.7px] border-ink-400 px-3 py-2 bg-input">
                   {token || <span className="text-muted-foreground">(none)</span>}
                 </div>
                 <Button

@@ -10,8 +10,13 @@ import {
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
+import rehypeHighlight from "rehype-highlight";
 import rehypeKatex from "rehype-katex";
 import "katex/dist/katex.min.css";
+// The chat renders far more code than the file viewer does, so the parchment
+// hljs theme is imported here too rather than riding on the viewer having
+// been mounted — the two share one stylesheet, so this costs nothing.
+import "../styles/highlight-parchment.css";
 import {
   useSessionStore,
   type AttachmentMetadata,
@@ -76,7 +81,7 @@ function AttachmentList({
               href={url}
               target="_blank"
               rel="noreferrer"
-              className="attachment-thumb block rounded-md border border-border overflow-hidden bg-muted/40 hover:border-primary/60 transition-colors"
+              className="attachment-thumb block rounded-md border border-ink-300 overflow-hidden bg-ink-100 transition-colors hover:border-primary"
               title={`${a.filename} (${formatBytes(a.size)})`}
             >
               <img
@@ -94,7 +99,7 @@ function AttachmentList({
             download={a.filename}
             target="_blank"
             rel="noreferrer"
-            className="attachment-chip inline-flex items-center gap-2 rounded-md border border-border bg-muted/40 px-2.5 py-1.5 text-xs text-foreground hover:border-primary/60 transition-colors"
+            className="attachment-chip inline-flex items-center gap-2 rounded-md border border-ink-300 bg-ink-100 px-2.5 py-1.5 text-xs text-foreground transition-colors hover:border-primary hover:bg-primary-50"
           >
             <IconFile size={14} className="text-muted-foreground shrink-0" />
             <span className="font-medium truncate max-w-[12rem]">{a.filename}</span>
@@ -158,7 +163,11 @@ export function MessageBubble({
                 )}
                 <span>You</span>
               </div>
-              <div className="msg-content inline-block rounded-lg border border-primary/60 bg-card px-4 py-3 text-sm text-foreground whitespace-pre-wrap break-words">
+              {/* The user's own words are the one thing on screen tinted
+               * with the brand — sent mail, sealed in brass. The agent's
+               * reply (below) sits on plain card, so the two speakers are
+               * distinguishable by surface alone, not just alignment. */}
+              <div className="msg-content inline-block rounded-lg rounded-br-sm border border-primary/35 bg-primary-50 px-4 py-3 text-sm text-foreground whitespace-pre-wrap break-words shadow-sm">
                 {message.content}
               </div>
               {message.attachments && message.attachments.length > 0 && (
@@ -181,10 +190,16 @@ export function MessageBubble({
             )}
             <span>{assistantLabel}</span>
           </div>
-          <div className="msg-content markdown rounded-lg border border-border bg-card px-4 py-3 text-sm leading-relaxed">
+          <div className="msg-content markdown rounded-lg rounded-tl-sm border border-border bg-card px-4 py-3 text-sm leading-relaxed shadow-sm">
             <Markdown
               remarkPlugins={[remarkGfm, remarkMath]}
-              rehypePlugins={[rehypeKatex]}
+              // `ignoreMissing`: the model names languages hljs may not have
+              // registered (or invents one); without it an unknown fence
+              // throws and takes the whole message down.
+              rehypePlugins={[
+                [rehypeHighlight, { ignoreMissing: true }],
+                rehypeKatex,
+              ]}
             >
               {message.content || ""}
             </Markdown>
@@ -209,7 +224,7 @@ export function MessageBubble({
             <div className="msg-label text-xs font-semibold text-muted-foreground text-right">
               You
             </div>
-            <div className="msg-content msg-question-answer inline-block rounded-lg border border-primary/60 bg-card px-4 py-3 text-sm text-foreground italic whitespace-pre-wrap break-words">
+            <div className="msg-content msg-question-answer inline-block rounded-lg rounded-br-sm border border-primary/35 bg-primary-50 px-4 py-3 text-sm text-foreground italic whitespace-pre-wrap break-words shadow-sm">
               {message.content}
             </div>
           </div>
@@ -219,7 +234,7 @@ export function MessageBubble({
     case "result":
       return (
         <div className="msg msg-system flex justify-center py-1">
-          <span className="result-badge text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted px-2 py-0.5 rounded-full">
+          <span className="result-badge text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-ink-200 px-2 py-0.5 rounded-full">
             Done{message.cost != null ? ` · $${message.cost.toFixed(4)}` : ""}
           </span>
         </div>
@@ -234,8 +249,8 @@ export function MessageBubble({
           <span
             className={`notice-pill max-w-[85%] rounded-full border px-3 py-1 text-xs ${
               message.is_error
-                ? "border-destructive/30 bg-destructive/10 text-destructive"
-                : "border-border bg-muted text-muted-foreground"
+                ? "border-destructive/30 bg-destructive-surface text-destructive"
+                : "border-ink-300 bg-ink-100 text-muted-foreground"
             }`}
           >
             {message.content}
@@ -249,7 +264,7 @@ export function MessageBubble({
           <div className="msg-label text-xs font-semibold text-destructive">
             Error
           </div>
-          <div className="msg-content rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive whitespace-pre-wrap break-words">
+          <div className="msg-content rounded-lg border border-destructive/40 bg-destructive-surface px-4 py-3 text-sm text-destructive whitespace-pre-wrap break-words">
             {message.content}
           </div>
         </div>
@@ -316,19 +331,22 @@ function ToolUseBlock({
         )
       : undefined;
 
+  // Tool machinery is *subordinate* to speech: it sits on the sunken
+  // parchment well with no shadow, while messages sit raised on card.
+  // Depth alone tells the user what is being said vs. what is being done.
   return (
     <div className="space-y-1.5">
-      <div className="msg msg-tool rounded-lg border border-border bg-card overflow-hidden">
+      <div className="msg msg-tool rounded-lg border border-ink-300 bg-ink-100 overflow-hidden">
         <button
           type="button"
-          className="tool-header w-full flex items-center gap-2 px-3 py-2 text-left text-sm hover:bg-accent/50 transition-colors"
+          className="tool-header w-full flex items-center gap-2 px-3 py-2 text-left text-sm transition-colors hover:bg-primary-50"
           onClick={() => setExpanded(!expanded)}
         >
           <span className="tool-icon text-muted-foreground shrink-0">
             {expanded ? <IconChevronDown size={14} /> : <IconChevronRight size={14} />}
           </span>
           <IconTool size={14} className="text-primary shrink-0" />
-          <span className="tool-name font-medium text-primary shrink-0">
+          <span className="tool-name font-mono text-[13px] font-medium text-primary-700 shrink-0">
             {message.tool_name}
           </span>
           {preview && (
@@ -338,7 +356,7 @@ function ToolUseBlock({
           )}
         </button>
         {expanded && (
-          <pre className="tool-detail border-t border-border bg-muted/40 px-4 py-2.5 text-xs font-mono text-foreground overflow-x-auto whitespace-pre-wrap break-words max-h-80 overflow-y-auto">
+          <pre className="tool-detail border-t border-ink-300 bg-card px-4 py-2.5 text-xs font-mono text-foreground overflow-x-auto whitespace-pre-wrap break-words max-h-80 overflow-y-auto">
             {inputStr}
           </pre>
         )}
@@ -388,7 +406,7 @@ function BgChipForToolUse({
   });
   if (!matchedId) {
     return (
-      <div className="octo-bgtask-chip inline-flex items-center gap-2 rounded-md border border-border bg-muted/40 px-2.5 py-1.5 text-xs text-muted-foreground">
+      <div className="octo-bgtask-chip inline-flex items-center gap-2 rounded-md border border-ink-300 bg-ink-100 px-2.5 py-1.5 text-xs text-muted-foreground">
         <span>Waiting for bg task to register…</span>
       </div>
     );
@@ -422,7 +440,7 @@ function BgTaskResultMessage({
         <button
           type="button"
           onClick={() => setExpanded((e) => !e)}
-          className="msg-content w-full text-left inline-block rounded-lg border border-dashed border-border bg-muted/30 px-4 py-3 text-sm text-foreground hover:bg-muted/50 transition-colors"
+          className="msg-content w-full text-left inline-block rounded-lg border border-dashed border-ink-400 bg-ink-100 px-4 py-3 text-sm text-foreground transition-colors hover:bg-ink-200"
           title={expanded ? "Collapse" : "Expand full result"}
           aria-expanded={expanded}
         >
@@ -455,13 +473,13 @@ function ToolResultBlock({ message }: { message: Message }) {
     <div
       className={`msg msg-tool-result rounded-lg border overflow-hidden ${
         errored
-          ? "error border-destructive/50 bg-destructive/5"
-          : "border-border bg-card"
+          ? "error border-destructive/50 bg-destructive-surface"
+          : "border-ink-300 bg-ink-100"
       }`}
     >
       <button
         type="button"
-        className="tool-header w-full flex items-center gap-2 px-3 py-2 text-left text-sm hover:bg-accent/50 transition-colors"
+        className="tool-header w-full flex items-center gap-2 px-3 py-2 text-left text-sm transition-colors hover:bg-primary-50"
         onClick={() => setExpanded(!expanded)}
       >
         <span className="tool-icon text-muted-foreground shrink-0">
@@ -469,7 +487,7 @@ function ToolResultBlock({ message }: { message: Message }) {
         </span>
         <span
           className={`tool-result-label text-xs font-semibold uppercase tracking-wider shrink-0 ${
-            errored ? "text-destructive" : "text-green-700"
+            errored ? "text-destructive" : "text-success"
           }`}
         >
           {errored ? "Error" : "Result"}
@@ -484,8 +502,8 @@ function ToolResultBlock({ message }: { message: Message }) {
         <pre
           className={`tool-detail border-t px-4 py-2.5 text-xs font-mono whitespace-pre-wrap break-words max-h-80 overflow-y-auto ${
             errored
-              ? "border-destructive/30 bg-destructive/5 text-destructive"
-              : "border-border bg-muted/40 text-foreground"
+              ? "border-destructive/30 bg-destructive-surface text-destructive"
+              : "border-ink-300 bg-card text-foreground"
           }`}
         >
           {content}

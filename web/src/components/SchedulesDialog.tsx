@@ -89,7 +89,7 @@ export function SchedulesDialog({ open, onOpenChange }: Props) {
         </DialogHeader>
 
         {schedules.length === 0 ? (
-          <div className="schedules-empty rounded-lg border border-dashed border-border bg-muted/30 px-4 py-8 text-center text-sm text-muted-foreground">
+          <div className="schedules-empty rounded-lg border border-dashed border-ink-400 bg-ink-100 px-4 py-10 text-center text-sm text-muted-foreground">
             No schedules yet. Type{" "}
             <code className="font-mono text-foreground">/schedule 30m …</code>{" "}
             in any chat to create one.

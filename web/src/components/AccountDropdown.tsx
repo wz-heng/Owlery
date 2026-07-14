@@ -15,7 +15,7 @@ import {
 } from "./ui/dropdown-menu";
 import { TOKEN_KEY, readStored } from "../lib/storage";
 
-/** vm0-style account block pinned to the bottom of the sidebar.
+/** Account block pinned to the bottom of the sidebar.
  *
  * This is the single home for settings: there are no gear icons in the
  * sidebar itself. "Settings" opens the app/connection dialog; "Agent

@@ -3,7 +3,7 @@ import { twMerge } from "tailwind-merge";
 
 /** Combine Tailwind class names, merging conflicting utilities sensibly.
  *
- * Pattern lifted from shadcn / vm0 (`packages/ui/src/lib/utils.ts`).
+ * The standard shadcn `cn` helper.
  * `clsx` collapses falsy values + arrays; `twMerge` resolves conflicts
  * so `cn("px-2", "px-4")` returns `"px-4"` not `"px-2 px-4"`.
  */

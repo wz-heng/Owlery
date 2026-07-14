@@ -126,7 +126,7 @@ export function SlashCommandMenu({
   return (
     <div
       className={cn(
-        "slash-menu z-30 overflow-hidden rounded-xl border-[0.7px] border-gray-400 bg-card p-1 shadow-lg",
+        "slash-menu z-30 overflow-hidden rounded-xl border-[0.7px] border-ink-400 bg-card p-1 shadow-lg",
         className
       )}
       role="listbox"
@@ -150,8 +150,8 @@ export function SlashCommandMenu({
             className={cn(
               "slash-item flex w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-sm transition-colors",
               active
-                ? "bg-accent text-foreground"
-                : "text-foreground hover:bg-accent/60"
+                ? "bg-primary-50 text-primary-700"
+                : "text-foreground hover:bg-ink-200"
             )}
           >
             <cmd.Icon size={15} className="shrink-0 text-muted-foreground" />

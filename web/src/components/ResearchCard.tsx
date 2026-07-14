@@ -41,7 +41,7 @@ export function ResearchCard({ sessionId }: { sessionId: string }) {
             key={job.id}
             data-research-id={job.id}
             data-status={job.status}
-            className="research-card rounded-lg border border-border bg-muted/30 px-3 py-2 text-sm"
+            className="research-card rounded-lg border border-ink-300 bg-ink-100 px-3 py-2 text-sm"
           >
             <div className="flex items-center gap-2">
               <IconWorldSearch
@@ -52,7 +52,7 @@ export function ResearchCard({ sessionId }: { sessionId: string }) {
                 {job.question}
               </span>
               {job.status === "completed" && (
-                <IconCheck size={15} className="text-emerald-600 shrink-0" />
+                <IconCheck size={15} className="text-success shrink-0" />
               )}
               {(job.status === "failed" ||
                 job.status === "cancelled" ||

@@ -16,7 +16,8 @@ const DialogOverlay = React.forwardRef<
   <DialogPrimitive.Overlay
     ref={ref}
     className={cn(
-      "fixed inset-0 z-50 bg-black/60 backdrop-blur-sm",
+      // Warm scrim — the page dims toward ink, not toward a neutral black.
+      "fixed inset-0 z-50 bg-ink-950/50 backdrop-blur-sm",
       className
     )}
     {...props}
@@ -81,8 +82,10 @@ const DialogTitle = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <DialogPrimitive.Title
     ref={ref}
+    // Serif — every dialog heading in the app flows through here, so this
+    // one line is what puts the brand voice on all of them.
     className={cn(
-      "text-lg font-semibold leading-none tracking-tight",
+      "font-brand text-xl font-semibold leading-tight tracking-tight",
       className
     )}
     {...props}

@@ -39,7 +39,7 @@ function StatusIcon({ state }: { state: Delegation["state"] }) {
     return <IconLoader2 size={14} className="animate-spin text-primary" />;
   }
   if (state === "completed") {
-    return <IconCheck size={14} className="text-green-700" />;
+    return <IconCheck size={14} className="text-success" />;
   }
   if (state === "cancelled") {
     return <IconHandStop size={14} className="text-muted-foreground" />;

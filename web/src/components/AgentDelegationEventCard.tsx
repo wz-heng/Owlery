@@ -95,7 +95,7 @@ export function parseDelegationEvent(
 
 function KindIcon({ kind }: { kind: DelegationEventKind }) {
   if (kind === "question") {
-    return <IconMessageQuestion size={14} className="text-yellow-700" />;
+    return <IconMessageQuestion size={14} className="text-attention" />;
   }
   if (kind === "error") {
     return <IconExclamationCircle size={14} className="text-destructive" />;
@@ -110,9 +110,9 @@ const KIND_LABEL: Record<DelegationEventKind, string> = {
 };
 
 const KIND_BORDER: Record<DelegationEventKind, string> = {
-  reply: "border-primary/40 bg-primary/5",
-  question: "border-yellow-600/40 bg-yellow-50",
-  error: "border-destructive/40 bg-destructive/5",
+  reply: "border-primary/40 bg-primary-50",
+  question: "border-attention/40 bg-attention-surface",
+  error: "border-destructive/40 bg-destructive-surface",
 };
 
 export function AgentDelegationEventCard({

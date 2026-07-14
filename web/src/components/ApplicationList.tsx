@@ -11,7 +11,7 @@ export function ApplicationList({ onAdd }: { onAdd: () => void }) {
           Applications
         </h2>
         <button
-          className="btn-application-add inline-flex h-6 w-6 items-center justify-center rounded-md text-sidebar-foreground/70 hover:bg-[hsl(var(--gray-200))] hover:text-sidebar-foreground transition-colors"
+          className="btn-application-add inline-flex h-6 w-6 items-center justify-center rounded-md text-sidebar-foreground/70 hover:bg-sidebar-selected hover:text-sidebar-foreground transition-colors"
           onClick={onAdd}
           title="Add application"
           aria-label="Add application"

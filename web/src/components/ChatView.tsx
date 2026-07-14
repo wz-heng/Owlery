@@ -18,6 +18,7 @@ import {
 import { ForkDialog } from "./ForkDialog";
 import { ResearchCard } from "./ResearchCard";
 import { MessageBubble } from "./MessageBubble";
+import { OwleryLogo } from "./OwleryLogo";
 import { QuestionPrompt, type AnswerPayload } from "./QuestionPrompt";
 import { ToolApproval } from "./ToolApproval";
 import {
@@ -401,10 +402,13 @@ export function ChatView({
   const footer = useCallback(
     () =>
       isRunning ? (
+        // The agent is composing. Brass dots, staggered — the app's one
+        // "thinking" affordance, so it carries the brand rather than a
+        // neutral grey.
         <div className="msg msg-loading flex items-center gap-1.5 px-3 py-2">
-          <span className="loading-dot inline-block size-2 rounded-full bg-muted-foreground/60 animate-pulse [animation-delay:-0.32s]" />
-          <span className="loading-dot inline-block size-2 rounded-full bg-muted-foreground/60 animate-pulse [animation-delay:-0.16s]" />
-          <span className="loading-dot inline-block size-2 rounded-full bg-muted-foreground/60 animate-pulse" />
+          <span className="loading-dot inline-block size-2 rounded-full bg-primary/60 animate-pulse [animation-delay:-0.32s]" />
+          <span className="loading-dot inline-block size-2 rounded-full bg-primary/60 animate-pulse [animation-delay:-0.16s]" />
+          <span className="loading-dot inline-block size-2 rounded-full bg-primary/60 animate-pulse" />
         </div>
       ) : null,
     [isRunning]
@@ -862,7 +866,9 @@ export function ChatView({
       "status-badge inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-1 rounded-full";
     if (status === "running") {
       return (
-        <span className={`${base} status-running bg-primary-50 text-primary-700`}>
+        <span
+          className={`${base} status-running bg-primary-50 text-primary-700`}
+        >
           <span className="inline-block size-1.5 rounded-full bg-primary animate-pulse" />
           Running
         </span>
@@ -870,8 +876,10 @@ export function ChatView({
     }
     if (status === "waiting_approval") {
       return (
-        <span className={`${base} status-waiting_approval bg-yellow-50 text-yellow-700`}>
-          <span className="inline-block size-1.5 rounded-full bg-yellow-500" />
+        <span
+          className={`${base} status-waiting_approval bg-attention-surface text-attention`}
+        >
+          <span className="inline-block size-1.5 rounded-full bg-attention-solid" />
           Waiting
         </span>
       );
@@ -951,7 +959,7 @@ export function ChatView({
       >
         <span
           className={`inline-block size-2 rounded-full ${
-            connected ? "bg-green-500" : "bg-destructive animate-pulse"
+            connected ? "bg-success" : "bg-destructive animate-pulse"
           }`}
         />
         {connected ? "Connected" : "Disconnected"}
@@ -1278,9 +1286,20 @@ export function ChatView({
       <div className="chat-view flex-1 flex flex-col min-h-0">
         {header}
         {delegationBanner}
-        <div className="chat-empty flex-1 flex flex-col items-center justify-center text-muted-foreground gap-3">
-          <h2 className="text-3xl font-bold text-primary tracking-tight">Owlery</h2>
-          <p className="text-sm leading-relaxed">Create or select a session to start.</p>
+        {/* Brand moment #3. The <h2> text stays exactly "Owlery" — e2e
+         * pins it (.chat-empty h2) — but the mark now carries it. */}
+        <div className="chat-empty flex-1 flex flex-col items-center justify-center text-muted-foreground gap-1 px-6 text-center">
+          <OwleryLogo
+            size={56}
+            className="text-primary/25 mb-3"
+          />
+          <h2 className="font-brand text-3xl font-semibold text-foreground tracking-tight">
+            Owlery
+          </h2>
+          <p className="text-sm leading-relaxed max-w-xs">
+            Pick an agent in the rail, or start a new session — your post
+            goes out from here.
+          </p>
         </div>
       </div>
     );
@@ -1310,7 +1329,7 @@ export function ChatView({
 
       {isDragOver && !isArchived && (
         <div className="chat-drop-overlay absolute inset-0 z-20 flex items-center justify-center bg-primary/10 border-2 border-dashed border-primary/60 pointer-events-none">
-          <div className="rounded-lg bg-background/90 px-6 py-4 text-center shadow-lg">
+          <div className="rounded-lg border border-primary/30 bg-card/95 px-6 py-4 text-center shadow-lg">
             <IconPaperclip
               size={24}
               className="mx-auto mb-1 text-primary"
@@ -1338,7 +1357,7 @@ export function ChatView({
       />
 
       {isWaitingForResponse && (
-        <div className="waiting-hint shrink-0 px-4 py-1.5 text-center text-xs text-muted-foreground border-t border-border bg-muted/30">
+        <div className="waiting-hint shrink-0 px-4 py-1.5 text-center text-xs text-attention border-t border-attention/25 bg-attention-surface">
           {agentLabel} is waiting for your response
         </div>
       )}
@@ -1351,7 +1370,7 @@ export function ChatView({
 
       {pendingQueue.length > 0 && (
         <div
-          className="queue-list shrink-0 border-t border-border bg-muted/30 px-4 py-2 text-xs space-y-1"
+          className="queue-list shrink-0 border-t border-ink-300 bg-ink-100 px-4 py-2 text-xs space-y-1"
           aria-label="Queued messages"
         >
           <div className="queue-list-label text-muted-foreground mb-2">
@@ -1392,11 +1411,11 @@ export function ChatView({
             />
           )}
           {/* Rounded card containing chips + textarea + bottom action row.
-              Layout copied from VM0 (zero-composer) but tuned shorter
+              Composer layout: tuned shorter
               for Owlery' chat panel: the textarea auto-grows with
               content (field-sizing-content) so the empty composer is a
               single comfortable line, not a hero-sized block. */}
-          <div className="zero-composer overflow-hidden rounded-xl border-[0.7px] border-gray-400 bg-card shadow-sm focus-within:border-primary/70 focus-within:ring-[3px] focus-within:ring-primary/10 transition-colors">
+          <div className="zero-composer overflow-hidden rounded-xl border-[0.7px] border-ink-400 bg-card shadow-sm transition-colors focus-within:border-primary focus-within:ring-[3px] focus-within:ring-primary/15">
             <input
               ref={fileInputRef}
               type="file"

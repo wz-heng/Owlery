@@ -356,7 +356,7 @@ export function CredentialList() {
           Harness
         </span>
         <button
-          className="btn-credential-add inline-flex h-6 w-6 items-center justify-center rounded-md text-sidebar-foreground/70 hover:bg-[hsl(var(--gray-200))] hover:text-sidebar-foreground transition-colors"
+          className="btn-credential-add inline-flex h-6 w-6 items-center justify-center rounded-md text-sidebar-foreground/70 hover:bg-sidebar-selected hover:text-sidebar-foreground transition-colors"
           onClick={openChooser}
           title="Add credential"
           aria-label="Add credential"

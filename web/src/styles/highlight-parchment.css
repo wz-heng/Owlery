@@ -1,0 +1,106 @@
+/* highlight.js theme — "Parchment".
+ *
+ * Replaces `highlight.js/styles/github.css`, which is calibrated for a
+ * pure-white background: on our parchment/card surfaces its comment grey
+ * (#6a737d) drops to ~3.4:1 and its keyword red clashes with the wax-seal
+ * destructive colour.
+ *
+ * Every colour below is drawn from the app's token scales and verified at
+ * >=4.5:1 (WCAG AA for body text) against *both* code surfaces — the card
+ * (file viewer) and the sunken parchment well (chat code blocks). Hues are
+ * chosen to stay clear of the brand brass so that syntax never reads as a
+ * clickable/branded element:
+ *
+ *   keyword  crimson   string  moss     number  rust
+ *   fn/title teal      attr    brass    comment ink-700 italic
+ *
+ * Applies to `.hljs` wherever it is rendered — the viewer's markdown code
+ * fences (via rehype-highlight) and its raw-code body (via hljs.highlight).
+ */
+
+.hljs {
+  color: hsl(var(--ink-950));
+  background: transparent;
+}
+
+/* Comments and other prose-in-code: recede, but stay legible. Italic is
+ * the signal here, not low contrast. */
+.hljs-comment,
+.hljs-quote {
+  color: hsl(var(--ink-700));
+  font-style: italic;
+}
+
+/* Keywords, operators, control flow — crimson. */
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-literal,
+.hljs-doctag,
+.hljs-formula,
+.hljs-name,
+.hljs-subst {
+  color: hsl(338 58% 38%);
+}
+
+/* Strings and everything string-shaped — moss. */
+.hljs-string,
+.hljs-regexp,
+.hljs-addition,
+.hljs-attribute,
+.hljs-meta .hljs-string {
+  color: hsl(152 48% 27%);
+}
+
+/* Numbers, constants, built-in types — rust. */
+.hljs-number,
+.hljs-variable,
+.hljs-template-variable,
+.hljs-type,
+.hljs-selector-class,
+.hljs-selector-attr,
+.hljs-selector-pseudo,
+.hljs-built_in,
+.hljs-symbol,
+.hljs-bullet,
+.hljs-link {
+  color: hsl(18 72% 36%);
+}
+
+/* Definitions — the names the reader is scanning for. Teal + weight. */
+.hljs-title,
+.hljs-section,
+.hljs-title.class_,
+.hljs-title.function_,
+.hljs-selector-id {
+  color: hsl(194 68% 26%);
+  font-weight: 600;
+}
+
+/* Attributes / properties / annotations — brass. */
+.hljs-attr,
+.hljs-property,
+.hljs-params,
+.hljs-meta,
+.hljs-meta .hljs-keyword {
+  color: hsl(var(--primary-700));
+}
+
+/* Diffs — wax red for removed, moss for added, matching the app's
+ * destructive/success semantics. */
+.hljs-deletion {
+  color: hsl(var(--destructive));
+  background: hsl(var(--destructive-surface));
+}
+
+.hljs-addition {
+  color: hsl(var(--success));
+  background: hsl(var(--success-surface));
+}
+
+.hljs-emphasis {
+  font-style: italic;
+}
+
+.hljs-strong {
+  font-weight: 600;
+}
