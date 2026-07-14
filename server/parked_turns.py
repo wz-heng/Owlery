@@ -202,6 +202,11 @@ class ParkedTurnRunner:
         row = await self._db.get_parked_turn(session_id)
         if row is None:
             return  # cancelled between the job firing and this coroutine running
+        # Consume the record BEFORE the turn runs: a resumed turn that limits
+        # again re-parks itself, and a stale row would rebuild into a duplicate
+        # job on the next boot. The attempt counters ride along on the row we
+        # hand to the resume, so the caps still bound the NEXT park — deleting
+        # the row must not amnesty a session that keeps failing.
         await self._db.delete_parked_turn(session_id)
         logger.info(
             "Session %s: usage limit reset — auto-resuming (mode=%s, attempt %d)",

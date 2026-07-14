@@ -587,3 +587,66 @@ async def test_the_park_signal_survives_send_message(manager):
 
     # And the session lock was still released, so the resumed turn can run.
     assert not manager.sessions["s1"]._lock.locked()
+
+
+async def test_repark_counts_survive_the_wake_up(manager):
+    """Regression: the wake-up DELETES the park row before re-running the turn.
+    If the re-park then reads its attempt count from that (now absent) row it
+    resets to zero, the cap never fires, and a permanently-exhausted window
+    re-parks forever. The count must survive the wake."""
+    epoch = int((datetime.now(timezone.utc) + timedelta(hours=3)).timestamp())
+    runner = manager._parked_turns
+
+    async def _limit_again(session_id, prompt):
+        """The resumed turn hits the limit again — the whole point of the cap."""
+        await _park(manager, reset_at=epoch)
+
+    manager.start_message = _limit_again
+
+    # First park, then let it wake and re-limit, repeatedly. Each wake consumes
+    # the row; each re-park must count as the NEXT attempt.
+    _event, parked = await _park(manager, reset_at=epoch)
+    assert parked is True
+
+    for _ in range(5):
+        row = await runner.get("s1")
+        if row is None:
+            break
+        await runner._wake("s1")
+
+    # It must have GIVEN UP rather than parking forever.
+    assert await runner.get("s1") is None
+    assert manager.sessions["s1"]._limit_attempts["attempts"] >= 3
+
+
+async def test_a_successful_turn_clears_the_park_count(manager):
+    """Two parks today must not count against an unrelated limit next week.
+
+    Drives the REAL run loop (a fake backend that streams a clean result), so
+    this asserts on production behaviour rather than restating it.
+    """
+    from server.harness import HarnessEvent
+
+    session = manager.sessions["s1"]
+    session._limit_attempts = {"attempts": 2, "probes": 0}
+
+    class _CleanRun:
+        stderr_text = ""
+        rate_limit_info = None
+
+        async def start(self, *a, **k):
+            return None
+
+        async def stream(self):
+            yield HarnessEvent(type="text", content="done")
+            yield HarnessEvent(type="result", is_error=False, session_id="sid")
+
+        async def stop(self):
+            return None
+
+    manager._make_run = lambda *a, **k: _CleanRun()
+
+    async for _ in manager._run_backend(session, "hello"):
+        pass
+
+    assert session._limit_attempts is None

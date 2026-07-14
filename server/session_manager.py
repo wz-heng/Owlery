@@ -264,6 +264,11 @@ class Session:
     _pending_question_answers: dict[str, str] = field(default_factory=dict, repr=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     _pending_queue: list[QueuedPrompt] = field(default_factory=list, repr=False)
+    # Consecutive usage-limit parks with no progress (limit-auto-resume.md §4).
+    # Carried in memory ONLY across a wake-up, which consumes the DB row before
+    # re-running the turn; the row itself is what survives a restart. Cleared as
+    # soon as a turn completes, so an old park can't count against a fresh one.
+    _limit_attempts: dict[str, int] | None = field(default=None, repr=False)
 
 
 class SessionManager:
@@ -2209,6 +2214,12 @@ class SessionManager:
                     # CLI reissued a different one mid-stream).
                     if event.type == "result":
                         saw_result = True
+                        if not event.is_error:
+                            # A turn got through — the window is open again, so
+                            # the consecutive-park count starts fresh. Without
+                            # this, two parks today would count against an
+                            # unrelated limit next week.
+                            session._limit_attempts = None
                         if event.session_id and session.claude_session_id != event.session_id:
                             session.claude_session_id = event.session_id
                             if self.db:
@@ -2975,7 +2986,15 @@ class SessionManager:
         A turn that streamed output but captured no resume id can't be safely
         resumed either way, so it is NOT parked.
         """
+        # The park counters must survive the wake-up that consumed the DB row.
+        # The wake deletes the record before re-running the turn (so a stale row
+        # can't rebuild into a duplicate job), so a re-park would otherwise find
+        # no prior row, reset to zero, and re-park forever — the cap would never
+        # fire. `_limit_attempts` carries them across that gap; the DB row is
+        # still the source of truth after a RESTART, so prefer it when present.
         prior = await self._parked_turns.get(session.id)
+        if prior is None:
+            prior = getattr(session, "_limit_attempts", None)
         attempts = (prior or {}).get("attempts", 0)
         probes = (prior or {}).get("probes", 0)
 
@@ -3177,6 +3196,15 @@ class SessionManager:
                     await self.db.update_session_field(
                         session_id, claude_session_id=resume_at
                     )
+
+        # Carry the park counters across the consumed DB row (see
+        # _park_limited_turn): if this resumed turn limits again, the re-park
+        # must count as the NEXT attempt, not start over — otherwise the cap
+        # never fires and a permanently-exhausted window parks forever.
+        session._limit_attempts = {
+            "attempts": row.get("attempts", 0),
+            "probes": row.get("probes", 0),
+        }
 
         await self._broadcast(
             {
