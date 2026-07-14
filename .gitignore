@@ -2,7 +2,11 @@
 .venv
 __pycache__/
 *.pyc
-node_modules/
+# No trailing slash: a bare `node_modules/` matches the directory but NOT a
+# *symlink* named `node_modules` (a common dev shortcut for a shared install).
+# One such symlink slipped past the slashed rule and got committed; this form
+# ignores both.
+node_modules
 web/dist/
 web/test-results/
 test-results/
