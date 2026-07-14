@@ -26,10 +26,13 @@ fourth disposition:
 3. **Usage-limit error → park; auto-resume at the reset time.** (this doc)
 4. Everything else → surface as-is.
 
-The classifiers stay mutually exclusive by construction. Today the bare
-"rate limit" / "429" / "quota" tokens appear in *neither* pattern set
-precisely so the user's-limit message falls through to "surface as-is";
-this work claims those messages for the new classifier instead.
+The classifiers stay mutually exclusive — but NOT by string
+construction. Captured samples (§4) proved both CLIs answer a
+server-side throttle and the user's own limit with the same HTTP 429
+and overlapping prose ("rate limit" appears in both), so no pattern set
+can claim those tokens safely. The limit classifier is structural
+(dedicated fields in the stream); the existing transient/auth pattern
+sets stay exactly as they are.
 
 ## 3. Goal
 
@@ -44,18 +47,46 @@ no `if backend ==` outside `server/harness/`.
 
 ## 4. Design points
 
-**Detection behind the harness contract.** Mirror the auth/transient
-work: `RuntimeProfile.usage_limit_patterns` for classification, plus a
-per-backend hook that extracts the reset time from the error text
-(Claude's CLI limit messages have historically carried one — e.g. an
-epoch after a `|`, or a human "resets 3pm" phrase; codex says "try again
-at …"). **Ground truth first**: no local transcript currently holds a
-real sample of either CLI's limit message (searched before writing
-this), so the first implementation step is to capture live samples from
-both backends — the next real limit hit is itself the capture
-opportunity — and derive patterns and the reset-time parser from those,
-not from folklore. Patterns must stay disjoint from the auth and
-transient sets.
+**Detection is structural, not textual.** The original cut of this
+plan specified `RuntimeProfile.usage_limit_patterns` (string matching,
+like the auth/transient sets). Live samples captured through the real
+spawn → stream-json paths (claude-code 2.1.209, codex-cli 0.142.5,
+driven against a local upstream returning genuine 429 envelopes;
+fixtures committed under `tests/fixtures/` on the feature branch)
+falsified that design: both CLIs answer BOTH the server-side throttle
+(transient — retry in seconds) and the user's own limit (park for
+hours) with HTTP 429 and overlapping prose, so any string set either
+parks on transient errors or misses real limits. The true
+discriminators are structured:
+
+- claude: a `rate_limit_event` whose `rate_limit_info` carries
+  `status: "rejected"`, a `rateLimitType` (e.g. `five_hour`) and an
+  epoch `resetsAt`; the server-side throttle lacks the unified-limit
+  claim, and its prose even says "(not your usage limit)".
+- codex: the 429 body's `usage_limit_reached` /
+  `rate_limit_reached_type`; additionally every `token_count` event
+  carries structured `rate_limits` (`window_minutes: 300`, epoch
+  `resets_at`).
+
+The contract is therefore a per-backend hook on `RuntimeProfile` —
+`classify_usage_limit(turn events + error blob) -> UsageLimitHit |
+None`, where `UsageLimitHit` carries the limit kind and an optional
+epoch `reset_at` — pure, and living entirely in `server/harness/` like
+the pattern sets it replaces. No `if backend ==` outside the harness,
+unchanged.
+
+**Prerequisite: stop discarding the discriminator.** The claude parser
+currently drops `rate_limit_event` on the floor ("nothing to surface
+under the VM0 shape", `claude_code.py`) — the exact record carrying
+`rateLimitType` and the epoch `resetsAt`. The run must latch the
+latest rate-limit info so the classifier can see it; whether it also
+surfaces to the UI is out of scope here.
+
+**Reset time comes from the structured epoch — never from prose.** The
+human-readable "resets 10:22pm (Asia/Shanghai)" / "try again at
+10:23 PM" strings are rendered BY the CLIs from that same epoch;
+parsing them back would downgrade reliable data into a fragile
+localized string.
 
 **Park is persisted, not slept.** When a turn is classified as
 limit-failed, the run loop ends the turn with a distinct `limit_paused`
@@ -74,16 +105,18 @@ captured → resume with "continue" so tools don't re-run and text doesn't
 duplicate. The park record stores which mode applies and its payload at
 park time.
 
-**Still limited at wake-up → re-park, bounded.** The parsed reset may be
-wrong, or the fresh window may already be eaten by whatever resumed
+**Still limited at wake-up → re-park, bounded.** The reset epoch may be
+stale, or the fresh window may already be eaten by whatever resumed
 first. A wake-up turn that immediately limit-fails re-parks to the newly
-parsed reset. Cap consecutive parks without progress (3); on exhaustion
-surface a clear terminal error.
+reported reset. Cap consecutive parks without progress (3); on
+exhaustion surface a clear terminal error.
 
-**Reset time unparseable → probe fallback.** If no reset time can be
-extracted, probe on a fixed interval (30 min), bounded (12 attempts,
-comfortably past one 5-hour window). A probe that limit-fails costs one
-spawn and near-zero tokens.
+**Reset epoch missing → probe fallback.** If a classified limit hit
+carries no epoch, probe on a fixed interval (30 min), bounded (12
+attempts, comfortably past one 5-hour window). A probe that limit-fails
+costs one spawn and near-zero tokens. With both backends supplying the
+epoch structurally this path should be rare — it exists as insurance
+against a CLI changing its stream shape, not as a mechanism.
 
 **Stagger the herd.** Several sessions parked on the same reset must not
 all fire at once — space wake-ups ~60s apart, first come first served.
@@ -113,13 +146,14 @@ Occurrences that come due while the session is parked follow the
 existing busy-session semantics; the parked resume is the continuation
 of record.
 
-**Testability without quota.** The e2e fake CLI (`e2e-slim.md`) emits a
-canned limit-error message to exercise classify → park → persist →
+**Testability without quota.** The e2e fake CLI (`e2e-slim.md`) replays
+the captured fixture streams to exercise classify → park → persist →
 wake-up through the real spawn path; scheduler time is injectable, so
 the wake-up fires in test time, not wall-clock hours. Backend unit
-tests cover the classifier disjointness (limit vs transient vs auth on
-real captured samples), reset-time parsing, re-park bounding, and
-boot-time job rebuild.
+tests cover the classifier disjointness (user-limit vs server-throttle
+vs auth, on the real captured samples — the 429-pair fixtures exist
+precisely for this), epoch extraction, re-park bounding, and boot-time
+job rebuild.
 
 ## 5. Rejected alternatives
 
@@ -137,6 +171,12 @@ boot-time job rebuild.
 - **Credential failover** (switch to another account when limited):
   semantically dangerous (silently burning a different subscription),
   entangled with the credential system, and not what was asked.
+- **String-pattern classification** (`RuntimeProfile.
+  usage_limit_patterns`, this plan's own first cut): falsified by the
+  captured samples — a server-side 429 and a user-limit 429 share
+  their tokens ("rate limit", "429"), so pattern sets cannot be kept
+  mutually exclusive no matter how carefully they are written. Kept on
+  this list so nobody re-proposes it.
 
 ## 6. What this does NOT do
 
