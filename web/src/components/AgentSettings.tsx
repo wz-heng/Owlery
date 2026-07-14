@@ -28,7 +28,7 @@ interface Props {
 }
 
 const textareaCls =
-  "flex w-full rounded-lg border-[0.7px] border-ink-400 bg-input px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground outline-none transition-colors focus:border-primary focus:ring-[3px] focus:ring-primary/10 resize-none";
+  "flex w-full rounded-lg border border-ink-400 bg-ink-100 shadow-[var(--elevation-inset)] px-3.5 py-2 text-sm text-foreground placeholder:text-muted-foreground outline-none transition-[color,background-color,border-color,box-shadow] hover:border-ink-600 focus:border-primary focus:bg-card focus:shadow-none focus:ring-[3px] focus:ring-primary/20 resize-none";
 
 const sameSet = (a: string[], b: string[]) =>
   a.length === b.length && [...a].sort().join() === [...b].sort().join();

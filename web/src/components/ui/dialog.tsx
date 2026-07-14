@@ -17,7 +17,7 @@ const DialogOverlay = React.forwardRef<
     ref={ref}
     className={cn(
       // Warm scrim — the page dims toward ink, not toward a neutral black.
-      "fixed inset-0 z-50 bg-ink-950/50 backdrop-blur-sm",
+      "fixed inset-0 z-50 bg-ink-950/30 backdrop-blur-[3px] data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=closed]:fade-out-0",
       className
     )}
     {...props}
@@ -34,7 +34,7 @@ const DialogContent = React.forwardRef<
     <DialogPrimitive.Content
       ref={ref}
       className={cn(
-        "fixed left-[50%] top-[50%] z-50 grid w-full max-w-lg max-h-[90vh] overflow-y-auto translate-x-[-50%] translate-y-[-50%] gap-4 border-[0.7px] border-border bg-card p-6 shadow-2xl rounded-xl",
+        "fixed left-[50%] top-[50%] z-50 grid w-full max-w-lg max-h-[90vh] overflow-y-auto translate-x-[-50%] translate-y-[-50%] gap-5 border border-ink-300 bg-card p-6 shadow-[var(--elevation-overlay)] rounded-2xl",
         className
       )}
       {...props}

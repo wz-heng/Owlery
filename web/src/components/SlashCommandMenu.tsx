@@ -126,7 +126,7 @@ export function SlashCommandMenu({
   return (
     <div
       className={cn(
-        "slash-menu z-30 overflow-hidden rounded-xl border-[0.7px] border-ink-400 bg-card p-1 shadow-lg",
+        "slash-menu z-30 overflow-hidden rounded-xl border border-ink-300 bg-popover p-1 shadow-[var(--elevation-floating)]",
         className
       )}
       role="listbox"

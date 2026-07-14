@@ -125,19 +125,47 @@
   --default-transition-duration: 150ms;
   --default-transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
 
-  /* Elevation — warm, low, paper-like. A shadow on parchment is a
-   * brown-gray shade, never a neutral black smudge. */
-  --shadow-sm: 0 1px 2px 0 hsl(var(--ink-950) / 0.05);
-  --shadow-md:
-    0 2px 4px -1px hsl(var(--ink-950) / 0.06),
-    0 4px 12px -2px hsl(var(--ink-950) / 0.08);
-  --shadow-lg:
-    0 4px 8px -2px hsl(var(--ink-950) / 0.07),
-    0 12px 28px -6px hsl(var(--ink-950) / 0.1);
-  --shadow-xl:
-    0 8px 16px -4px hsl(var(--ink-950) / 0.08),
-    0 24px 48px -12px hsl(var(--ink-950) / 0.12);
-  --shadow-2xl: 0 32px 64px -16px hsl(var(--ink-950) / 0.18);
+  /* ── Elevation ───────────────────────────────────────────────────
+   *
+   * Four semantic steps, not a size ramp. Ask "what is this thing
+   * doing?", not "how big a shadow do I want?":
+   *
+   *   raised    a card sitting ON the parchment  (message, panel)
+   *   floating  an overlay ABOVE the page        (dropdown, popover)
+   *   overlay   a modal, lifted off the world    (dialog)
+   *   inset     a well pressed INTO the paper    (input, empty state)
+   *
+   * `inset` is the one that earns its keep: an empty state or a text
+   * field reads as a recess in the sheet, which is why none of them
+   * needs a dashed border. Dashed = wireframe; a well is a surface.
+   *
+   * The shadow hue is brass-tinted ink (28°), not neutral black — on a
+   * warm ground a gray shadow reads as dirt. Each step pairs a tight
+   * contact shadow (the object touching the paper) with a wide soft
+   * one (the ambient occlusion); one shadow alone always looks fake.
+   * Alphas are deliberately higher than a white-background app would
+   * use: parchment is darker than #fff, so a timid shadow vanishes. */
+  --elevation-raised:
+    0 1px 2px -1px hsl(var(--ink-950) / 0.1),
+    0 2px 6px -2px hsl(var(--ink-950) / 0.08);
+  --elevation-floating:
+    0 2px 4px -2px hsl(var(--ink-950) / 0.12),
+    0 8px 20px -6px hsl(var(--ink-950) / 0.14);
+  --elevation-overlay:
+    0 4px 8px -4px hsl(var(--ink-950) / 0.16),
+    0 24px 56px -12px hsl(var(--ink-950) / 0.22);
+  --elevation-inset:
+    inset 0 1px 3px 0 hsl(var(--ink-950) / 0.07),
+    inset 0 1px 1px 0 hsl(var(--ink-950) / 0.04);
+
+  /* Tailwind's `shadow-*` utilities map onto the same four steps, so
+   * `shadow-md` and `--elevation-floating` can't drift apart. */
+  --shadow-sm: var(--elevation-raised);
+  --shadow-md: var(--elevation-floating);
+  --shadow-lg: var(--elevation-floating);
+  --shadow-xl: var(--elevation-overlay);
+  --shadow-2xl: var(--elevation-overlay);
+  --inset-shadow-well: var(--elevation-inset);
 
   /* Tabler icons — consistent stroke weight across the app */
   --icon-stroke-width: 1.5;

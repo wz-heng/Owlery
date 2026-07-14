@@ -143,7 +143,7 @@ export function FileViewerDialog() {
     <DialogPrimitive.Root open={open} onOpenChange={onOpenChange}>
       <DialogPrimitive.Portal>
         <DialogPrimitive.Overlay
-          className="fixed inset-0 z-[100] bg-ink-950/60 backdrop-blur-sm data-[state=open]:animate-in data-[state=open]:fade-in-0"
+          className="fixed inset-0 z-[100] bg-ink-950/40 backdrop-blur-[3px] data-[state=open]:animate-in data-[state=open]:fade-in-0"
         />
         <DialogPrimitive.Content
           aria-describedby={undefined}
@@ -151,7 +151,7 @@ export function FileViewerDialog() {
             "fixed left-[50%] top-[50%] z-[100] flex flex-col",
             "translate-x-[-50%] translate-y-[-50%]",
             "w-[min(1100px,95vw)] h-[min(85vh,900px)]",
-            "rounded-xl border border-border bg-card shadow-2xl",
+            "rounded-2xl border border-ink-300 bg-card shadow-[var(--elevation-overlay)]",
             "focus:outline-none"
           )}
         >

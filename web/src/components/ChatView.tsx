@@ -230,7 +230,7 @@ export function ChatView({
         const questions =
           (msg.tool_input?.questions as PendingQuestion["questions"]) || [];
         return (
-          <div className="msg msg-question msg-question-done rounded-lg border-[0.7px] border-dashed border-border bg-muted/30 overflow-hidden opacity-75">
+          <div className="msg msg-question msg-question-done rounded-lg border border-ink-300 bg-ink-100 shadow-[var(--elevation-inset)] overflow-hidden opacity-75">
             <div className="question-header flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground">
               <span aria-hidden className="text-xs">?</span>
               <strong>{agentLabel} asked</strong>
@@ -1288,17 +1288,36 @@ export function ChatView({
         {delegationBanner}
         {/* Brand moment #3. The <h2> text stays exactly "Owlery" — e2e
          * pins it (.chat-empty h2) — but the mark now carries it. */}
-        <div className="chat-empty flex-1 flex flex-col items-center justify-center text-muted-foreground gap-1 px-6 text-center">
-          <OwleryLogo
-            size={56}
-            className="text-primary/25 mb-3"
-          />
-          <h2 className="font-brand text-3xl font-semibold text-foreground tracking-tight">
+        {/* Optical centering: the composition sits slightly ABOVE geometric
+         * center, which is where the eye expects it. Done with bottom padding
+         * rather than a negative top margin — `-mt-*` grew the box upward past
+         * the header and silently swallowed clicks on the mobile hamburger
+         * (caught by the e2e). Padding moves the content without moving the
+         * box, so nothing overlaps the chrome. */}
+        <div className="chat-empty flex-1 flex flex-col items-center justify-center pb-16 text-muted-foreground px-6 text-center">
+          {/* A composition, not a void. The mark sits on a brass plate with
+           * a soft halo behind it, so it reads as an object placed on the
+           * page rather than a watermark that failed to load. The copy then
+           * steps down in three beats — headline, lede, hint — which is what
+           * gives the screen a center of gravity. */}
+          <div className="chat-empty-plate relative mb-6 flex size-24 items-center justify-center">
+            <span
+              aria-hidden
+              className="absolute inset-0 rounded-full bg-primary/10 blur-xl"
+            />
+            <span className="relative inline-flex size-20 items-center justify-center rounded-full border border-primary/25 bg-card shadow-[var(--elevation-raised)]">
+              <OwleryLogo size={40} className="text-primary" />
+            </span>
+          </div>
+          <h2 className="font-brand text-4xl font-semibold text-foreground tracking-tight">
             Owlery
           </h2>
-          <p className="text-sm leading-relaxed max-w-xs">
-            Pick an agent in the rail, or start a new session — your post
-            goes out from here.
+          <p className="mt-2 max-w-sm text-[15px] leading-relaxed text-ink-800">
+            Your agents are perched and waiting.
+          </p>
+          <p className="mt-1.5 max-w-xs text-[13px] leading-relaxed text-muted-foreground">
+            Pick one in the rail, or start a new session — your post goes out
+            from here.
           </p>
         </div>
       </div>
@@ -1329,7 +1348,7 @@ export function ChatView({
 
       {isDragOver && !isArchived && (
         <div className="chat-drop-overlay absolute inset-0 z-20 flex items-center justify-center bg-primary/10 border-2 border-dashed border-primary/60 pointer-events-none">
-          <div className="rounded-lg border border-primary/30 bg-card/95 px-6 py-4 text-center shadow-lg">
+          <div className="rounded-xl border border-primary/30 bg-card/95 px-6 py-4 text-center shadow-[var(--elevation-overlay)]">
             <IconPaperclip
               size={24}
               className="mx-auto mb-1 text-primary"
@@ -1415,7 +1434,7 @@ export function ChatView({
               for Owlery' chat panel: the textarea auto-grows with
               content (field-sizing-content) so the empty composer is a
               single comfortable line, not a hero-sized block. */}
-          <div className="zero-composer overflow-hidden rounded-xl border-[0.7px] border-ink-400 bg-card shadow-sm transition-colors focus-within:border-primary focus-within:ring-[3px] focus-within:ring-primary/15">
+          <div className="zero-composer overflow-hidden rounded-xl border border-ink-400 bg-card shadow-[var(--elevation-raised)] transition-all focus-within:border-primary focus-within:shadow-[var(--elevation-floating)] focus-within:ring-[3px] focus-within:ring-primary/20">
             <input
               ref={fileInputRef}
               type="file"

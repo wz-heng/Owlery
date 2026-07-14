@@ -327,11 +327,11 @@ export function ForkDialog({
 
   return (
     <div
-      className="fork-dialog-overlay fixed inset-0 z-50 flex items-center justify-center bg-ink-950/50 p-4"
+      className="fork-dialog-overlay fixed inset-0 z-50 flex items-center justify-center bg-ink-950/30 backdrop-blur-[3px] p-4"
       onClick={onClose}
     >
       <div
-        className="fork-dialog w-full max-w-md rounded-xl border-[0.7px] border-border bg-background p-5 shadow-xl"
+        className="fork-dialog w-full max-w-md rounded-2xl border border-ink-300 bg-card p-5 shadow-[var(--elevation-overlay)]"
         onClick={(e) => e.stopPropagation()}
         data-testid="fork-dialog"
       >

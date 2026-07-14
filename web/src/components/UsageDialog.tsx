@@ -138,14 +138,14 @@ export function UsageDialog({ open, onOpenChange }: Props) {
         </DialogHeader>
 
         <div className="usage-controls flex flex-wrap items-center gap-2">
-          <div className="flex rounded-lg border border-border p-0.5">
+          <div className="flex rounded-lg border border-ink-300 bg-ink-100 shadow-[var(--elevation-inset)] p-1">
             {GROUPS.map((g) => (
               <button
                 key={g.value}
-                className={`usage-group-${g.value} rounded-md px-2.5 py-1 text-xs ${
+                className={`usage-group-${g.value} rounded-md px-3 py-1 text-xs transition-all ${
                   groupBy === g.value
-                    ? "bg-accent font-medium text-foreground"
-                    : "text-muted-foreground hover:text-foreground"
+                    ? "bg-card font-semibold text-primary-700 shadow-[var(--elevation-raised)]"
+                    : "text-muted-foreground hover:text-foreground hover:bg-ink-200/70"
                 }`}
                 onClick={() => setGroupBy(g.value)}
               >
@@ -153,14 +153,14 @@ export function UsageDialog({ open, onOpenChange }: Props) {
               </button>
             ))}
           </div>
-          <div className="ml-auto flex rounded-lg border border-border p-0.5">
+          <div className="ml-auto flex rounded-lg border border-ink-300 bg-ink-100 shadow-[var(--elevation-inset)] p-1">
             {WINDOWS.map((w) => (
               <button
                 key={w.days}
-                className={`usage-window-${w.days} rounded-md px-2.5 py-1 text-xs ${
+                className={`usage-window-${w.days} rounded-md px-3 py-1 text-xs transition-all ${
                   windowDays === w.days
-                    ? "bg-accent font-medium text-foreground"
-                    : "text-muted-foreground hover:text-foreground"
+                    ? "bg-card font-semibold text-primary-700 shadow-[var(--elevation-raised)]"
+                    : "text-muted-foreground hover:text-foreground hover:bg-ink-200/70"
                 }`}
                 onClick={() => setWindowDays(w.days)}
               >
@@ -171,7 +171,7 @@ export function UsageDialog({ open, onOpenChange }: Props) {
         </div>
 
         {error ? (
-          <div className="usage-error rounded-lg border border-dashed border-destructive/40 bg-destructive-surface px-4 py-10 text-center text-sm text-destructive">
+          <div className="usage-error rounded-lg border border-destructive/40 bg-destructive-surface shadow-[var(--elevation-inset)] px-4 py-12 text-center text-sm text-destructive">
             {error}
           </div>
         ) : loading && !data ? (
@@ -182,7 +182,7 @@ export function UsageDialog({ open, onOpenChange }: Props) {
             ))}
           </div>
         ) : !data || data.rows.length === 0 ? (
-          <div className="usage-empty rounded-lg border border-dashed border-ink-400 bg-ink-100 px-4 py-10 text-center text-sm text-muted-foreground">
+          <div className="usage-empty rounded-lg border border-ink-300 bg-ink-100 shadow-[var(--elevation-inset)] px-4 py-12 text-center text-sm text-muted-foreground">
             No usage recorded in this window yet. Run a turn and it will show
             up here.
           </div>

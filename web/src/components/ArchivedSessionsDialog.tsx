@@ -136,7 +136,7 @@ export function ArchivedSessionsDialog({ open, onOpenChange }: Props) {
         </DialogHeader>
 
         {archived.length === 0 ? (
-          <div className="archived-empty rounded-lg border border-dashed border-ink-400 bg-ink-100 px-4 py-10 text-center text-sm text-muted-foreground">
+          <div className="archived-empty rounded-lg border border-ink-300 bg-ink-100 shadow-[var(--elevation-inset)] px-4 py-12 text-center text-sm text-muted-foreground">
             No archived sessions. Type{" "}
             <code className="font-mono text-foreground">/archive</code> in a
             chat to archive its history.

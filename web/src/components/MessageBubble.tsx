@@ -167,7 +167,7 @@ export function MessageBubble({
                * with the brand — sent mail, sealed in brass. The agent's
                * reply (below) sits on plain card, so the two speakers are
                * distinguishable by surface alone, not just alignment. */}
-              <div className="msg-content inline-block rounded-lg rounded-br-sm border border-primary/35 bg-primary-50 px-4 py-3 text-sm text-foreground whitespace-pre-wrap break-words shadow-sm">
+              <div className="msg-content inline-block rounded-lg rounded-br-sm border border-primary/35 bg-primary-50 px-4 py-3 text-sm text-foreground whitespace-pre-wrap break-words shadow-[var(--elevation-raised)]">
                 {message.content}
               </div>
               {message.attachments && message.attachments.length > 0 && (
@@ -190,7 +190,7 @@ export function MessageBubble({
             )}
             <span>{assistantLabel}</span>
           </div>
-          <div className="msg-content markdown rounded-lg rounded-tl-sm border border-border bg-card px-4 py-3 text-sm leading-relaxed shadow-sm">
+          <div className="msg-content markdown rounded-lg rounded-tl-sm border border-border bg-card px-4 py-3 text-sm leading-relaxed shadow-[var(--elevation-raised)]">
             <Markdown
               remarkPlugins={[remarkGfm, remarkMath]}
               // `ignoreMissing`: the model names languages hljs may not have
@@ -224,7 +224,7 @@ export function MessageBubble({
             <div className="msg-label text-xs font-semibold text-muted-foreground text-right">
               You
             </div>
-            <div className="msg-content msg-question-answer inline-block rounded-lg rounded-br-sm border border-primary/35 bg-primary-50 px-4 py-3 text-sm text-foreground italic whitespace-pre-wrap break-words shadow-sm">
+            <div className="msg-content msg-question-answer inline-block rounded-lg rounded-br-sm border border-primary/35 bg-primary-50 px-4 py-3 text-sm text-foreground italic whitespace-pre-wrap break-words shadow-[var(--elevation-raised)]">
               {message.content}
             </div>
           </div>
@@ -440,7 +440,7 @@ function BgTaskResultMessage({
         <button
           type="button"
           onClick={() => setExpanded((e) => !e)}
-          className="msg-content w-full text-left inline-block rounded-lg border border-dashed border-ink-400 bg-ink-100 px-4 py-3 text-sm text-foreground transition-colors hover:bg-ink-200"
+          className="msg-content w-full text-left inline-block rounded-lg border border-ink-300 bg-ink-100 shadow-[var(--elevation-inset)] px-4 py-3 text-sm text-foreground transition-colors hover:bg-ink-200"
           title={expanded ? "Collapse" : "Expand full result"}
           aria-expanded={expanded}
         >

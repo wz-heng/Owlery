@@ -32,7 +32,7 @@ export function ScheduleList({ onOpen }: { onOpen: () => void }) {
         onClick={onOpen}
         title="View all schedules"
       >
-        <span className="schedule-title text-[13px] font-medium leading-4 text-sidebar-foreground/50 group-hover:text-sidebar-foreground transition-colors uppercase tracking-wide">
+        <span className="schedule-title text-[11px] font-semibold leading-4 text-sidebar-foreground/55 group-hover:text-sidebar-foreground/80 transition-colors uppercase tracking-[0.12em]">
           Schedules
         </span>
         <span className="schedule-count flex items-center gap-1 text-xs text-sidebar-foreground/60 group-hover:text-sidebar-foreground transition-colors">

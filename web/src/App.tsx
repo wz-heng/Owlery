@@ -39,16 +39,30 @@ function App() {
     // card reads as a sealed letter waiting to be opened.
     return (
       <div className="login-screen min-h-screen flex items-center justify-center bg-background p-6">
-        <div className="w-full max-w-sm rounded-2xl border-[0.7px] border-border bg-card p-8 shadow-xl">
-          <div className="flex flex-col items-center text-center mb-7">
-            <span className="mb-4 inline-flex size-14 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-md">
-              <OwleryLogo size={30} />
+        <div className="w-full max-w-sm rounded-2xl border border-ink-300 bg-card p-8 shadow-[var(--elevation-overlay)]">
+          <div className="flex flex-col items-center text-center mb-8">
+            {/* The seal, haloed — the same plate treatment as the empty
+             * state, so the mark reads as one object across the product. */}
+            <span className="relative mb-5 inline-flex size-16 items-center justify-center">
+              <span
+                aria-hidden
+                className="absolute inset-0 rounded-full bg-primary/20 blur-lg"
+              />
+              <span className="relative inline-flex size-16 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-[var(--elevation-floating)]">
+                <OwleryLogo size={34} />
+              </span>
             </span>
-            <h1 className="font-brand text-3xl font-semibold tracking-tight text-foreground">
+            {/* Weight contrast: the wordmark is the loudest thing here, the
+             * tagline recedes to a tracked-out small-caps line. Previously
+             * both sat at a similar visual weight, which read as flat. */}
+            <h1 className="font-brand text-[2rem] leading-none font-semibold tracking-tight text-foreground">
               Owlery
             </h1>
-            <p className="mt-1.5 text-sm text-muted-foreground leading-relaxed">
-              Your agents are waiting. Present your token to enter.
+            <p className="mt-3 text-[11px] font-semibold uppercase tracking-[0.14em] text-primary-700">
+              Owl post for your agents
+            </p>
+            <p className="mt-3 text-sm leading-relaxed text-muted-foreground">
+              Present your token to enter.
             </p>
           </div>
           <div className="space-y-4">
@@ -66,7 +80,7 @@ function App() {
                 autoFocus
               />
             </div>
-            <Button className="btn-login w-full" onClick={submit}>
+            <Button className="btn-login w-full" size="lg" onClick={submit}>
               Enter the Owlery
             </Button>
           </div>
@@ -159,17 +173,26 @@ function AuthenticatedApp({
 
         {/* Scrollable middle: sessions / schedules / harness sections.
          * px-5 on the nav inset + px-3 on each item pill = 32px from
-         * sidebar edge to item text. Hover pill itself insets 20px. */}
-        <nav className="flex-1 flex flex-col min-h-0 overflow-y-auto px-3">
+         * sidebar edge to item text. Hover pill itself insets 20px.
+         *
+         * `gap-1` + the pt on the divided sections gives the rail a real
+         * vertical rhythm: previously all five sections butted together with
+         * zero breathing room, which is what made it read as a generated
+         * template rather than a designed navigation. */}
+        <nav className="flex-1 flex flex-col min-h-0 overflow-y-auto px-3 gap-0.5 pb-3">
           <AgentList onCreateAgent={openCreateAgent} />
-          <ScheduleList onOpen={() => setSchedulesOpen(true)} />
-          <ApplicationList onAdd={() => {}} />
-          <ConnectorList />
-          <CredentialList />
+          {/* Everything below Agents is infrastructure, not the daily path —
+           * a hairline sets it apart so the eye lands on Agents first. */}
+          <div className="mt-2 pt-2 border-t border-sidebar-border/60 flex flex-col gap-0.5">
+            <ScheduleList onOpen={() => setSchedulesOpen(true)} />
+            <ApplicationList onAdd={() => {}} />
+            <ConnectorList />
+            <CredentialList />
+          </div>
         </nav>
 
         {/* Account footer — the single home for settings (no sidebar gears). */}
-        <div className="shrink-0 border-t border-sidebar-border px-3 py-2">
+        <div className="shrink-0 border-t border-sidebar-border bg-ink-100/60 px-3 py-2.5">
           <AccountDropdown
             onSignOut={signOut}
             onOpenSettings={() => setSettingsOpen(true)}

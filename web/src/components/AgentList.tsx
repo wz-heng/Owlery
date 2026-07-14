@@ -98,11 +98,11 @@ export function AgentList({ onCreateAgent }: { onCreateAgent: () => void }) {
   return (
     <div className="agent-list shrink-0">
       <div className="agent-list-header group flex h-8 items-center justify-between rounded-lg px-2 hover:bg-sidebar-accent transition-colors">
-        <h2 className="text-[13px] font-medium leading-4 text-sidebar-foreground/50 group-hover:text-sidebar-foreground transition-colors uppercase tracking-wide">
+        <h2 className="text-[11px] font-semibold leading-4 text-sidebar-foreground/55 group-hover:text-sidebar-foreground/80 transition-colors uppercase tracking-[0.12em]">
           Agents
         </h2>
         <button
-          className="btn-agent-add inline-flex h-6 w-6 items-center justify-center rounded-md text-sidebar-foreground/70 hover:bg-sidebar-selected hover:text-sidebar-foreground transition-colors"
+          className="btn-agent-add inline-flex h-6 w-6 items-center justify-center rounded-md border border-ink-300 bg-card text-sidebar-foreground/60 shadow-[var(--elevation-raised)] transition-all hover:border-primary/50 hover:bg-primary-50 hover:text-primary-700 active:translate-y-px active:shadow-none"
           onClick={onCreateAgent}
           title="New agent"
           aria-label="New agent"
