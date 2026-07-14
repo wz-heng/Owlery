@@ -63,17 +63,31 @@ discriminators are structured:
   `status: "rejected"`, a `rateLimitType` (e.g. `five_hour`) and an
   epoch `resetsAt`; the server-side throttle lacks the unified-limit
   claim, and its prose even says "(not your usage limit)".
-- codex: the 429 body's `usage_limit_reached` /
-  `rate_limit_reached_type`; additionally every `token_count` event
-  carries structured `rate_limits` (`window_minutes: 300`, epoch
-  `resets_at`).
+- codex: classification keys on codex's own unambiguous stdout limit
+  marker. The machine-readable epoch does NOT reach
+  `codex exec --json` stdout (implementation-time capture confirmed
+  stdout carries only rendered prose): the structured `rate_limits`
+  (`window_minutes: 300`, epoch `resets_at`) land in codex's rollout
+  session file, which Owlery already locates by resume id.
 
-The contract is therefore a per-backend hook on `RuntimeProfile` —
-`classify_usage_limit(turn events + error blob) -> UsageLimitHit |
-None`, where `UsageLimitHit` carries the limit kind and an optional
-epoch `reset_at` — pure, and living entirely in `server/harness/` like
-the pattern sets it replaces. No `if backend ==` outside the harness,
-unchanged.
+The contract is therefore TWO per-backend hooks on `RuntimeProfile`,
+split so purity and I/O don't blend:
+
+1. `classify_usage_limit(turn events + error blob) -> UsageLimitHit |
+   None` — PURE and stream-only; decides *whether the user's own limit
+   was hit* and carries the limit kind plus whatever epoch the stream
+   itself supplied (claude's `resetsAt`; `None` for codex).
+2. An optional epoch-lookup hook that MAY do I/O — codex reads
+   `resets_at` from its rollout file; claude doesn't need it. It only
+   fills a missing `reset_at`; it never changes the classification
+   verdict.
+
+A hit whose epoch stays missing after the lookup falls to the probe
+fallback below. Both hooks live entirely in `server/harness/` like the
+pattern sets they replace. No `if backend ==` outside the harness,
+unchanged. The split matters for the disjointness proof: the
+classifier is testable on the captured fixtures alone, with no disk
+state involved.
 
 **Prerequisite: stop discarding the discriminator.** The claude parser
 currently drops `rate_limit_event` on the floor ("nothing to surface
