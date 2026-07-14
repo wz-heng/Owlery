@@ -1937,6 +1937,15 @@ class SessionManager:
                 async for ws_event in self._run_backend(session, backend_dispatch_prompt):
                     await self._broadcast(ws_event)
                     yield ws_event
+            except UsageLimitParked:
+                # NOT a backend error: the turn is parked and will resume itself
+                # when the limit resets (limit-auto-resume.md §4). It must reach
+                # _drive_messages, which stops draining the queue — swallowing it
+                # here would log a bogus failure AND fire every queued prompt
+                # into the window we just proved is exhausted. The `finally`
+                # below still runs, so the lock is released and the session goes
+                # idle exactly as it would after any other turn.
+                raise
             except Exception as e:
                 logger.exception("Backend error in session %s", session_id)
                 error_msg = MessageContent(

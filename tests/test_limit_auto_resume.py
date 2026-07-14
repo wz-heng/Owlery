@@ -566,3 +566,24 @@ async def test_resume_is_skipped_if_the_user_came_back_first(manager):
         assert started == []
     finally:
         session._active_task.cancel()
+
+
+async def test_the_park_signal_survives_send_message(manager):
+    """Regression: `send_message` wraps the run loop in `except Exception`, which
+    would swallow the park signal — logging a bogus "Backend error" and letting
+    the queue drain straight into the exhausted window. The signal must reach
+    `_drive_messages` intact."""
+    from server.session_manager import UsageLimitParked
+
+    async def _parks(session, prompt):
+        raise UsageLimitParked(session.id)
+        yield  # pragma: no cover — makes this an async generator
+
+    manager._run_backend = _parks
+
+    with pytest.raises(UsageLimitParked):
+        async for _ in manager.send_message("s1", "do it"):
+            pass
+
+    # And the session lock was still released, so the resumed turn can run.
+    assert not manager.sessions["s1"]._lock.locked()
