@@ -31,6 +31,8 @@ from .profile import (
     ParseOutput,
     RuntimeProfile,
     TurnContext,
+    TurnFailure,
+    UsageLimitHit,
     WebCapability,
 )
 from .registry import register
@@ -258,6 +260,11 @@ class ClaudeEventParser(EventParser):
 
     def __init__(self) -> None:
         self._captured_session_id: str | None = None
+        self._rate_limit_info: dict[str, Any] | None = None
+
+    @property
+    def rate_limit_info(self) -> dict[str, Any] | None:
+        return self._rate_limit_info
 
     def parse(self, obj: dict[str, Any]) -> ParseOutput:
         kind = obj.get("type")
@@ -272,9 +279,19 @@ class ClaudeEventParser(EventParser):
                     )
             return ParseOutput()
 
-        # Partial deltas / rate-limit notices / vestigial control protocol —
-        # nothing to surface under the VM0 shape.
-        if kind in ("rate_limit_event", "stream_event", "control_response", "control_request"):
+        # `rate_limit_event` surfaces no event (nothing to render under the VM0
+        # shape) but IS latched: its `rate_limit_info` is the only thing that
+        # tells the user's own usage limit apart from a server-side 429 — both
+        # arrive as HTTP 429 with overlapping prose, and this record lands
+        # BEFORE the terminal error (limit-auto-resume.md §4).
+        if kind == "rate_limit_event":
+            info = obj.get("rate_limit_info")
+            if isinstance(info, dict):
+                self._rate_limit_info = info
+            return ParseOutput()
+
+        # Partial deltas / vestigial control protocol — nothing to surface.
+        if kind in ("stream_event", "control_response", "control_request"):
             return ParseOutput()
 
         if kind == "assistant":
@@ -633,6 +650,36 @@ _CLAUDE_TRANSIENT_ERROR_PATTERNS = (
 )
 
 
+def _claude_classify_usage_limit(failure: TurnFailure) -> UsageLimitHit | None:
+    """Was this failed claude turn the user's OWN usage limit?
+    (limit-auto-resume.md §4)
+
+    Structural, not textual. The CLI emits a `rate_limit_event` carrying
+    `rate_limit_info` before it fails the turn; the user's-limit case has
+    `status: "rejected"` plus the window it exhausted (`rateLimitType`, e.g.
+    "five_hour") and an epoch `resetsAt`. A server-side 429 produces the same
+    HTTP status and prose that also says "rate limit", but carries no
+    unified-limit claim — so it falls through to the transient patterns, which
+    is the disposition we want. Captured live from claude-code 2.1.209; both
+    halves of the pair are fixtures under tests/fixtures/.
+    """
+    info = failure.rate_limit_info
+    if not isinstance(info, dict):
+        return None
+    if info.get("status") != "rejected":
+        # "allowed_warning" (approaching the limit) is not a failure — the turn
+        # that carried it succeeded. Only a rejection parks.
+        return None
+    kind = info.get("rateLimitType")
+    if not isinstance(kind, str) or not kind:
+        # Rejected with no claim on WHICH window: that's the server-side
+        # throttle shape, not the user's limit. Leave it to transient retry.
+        return None
+    resets_at = info.get("resetsAt")
+    reset_at = int(resets_at) if isinstance(resets_at, (int, float)) else None
+    return UsageLimitHit(kind=kind, reset_at=reset_at)
+
+
 CLAUDE_CODE = RuntimeProfile(
     backend="claude-code",
     binary="claude",
@@ -641,6 +688,7 @@ CLAUDE_CODE = RuntimeProfile(
     premature_exit_recovery=True,
     auth_error_patterns=_CLAUDE_AUTH_ERROR_PATTERNS,
     transient_error_patterns=_CLAUDE_TRANSIENT_ERROR_PATTERNS,
+    classify_usage_limit=_claude_classify_usage_limit,
     web=WebCapability(tool_names=("WebSearch", "WebFetch"), combined=False),
     # Close stdin right after spawn. `claude --print` takes its prompt from
     # argv (`-- <prompt>`) and never reads stdin, so leaving the pipe open made

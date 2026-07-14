@@ -364,6 +364,13 @@ class HarnessRun:
     def stderr_text(self) -> str:
         return "\n".join(self._stderr_lines)
 
+    @property
+    def rate_limit_info(self) -> dict[str, Any] | None:
+        """Structured rate-limit state the parser latched off this turn's
+        stream, for the usage-limit classifier (limit-auto-resume.md §4).
+        None for backends that emit no such record."""
+        return self._parser.rate_limit_info
+
     # ------------------------------------------------------------------ readers
 
     async def _handle_line(self, line: str) -> None:

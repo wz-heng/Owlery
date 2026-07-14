@@ -18,7 +18,7 @@ import signal
 
 from .events import HarnessOneshotError
 from .login import LoginDriver
-from .profile import OneShotContext, RuntimeProfile
+from .profile import OneShotContext, RuntimeProfile, TurnFailure, UsageLimitHit
 from .run import HarnessRun, RunConfig, _which_with_fallback, prepare_spawn
 
 logger = logging.getLogger(__name__)
@@ -71,6 +71,23 @@ class Harness:
             return False
         low = text.lower()
         return any(p in low for p in self.profile.transient_error_patterns)
+
+    def classify_usage_limit(self, failure: "TurnFailure") -> "UsageLimitHit | None":
+        """Whether a failed turn was the USER'S OWN usage limit — and if so,
+        when the window reopens — so the caller can park the turn and resume it
+        unattended (limit-auto-resume.md §4).
+
+        Structural, not a pattern match: both CLIs answer a server-side
+        throttle and the user's real limit with HTTP 429 and prose that both
+        contain "rate limit", so only the backends' dedicated fields separate
+        them. Mutually exclusive with `is_auth_error` / `is_transient_error` by
+        construction — those two keep their pattern sets untouched, and a
+        message they'd claim carries none of the structure this reads. Pure.
+        Callers gate on the turn actually having failed."""
+        hook = self.profile.classify_usage_limit
+        if hook is None:
+            return None
+        return hook(failure)
 
     @property
     def premature_exit_recovery(self) -> bool:
