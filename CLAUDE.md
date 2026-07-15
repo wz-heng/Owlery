@@ -83,6 +83,22 @@ you'd route much of the suite to the real CLIs. And there is no fake
 real binary from an unmarked dir; if you need a canned codex turn, read
 `e2e-slim.md` §4 first.
 
+A third trap is environmental, not code: if the shell has `http_proxy` /
+`https_proxy` set (e.g. a system-wide Clash proxy) without a matching
+`no_proxy` exemption for `127.0.0.1`/`localhost`, five e2e specs go red —
+`handoff-pull.spec.ts` (its `--server` flag and the webhook notifier both
+intentionally support a *remote* target, so Owlery can't just force
+`trust_env=False` there) and the webhook-notifier idle test in
+`new-features.spec.ts`, both of which stand up a throwaway loopback HTTP
+listener that the proxy swallows. Export
+`no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost` before running
+`test:e2e` on such a box — that's the fix, not touching the product code.
+Owlery's own MCP-callback servers (`server/mcp_servers/*.py`,
+`connectors/_shared.py`) are a different case: their target is always a
+hardcoded `127.0.0.1:{port}` (`server/harness/assembly.py`), so those calls
+always pass `trust_env=False` unconditionally rather than relying on the
+environment.
+
 ## Test Coverage
 
 What each suite covers; detail lives in the linked plan docs.

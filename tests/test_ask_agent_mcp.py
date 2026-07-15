@@ -89,10 +89,13 @@ def test_ask_agent_success(monkeypatch):
                 "state": "running",
             }
 
-    def fake_post(url, json=None, headers=None, timeout=None):  # noqa: ARG001
+    def fake_post(
+        url, json=None, headers=None, timeout=None, trust_env=None
+    ):  # noqa: ARG001
         posted["url"] = url
         posted["body"] = json
         posted["headers"] = headers
+        posted["trust_env"] = trust_env
         return FakeResp()
 
     import httpx
@@ -114,6 +117,10 @@ def test_ask_agent_success(monkeypatch):
         "files": ["a.tsx", "b.tsx"],
     }
     assert posted["headers"]["Authorization"] == "Bearer t"
+    # Never honor a system proxy for this loopback callback — an
+    # http_proxy/https_proxy in the environment (e.g. Clash) must not
+    # hijack the request and hand back a bogus 502.
+    assert posted["trust_env"] is False
     # Tool's return text quotes the delegation id and target name so
     # the model can cite them back to the user.
     assert "abcd1234" in out
@@ -134,7 +141,9 @@ def test_ask_agent_omits_files_when_none(monkeypatch):
         def json(self):
             return {"delegation_id": "id", "target_agent_name": "Vera"}
 
-    def fake_post(url, json=None, headers=None, timeout=None):  # noqa: ARG001
+    def fake_post(
+        url, json=None, headers=None, timeout=None, trust_env=None
+    ):  # noqa: ARG001
         posted["body"] = json
         return FakeResp()
 
@@ -236,9 +245,12 @@ def test_cancel_agent_task_success(monkeypatch):
         def json(self):
             return {"state": "cancelled"}
 
-    def fake_post(url, json=None, headers=None, timeout=None):  # noqa: ARG001
+    def fake_post(
+        url, json=None, headers=None, timeout=None, trust_env=None
+    ):  # noqa: ARG001
         posted["url"] = url
         posted["body"] = json
+        posted["trust_env"] = trust_env
         return R()
 
     import httpx
@@ -251,6 +263,7 @@ def test_cancel_agent_task_success(monkeypatch):
         "/api/sessions/s/delegations/d1/cancel"
     )
     assert posted["body"] == {"reason": "user stopped"}
+    assert posted["trust_env"] is False
     assert "cancelled" in out
 
 
@@ -301,9 +314,12 @@ def test_ask_agent_continue_routes_to_follow_up_endpoint(monkeypatch):
                 "state": "running",
             }
 
-    def fake_post(url, json=None, headers=None, timeout=None):  # noqa: ARG001
+    def fake_post(
+        url, json=None, headers=None, timeout=None, trust_env=None
+    ):  # noqa: ARG001
         posted["url"] = url
         posted["body"] = json
+        posted["trust_env"] = trust_env
         return R()
 
     import httpx
@@ -318,6 +334,7 @@ def test_ask_agent_continue_routes_to_follow_up_endpoint(monkeypatch):
         "/api/sessions/s/delegations/d1/follow-up"
     )
     assert posted["body"] == {"request": "round 2"}
+    assert posted["trust_env"] is False
     # No `agent_name` / `files` keys in the body for continuation mode.
     assert "agent_name" not in posted["body"]
     assert "files" not in posted["body"]
@@ -415,9 +432,12 @@ def test_answer_agent_question_success(monkeypatch):
         def json(self):
             return {"ok": True}
 
-    def fake_post(url, json=None, headers=None, timeout=None):  # noqa: ARG001
+    def fake_post(
+        url, json=None, headers=None, timeout=None, trust_env=None
+    ):  # noqa: ARG001
         posted["url"] = url
         posted["body"] = json
+        posted["trust_env"] = trust_env
         return R()
 
     import httpx
@@ -430,6 +450,7 @@ def test_answer_agent_question_success(monkeypatch):
         "/api/sessions/s/delegations/d1/answer"
     )
     assert posted["body"] == {"choice": "Yes"}
+    assert posted["trust_env"] is False
     assert "Answered" in out
     assert "Yes" in out
 
@@ -497,10 +518,17 @@ def test_list_agent_tasks_summary(monkeypatch):
                 },
             ]
 
+    captured: dict = {}
+
+    def fake_get(url, headers=None, timeout=None, trust_env=None):  # noqa: ARG001
+        captured["trust_env"] = trust_env
+        return R()
+
     import httpx
 
-    monkeypatch.setattr(httpx, "get", lambda *a, **k: R())
+    monkeypatch.setattr(httpx, "get", fake_get)
     out = _call("list_agent_tasks")
     assert "d1" in out and "Vera" in out and "running" in out
     assert "d2" in out and "Pete" in out and "failed" in out
+    assert captured["trust_env"] is False
     assert "boom" in out

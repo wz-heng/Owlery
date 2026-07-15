@@ -82,6 +82,7 @@ def deep_research(question: str) -> str:
             json={"question": question},
             headers={"Authorization": f"Bearer {tok}"},
             timeout=15.0,
+            trust_env=False,
         )
     except httpx.HTTPError as e:
         return f"Error: failed to reach Owlery to start research: {e}"

@@ -68,6 +68,7 @@ class ConnectorContext:
                 f"{self.api_base}/api/connectors/{self.installation_id}/token",
                 headers=self._headers(),
                 timeout=_HTTP_TIMEOUT,
+                trust_env=False,
             )
         except httpx.HTTPError as e:
             logger.warning("token fetch failed: %s", e)
@@ -91,6 +92,7 @@ class ConnectorContext:
                 params={"error_code": error_code},
                 headers=self._headers(),
                 timeout=_HTTP_TIMEOUT,
+                trust_env=False,
             )
         except httpx.HTTPError as e:
             logger.warning("mark-needs-reconnect failed: %s", e)

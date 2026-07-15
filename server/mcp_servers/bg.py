@@ -115,7 +115,9 @@ def bg_run(command: str, description: str | None = None) -> str:
     url = f"{api}/api/sessions/{sid}/bg-tasks"
     body = {"command": command, "description": description}
     try:
-        r = httpx.post(url, json=body, headers=hdrs, timeout=10.0)
+        r = httpx.post(
+            url, json=body, headers=hdrs, timeout=10.0, trust_env=False
+        )
     except httpx.HTTPError as e:
         return f"Error: failed to reach Owlery to start bg task: {e}"
     if r.status_code != 201:
@@ -152,7 +154,7 @@ def bg_cancel(task_id: str) -> str:
         return "Error: bg server is misconfigured (env vars missing)."
     url = f"{api}/api/sessions/{sid}/bg-tasks/{task_id}/cancel"
     try:
-        r = httpx.post(url, headers=hdrs, timeout=10.0)
+        r = httpx.post(url, headers=hdrs, timeout=10.0, trust_env=False)
     except httpx.HTTPError as e:
         return f"Error: failed to reach Owlery to cancel bg task {task_id}: {e}"
     if r.status_code == 404:
@@ -188,7 +190,7 @@ def bg_list() -> str:
         return "Error: bg server is misconfigured (env vars missing)."
     url = f"{api}/api/sessions/{sid}/bg-tasks"
     try:
-        r = httpx.get(url, headers=hdrs, timeout=10.0)
+        r = httpx.get(url, headers=hdrs, timeout=10.0, trust_env=False)
     except httpx.HTTPError as e:
         return f"Error: failed to reach Owlery to list bg tasks: {e}"
     if r.status_code != 200:
