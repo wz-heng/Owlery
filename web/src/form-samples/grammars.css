@@ -1,0 +1,230 @@
+/* Messenger Form — round 3 stage 1 candidate shape grammars.
+ *
+ * SAMPLE ROOM ONLY. Nothing here is imported by the product bundle;
+ * `form-samples.html` is a dev-server-only entry that `vite build`
+ * never sees (index.html is the sole build input). When the owner picks
+ * a grammar, its block below is what graduates into `tokens.css` and
+ * the real components — the classes are written to be lifted verbatim.
+ *
+ * Every candidate obeys round 1/2 law: no color, elevation, or type
+ * value is invented here. Surfaces keep `--elevation-raised` as a real
+ * `box-shadow` on the border-box — that is why none of the three uses
+ * `clip-path` or `mask` on a *surface* (both detach the shadow from the
+ * silhouette, and `drop-shadow()` cannot reproduce the elevation
+ * scale's negative spreads). Ornament-scale bits (a 22px seal, a logo)
+ * are free to clip; they carry no elevation.
+ */
+
+/* ── Grammar A — Seal & Letterhead ─────────────────────────────────
+ *
+ * One motif: THE DISC. Corners are uniform and soft (no corner ever
+ * carries meaning); every sheet is ruled under its header like a piece
+ * of letterhead; a wax seal disc straddles the sheet's top edge at a
+ * fixed inset from the author's side. Asymmetry lives ONLY in which
+ * side the seal sits on — never in the corners.
+ */
+.g-seal {
+  --seal-size: 26px;
+  --seal-inset: 14px;
+  --rule-color: hsl(var(--ink-950) / 0.14);
+
+  position: relative;
+  border-radius: var(--radius);
+  /* The seal hangs half above the sheet; the top padding buys back the
+   * room it takes so text never collides with it. */
+  padding-top: calc(var(--seal-size) / 2 + 6px);
+}
+
+/* The letterhead rule: full-bleed, directly under the header line.
+ * Full-bleed (not inset) is the point — an inset rule reads as a
+ * divider, a bled rule reads as printed stationery. */
+.g-seal-rule {
+  border-bottom: 1px solid var(--rule-color);
+  margin-inline: calc(var(--g-gutter) * -1);
+  padding-inline: var(--g-gutter);
+  padding-bottom: 7px;
+  margin-bottom: 9px;
+}
+
+/* The seal itself. `--seal-side` is `left` or `right` — the author's
+ * side. Nothing else about the sheet changes between authors. */
+.g-seal-mark {
+  position: absolute;
+  top: calc(var(--seal-size) / -2);
+  width: var(--seal-size);
+  height: var(--seal-size);
+  filter: drop-shadow(0 1px 1.5px hsl(var(--ink-950) / 0.28));
+}
+.g-seal-mark[data-side="left"] {
+  left: var(--seal-inset);
+}
+.g-seal-mark[data-side="right"] {
+  right: var(--seal-inset);
+}
+
+/* ── Grammar B — Dog-ear / Fold ────────────────────────────────────
+ *
+ * One motif: THE FOLD. Three corners at `--radius`; the fourth is
+ * square and carries a turned-up flap of paper-back. Rule for where:
+ * the fold is at the sheet's bottom corner on the author's side —
+ * where a letter is signed and folded. That single rule gives user vs
+ * assistant a *formal* difference (§4.1) with zero ornament.
+ *
+ * Shadow law: the corner is genuinely square (border-radius: 0), so
+ * `--elevation-raised` traces the real silhouette. The flap is painted
+ * inside the box and casts its own crease shadow onto the sheet.
+ */
+.g-fold {
+  --fold: 18px;
+  position: relative;
+  border-radius: var(--radius);
+}
+.g-fold[data-fold="br"] {
+  border-bottom-right-radius: 0;
+}
+.g-fold[data-fold="bl"] {
+  border-bottom-left-radius: 0;
+}
+
+.g-fold::after {
+  content: "";
+  position: absolute;
+  bottom: 0;
+  width: var(--fold);
+  height: var(--fold);
+  pointer-events: none;
+  /* Two stacked layers: the crease hairline on top, the paper-back
+   * tone under it. The 49.6/50.4% stops are a 1px-ish line at these
+   * sizes without needing a rotated pseudo-element. */
+  background-repeat: no-repeat;
+}
+.g-fold[data-fold="br"]::after {
+  right: 0;
+  border-bottom-right-radius: inherit;
+  background-image:
+    linear-gradient(
+      to top left,
+      transparent 0 49.4%,
+      hsl(var(--ink-950) / 0.32) 49.4% 50.6%,
+      transparent 50.6% 100%
+    ),
+    linear-gradient(to top left, var(--fold-back) 0 50%, transparent 50% 100%);
+  filter: drop-shadow(-1.5px -1.5px 1px hsl(var(--ink-950) / 0.16));
+}
+.g-fold[data-fold="bl"]::after {
+  left: 0;
+  border-bottom-left-radius: inherit;
+  background-image:
+    linear-gradient(
+      to top right,
+      transparent 0 49.4%,
+      hsl(var(--ink-950) / 0.32) 49.4% 50.6%,
+      transparent 50.6% 100%
+    ),
+    linear-gradient(to top right, var(--fold-back) 0 50%, transparent 50% 100%);
+  filter: drop-shadow(1.5px -1.5px 1px hsl(var(--ink-950) / 0.16));
+}
+
+/* Content must not run under the flap. Only the last line needs the
+ * clearance, so we shape-pad rather than pad the whole box. */
+.g-fold-body[data-fold="br"] {
+  padding-right: calc(var(--fold) - 4px);
+}
+.g-fold-body[data-fold="bl"] {
+  padding-left: calc(var(--fold) - 4px);
+}
+
+/* ── Grammar C — Postal Frame ──────────────────────────────────────
+ *
+ * One motif: THE PERFORATION. Every sheet is a stamp: a tinted margin
+ * band around a content field, the two separated by a punched rule.
+ * Asymmetry lives in the selvedge — the band is double-width on the
+ * author's side and that widened edge is the only place a mark may go.
+ *
+ * Shadow law: the outer sheet is an ordinary rounded rect, so the
+ * elevation is untouched. The teeth are punched into the *inner field*
+ * with the band's own tone, which is what makes them read as holes
+ * rather than dots.
+ */
+.g-stamp {
+  --stamp-band: 9px;
+  --stamp-selvedge: 19px;
+  --perf-pitch: 8px;
+  --perf-r: 2.6px;
+
+  position: relative;
+  border-radius: var(--radius);
+  padding: var(--stamp-band);
+}
+.g-stamp[data-selvedge="left"] {
+  padding-left: var(--stamp-selvedge);
+}
+.g-stamp[data-selvedge="right"] {
+  padding-right: var(--stamp-selvedge);
+}
+
+.g-stamp-field {
+  position: relative;
+  border-radius: calc(var(--radius) - 4px);
+}
+
+/* Four repeating radial-gradient tiles, one per edge, each with its
+ * circle centred exactly on the field's boundary so the tooth bites
+ * half in / half out. `--perf` is the band tone showing through. */
+.g-stamp-field::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  border-radius: inherit;
+  background-image:
+    radial-gradient(
+      circle var(--perf-r) at calc(var(--perf-pitch) / 2) 0,
+      var(--perf) 96%,
+      transparent 98%
+    ),
+    radial-gradient(
+      circle var(--perf-r) at calc(var(--perf-pitch) / 2) 100%,
+      var(--perf) 96%,
+      transparent 98%
+    ),
+    radial-gradient(
+      circle var(--perf-r) at 0 calc(var(--perf-pitch) / 2),
+      var(--perf) 96%,
+      transparent 98%
+    ),
+    radial-gradient(
+      circle var(--perf-r) at 100% calc(var(--perf-pitch) / 2),
+      var(--perf) 96%,
+      transparent 98%
+    );
+  background-size:
+    var(--perf-pitch) var(--perf-pitch),
+    var(--perf-pitch) var(--perf-pitch),
+    var(--perf-pitch) var(--perf-pitch),
+    var(--perf-pitch) var(--perf-pitch);
+  background-repeat: repeat-x, repeat-x, repeat-y, repeat-y;
+  background-position: 0 0, 0 100%, 0 0, 100% 0;
+}
+
+/* The denomination: the one mark the selvedge is allowed to carry.
+ * Rotated to read along the band, like a stamp's value. */
+.g-stamp-denom {
+  position: absolute;
+  top: 50%;
+  width: var(--stamp-selvedge);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: hsl(var(--ink-700));
+}
+.g-stamp-denom[data-selvedge="left"] {
+  left: 0;
+  transform: translateY(-50%) rotate(180deg);
+  writing-mode: vertical-rl;
+}
+.g-stamp-denom[data-selvedge="right"] {
+  right: 0;
+  transform: translateY(-50%);
+  writing-mode: vertical-rl;
+}
