@@ -26,6 +26,7 @@ from .notifiers import notifier_manager
 from .agent_manager import AgentManager
 from .connector_manager import ConnectorManager
 from .routers import agents, attachments, bg_tasks as bg_tasks_router, connectors, credentials, delegations as delegations_router, files, notifiers, questions, research as research_router, schedules, sessions, usage as usage_router, ws
+from .parked_turns import ParkedTurnRunner
 from .scheduler import ScheduleRunner
 from .session_manager import session_manager
 
@@ -75,6 +76,15 @@ async def lifespan(app: FastAPI):
     session_manager.set_schedule_runner(schedule_runner)
     schedules._db = db
     schedules._runner = schedule_runner
+
+    # Usage-limit parks (limit-auto-resume.md §4). Rebuilds the wake-up jobs a
+    # restart destroyed — a park is a multi-hour wait, so the DB records are the
+    # source of truth and the scheduler jobs are derived state.
+    parked_turn_runner = ParkedTurnRunner(session_manager, db)
+    await parked_turn_runner.initialize()
+    app.state.parked_turn_runner = parked_turn_runner
+    session_manager.set_parked_turn_runner(parked_turn_runner)
+    sessions._parked_turns = parked_turn_runner
     usage_router._db = db
     agents.set_manager(AgentManager(db))
     connectors.set_manager(ConnectorManager(db))
@@ -130,6 +140,7 @@ async def lifespan(app: FastAPI):
     await bg_task_manager.shutdown()
     delegation_manager.shutdown()
     await schedule_runner.shutdown()
+    await parked_turn_runner.shutdown()
     await bridge_manager.stop_all()
     await bridge_manager.unregister_broadcast()
     await db.close()

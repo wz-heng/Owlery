@@ -261,6 +261,13 @@ class Bridge(ABC):
                     chat_id, event.get("message", "Unknown error")
                 )
 
+            elif event_type == "limit_resumed":
+                # The usage limit reset and the parked turn is running again
+                # (limit-auto-resume.md §4). The park itself already reached the
+                # chat as an `error` marker; without this, an unattended phone
+                # user would see "auto-resuming at 22:30" and then silence.
+                await self.send_status(chat_id, "Usage limit reset — resuming.")
+
             elif event_type == "user_message":
                 pass  # No need to echo user's own message
 

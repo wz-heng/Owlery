@@ -28,6 +28,7 @@ from .harness import (
     HarnessEvent,
     HarnessRun,
     RunConfig,
+    TurnFailure,
     get_harness,
 )
 from . import fork_helpers
@@ -47,6 +48,20 @@ from .models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class UsageLimitParked(Exception):
+    """A turn was parked on the user's usage limit and will auto-resume when the
+    window resets (limit-auto-resume.md §4).
+
+    Raised to unwind the whole message drive, not just the failed turn: any
+    prompts still queued behind it must STAY queued rather than fire into an
+    exhausted window. They drain normally once the resume lands.
+    """
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__(f"Session {session_id} parked on a usage limit")
+        self.session_id = session_id
 
 
 class ForkError(Exception):
@@ -249,6 +264,11 @@ class Session:
     _pending_question_answers: dict[str, str] = field(default_factory=dict, repr=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     _pending_queue: list[QueuedPrompt] = field(default_factory=list, repr=False)
+    # Consecutive usage-limit parks with no progress (limit-auto-resume.md §4).
+    # Carried in memory ONLY across a wake-up, which consumes the DB row before
+    # re-running the turn; the row itself is what survives a restart. Cleared as
+    # soon as a turn completes, so an old park can't count against a fresh one.
+    _limit_attempts: dict[str, int] | None = field(default=None, repr=False)
 
 
 class SessionManager:
@@ -265,12 +285,19 @@ class SessionManager:
         # re-register jobs when archiving a session repoints the schedules
         # anchored to it. Opaque: we only call `.reschedule(row)`.
         self._schedule_runner: Any = None
+        # Likewise — the ParkedTurnRunner (limit-auto-resume.md §4). None means
+        # no park machinery is wired (unit tests with a bare manager), and a
+        # usage-limit failure just surfaces as-is, as it did before this feature.
+        self._parked_turns: Any = None
 
     def set_notifier_manager(self, mgr: Any) -> None:
         self._notifier_manager = mgr
 
     def set_schedule_runner(self, runner: Any) -> None:
         self._schedule_runner = runner
+
+    def set_parked_turn_runner(self, runner: Any) -> None:
+        self._parked_turns = runner
 
     async def initialize(self, db: Database) -> None:
         self.db = db
@@ -1625,7 +1652,16 @@ class SessionManager:
         # flight here, because fork_session only sets `_forking` against a
         # quiescent parent (no `_active_task`), so a running turn implies
         # not-forking — no `_forking` check needed on this branch.
-        if session._active_task and not session._active_task.done():
+        #
+        # A pending usage-limit park counts as busy too (limit-auto-resume.md
+        # §4): after a park the turn task is done and the session LOOKS idle,
+        # but firing a new turn now would just knock on the exhausted window.
+        # Hold the message — the auto-resume drains the queue once the limit
+        # resets. The wake-up deletes the park row BEFORE it re-drives the turn
+        # (parked_turns._wake), so this guard never blocks the resume itself.
+        if await self._is_parked(session_id) or (
+            session._active_task and not session._active_task.done()
+        ):
             session._pending_queue.append(queued)
             await self._broadcast(
                 {
@@ -1645,7 +1681,12 @@ class SessionManager:
         async with session._lock:
             if session._forking:
                 raise ValueError(f"Session {session_id} is busy (forking)")
-            if session._active_task and not session._active_task.done():
+            # Re-check the park under the lock: a turn on this session could
+            # have limit-parked in the window between the fast-path check above
+            # and acquiring the lock, and we must not drive into that.
+            if await self._is_parked(session_id) or (
+                session._active_task and not session._active_task.done()
+            ):
                 session._pending_queue.append(queued)
                 await self._broadcast(
                     {
@@ -1659,6 +1700,23 @@ class SessionManager:
             session._active_task = asyncio.create_task(
                 self._drive_messages(session_id, queued)
             )
+
+    async def _is_parked(self, session_id: str) -> bool:
+        """Is a usage-limit park pending for this session? (limit-auto-resume.md
+        §4) A parked session holds new turns in the queue rather than firing
+        them into the still-exhausted window."""
+        if self._parked_turns is None:
+            return False
+        return await self._parked_turns.get(session_id) is not None
+
+    async def get_pending_park(self, session_id: str) -> dict[str, Any] | None:
+        """The pending usage-limit park for a session, or None. Lets the REST
+        layer surface the "auto-resumes at HH:MM" state so a reload/reconnect
+        restores the banner instead of showing a dead-looking idle session
+        (limit-auto-resume.md §4)."""
+        if self._parked_turns is None:
+            return None
+        return await self._parked_turns.get(session_id)
 
     async def _drive_messages(
         self, session_id: str, initial: QueuedPrompt
@@ -1680,6 +1738,13 @@ class SessionManager:
                 await inner
             except asyncio.CancelledError:
                 pass  # interrupt() cancelled the inner task; continue draining
+            except UsageLimitParked:
+                # The turn hit the user's usage limit and is parked until the
+                # window resets (limit-auto-resume.md §4). Stop draining: the
+                # queue must NOT fire into an exhausted window. Whatever is
+                # still queued stays queued, and drains after the auto-resume.
+                session._inner_task = None
+                return
             except Exception:
                 logger.exception(
                     "Background task error for session %s", session_id
@@ -1908,6 +1973,15 @@ class SessionManager:
                 async for ws_event in self._run_backend(session, backend_dispatch_prompt):
                     await self._broadcast(ws_event)
                     yield ws_event
+            except UsageLimitParked:
+                # NOT a backend error: the turn is parked and will resume itself
+                # when the limit resets (limit-auto-resume.md §4). It must reach
+                # _drive_messages, which stops draining the queue — swallowing it
+                # here would log a bogus failure AND fire every queued prompt
+                # into the window we just proved is exhausted. The `finally`
+                # below still runs, so the lock is released and the session goes
+                # idle exactly as it would after any other turn.
+                raise
             except Exception as e:
                 logger.exception("Backend error in session %s", session_id)
                 error_msg = MessageContent(
@@ -2054,6 +2128,14 @@ class SessionManager:
     _MAX_TRANSIENT_RETRIES = 2
     _TRANSIENT_RETRY_BASE_DELAY = 1.0  # seconds; doubles each attempt
 
+    # Usage-limit park (limit-auto-resume.md §4). A resumed turn that is STILL
+    # limited re-parks against the newly reported reset — bounded, or a window
+    # that never frees up (someone else eating it first) would park forever.
+    _MAX_LIMIT_PARKS = 3
+    # When no reset epoch is reported at all, we knock periodically instead.
+    # 12 × 30min comfortably outlasts one 5-hour window.
+    _MAX_LIMIT_PROBES = 12
+
     async def _run_backend(
         self, session: Session, prompt: str
     ) -> AsyncIterator[dict[str, Any]]:
@@ -2163,6 +2245,12 @@ class SessionManager:
                     # CLI reissued a different one mid-stream).
                     if event.type == "result":
                         saw_result = True
+                        if not event.is_error:
+                            # A turn got through — the window is open again, so
+                            # the consecutive-park count starts fresh. Without
+                            # this, two parks today would count against an
+                            # unrelated limit next week.
+                            session._limit_attempts = None
                         if event.session_id and session.claude_session_id != event.session_id:
                             session.claude_session_id = event.session_id
                             if self.db:
@@ -2249,7 +2337,54 @@ class SessionManager:
                     )
                     return
 
-                # (b) Transient provider-reliability failure (5xx / overloaded /
+                # (b) The USER'S OWN usage limit → park the turn and auto-resume
+                # when the window resets (limit-auto-resume.md §4). Checked
+                # BEFORE the transient branch: a limit and a server-side
+                # throttle both arrive as a 429 whose prose says "rate limit",
+                # and hammering an exhausted quota is pure waste. The classifier
+                # is structural (the latched rate_limit_event / the backend's own
+                # unambiguous marker), so it cannot claim a transient failure —
+                # the two are disjoint by construction, not by phrasing.
+                #
+                # A turn the user interrupted never reaches here at all: Esc
+                # cancels the inner task, so CancelledError unwinds this
+                # generator long before the classification ladder runs.
+                turn_failure = TurnFailure(
+                    error_text=error_blob,
+                    rate_limit_info=getattr(backend, "rate_limit_info", None),
+                    resume_id=session.claude_session_id,
+                    home_dir=getattr(credential, "home_dir", None),
+                )
+                limit_hit = harness.classify_usage_limit(turn_failure)
+                if limit_hit is not None and self._parked_turns is not None:
+                    # The classifier is pure and stream-only, so a backend whose
+                    # epoch lives off-stream (codex writes it to the rollout, not
+                    # stdout) still needs its reset filled in — done here, where
+                    # I/O is allowed. The lookup only supplies a missing epoch;
+                    # it never revisits the verdict (limit-auto-resume.md §4).
+                    limit_hit = harness.resolve_usage_limit_reset(
+                        limit_hit, turn_failure
+                    )
+                    event, parked = await self._park_limited_turn(
+                        session,
+                        hit=limit_hit,
+                        prompt=prompt,
+                        resume_at_turn_start=resume_at_turn_start,
+                        produced_output=saw_tool_use or saw_text,
+                    )
+                    if event is not None:
+                        yield event
+                    if parked:
+                        # Stop the whole drive, not just this turn: queued
+                        # prompts must stay queued rather than fire into the
+                        # exhausted window. They drain after the resume lands.
+                        raise UsageLimitParked(session.id)
+                    if event is not None:
+                        return  # gave up after N resumes — terminal, already told
+                    # Nothing safe to resume — fall through and let the limit
+                    # surface as an ordinary error (pre-existing behaviour).
+
+                # (c) Transient provider-reliability failure (5xx / overloaded /
                 # dropped connection / server-side throttle) → bounded retry.
                 # TWO modes, by whether the turn already produced output:
                 #   - NO output yet → re-run the ORIGINAL prompt from the
@@ -2857,6 +2992,266 @@ class SessionManager:
         if seq is not None:
             event["seq"] = seq
         return event
+
+    # ------------------------------------------------- usage-limit park/resume
+
+    async def _park_limited_turn(
+        self,
+        session: Session,
+        *,
+        hit: Any,
+        prompt: str,
+        resume_at_turn_start: str | None,
+        produced_output: bool,
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """Park a turn that died on the user's own usage limit, and schedule its
+        unattended resume (limit-auto-resume.md §4).
+
+        Returns `(event, parked)`. `parked` is True only when a resume is
+        actually scheduled — the caller halts the message drive on that, holding
+        the queue. When False, the turn is over for good and `event` is either a
+        terminal "gave up" marker or None (nothing safe to resume → let the
+        limit surface as an ordinary error).
+
+        The resume mode reuses the transient-retry two-mode recovery verbatim —
+        that recovery already solved the hard part (don't re-run tools, don't
+        duplicate text) and must not be re-derived:
+          - no output streamed → re-run the ORIGINAL prompt, and rewind to the
+            resume id we held at turn start so a half-born attempt id can't
+            leak into the retry.
+          - output streamed AND a resume id was captured → "continue" the
+            conversation.
+        A turn that streamed output but captured no resume id can't be safely
+        resumed either way, so it is NOT parked.
+        """
+        # The park counters must survive the wake-up that consumed the DB row.
+        # The wake deletes the record before re-running the turn (so a stale row
+        # can't rebuild into a duplicate job), so a re-park would otherwise find
+        # no prior row, reset to zero, and re-park forever — the cap would never
+        # fire. `_limit_attempts` carries them across that gap; the DB row is
+        # still the source of truth after a RESTART, so prefer it when present.
+        prior = await self._parked_turns.get(session.id)
+        if prior is None:
+            prior = getattr(session, "_limit_attempts", None)
+        attempts = (prior or {}).get("attempts", 0)
+        probes = (prior or {}).get("probes", 0)
+
+        if produced_output and not session.claude_session_id:
+            return None, False  # nothing to continue from — surface as-is
+
+        if hit.reset_at is None:
+            # No epoch reported: probe on a fixed interval instead of guessing.
+            if probes >= self._MAX_LIMIT_PROBES:
+                event = await self._surface_limit_exhausted(
+                    session, reason="probe", attempts=probes
+                )
+                return event, False
+            probes += 1
+            reset_dt = None
+        else:
+            # A wake-up that limit-fails again re-parks — but bound it, or a
+            # window that never really frees up would park forever.
+            if attempts >= self._MAX_LIMIT_PARKS:
+                event = await self._surface_limit_exhausted(
+                    session, reason="repark", attempts=attempts
+                )
+                return event, False
+            attempts += 1
+            probes = 0
+            reset_dt = datetime.fromtimestamp(hit.reset_at, tz=timezone.utc)
+
+        if produced_output:
+            resume_mode, payload = "continue", "continue"
+        else:
+            resume_mode, payload = "prompt", prompt
+
+        row = await self._parked_turns.park(
+            session.id,
+            resume_mode=resume_mode,
+            payload=payload,
+            resume_at_turn_start=resume_at_turn_start,
+            limit_kind=hit.kind,
+            reset_at=reset_dt,
+            attempts=attempts,
+            probes=probes,
+        )
+        return await self._surface_limit_parked(session, row=row), True
+
+    async def _surface_limit_parked(
+        self, session: Session, *, row: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Persist + return the "parked, resuming at HH:MM" marker, so the wait
+        is visible rather than a silent stall, and the UI/bridge can show it."""
+        wake_at = row.get("wake_at")
+        when = ""
+        try:
+            if wake_at:
+                when = datetime.fromisoformat(wake_at).astimezone().strftime("%H:%M")
+        except ValueError:
+            when = ""
+        human = (
+            f"(usage limit reached — auto-resuming at {when})"
+            if when
+            else "(usage limit reached — auto-resuming when the limit resets)"
+        )
+        seq = await self._persist_message(
+            session,
+            MessageContent(role=MessageRole.system, type="error", content=human),
+        )
+        event: dict[str, Any] = {
+            "type": "error",
+            "session_id": session.id,
+            "message": human,
+            "code": "limit_paused",
+            "resume_at": wake_at,
+            "limit_kind": row.get("limit_kind"),
+        }
+        if seq is not None:
+            event["seq"] = seq
+        await self._fire_limit_notification(session, human)
+        return event
+
+    async def _surface_limit_exhausted(
+        self, session: Session, *, reason: str, attempts: int
+    ) -> dict[str, Any]:
+        """The park budget is spent — the limit kept rejecting us across
+        consecutive resumes. Surface a clear terminal error rather than parking
+        forever (limit-auto-resume.md §4)."""
+        if reason == "probe":
+            human = (
+                f"Still usage-limited after {attempts} retries over "
+                "several hours, and the backend never reported a reset time. "
+                "Giving up on auto-resume — send the message again when your "
+                "limit has reset."
+            )
+        else:
+            human = (
+                f"Still usage-limited after {attempts} automatic resumes at the "
+                "reported reset time. Giving up on auto-resume — send the "
+                "message again when your limit has reset."
+            )
+        seq = await self._persist_message(
+            session,
+            MessageContent(
+                role=MessageRole.system, type="error", content=human, is_error=True
+            ),
+        )
+        event: dict[str, Any] = {
+            "type": "error",
+            "session_id": session.id,
+            "message": human,
+            "code": "limit_exhausted",
+        }
+        if seq is not None:
+            event["seq"] = seq
+        await self._fire_limit_notification(session, human)
+        # The park is over — drop any record so a boot can't revive it.
+        if self._parked_turns is not None:
+            await self._parked_turns.cancel(session.id)
+        return event
+
+    async def _fire_limit_notification(self, session: Session, text: str) -> None:
+        """Relay a park / give-up to the notifiers, so an unattended phone user
+        isn't staring at hours of silence (limit-auto-resume.md §4)."""
+        if self._notifier_manager is None:
+            return
+        try:
+            from .notifiers import NotifierEvent
+
+            await self._notifier_manager.fire(
+                NotifierEvent(
+                    type="usage_limit",
+                    title=session.name or "Usage limit",
+                    message=f"Session '{session.name}': {text}",
+                    session_id=session.id,
+                    session_name=session.name,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "usage-limit notification failed for session %s", session.id
+            )
+
+    async def release_parked_queue(self, session_id: str) -> None:
+        """The user cancelled a pending auto-resume. The parked turn itself is
+        abandoned (that's what cancelling means), but prompts that piled up
+        behind it were held, not dropped — drain them now rather than stranding
+        them until the next message (limit-auto-resume.md §4)."""
+        session = self.sessions.get(session_id)
+        if session is None or not session._pending_queue:
+            return
+        if session._active_task and not session._active_task.done():
+            return  # a turn is already running; it will drain the queue itself
+        async with session._lock:
+            if session._active_task and not session._active_task.done():
+                return
+            if not session._pending_queue:
+                return
+            nxt = session._pending_queue.pop(0)
+            await self._broadcast(
+                {
+                    "type": "dequeued",
+                    "session_id": session_id,
+                    "queue_length": len(session._pending_queue),
+                }
+            )
+            session._active_task = asyncio.create_task(
+                self._drive_messages(session_id, nxt)
+            )
+
+    async def resume_parked_turn(self, row: dict[str, Any]) -> None:
+        """Re-run a turn the usage limit parked (limit-auto-resume.md §4).
+
+        Called by the ParkedTurnRunner when the reset lands. Drives the turn
+        through the ordinary path, so the resumed turn behaves like any other —
+        including parking again if the window is still (or already) exhausted.
+        """
+        session_id = row["session_id"]
+        session = self.sessions.get(session_id)
+        if session is None:
+            logger.info(
+                "Parked turn for session %s dropped — the session is gone",
+                session_id,
+            )
+            return
+
+        # A turn started while we were parked (the user came back and typed).
+        # Don't double-drive: leave the park consumed and let their turn stand.
+        if session._active_task and not session._active_task.done():
+            logger.info(
+                "Session %s is busy at wake-up — dropping the parked resume",
+                session_id,
+            )
+            return
+
+        if row.get("resume_mode") == "prompt":
+            # Rewind to the resume id we held at turn start, discarding any id
+            # the limit-failed attempt captured (same rule as transient retry).
+            resume_at = row.get("resume_at_turn_start")
+            if session.claude_session_id != resume_at:
+                session.claude_session_id = resume_at
+                if self.db:
+                    await self.db.update_session_field(
+                        session_id, claude_session_id=resume_at
+                    )
+
+        # Carry the park counters across the consumed DB row (see
+        # _park_limited_turn): if this resumed turn limits again, the re-park
+        # must count as the NEXT attempt, not start over — otherwise the cap
+        # never fires and a permanently-exhausted window parks forever.
+        session._limit_attempts = {
+            "attempts": row.get("attempts", 0),
+            "probes": row.get("probes", 0),
+        }
+
+        await self._broadcast(
+            {
+                "type": "limit_resumed",
+                "session_id": session_id,
+                "attempt": row.get("attempts", 0),
+            }
+        )
+        await self.start_message(session_id, row["payload"])
 
     async def _mark_needs_reconnect(
         self, credential_id: str, code: RefreshErrorCode

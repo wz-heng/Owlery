@@ -757,6 +757,15 @@ class DelegationManager:
             await self._inject_terminal(rec)
             return
         if kind == "error":
+            # A parked child is PENDING, not failed (limit-auto-resume.md §4).
+            # The usage-limit markers ride the `error` event shape, but the turn
+            # is coming back by itself when the window resets — finalising here
+            # would inject a bogus `[agent-error]` into the parent AND leave the
+            # resumed child answering a delegation nobody is waiting on any more.
+            # Stay `running` and keep waiting; the resumed turn ends the
+            # delegation for real, via `result` or a genuine error.
+            if msg.get("code") == "limit_paused":
+                return
             rec.state = "failed"
             rec.error = str(msg.get("message") or "child session error")
             rec.finished_at = datetime.now(timezone.utc).isoformat()

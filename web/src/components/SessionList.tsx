@@ -7,6 +7,7 @@ import {
   IconSubtask,
   IconX,
 } from "@tabler/icons-react";
+import { parkedTurnFromSnapshot } from "../hooks/useWebSocket";
 import { useSessionStore, type SessionInfo } from "../stores/sessionStore";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
@@ -140,6 +141,13 @@ export function SessionList({
         setMessages(id, data.messages || []);
         setPendingQueue(id, data.pending_queue || []);
         setPendingQuestions(id, data.pending_questions || []);
+        // Restore the usage-limit park banner from the snapshot, so selecting a
+        // paused session shows "auto-resumes at HH:MM" + cancel rather than a
+        // dead-looking idle chat (limit-auto-resume.md §4).
+        const park = parkedTurnFromSnapshot(data.pending_park);
+        const store = useSessionStore.getState();
+        if (park) store.setParkedTurn(id, park);
+        else store.clearParkedTurn(id);
         if (typeof data.next_message_seq === "number") {
           useSessionStore
             .getState()

@@ -125,6 +125,34 @@ export function ChatView({
   const pendingQueue = activeSessionId
     ? (pendingQueueMap[activeSessionId] ?? EMPTY_QUEUE)
     : EMPTY_QUEUE;
+
+  // Usage-limit park (limit-auto-resume.md §4): the turn resumes by itself when
+  // the window resets. The banner makes the multi-hour wait visible — and
+  // cancellable, for a user who'd rather take the wheel back.
+  const parkedTurnMap = useSessionStore((s) => s.parkedTurns);
+  const parkedTurn = activeSessionId ? parkedTurnMap[activeSessionId] : undefined;
+  const parkedResumeLabel = useMemo(() => {
+    if (!parkedTurn?.resumeAt) return "";
+    const at = new Date(parkedTurn.resumeAt);
+    return Number.isNaN(at.getTime())
+      ? ""
+      : at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }, [parkedTurn?.resumeAt]);
+
+  const cancelParkedTurn = useCallback(async () => {
+    if (!activeSessionId) return;
+    const token = useSessionStore.getState().token;
+    try {
+      await fetch(`/api/sessions/${activeSessionId}/parked-turn`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+    } finally {
+      // Drop the banner either way: if the record was already gone (it resumed
+      // as we clicked), the banner is stale and must not linger.
+      useSessionStore.getState().clearParkedTurn(activeSessionId);
+    }
+  }, [activeSessionId]);
   const pendingQuestionsMap = useSessionStore((s) => s.pendingQuestions);
   const pendingQuestions = activeSessionId
     ? (pendingQuestionsMap[activeSessionId] ?? EMPTY_QUESTIONS)
@@ -1349,13 +1377,37 @@ export function ChatView({
         </div>
       )}
 
+      {parkedTurn && (
+        <div
+          className="chat-limit-banner flex items-center justify-between gap-3 px-4 py-2 shrink-0 border-t border-border bg-amber-500/10 text-xs"
+          data-testid="limit-parked-banner"
+        >
+          <span className="text-foreground">
+            <span className="mr-1.5">⏸</span>
+            Usage limit reached — auto-resuming
+            {parkedResumeLabel ? ` at ${parkedResumeLabel}` : " when it resets"}.
+          </span>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-6 px-2 text-xs shrink-0"
+            data-testid="limit-parked-cancel"
+            onClick={cancelParkedTurn}
+          >
+            Cancel
+          </Button>
+        </div>
+      )}
+
       {pendingQueue.length > 0 && (
         <div
           className="queue-list shrink-0 border-t border-border bg-muted/30 px-4 py-2 text-xs space-y-1"
           aria-label="Queued messages"
         >
           <div className="queue-list-label text-muted-foreground mb-2">
-            Queued ({pendingQueue.length}) — will fire after the current turn
+            {parkedTurn
+              ? `Queued (${pendingQueue.length}) — held until the limit resets`
+              : `Queued (${pendingQueue.length}) — will fire after the current turn`}
           </div>
           {pendingQueue.map((q, i) => (
             <div

@@ -96,6 +96,51 @@ async def test_get_session_not_found(client):
 
 
 @pytest.mark.asyncio
+async def test_get_session_surfaces_a_pending_park(client):
+    """A usage-limit-parked session carries its pending park on the snapshot, so
+    a reload/reconnect restores the "auto-resumes at HH:MM" banner instead of
+    showing a paused session as ordinary idle (limit-auto-resume.md §4). A
+    non-parked session reports null."""
+    from datetime import datetime, timedelta, timezone
+
+    from server.parked_turns import ParkedTurnRunner
+
+    parked_id = (
+        await client.post("/api/sessions", headers=HEADERS, json={"name": "Parked"})
+    ).json()["id"]
+    idle_id = (
+        await client.post("/api/sessions", headers=HEADERS, json={"name": "Idle"})
+    ).json()["id"]
+
+    runner = ParkedTurnRunner(session_manager, session_manager.db)
+    session_manager.set_parked_turn_runner(runner)
+    try:
+        await runner.park(
+            parked_id,
+            resume_mode="prompt",
+            payload="p",
+            resume_at_turn_start=None,
+            limit_kind="five_hour",
+            reset_at=datetime.now(timezone.utc) + timedelta(hours=2),
+        )
+
+        parked = (
+            await client.get(f"/api/sessions/{parked_id}", headers=HEADERS)
+        ).json()
+        assert parked["pending_park"] is not None
+        assert parked["pending_park"]["limit_kind"] == "five_hour"
+        assert parked["pending_park"]["resume_at"]
+
+        idle = (
+            await client.get(f"/api/sessions/{idle_id}", headers=HEADERS)
+        ).json()
+        assert idle["pending_park"] is None
+    finally:
+        # Don't leak the runner onto the module-level singleton for later tests.
+        session_manager.set_parked_turn_runner(None)
+
+
+@pytest.mark.asyncio
 async def test_delete_session(client):
     create_resp = await client.post(
         "/api/sessions",
