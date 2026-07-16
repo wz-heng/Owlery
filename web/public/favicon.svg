@@ -1,10 +1,13 @@
-<!-- The Owlery mark as a brass wax seal — same silhouette as OwleryLogo.tsx
-     and the login/sidebar lockups, recolored (not redrawn) into the
-     Messenger identity: parchment owl punched out of a brass disc.
+<!-- The Owlery mark: the wax seal, with the owl impressed into it.
+     Geometry is generated from web/src/lib/seal.ts (13 lobes, r=13.4/16.4 on
+     a 32 grid) — the SAME rim the app stamps on every bubble, card and
+     dialog, and the same path baked into --seal-rim in tokens.css. Redraw it
+     there, not here.
+     The face is painted parchment rather than punched to transparent: a
+     favicon lands on a browser tab of unknown colour, and holes that show
+     through would let the owl vanish on a warm one.
      #8C5A0D = hsl(36 82% 30%) (primary-700); #FBF8F1 = the parchment. -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
-  <rect width="32" height="32" rx="7" fill="#8C5A0D"/>
-  <path fill-rule="evenodd" clip-rule="evenodd" fill="#FBF8F1"
-    transform="translate(3.2 3.2) scale(0.8)"
-    d="M9.6 2.4a1 1 0 0 1 1.5-.9l3.3 1.9a7.7 7.7 0 0 1 3.2 0l3.3-1.9a1 1 0 0 1 1.5.9l-.3 3.9a9.2 9.2 0 0 1 2.5 6.3v6.1c0 4.2-2.9 7.8-6.9 8.9v1.5l2.4 1.4a1 1 0 0 1-.5 1.9h-6.2a1 1 0 0 1-.5-1.9l2.4-1.4v-1.5c-4-1.1-6.9-4.7-6.9-8.9v-6.1c0-2.4.9-4.7 2.5-6.3l-.3-3.9Zm2.8 7.4a4.3 4.3 0 1 0 0 8.6 4.3 4.3 0 0 0 0-8.6Zm7.2 0a4.3 4.3 0 1 0 0 8.6 4.3 4.3 0 0 0 0-8.6ZM12.4 12a2.1 2.1 0 1 1 0 4.2 2.1 2.1 0 0 1 0-4.2Zm7.2 0a2.1 2.1 0 1 1 0 4.2 2.1 2.1 0 0 1 0-4.2ZM16 18.6l1.7 2.5h-3.4l1.7-2.5Z"/>
+  <path fill="#8C5A0D" d="M29.40 16.00Q31.92 19.92 27.87 22.23Q28.28 26.88 23.61 27.03Q21.82 31.33 17.62 29.30Q14.02 32.28 11.25 28.53Q6.68 29.50 5.97 24.89Q1.48 23.62 2.99 19.21Q-0.40 16.00 2.99 12.79Q1.48 8.38 5.97 7.11Q6.68 2.50 11.25 3.47Q14.02 -0.28 17.62 2.70Q21.82 0.67 23.61 4.97Q28.28 5.12 27.87 9.77Q31.92 12.08 29.40 16.00Z"/>
+  <path fill="#FBF8F1" fill-rule="evenodd" clip-rule="evenodd" d="M8.16 14.13a3.34 3.34 0 1 0 6.68 0a3.34 3.34 0 1 0 -6.68 0ZM17.17 14.13a3.34 3.34 0 1 0 6.68 0a3.34 3.34 0 1 0 -6.68 0ZM14.04 17.20L17.96 17.20L16.00 21.76Z"/>
 </svg>

@@ -169,13 +169,16 @@ export function SessionList({
           }`}
           onClick={() => selectSession(s.id)}
         >
+          {/* `seal-dot` masks the seal's rim out of `currentColor`, so the
+           * state colour stays exactly where round 1 put it — plum for
+           * waiting, brass for running — and only the silhouette changes. */}
           <span
-            className={`status-dot status-${s.status} inline-block size-2 rounded-full shrink-0 ${
+            className={`status-dot status-${s.status} seal-dot ${
               s.status === "running"
-                ? "bg-primary animate-pulse"
+                ? "text-primary animate-pulse"
                 : s.status === "waiting_approval"
-                ? "bg-attention-solid"
-                : "bg-muted-foreground/40"
+                ? "text-attention-solid"
+                : "text-muted-foreground/40"
             }`}
           />
           <span

@@ -26,6 +26,7 @@ import {
 } from "@tabler/icons-react";
 
 import { useSessionStore, type BgTask } from "../stores/sessionStore";
+import { Seal, type SealTone } from "./ui/seal";
 import { cn } from "../lib/utils";
 
 interface Props {
@@ -42,17 +43,39 @@ const STATUS_LABEL: Record<BgTask["status"], string> = {
   interrupted: "interrupted",
 };
 
+/** A chip's wax follows its status, on the round-1 state colours. */
+const STATUS_WAX: Record<BgTask["status"], SealTone> = {
+  pending: "ink",
+  running: "brand",
+  completed: "success",
+  failed: "destructive",
+  cancelled: "ink",
+  interrupted: "ink",
+};
+
+/**
+ * While the task is live the spinner wins: motion is the information, and
+ * the ornament budget is one mark per surface. The moment it settles, the
+ * result gets sealed — which is exactly what a bg task delivering back
+ * into the transcript *is*.
+ */
 function StatusIcon({ status }: { status: BgTask["status"] }) {
   if (status === "running" || status === "pending") {
-    return <IconLoader2 size={14} className="animate-spin text-primary" />;
+    return <IconLoader2 size={14} className="animate-spin text-primary shrink-0" />;
   }
-  if (status === "completed") {
-    return <IconCheck size={14} className="text-success" />;
-  }
-  if (status === "cancelled" || status === "interrupted") {
-    return <IconHandStop size={14} className="text-muted-foreground" />;
-  }
-  return <IconExclamationCircle size={14} className="text-destructive" />;
+  const glyph =
+    status === "completed" ? (
+      <IconCheck />
+    ) : status === "cancelled" || status === "interrupted" ? (
+      <IconHandStop />
+    ) : (
+      <IconExclamationCircle />
+    );
+  return (
+    <Seal side="left" tone={STATUS_WAX[status]} scale="chip" straddle={false}>
+      {glyph}
+    </Seal>
+  );
 }
 
 function lastLine(text: string): string {

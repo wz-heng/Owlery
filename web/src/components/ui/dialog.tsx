@@ -2,6 +2,7 @@ import * as React from "react";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { IconX } from "@tabler/icons-react";
 
+import { Seal } from "./seal";
 import { cn } from "../../lib/utils";
 
 const Dialog = DialogPrimitive.Root;
@@ -34,12 +35,26 @@ const DialogContent = React.forwardRef<
     <DialogPrimitive.Content
       ref={ref}
       className={cn(
-        "fixed left-[50%] top-[50%] z-50 grid w-full max-w-lg max-h-[90vh] overflow-y-auto translate-x-[-50%] translate-y-[-50%] gap-5 border border-ink-300 bg-card p-6 shadow-[var(--elevation-overlay)] rounded-2xl",
+        // A dialog is a sheet like any other, at the top of the pile:
+        // uniform radius, a seal straddling its edge, and its header
+        // ruled.
+        //
+        // The scroll container moved to an inner element on purpose. The
+        // seal hangs half off the top edge, and an `overflow-y-auto` box
+        // clips its own overflow — so a scrolling DialogContent would
+        // slice the wax in half. Outer box positions and clips nothing;
+        // inner box scrolls and owns the padding.
+        "dialog-sheet fixed left-[50%] top-[50%] z-50 w-full max-w-lg translate-x-[-50%] translate-y-[-50%] border border-ink-300 bg-card shadow-[var(--elevation-overlay)] rounded-lg",
         className
       )}
       {...props}
     >
-      {children}
+      {/* The app's own voice gets the app's own seal: the owl, impressed.
+       * An agent never gets this one — agents get monograms. */}
+      <Seal side="left" scale="dialog" tone="brand" mark />
+      <div className="dialog-scroll grid max-h-[90vh] gap-5 overflow-y-auto rounded-lg p-6">
+        {children}
+      </div>
       <DialogPrimitive.Close
         className="absolute right-4 top-4 flex items-center justify-center size-8 rounded-md transition-colors text-muted-foreground hover:text-foreground hover:bg-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         aria-label="Close"
@@ -56,7 +71,7 @@ const DialogHeader = ({
   ...props
 }: React.HTMLAttributes<HTMLDivElement>) => (
   <div
-    className={cn("flex flex-col space-y-2 text-left", className)}
+    className={cn("dialog-rule flex flex-col space-y-2 text-left", className)}
     {...props}
   />
 );

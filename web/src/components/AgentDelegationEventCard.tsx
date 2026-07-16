@@ -17,7 +17,6 @@
 
 import { useEffect, useState } from "react";
 import {
-  IconArrowBackUp,
   IconChevronDown,
   IconChevronRight,
   IconExclamationCircle,
@@ -27,6 +26,7 @@ import {
 } from "@tabler/icons-react";
 
 import { useSessionStore } from "../stores/sessionStore";
+import { SheetCard, type CardTone } from "./ui/sheet-card";
 
 export type DelegationEventKind = "reply" | "question" | "error";
 
@@ -93,14 +93,12 @@ export function parseDelegationEvent(
   return null;
 }
 
+/** The kind icon is what gets impressed into the wax — the seal is this
+ * card's whole identity, so the icon moved out of the body and into it. */
 function KindIcon({ kind }: { kind: DelegationEventKind }) {
-  if (kind === "question") {
-    return <IconMessageQuestion size={14} className="text-attention" />;
-  }
-  if (kind === "error") {
-    return <IconExclamationCircle size={14} className="text-destructive" />;
-  }
-  return <IconSubtask size={14} className="text-primary" />;
+  if (kind === "question") return <IconMessageQuestion />;
+  if (kind === "error") return <IconExclamationCircle />;
+  return <IconSubtask />;
 }
 
 const KIND_LABEL: Record<DelegationEventKind, string> = {
@@ -109,10 +107,12 @@ const KIND_LABEL: Record<DelegationEventKind, string> = {
   error: "ended with an error",
 };
 
-const KIND_BORDER: Record<DelegationEventKind, string> = {
-  reply: "border-primary/40 bg-primary-50",
-  question: "border-attention/40 bg-attention-surface",
-  error: "border-destructive/40 bg-destructive-surface",
+/* State colour is round-1 law and does not move: a question is still
+ * plum, an error is still wax red. Only the form changed. */
+const KIND_TONE: Record<DelegationEventKind, CardTone> = {
+  reply: "brand",
+  question: "attention",
+  error: "destructive",
 };
 
 export function AgentDelegationEventCard({
@@ -190,34 +190,40 @@ export function AgentDelegationEventCard({
     setActiveSessionId(childSession.id);
   };
 
-  const headerText = (
-    <>
-      <span className="font-medium">{event.agentName}</span>
-      <span className="text-muted-foreground"> {KIND_LABEL[event.kind]}</span>
-      {event.kind === "error" && event.reason && (
-        <>
-          <span className="text-muted-foreground"> — </span>
-          <span className="text-destructive">{event.reason}</span>
-        </>
-      )}
-    </>
-  );
-
   const firstLine = event.body.split("\n", 1)[0];
 
   return (
     <div className="msg msg-agent-delegation-event flex justify-end">
       <div className="max-w-[85%] space-y-1">
-        <div
-          className="msg-label text-xs font-semibold text-muted-foreground text-right flex items-center justify-end gap-1.5"
-          data-delegation-kind={event.kind}
+        <SheetCard
+          className="agent-delegation-card"
+          tone={KIND_TONE[event.kind]}
+          side="right"
+          glyph={<KindIcon kind={event.kind} />}
+          title={
+            <span data-delegation-kind={event.kind}>
+              <span className="font-semibold">{event.agentName}</span>
+              <span className="font-normal text-muted-foreground/90">
+                {" "}
+                {KIND_LABEL[event.kind]}
+              </span>
+              {event.kind === "error" && event.reason && (
+                <span className="font-normal text-destructive">
+                  {" "}
+                  — {event.reason}
+                </span>
+              )}
+            </span>
+          }
+          meta={`From delegation · ${event.delegationId.slice(0, 8)}`}
         >
-          <IconArrowBackUp size={12} className="text-muted-foreground" />
-          <span>From delegation · {event.delegationId.slice(0, 8)}</span>
-        </div>
-        <div
-          className={`agent-delegation-card rounded-lg border px-3 py-2.5 text-sm ${KIND_BORDER[event.kind]}`}
-        >
+          {/* The toggle owns the chevron and the collapsed preview ONLY.
+           * The expanded body stays outside it: a delegated agent's
+           * question renders its options as plain text on purpose
+           * (agent-collaboration.md §6 — the parent's model answers, not
+           * the human), and burying the body inside a <button> would both
+           * make every option look clickable and hand the button an
+           * accessible name the length of the whole reply. */}
           <button
             type="button"
             onClick={() => setExpanded((e) => !e)}
@@ -231,18 +237,14 @@ export function AgentDelegationEventCard({
                 <IconChevronRight size={14} />
               )}
             </span>
-            <KindIcon kind={event.kind} />
-            <span className="flex-1 leading-snug">
-              {headerText}
-              {!expanded && (
-                <span className="block text-xs text-muted-foreground truncate mt-0.5">
-                  {firstLine}
-                </span>
-              )}
-            </span>
+            {!expanded && (
+              <span className="flex-1 block text-xs text-muted-foreground truncate leading-snug">
+                {firstLine}
+              </span>
+            )}
           </button>
           {expanded && (
-            <pre className="agent-delegation-body mt-2 ml-6 whitespace-pre-wrap break-words text-xs text-foreground font-sans leading-relaxed">
+            <pre className="agent-delegation-body mt-1 ml-6 whitespace-pre-wrap break-words text-xs text-foreground font-sans leading-relaxed">
               {event.body}
             </pre>
           )}
@@ -271,7 +273,7 @@ export function AgentDelegationEventCard({
               {event.questionId ? ` · question_id=${event.questionId}` : ""}
             </span>
           </div>
-        </div>
+        </SheetCard>
       </div>
     </div>
   );

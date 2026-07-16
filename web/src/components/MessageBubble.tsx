@@ -5,7 +5,9 @@ import {
   IconTool,
   IconFile,
   IconGitFork,
+  IconFeather,
   IconRobot,
+  IconAlertTriangle,
 } from "@tabler/icons-react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -28,7 +30,7 @@ import {
   parseDelegationEvent,
 } from "./AgentDelegationEventCard";
 import { AgentDelegationRequestCard } from "./AgentDelegationRequestCard";
-import { DEFAULT_AGENT_AVATAR } from "../lib/agentAvatar";
+import { Seal, monogram } from "./ui/seal";
 
 // Marker the backend prepends to the synthesized user message it
 // injects when a bg task completes. Used to render those messages
@@ -39,11 +41,12 @@ const BG_TASK_RESULT_PREFIX = "[bg-task-result]";
 interface MessageBubbleProps {
   message: Message;
   sessionId: string;
-  // Name + avatar of the agent that owns this session, used to label
-  // assistant turns. Falls back to a harness-neutral "Assistant" when the
-  // session has no owning agent.
+  // Name of the agent that owns this session, used to label assistant
+  // turns. Falls back to a harness-neutral "Assistant" when the session
+  // has no owning agent. The avatar is deliberately absent: the grammar
+  // seals a turn with the agent's monogram, and emoji don't get impressed
+  // into wax (messenger-form.md §4.1).
   agentName?: string;
-  agentAvatar?: string | null;
   // "Fork from here" affordance (session-rewind.md §6.1): rendered on
   // user messages when set + the message has a known seq. Called with the
   // rewind target seq.
@@ -115,13 +118,9 @@ export function MessageBubble({
   message,
   sessionId,
   agentName,
-  agentAvatar,
   onFork,
 }: MessageBubbleProps) {
   const assistantLabel = agentName || "Assistant";
-  // Mirror the header's avatar treatment: show the agent's emoji, falling
-  // back to the default owlery when an agent exists but set no avatar.
-  const assistantAvatar = agentName ? agentAvatar || DEFAULT_AGENT_AVATAR : null;
   switch (message.type) {
     case "text":
       if (message.role === "user") {
@@ -148,27 +147,36 @@ export function MessageBubble({
         return (
           <div className="msg msg-user group flex justify-end">
             <div className="max-w-[85%] space-y-1">
-              <div className="msg-label flex items-center justify-end gap-2 text-xs font-semibold text-muted-foreground">
-                {onFork && typeof message.seq === "number" && (
-                  <button
-                    type="button"
-                    data-testid="fork-from-here"
-                    className="fork-from-here inline-flex items-center gap-1 font-normal text-muted-foreground/70 opacity-0 transition-opacity hover:text-primary group-hover:opacity-100"
-                    title="Rewind to this message and redo it"
-                    onClick={() => onFork(message.seq as number)}
-                  >
-                    <IconGitFork size={12} />
-                    Rewind to here
-                  </button>
-                )}
-                <span>You</span>
-              </div>
               {/* The user's own words are the one thing on screen tinted
                * with the brand — sent mail, sealed in brass. The agent's
                * reply (below) sits on plain card, so the two speakers are
-               * distinguishable by surface alone, not just alignment. */}
-              <div className="msg-content inline-block rounded-lg rounded-br-sm border border-primary/35 bg-primary-50 px-4 py-3 text-sm text-foreground whitespace-pre-wrap break-words shadow-[var(--elevation-raised)]">
-                {message.content}
+               * distinguishable by surface alone, not just alignment.
+               *
+               * The attribution row is no longer a caption floating above
+               * the bubble: it is the sheet's letterhead, and the quill
+               * seal on the right edge is what signs it. */}
+              <div className="msg-content sheet inline-block border border-primary/35 bg-primary-50 text-sm text-foreground shadow-[var(--elevation-raised)]">
+                <Seal side="right" tone="brand">
+                  <IconFeather />
+                </Seal>
+                <div className="msg-label sheet-rule">
+                  <span>You</span>
+                  {onFork && typeof message.seq === "number" && (
+                    <button
+                      type="button"
+                      data-testid="fork-from-here"
+                      className="fork-from-here sheet-rule-meta inline-flex items-center gap-1 text-muted-foreground/70 opacity-0 transition-opacity hover:text-primary group-hover:opacity-100"
+                      title="Rewind to this message and redo it"
+                      onClick={() => onFork(message.seq as number)}
+                    >
+                      <IconGitFork size={12} />
+                      Rewind to here
+                    </button>
+                  )}
+                </div>
+                <div className="whitespace-pre-wrap break-words">
+                  {message.content}
+                </div>
               </div>
               {message.attachments && message.attachments.length > 0 && (
                 <AttachmentList
@@ -181,16 +189,17 @@ export function MessageBubble({
         );
       }
       return (
-        <div className="msg msg-assistant space-y-1">
-          <div className="msg-label flex items-center gap-1.5 text-xs font-semibold text-muted-foreground">
-            {assistantAvatar && (
-              <span aria-hidden className="text-sm leading-none">
-                {assistantAvatar}
-              </span>
-            )}
-            <span>{assistantLabel}</span>
-          </div>
-          <div className="msg-content markdown rounded-lg rounded-tl-sm border border-border bg-card px-4 py-3 text-sm leading-relaxed shadow-[var(--elevation-raised)]">
+        <div className="msg msg-assistant">
+          {/* The agent's monogram, not its emoji: a seal is impressed, not
+           * stuck on. The emoji avatar still identifies the agent in the
+           * sidebar rail, where nothing is being sealed. */}
+          <div className="msg-content sheet markdown border border-border bg-card text-sm leading-relaxed shadow-[var(--elevation-raised)]">
+            <Seal side="left" tone="ink">
+              {monogram(assistantLabel)}
+            </Seal>
+            <div className="msg-label sheet-rule">
+              <span>{assistantLabel}</span>
+            </div>
             <Markdown
               remarkPlugins={[remarkGfm, remarkMath]}
               // `ignoreMissing`: the model names languages hljs may not have
@@ -221,11 +230,17 @@ export function MessageBubble({
       return (
         <div className="msg msg-user flex justify-end">
           <div className="max-w-[85%] space-y-1">
-            <div className="msg-label text-xs font-semibold text-muted-foreground text-right">
-              You
-            </div>
-            <div className="msg-content msg-question-answer inline-block rounded-lg rounded-br-sm border border-primary/35 bg-primary-50 px-4 py-3 text-sm text-foreground italic whitespace-pre-wrap break-words shadow-[var(--elevation-raised)]">
-              {message.content}
+            <div className="msg-content msg-question-answer sheet inline-block border border-primary/35 bg-primary-50 text-sm text-foreground shadow-[var(--elevation-raised)]">
+              <Seal side="right" tone="brand">
+                <IconFeather />
+              </Seal>
+              <div className="msg-label sheet-rule">
+                <span>You</span>
+                <span className="sheet-rule-meta">answered</span>
+              </div>
+              <div className="italic whitespace-pre-wrap break-words">
+                {message.content}
+              </div>
             </div>
           </div>
         </div>
@@ -234,7 +249,8 @@ export function MessageBubble({
     case "result":
       return (
         <div className="msg msg-system flex justify-center py-1">
-          <span className="result-badge text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-ink-200 px-2 py-0.5 rounded-full">
+          <span className="result-badge inline-flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-ink-200 px-2 py-0.5 rounded-full">
+            <span className="seal-dot opacity-60" aria-hidden />
             Done{message.cost != null ? ` · $${message.cost.toFixed(4)}` : ""}
           </span>
         </div>
@@ -260,12 +276,17 @@ export function MessageBubble({
 
     case "error":
       return (
-        <div className="msg msg-error space-y-1">
-          <div className="msg-label text-xs font-semibold text-destructive">
-            Error
-          </div>
-          <div className="msg-content rounded-lg border border-destructive/40 bg-destructive-surface px-4 py-3 text-sm text-destructive whitespace-pre-wrap break-words">
-            {message.content}
+        <div className="msg msg-error">
+          <div className="msg-content sheet border border-destructive/40 bg-destructive-surface text-sm text-destructive shadow-[var(--elevation-raised)]">
+            <Seal side="left" tone="destructive">
+              <IconAlertTriangle />
+            </Seal>
+            <div className="msg-label sheet-rule !text-destructive">
+              <span>Error</span>
+            </div>
+            <div className="whitespace-pre-wrap break-words">
+              {message.content}
+            </div>
           </div>
         </div>
       );
@@ -430,33 +451,41 @@ function BgTaskResultMessage({
   // Show only the first line collapsed; that line is the "finished
   // with status …" summary which is the most-important info.
   const firstLine = stripped.split("\n", 1)[0];
+  // A system-injected turn: it wears the user's side of the room because
+  // the backend posted it *as* the user, but it is not spoken. Subdued is
+  // the whole grammar at lower volume — same seal, same rule, cooler wax,
+  // and the sunken well it already had instead of a raised sheet.
   return (
     <div className="msg msg-bg-result flex justify-end">
       <div className="max-w-[85%] space-y-1">
-        <div className="msg-label text-xs font-semibold text-muted-foreground text-right flex items-center justify-end gap-1.5">
-          <IconRobot size={12} className="text-muted-foreground" />
-          <span>Auto · bg-task result</span>
-        </div>
-        <button
-          type="button"
-          onClick={() => setExpanded((e) => !e)}
-          className="msg-content w-full text-left inline-block rounded-lg border border-ink-300 bg-ink-100 shadow-[var(--elevation-inset)] px-4 py-3 text-sm text-foreground transition-colors hover:bg-ink-200"
-          title={expanded ? "Collapse" : "Expand full result"}
-          aria-expanded={expanded}
-        >
-          <div className="flex items-start gap-2">
-            <span className="text-muted-foreground shrink-0 mt-0.5">
-              {expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
-            </span>
-            {expanded ? (
-              <pre className="m-0 flex-1 font-mono text-xs whitespace-pre-wrap break-words">
-                {stripped}
-              </pre>
-            ) : (
-              <span className="flex-1">{firstLine}</span>
-            )}
+        <div className="msg-content sheet w-full border border-ink-300 bg-ink-100 text-sm text-foreground shadow-[var(--elevation-inset)]">
+          <Seal side="right" tone="ink" subdued>
+            <IconRobot />
+          </Seal>
+          <div className="msg-label sheet-rule">
+            <span>Auto · bg-task result</span>
           </div>
-        </button>
+          <button
+            type="button"
+            onClick={() => setExpanded((e) => !e)}
+            className="w-full text-left transition-colors"
+            title={expanded ? "Collapse" : "Expand full result"}
+            aria-expanded={expanded}
+          >
+            <div className="flex items-start gap-2">
+              <span className="text-muted-foreground shrink-0 mt-0.5">
+                {expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
+              </span>
+              {expanded ? (
+                <pre className="m-0 flex-1 font-mono text-xs whitespace-pre-wrap break-words">
+                  {stripped}
+                </pre>
+              ) : (
+                <span className="flex-1">{firstLine}</span>
+              )}
+            </div>
+          </button>
+        </div>
       </div>
     </div>
   );

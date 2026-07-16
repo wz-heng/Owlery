@@ -252,7 +252,6 @@ export function ChatView({
           message={msg}
           sessionId={activeSessionId ?? ""}
           agentName={activeAgent?.name}
-          agentAvatar={activeAgent?.avatar}
           onFork={(seq) => setForkDialog({ seq })}
         />
       );

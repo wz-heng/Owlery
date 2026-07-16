@@ -25,6 +25,7 @@ import {
   IconX,
 } from "@tabler/icons-react";
 
+import { Seal } from "./ui/seal";
 import { useSessionStore, type Delegation } from "../stores/sessionStore";
 
 const STATUS_LABEL: Record<Delegation["state"], string> = {
@@ -217,7 +218,11 @@ export function AgentDelegationRequestCard({
       }`}
       data-delegation-state={state}
     >
-      <IconSubtask size={14} className="text-primary mt-0.5 shrink-0" />
+      {/* Outbound: the request we sealed and sent. The reply comes back
+       * as an AgentDelegationEventCard wearing the same wax. */}
+      <Seal side="left" tone="brand" scale="chip" straddle={false} className="mt-0.5">
+        <IconSubtask />
+      </Seal>
       <div className="flex-1 min-w-0 space-y-0.5">
         <div className="flex items-center gap-2 flex-wrap">
           <span className="font-medium truncate">

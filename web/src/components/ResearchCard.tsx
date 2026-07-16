@@ -1,5 +1,6 @@
 import { IconWorldSearch, IconX, IconCheck, IconAlertTriangle } from "@tabler/icons-react";
 import { useSessionStore, type ResearchJob } from "../stores/sessionStore";
+import { Seal } from "./ui/seal";
 
 const API = window.location.origin;
 
@@ -44,10 +45,19 @@ export function ResearchCard({ sessionId }: { sessionId: string }) {
             className="research-card rounded-lg border border-ink-300 bg-ink-100 px-3 py-2 text-sm"
           >
             <div className="flex items-center gap-2">
-              <IconWorldSearch
-                size={15}
-                className={running ? "text-primary animate-pulse" : "text-muted-foreground"}
-              />
+              {/* A running job shows the live icon; a settled one gets the
+               * wax. One mark per surface — a spinner outranks a seal
+               * while something is actually moving. */}
+              {running ? (
+                <IconWorldSearch
+                  size={15}
+                  className="text-primary animate-pulse shrink-0"
+                />
+              ) : (
+                <Seal side="left" tone="ink" scale="chip" straddle={false}>
+                  <IconWorldSearch />
+                </Seal>
+              )}
               <span className="research-question flex-1 truncate font-medium text-foreground">
                 {job.question}
               </span>

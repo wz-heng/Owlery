@@ -3,6 +3,7 @@ import { IconHelpCircle } from "@tabler/icons-react";
 import type { PendingQuestion } from "../stores/sessionStore";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
+import { SheetCard } from "./ui/sheet-card";
 
 export interface AnswerPayload {
   selected?: string[];
@@ -55,12 +56,15 @@ export function QuestionPrompt({ question, onSubmit }: Props) {
   };
 
   return (
-    <div className="msg msg-question rounded-lg border-[0.7px] border-attention/35 bg-card overflow-hidden">
-      <div className="question-header flex items-center gap-2.5 px-3 py-2 bg-attention-surface text-sm text-foreground">
-        <IconHelpCircle size={18} className="text-attention shrink-0" />
-        <strong>Claude is asking</strong>
-      </div>
-      <div className="question-body px-3 py-3 space-y-5">
+    <SheetCard
+      className="msg msg-question"
+      tone="attention"
+      side="left"
+      glyph={<IconHelpCircle />}
+      title="Claude is asking"
+      surfaceClassName="border-attention/35 bg-card"
+    >
+      <div className="question-body space-y-5">
         {question.questions.map((q, i) => {
           const multi = !!q.multiSelect;
           const selected = answers[i]?.selected || [];
@@ -123,7 +127,7 @@ export function QuestionPrompt({ question, onSubmit }: Props) {
           );
         })}
       </div>
-      <div className="question-actions flex justify-end gap-2 px-3 py-2 border-t border-border">
+      <div className="question-actions mt-4 flex justify-end gap-2">
         <Button
           className="btn btn-approve"
           onClick={handleSubmit}
@@ -132,6 +136,6 @@ export function QuestionPrompt({ question, onSubmit }: Props) {
           Submit
         </Button>
       </div>
-    </div>
+    </SheetCard>
   );
 }

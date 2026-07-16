@@ -1,0 +1,188 @@
+/* The Seal & Letterhead grammar, as CSS.
+ *
+ * Round 3 of the Messenger reskin (`docs/plans/messenger-form.md` §4).
+ * The shape values all live in tokens.css next to the palette; this file
+ * is only the rules that spend them. Three things exist here and nothing
+ * else should join them without a reason:
+ *
+ *   .seal      the disc — the motif, and the one avatar/status primitive
+ *   .sheet     a ruled surface that a seal can straddle
+ *   .seal-dot  the motif's echo, for things too small to carry a disc
+ *
+ * Elevation is round-1/2 law and is untouched: a .sheet keeps a real
+ * box-shadow on its border-box, which is why the seal is a positioned
+ * child rather than a clip-path notch out of the surface.
+ */
+
+/* ── The seal ──────────────────────────────────────────────────────── */
+
+.seal {
+  --seal-size: var(--seal-sheet);
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  width: var(--seal-size);
+  height: var(--seal-size);
+  flex-shrink: 0;
+  /* Wax sits ON the paper: its own contact shadow, independent of the
+   * sheet's elevation. Ornament may use drop-shadow; surfaces may not. */
+  filter: drop-shadow(0 1px 1.5px hsl(var(--ink-950) / 0.28));
+}
+
+.seal-rim {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.seal-glyph {
+  position: relative;
+  color: hsl(var(--primary-foreground));
+  font-size: calc(var(--seal-size) * 0.42);
+  font-weight: 600;
+  line-height: 1;
+  /* The glyph is stamped into the wax, so it never overflows the disc —
+   * a monogram is one character by contract (see `monogram()`). */
+  display: grid;
+  place-items: center;
+}
+
+.seal-glyph svg {
+  width: calc(var(--seal-size) * 0.46);
+  height: calc(var(--seal-size) * 0.46);
+}
+
+/* Straddling the top edge: half on the sheet, half off it. The 50%
+ * overhang is the whole point — a seal that sits politely inside the
+ * border is a badge, not a seal. */
+.seal-straddle {
+  position: absolute;
+  top: calc(var(--seal-size) / -2);
+  z-index: 1;
+}
+.seal-straddle[data-side="left"] {
+  left: var(--seal-inset);
+}
+.seal-straddle[data-side="right"] {
+  right: var(--seal-inset);
+}
+
+/* Subdued — system-injected turns. Ours, but not spoken aloud: the same
+ * impression in cooler wax, with the contact shadow pulled back. */
+.seal-subdued {
+  opacity: 0.55;
+  filter: drop-shadow(0 1px 1px hsl(var(--ink-950) / 0.16));
+}
+
+/* ── The sheet ─────────────────────────────────────────────────────── */
+
+.sheet {
+  --sheet-gutter: 1rem;
+  --sheet-seal: var(--seal-sheet);
+  --sheet-pad-bottom: 0.75rem;
+  position: relative;
+  border-radius: var(--radius);
+  /* Top padding buys back the room the straddling seal takes, so text
+   * never collides with the wax. */
+  padding: calc(var(--sheet-seal) / 2 + 6px) var(--sheet-gutter)
+    var(--sheet-pad-bottom);
+}
+
+/* A sheet with no seal keeps the rule but not the clearance. */
+.sheet-plain {
+  padding-top: 0.75rem;
+}
+
+/* The letterhead. Full-bleed is the point: an inset rule reads as a
+ * divider between two panels, a bled rule reads as printed stationery.
+ * The negative margin is exactly the gutter, so it always reaches the
+ * sheet's edge no matter what the component set the gutter to. */
+.sheet-rule {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 2rem;
+  margin-inline: calc(var(--sheet-gutter) * -1);
+  padding-inline: var(--sheet-gutter);
+  padding-bottom: 7px;
+  margin-bottom: 9px;
+  border-bottom: 1px solid var(--rule-color);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.2;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  color: hsl(var(--muted-foreground));
+}
+
+/* The right-hand end of a letterhead: a timestamp, an id, a status. It
+ * is metadata, so it drops the display-caps treatment. */
+.sheet-rule-meta {
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: normal;
+  white-space: nowrap;
+}
+
+/* ── The echo ──────────────────────────────────────────────────────── */
+
+/* Things too small to carry a disc get the rim as a silhouette: tabs,
+ * sidebar rows, status dots. `background: currentColor` means it inherits
+ * whatever state colour its context already set — the dot never invents
+ * one. This is the whole ornament budget for controls: a scalloped dot,
+ * or nothing at all. */
+.seal-dot {
+  display: inline-block;
+  width: var(--seal-dot);
+  height: var(--seal-dot);
+  flex-shrink: 0;
+  background: currentColor;
+  mask-image: var(--seal-rim);
+  mask-size: contain;
+  mask-repeat: no-repeat;
+  mask-position: center;
+  -webkit-mask-image: var(--seal-rim);
+  -webkit-mask-size: contain;
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+}
+
+/* The active tab's mark. Present only when selected — an inactive tab is
+ * an unsealed sheet, which is exactly what it is. */
+.tab-seal[data-state="active"]::before {
+  content: "";
+  display: inline-block;
+  width: var(--seal-dot);
+  height: var(--seal-dot);
+  margin-right: 0.4rem;
+  background: currentColor;
+  mask-image: var(--seal-rim);
+  mask-size: contain;
+  mask-repeat: no-repeat;
+  mask-position: center;
+  -webkit-mask-image: var(--seal-rim);
+  -webkit-mask-size: contain;
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+}
+
+/* ── The dialog sheet ──────────────────────────────────────────────── */
+
+/* The dialog's header is ruled like any other sheet's, but it keeps the
+ * serif title rather than the letterhead's display caps: a dialog is the
+ * app introducing itself, not an attribution line. The gutter matches the
+ * scroll box's p-6 so the rule bleeds to both edges. */
+.dialog-rule {
+  --dialog-gutter: 1.5rem;
+  margin-inline: calc(var(--dialog-gutter) * -1);
+  padding-inline: var(--dialog-gutter);
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--rule-color);
+}
+
+/* The seal straddles the outer box, so the first line of the scrolling
+ * content needs to clear the half that hangs inside. */
+.dialog-sheet .seal-straddle {
+  top: calc(var(--seal-dialog) / -2);
+}

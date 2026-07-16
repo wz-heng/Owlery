@@ -134,6 +134,12 @@ export function AgentList({ onCreateAgent }: { onCreateAgent: () => void }) {
                     isExpanded ? "rotate-90" : ""
                   }`}
                 />
+                {/* Emoji stays here: the rail is a list of people, not a
+                 * stack of letters, and nothing is being sealed. The agent
+                 * row gets no seal of its own either — the session rows
+                 * nested under it already carry one each, and a second
+                 * mark on the parent would spend the motif on a row whose
+                 * selected state the fill and weight already say. */}
                 <span className="agent-avatar shrink-0 text-base leading-none w-5 text-center">
                   {a.avatar || DEFAULT_AGENT_AVATAR}
                 </span>
