@@ -255,6 +255,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/sessions/{session_id}/parked-turn": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Cancel Parked Turn
+         * @description Cancel a pending usage-limit auto-resume (limit-auto-resume.md §4).
+         *
+         *     Drops the record and its wake-up job, so the parked turn will not fire when
+         *     the limit resets. The queued prompts behind it are released to drain
+         *     normally — the user is taking the wheel back.
+         */
+        delete: operations["cancel_parked_turn_api_sessions__session_id__parked_turn_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/sessions/{session_id}/archive": {
         parameters: {
             query?: never;
@@ -734,6 +758,23 @@ export interface paths {
         head?: never;
         /** Update Schedule */
         patch: operations["update_schedule_api_schedules__schedule_id__patch"];
+        trace?: never;
+    };
+    "/api/usage/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Usage Summary */
+        get: operations["usage_summary_api_usage_summary_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/api/credentials": {
@@ -1871,6 +1912,19 @@ export interface components {
             /** Device Url */
             device_url: string;
         };
+        /**
+         * PendingParkInfo
+         * @description A session paused on the user's own usage limit, awaiting auto-resume
+         *     (limit-auto-resume.md §4). Carried on the session snapshot so a reload or
+         *     WS reconnect restores the "auto-resumes at HH:MM" banner (and its cancel
+         *     affordance) instead of showing what looks like an idle session.
+         */
+        PendingParkInfo: {
+            /** Resume At */
+            resume_at?: string | null;
+            /** Limit Kind */
+            limit_kind?: string | null;
+        };
         /** PendingQuestionInfo */
         PendingQuestionInfo: {
             /** Question Id */
@@ -1925,7 +1979,7 @@ export interface components {
             last_run_at?: string | null;
             /** Origin Session Id */
             origin_session_id?: string | null;
-            /** Run At — ISO datetime for one-time schedules; null for recurring. */
+            /** Run At */
             run_at?: string | null;
         };
         /** SessionDetail */
@@ -1998,6 +2052,7 @@ export interface components {
              * @default []
              */
             pending_questions: components["schemas"]["PendingQuestionInfo"][];
+            pending_park?: components["schemas"]["PendingParkInfo"] | null;
             /**
              * Next Message Seq
              * @default 0
@@ -2814,6 +2869,35 @@ export interface operations {
                 content: {
                     "application/json": unknown;
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cancel_parked_turn_api_sessions__session_id__parked_turn_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {
@@ -3737,6 +3821,43 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ScheduleInfo"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    usage_summary_api_usage_summary_get: {
+        parameters: {
+            query?: {
+                group_by?: "agent" | "session" | "day" | "backend";
+                since?: string | null;
+                until?: string | null;
+                agent_id?: string | null;
+                session_id?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
                 };
             };
             /** @description Validation Error */

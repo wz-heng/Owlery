@@ -81,6 +81,11 @@ class ParkedTurnRunner:
         self._scheduler = scheduler or AsyncIOScheduler()
         self._owns_scheduler = scheduler is None
         self._now = now or (lambda: datetime.now(timezone.utc))
+        # Serializes the stagger read → row write so two concurrent parks can't
+        # both read the same "taken" set and land on the same wake_at (the
+        # stampede `_staggered` exists to prevent). Parks are rare, so a plain
+        # in-process lock is enough — no DB-level contention needed.
+        self._park_lock = asyncio.Lock()
 
     # ---------------------------------------------------------------- lifecycle
 
@@ -137,23 +142,27 @@ class ParkedTurnRunner:
     ) -> dict[str, Any]:
         """Persist a park and schedule its wake-up. Returns the stored row."""
         now = self._now()
-        if reset_at is not None:
-            wake_at = await self._staggered(reset_at + RESET_GRACE)
-        else:
-            wake_at = now + PROBE_INTERVAL
-        row = {
-            "session_id": session_id,
-            "resume_mode": resume_mode,
-            "payload": payload,
-            "resume_at_turn_start": resume_at_turn_start,
-            "limit_kind": limit_kind,
-            "reset_at": _iso(reset_at) if reset_at else None,
-            "wake_at": _iso(wake_at),
-            "attempts": attempts,
-            "probes": probes,
-            "created_at": _iso(now),
-        }
-        await self._db.upsert_parked_turn(row)
+        # Choose the slot and write the row as one atomic step: `_staggered`
+        # reads every existing wake_at, so a concurrent park must not slip its
+        # own read between this one and its write, or both pick the same slot.
+        async with self._park_lock:
+            if reset_at is not None:
+                wake_at = await self._staggered(reset_at + RESET_GRACE)
+            else:
+                wake_at = now + PROBE_INTERVAL
+            row = {
+                "session_id": session_id,
+                "resume_mode": resume_mode,
+                "payload": payload,
+                "resume_at_turn_start": resume_at_turn_start,
+                "limit_kind": limit_kind,
+                "reset_at": _iso(reset_at) if reset_at else None,
+                "wake_at": _iso(wake_at),
+                "attempts": attempts,
+                "probes": probes,
+                "created_at": _iso(now),
+            }
+            await self._db.upsert_parked_turn(row)
         self._add_job(row)
         logger.info(
             "Session %s parked on usage limit (%s); resuming at %s (mode=%s)",

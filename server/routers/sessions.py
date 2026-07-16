@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from ..auth import verify_token
 from ..harness import BackendForkNotSupported
-from ..models import CreateSessionRequest, DuplicateSessionRequest, ForkSessionRequest, ImportSessionRequest, MessageContent, PendingQuestionInfo, SessionDetail, SessionInfo, SessionStatus
+from ..models import CreateSessionRequest, DuplicateSessionRequest, ForkSessionRequest, ImportSessionRequest, MessageContent, PendingParkInfo, PendingQuestionInfo, SessionDetail, SessionInfo, SessionStatus
 from ..session_manager import ForkError, fork_info_fields, session_manager
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
@@ -161,6 +161,17 @@ async def get_session(session_id: str, _: str = Depends(verify_token)):
     if s is not None:
         messages_raw = await session_manager.db.load_messages(s.id)
         messages = [MessageContent(**m) for m in messages_raw]
+        # A pending usage-limit park (limit-auto-resume.md §4): surfaced on the
+        # snapshot so a reload/reconnect restores the "auto-resumes at HH:MM"
+        # banner rather than showing the paused session as ordinary idle.
+        park = await session_manager.get_pending_park(s.id)
+        pending_park = (
+            PendingParkInfo(
+                resume_at=park.get("wake_at"), limit_kind=park.get("limit_kind")
+            )
+            if park is not None
+            else None
+        )
         return SessionDetail(
             id=s.id,
             name=s.name,
@@ -182,6 +193,7 @@ async def get_session(session_id: str, _: str = Depends(verify_token)):
                 PendingQuestionInfo(question_id=q.question_id, questions=q.questions)
                 for q in s._pending_questions.values()
             ],
+            pending_park=pending_park,
             # High-water mark: clients use this as the dedup baseline so any
             # WS event with seq < next_message_seq is treated as already
             # applied (it's in the messages list above).

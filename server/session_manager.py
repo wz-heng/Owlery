@@ -1652,7 +1652,16 @@ class SessionManager:
         # flight here, because fork_session only sets `_forking` against a
         # quiescent parent (no `_active_task`), so a running turn implies
         # not-forking — no `_forking` check needed on this branch.
-        if session._active_task and not session._active_task.done():
+        #
+        # A pending usage-limit park counts as busy too (limit-auto-resume.md
+        # §4): after a park the turn task is done and the session LOOKS idle,
+        # but firing a new turn now would just knock on the exhausted window.
+        # Hold the message — the auto-resume drains the queue once the limit
+        # resets. The wake-up deletes the park row BEFORE it re-drives the turn
+        # (parked_turns._wake), so this guard never blocks the resume itself.
+        if await self._is_parked(session_id) or (
+            session._active_task and not session._active_task.done()
+        ):
             session._pending_queue.append(queued)
             await self._broadcast(
                 {
@@ -1672,7 +1681,12 @@ class SessionManager:
         async with session._lock:
             if session._forking:
                 raise ValueError(f"Session {session_id} is busy (forking)")
-            if session._active_task and not session._active_task.done():
+            # Re-check the park under the lock: a turn on this session could
+            # have limit-parked in the window between the fast-path check above
+            # and acquiring the lock, and we must not drive into that.
+            if await self._is_parked(session_id) or (
+                session._active_task and not session._active_task.done()
+            ):
                 session._pending_queue.append(queued)
                 await self._broadcast(
                     {
@@ -1686,6 +1700,23 @@ class SessionManager:
             session._active_task = asyncio.create_task(
                 self._drive_messages(session_id, queued)
             )
+
+    async def _is_parked(self, session_id: str) -> bool:
+        """Is a usage-limit park pending for this session? (limit-auto-resume.md
+        §4) A parked session holds new turns in the queue rather than firing
+        them into the still-exhausted window."""
+        if self._parked_turns is None:
+            return False
+        return await self._parked_turns.get(session_id) is not None
+
+    async def get_pending_park(self, session_id: str) -> dict[str, Any] | None:
+        """The pending usage-limit park for a session, or None. Lets the REST
+        layer surface the "auto-resumes at HH:MM" state so a reload/reconnect
+        restores the banner instead of showing a dead-looking idle session
+        (limit-auto-resume.md §4)."""
+        if self._parked_turns is None:
+            return None
+        return await self._parked_turns.get(session_id)
 
     async def _drive_messages(
         self, session_id: str, initial: QueuedPrompt

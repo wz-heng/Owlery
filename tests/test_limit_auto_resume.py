@@ -334,6 +334,39 @@ async def test_sessions_sharing_a_reset_are_staggered(db, tmp_path):
         assert (later - earlier).total_seconds() >= 55
 
 
+async def test_concurrent_parks_on_one_reset_get_distinct_wake_ups(db, tmp_path):
+    """Regression: `_staggered` reads the whole table to pick a free slot, so two
+    parks racing on the SAME reset can both read the same "taken" set before
+    either writes its row — and both land on the same wake_at, the very stampede
+    the staggering exists to prevent. The slot-pick and the row-write must be
+    one atomic step (limit-auto-resume.md §4)."""
+    import asyncio
+
+    await db.save_session(
+        "s2", "s2", str(tmp_path), datetime.now(timezone.utc).isoformat()
+    )
+    runner = ParkedTurnRunner(_FakeSessionManager(), db)
+    reset = datetime.now(timezone.utc) + timedelta(hours=3)
+
+    rows = await asyncio.gather(
+        *(
+            runner.park(
+                sid,
+                resume_mode="prompt",
+                payload="p",
+                resume_at_turn_start=None,
+                limit_kind="five_hour",
+                reset_at=reset,  # identical reset for both racers
+            )
+            for sid in ("s1", "s2")
+        )
+    )
+
+    wakes = sorted(datetime.fromisoformat(r["wake_at"]) for r in rows)
+    assert wakes[0] != wakes[1], "concurrent parks collided on one wake-up"
+    assert (wakes[1] - wakes[0]).total_seconds() >= 55
+
+
 async def test_wake_up_consumes_the_record_and_resumes(db):
     """The record is consumed BEFORE the turn runs: a resumed turn that limits
     again re-parks itself, and a stale row would rebuild into a duplicate job."""
@@ -552,6 +585,52 @@ async def test_cancelling_a_park_releases_the_held_queue(manager):
 
     assert drove == ["held one"]
     assert session._pending_queue == []
+
+
+async def test_a_new_message_while_parked_queues_instead_of_firing(manager):
+    """Regression: after a park the turn task is done and the session LOOKS idle,
+    so `start_message` would drive a brand-new turn straight into the still-
+    exhausted window. A pending park has to count as busy — the new message
+    queues and drains only after the auto-resume (limit-auto-resume.md §4)."""
+    epoch = int((datetime.now(timezone.utc) + timedelta(hours=3)).timestamp())
+    await _park(manager, reset_at=epoch)
+    session = manager.sessions["s1"]
+    assert await manager._parked_turns.get("s1") is not None
+    assert session._active_task is None  # the parked turn's task is finished
+
+    await manager.start_message("s1", "new-msg")
+
+    # Queued, NOT driven: no fresh turn was started against the dead window.
+    assert [q.prompt for q in session._pending_queue] == ["new-msg"]
+    assert session._active_task is None
+
+
+async def test_the_park_guard_does_not_block_the_auto_resume(manager):
+    """The guard holds USER messages, never the resume itself: the wake-up
+    deletes the park row BEFORE it re-drives the turn, so once the row is gone
+    `start_message` runs normally (limit-auto-resume.md §4)."""
+    epoch = int((datetime.now(timezone.utc) + timedelta(hours=3)).timestamp())
+    await _park(manager, reset_at=epoch)
+    session = manager.sessions["s1"]
+
+    drove: list[str] = []
+
+    async def _rec(session_id, queued):
+        drove.append(queued.prompt)
+
+    manager._drive_messages = _rec
+
+    # Row still present → a user message queues, nothing drives.
+    await manager.start_message("s1", "user-msg")
+    assert drove == []
+    assert [q.prompt for q in session._pending_queue] == ["user-msg"]
+
+    # The wake consumes the row; now the resume's start_message drives.
+    await manager._parked_turns.cancel("s1")
+    await manager.start_message("s1", "resumed-turn")
+    if session._active_task:
+        await session._active_task
+    assert drove == ["resumed-turn"]
 
 
 async def test_resume_rewinds_the_session_id_in_prompt_mode(manager):
