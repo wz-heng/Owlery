@@ -137,10 +137,9 @@ def test_claude_limit_without_an_epoch_yields_no_reset():
     assert hit is not None and hit.reset_at is None
 
 
-def test_codex_epoch_comes_from_the_rollout_not_the_prose(tmp_path):
-    """Codex renders its reset as a localized string ("try again at 10:23 PM")
-    but writes the machine-readable epoch to the turn's rollout. We must read
-    the epoch, never parse the prose back."""
+def _write_codex_rollout(tmp_path, *, resets_at: int) -> None:
+    """A minimal codex rollout carrying the machine-readable reset epoch in its
+    `token_count.rate_limits`, where the epoch actually lives (never on stdout)."""
     sessions = tmp_path / "sessions" / "2026" / "07" / "14"
     sessions.mkdir(parents=True)
     rollout = sessions / "rollout-2026-07-14T19-24-42-thread-1.jsonl"
@@ -155,7 +154,7 @@ def test_codex_epoch_comes_from_the_rollout_not_the_prose(tmp_path):
                         "primary": {
                             "used_percent": 100.0,
                             "window_minutes": 300,
-                            "resets_at": 1784039851,
+                            "resets_at": resets_at,
                         }
                     },
                 },
@@ -163,18 +162,61 @@ def test_codex_epoch_comes_from_the_rollout_not_the_prose(tmp_path):
         )
         + "\n"
     )
-    hit = get_harness("codex").classify_usage_limit(
-        TurnFailure(
-            error_text=(
-                "You've hit your usage limit. Upgrade to Pro ... or try again "
-                "at 10:23 PM."
-            ),
-            resume_id="thread-1",
-            home_dir=str(tmp_path),
-        )
+
+
+def test_codex_classify_is_pure_and_the_lookup_fills_the_epoch(tmp_path):
+    """The two-hook split (limit-auto-resume.md §4): `classify_usage_limit` is
+    PURE and stream-only — it decides the verdict and carries NO epoch even when
+    a rollout with one sits right there on disk (codex puts none on stdout). The
+    separate I/O hook `resolve_usage_limit_reset` reads the machine-readable
+    epoch from the rollout. Codex renders its reset as a localized string ("try
+    again at 10:23 PM") but we read the epoch, never parse the prose back."""
+    _write_codex_rollout(tmp_path, resets_at=1784039851)
+    harness = get_harness("codex")
+    failure = TurnFailure(
+        error_text=(
+            "You've hit your usage limit. Upgrade to Pro ... or try again "
+            "at 10:23 PM."
+        ),
+        resume_id="thread-1",
+        home_dir=str(tmp_path),
     )
+
+    hit = harness.classify_usage_limit(failure)
     assert hit is not None
-    assert hit.reset_at == 1784039851
+    # Pure: the classifier did NOT touch the rollout, so the epoch is still
+    # unfilled even though it exists on disk.
+    assert hit.reset_at is None
+
+    resolved = harness.resolve_usage_limit_reset(hit, failure)
+    assert resolved.reset_at == 1784039851  # the I/O lookup read it from the rollout
+
+
+def test_resolve_is_a_noop_when_the_stream_already_carried_the_epoch():
+    """Claude's epoch rides the stream, so `classify_usage_limit` already has it
+    and the lookup must not run: claude has no lookup hook, and a hit that
+    already carries a reset is returned untouched, never re-judged."""
+    harness = get_harness("claude-code")
+    hit = harness.classify_usage_limit(
+        _replay("claude-code", "limit_claude_user_5h.jsonl")
+    )
+    assert hit.reset_at == 1784038967
+    assert harness.resolve_usage_limit_reset(hit, TurnFailure()) is hit
+
+
+def test_codex_resolve_degrades_when_the_rollout_is_absent(tmp_path):
+    """No rollout on disk → the I/O lookup finds no epoch and the hit keeps its
+    missing reset, sending the caller to the probe fallback rather than guessing
+    a reset time. A failed lookup degrades; it never breaks the park."""
+    harness = get_harness("codex")
+    failure = TurnFailure(
+        error_text="You've hit your usage limit.",
+        resume_id="thread-missing",
+        home_dir=str(tmp_path),
+    )
+    hit = harness.classify_usage_limit(failure)
+    assert hit is not None and hit.reset_at is None
+    assert harness.resolve_usage_limit_reset(hit, failure).reset_at is None
 
 
 # ------------------------------------------------------------------ parking

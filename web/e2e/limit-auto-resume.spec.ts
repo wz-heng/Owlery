@@ -24,12 +24,19 @@ async function login(page: Page) {
   await expect(page.locator(".agent-list-header")).toBeVisible();
 }
 
-/** A fresh session on the default agent, so specs don't collide on one chat. */
+/** A fresh session on the default agent, so specs don't collide on one chat.
+ * The "+" opens the inline create form (name + working dir + backend); the
+ * chat only mounts once it's submitted, so fill a name and click Create — the
+ * same flow app.spec.ts uses. */
 async function newSession(page: Page) {
   await page
     .locator(".agent-item", { hasText: "Octo" })
     .locator(".btn-session-add")
     .click();
+  await page
+    .locator('.session-create input[placeholder="Session name"]')
+    .fill("Limit Test");
+  await page.locator("button.btn-create").click();
   await expect(page.locator(".chat-input-bar textarea")).toBeVisible();
 }
 
@@ -102,7 +109,11 @@ test.describe("usage-limit park & auto-resume", () => {
   test("the user can cancel a pending auto-resume", async ({ page }) => {
     await login(page);
     await newSession(page);
-    await send(page, `park me ${fake({ t: "limit", reset_in: 3600 })}`);
+    // A prompt unique to this test: the fake keys its "already limited once"
+    // flag on the prompt text (it's the only thing stable across the park), so
+    // sharing "park me" with the persistence test above would make this turn
+    // read as a resume and succeed instead of parking.
+    await send(page, `cancel me ${fake({ t: "limit", reset_in: 3600 })}`);
 
     const banner = page.locator('[data-testid="limit-parked-banner"]');
     await expect(banner).toBeVisible({ timeout: 15_000 });
@@ -114,6 +125,11 @@ test.describe("usage-limit park & auto-resume", () => {
   test("the parked turn resumes on its own when the limit resets", async ({
     page,
   }) => {
+    // The wake fires at reset + RESET_GRACE (30s), then the resume streams and
+    // clears the banner — comfortably past Playwright's 30s default. Give the
+    // unattended round-trip the room the banner assertion below already asks
+    // for (120s), plus setup headroom.
+    test.setTimeout(150_000);
     await login(page);
     await newSession(page);
 

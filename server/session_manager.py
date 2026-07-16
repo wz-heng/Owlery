@@ -2318,15 +2318,22 @@ class SessionManager:
                 # A turn the user interrupted never reaches here at all: Esc
                 # cancels the inner task, so CancelledError unwinds this
                 # generator long before the classification ladder runs.
-                limit_hit = harness.classify_usage_limit(
-                    TurnFailure(
-                        error_text=error_blob,
-                        rate_limit_info=getattr(backend, "rate_limit_info", None),
-                        resume_id=session.claude_session_id,
-                        home_dir=getattr(credential, "home_dir", None),
-                    )
+                turn_failure = TurnFailure(
+                    error_text=error_blob,
+                    rate_limit_info=getattr(backend, "rate_limit_info", None),
+                    resume_id=session.claude_session_id,
+                    home_dir=getattr(credential, "home_dir", None),
                 )
+                limit_hit = harness.classify_usage_limit(turn_failure)
                 if limit_hit is not None and self._parked_turns is not None:
+                    # The classifier is pure and stream-only, so a backend whose
+                    # epoch lives off-stream (codex writes it to the rollout, not
+                    # stdout) still needs its reset filled in — done here, where
+                    # I/O is allowed. The lookup only supplies a missing epoch;
+                    # it never revisits the verdict (limit-auto-resume.md §4).
+                    limit_hit = harness.resolve_usage_limit_reset(
+                        limit_hit, turn_failure
+                    )
                     event, parked = await self._park_limited_turn(
                         session,
                         hit=limit_hit,

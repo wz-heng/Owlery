@@ -750,17 +750,30 @@ def _codex_classify_usage_limit(failure: TurnFailure) -> UsageLimitHit | None:
     """Was this failed codex turn the user's OWN usage limit?
     (limit-auto-resume.md §4)
 
-    Codex states it unambiguously in the error text — and, unlike claude, uses
-    a phrase that its server-side-429 message does not share — so the marker
-    IS the structural discriminator here. The reset epoch never comes from the
-    prose (a rendered local time); it comes from the rollout's `rate_limits`.
+    PURE and stream-only — no I/O. Codex states its limit unambiguously in the
+    error text and, unlike claude, uses a phrase its server-side-429 message
+    does not share, so the marker IS the structural discriminator, decided from
+    the stream alone. Codex puts no epoch on `codex exec --json` stdout, so the
+    hit carries none here; `_codex_lookup_usage_limit_reset` fills it from the
+    rollout out of band. The reset never comes from the prose (a rendered local
+    time). Keeping this disk-free is what lets the disjointness proof hold on
+    the captured fixtures alone.
     """
     if _CODEX_USAGE_LIMIT_MARKER not in (failure.error_text or "").lower():
         return None
-    return UsageLimitHit(
-        kind="usage_limit",
-        reset_at=_codex_rollout_reset_at(failure.resume_id, failure.home_dir),
-    )
+    return UsageLimitHit(kind="usage_limit")
+
+
+def _codex_lookup_usage_limit_reset(
+    hit: UsageLimitHit, failure: TurnFailure
+) -> int | None:
+    """Fetch codex's reset epoch from the turn's rollout file — the I/O half of
+    detection, split off from the pure classifier so the verdict stays disk-free
+    (limit-auto-resume.md §4). Codex writes the machine-readable `resets_at`
+    only to the rollout, never to stdout, so this reads it there. It only ever
+    supplies a missing epoch — it never revisits the classification. None (no
+    rollout, or no epoch in it) sends the caller to the probe fallback."""
+    return _codex_rollout_reset_at(failure.resume_id, failure.home_dir)
 
 
 CODEX = RuntimeProfile(
@@ -772,6 +785,7 @@ CODEX = RuntimeProfile(
     auth_error_patterns=_CODEX_AUTH_ERROR_PATTERNS,
     transient_error_patterns=_CODEX_TRANSIENT_ERROR_PATTERNS,
     classify_usage_limit=_codex_classify_usage_limit,
+    lookup_usage_limit_reset=_codex_lookup_usage_limit_reset,
     # Single combined search-and-read tool, enabled per-leaf via the
     # web_research render path (-c tools.web_search=true). native-deep-research.md §4.
     web=WebCapability(tool_names=("web_search",), combined=True),

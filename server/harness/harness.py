@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+from dataclasses import replace
 
 from .events import HarnessOneshotError
 from .login import LoginDriver
@@ -82,12 +83,49 @@ class Harness:
         contain "rate limit", so only the backends' dedicated fields separate
         them. Mutually exclusive with `is_auth_error` / `is_transient_error` by
         construction — those two keep their pattern sets untouched, and a
-        message they'd claim carries none of the structure this reads. Pure.
-        Callers gate on the turn actually having failed."""
+        message they'd claim carries none of the structure this reads.
+
+        PURE and stream-only — it does no I/O, so the disjointness proof holds
+        on captured fixtures alone with no disk state able to change the
+        verdict. The returned hit carries an epoch only when the STREAM had one
+        (claude does; codex never does) — use `resolve_usage_limit_reset` to
+        fill the gap. Callers gate on the turn actually having failed."""
         hook = self.profile.classify_usage_limit
         if hook is None:
             return None
         return hook(failure)
+
+    def resolve_usage_limit_reset(
+        self, hit: "UsageLimitHit", failure: "TurnFailure"
+    ) -> "UsageLimitHit":
+        """Fill in a reset epoch the stream couldn't supply, and return the hit
+        (limit-auto-resume.md §4).
+
+        The separation from `classify_usage_limit` is the point: THIS may touch
+        disk (codex's epoch lives only in its rollout file), while the verdict
+        above stays pure. So a lookup can only ever add a `reset_at` — never
+        turn a limit into a non-limit or vice versa.
+
+        A hit that still has no epoch afterwards is returned unchanged, and the
+        caller falls back to probing rather than guessing a reset time."""
+        if hit.reset_at is not None:
+            return hit
+        hook = self.profile.lookup_usage_limit_reset
+        if hook is None:
+            return hit
+        try:
+            reset_at = hook(hit, failure)
+        except OSError:
+            # A lookup is best-effort: an unreadable rollout must degrade to the
+            # probe fallback, never fail the park.
+            logger.warning(
+                "usage-limit reset lookup failed for %s", self.profile.backend,
+                exc_info=True,
+            )
+            return hit
+        if reset_at is None:
+            return hit
+        return replace(hit, reset_at=reset_at)
 
     @property
     def premature_exit_recovery(self) -> bool:

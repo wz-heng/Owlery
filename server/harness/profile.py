@@ -211,13 +211,33 @@ class RuntimeProfile:
     # turn matching these is retried with backoff. Must stay free of auth
     # phrases (handled separately) and quota/credit phrases (never retried).
     transient_error_patterns: tuple[str, ...] = ()
-    # Whether a failed turn was the USER'S OWN usage limit, and when the window
-    # reopens (limit-auto-resume.md §4). NOT a pattern set: both CLIs answer a
-    # server-side throttle and the user's real limit with the same 429 and
-    # overlapping prose, so this is a structural check over the latched
-    # stream state. Pure. None = this backend has no limit detection, and a
-    # limit failure surfaces as-is (the pre-existing behaviour).
+    # Whether a failed turn was the USER'S OWN usage limit (limit-auto-resume.md
+    # §4). NOT a pattern set: both CLIs answer a server-side throttle and the
+    # user's real limit with the same 429 and overlapping prose, so this is a
+    # structural check over the latched stream state.
+    #
+    # PURE and STREAM-ONLY — no I/O, ever. The verdict must depend on nothing
+    # but the turn's own stream, so the disjointness proof (limit vs transient
+    # vs auth) holds on the captured fixtures alone, with no disk state that
+    # could silently change the answer. The hit carries whatever epoch the
+    # stream itself supplied (claude's `resetsAt`; always None for codex, whose
+    # stdout has no epoch at all).
+    #
+    # None = this backend has no limit detection, and a limit failure surfaces
+    # as-is (the pre-existing behaviour).
     classify_usage_limit: "Callable[[TurnFailure], UsageLimitHit | None] | None" = None
+    # Fill in a reset epoch the STREAM could not supply (limit-auto-resume.md
+    # §4). This one MAY do I/O: codex writes its machine-readable `resets_at`
+    # only to the turn's rollout file, never to stdout, so the epoch has to be
+    # fetched from disk. Claude needs no lookup (its epoch is on the stream) and
+    # leaves this None.
+    #
+    # It may ONLY supply a missing `reset_at` — it must never revisit the
+    # verdict. A hit whose epoch is still missing afterwards falls to the probe
+    # fallback, so a failed lookup degrades rather than breaks.
+    lookup_usage_limit_reset: (
+        "Callable[[UsageLimitHit, TurnFailure], int | None] | None"
+    ) = None
     # Whether the composed system prompt should carry the agent-memory blurb
     # (docs/plans/memory.md §3). Codex: True (no native memory — it reads/
     # writes the canonical dir with file tools by instruction). Claude: False
