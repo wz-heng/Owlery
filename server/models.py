@@ -164,10 +164,25 @@ class PendingQuestionInfo(BaseModel):
     questions: list[dict[str, Any]]
 
 
+class PendingParkInfo(BaseModel):
+    """A session paused on the user's own usage limit, awaiting auto-resume
+    (limit-auto-resume.md §4). Carried on the session snapshot so a reload or
+    WS reconnect restores the "auto-resumes at HH:MM" banner (and its cancel
+    affordance) instead of showing what looks like an idle session."""
+
+    # UTC ISO-8601 instant the parked turn will auto-resume — the park row's
+    # `wake_at`, matching the `resume_at` the `limit_paused` WS event carries.
+    resume_at: str | None = None
+    # The backend's name for the exhausted window ("five_hour", …).
+    limit_kind: str | None = None
+
+
 class SessionDetail(SessionInfo):
     messages: list[MessageContent] = []
     pending_queue: list[str] = []
     pending_questions: list[PendingQuestionInfo] = []
+    # Set only while a usage-limit park is pending; None on an ordinary session.
+    pending_park: PendingParkInfo | None = None
     # High-water mark of the messages above: the seq of the next message
     # the server will assign. Frontends use this to set their dedup
     # baseline so any subsequently-broadcast event with seq <=

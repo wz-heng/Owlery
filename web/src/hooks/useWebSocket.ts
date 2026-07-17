@@ -3,6 +3,7 @@ import {
   useSessionStore,
   type BgTask,
   type Message,
+  type ParkedTurn,
   type PendingQuestion,
   type ResearchJob,
   type SessionStatus,
@@ -37,6 +38,27 @@ export function shouldApplyWsEvent(
   if (typeof seq !== "number") return true;
   const b = typeof baseline === "number" ? baseline : -1;
   return seq > b;
+}
+
+/** Map a session snapshot's `pending_park` (from `GET /api/sessions/{id}`) to
+ * the store's ParkedTurn, or null when the session isn't parked.
+ *
+ * The park banner is otherwise only ever set by a live `limit_paused` WS event
+ * (limit-auto-resume.md §4), so a reload or reconnect would lose it and the
+ * paused session would look like an ordinary idle one — with no cancel
+ * affordance. Restoring from the snapshot is what makes the pause a durable,
+ * visible state. Exported so the unit test can exercise the mapping directly;
+ * the reconnect and session-select restore paths consume it internally.
+ */
+export function parkedTurnFromSnapshot(
+  pendingPark: { resume_at?: string | null; limit_kind?: string | null } | null
+    | undefined
+): ParkedTurn | null {
+  if (!pendingPark) return null;
+  return {
+    resumeAt: pendingPark.resume_at ?? null,
+    limitKind: pendingPark.limit_kind ?? null,
+  };
 }
 
 function handleWsMessage(data: Record<string, unknown>) {
@@ -173,6 +195,19 @@ function handleWsMessage(data: Record<string, unknown>) {
         type: "error",
         content: data.message as string,
       });
+      // The turn hit the user's own usage limit and is parked until the window
+      // resets (limit-auto-resume.md §4). It comes back on its own — show the
+      // wait (and the cancel affordance) rather than leaving a dead session.
+      if (data.code === "limit_paused") {
+        getState().setParkedTurn(sessionId, {
+          resumeAt: (data.resume_at as string) ?? null,
+          limitKind: (data.limit_kind as string) ?? null,
+        });
+      }
+      // Auto-resume gave up after repeated limits — no longer pending.
+      if (data.code === "limit_exhausted") {
+        getState().clearParkedTurn(sessionId);
+      }
       // A mid-turn 401 flagged the bound credential needs_reconnect server-side
       // (harness-credential-reauth.md §6). Refetch credentials so the Harness
       // sidebar lights up its "Re-authorize" badge without a manual reload.
@@ -187,6 +222,11 @@ function handleWsMessage(data: Record<string, unknown>) {
             .catch(() => {});
         }
       }
+      break;
+
+    case "limit_resumed":
+      // The limit reset and the parked turn is running again — drop the banner.
+      getState().clearParkedTurn(sessionId);
       break;
 
     case "bg_started": {
@@ -405,6 +445,12 @@ export function useWebSocket() {
                   activeSessionId,
                   data.pending_questions || []
                 );
+                // Restore the usage-limit park banner from the snapshot: a
+                // reconnect would otherwise drop it (it's only ever set by a
+                // live WS event). limit-auto-resume.md §4.
+                const park = parkedTurnFromSnapshot(data.pending_park);
+                if (park) getState().setParkedTurn(activeSessionId, park);
+                else getState().clearParkedTurn(activeSessionId);
                 // Bump the WS-event dedup baseline so any event with
                 // seq < next_message_seq is treated as already applied
                 // (it's in the snapshot we just set).

@@ -684,10 +684,13 @@ def test_mcp_bg_run_success(monkeypatch):
         def json(self):
             return {"id": "task-9", "description": posted.get("description")}
 
-    def fake_post(url, json=None, headers=None, timeout=None):  # noqa: ARG001
+    def fake_post(
+        url, json=None, headers=None, timeout=None, trust_env=None
+    ):  # noqa: ARG001
         posted["url"] = url
         posted["description"] = (json or {}).get("description")
         posted["command"] = (json or {}).get("command")
+        posted["trust_env"] = trust_env
         return FakeResp()
 
     import httpx
@@ -698,28 +701,39 @@ def test_mcp_bg_run_success(monkeypatch):
     assert posted["command"] == "echo hi"
     assert posted["description"] == "say hi"
     assert posted["url"].endswith("/api/sessions/s/bg-tasks")
+    # Never honor a system proxy for this loopback callback — an
+    # http_proxy/https_proxy in the environment (e.g. Clash) must not
+    # hijack the request and hand back a bogus response.
+    assert posted["trust_env"] is False
 
 
 def test_mcp_bg_cancel_handles_404(monkeypatch):
     monkeypatch.setenv("OWLERY_API_BASE", "http://x")
     monkeypatch.setenv("OWLERY_SESSION_ID", "s")
     monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
+    captured: dict = {}
 
     class R:
         status_code = 404
         text = ""
 
+    def fake_post(url, headers=None, timeout=None, trust_env=None):  # noqa: ARG001
+        captured["trust_env"] = trust_env
+        return R()
+
     import httpx
 
-    monkeypatch.setattr(httpx, "post", lambda *a, **k: R())
+    monkeypatch.setattr(httpx, "post", fake_post)
     out = _call("bg_cancel", task_id="t1")
     assert "No bg task" in out
+    assert captured["trust_env"] is False
 
 
 def test_mcp_bg_list_empty(monkeypatch):
     monkeypatch.setenv("OWLERY_API_BASE", "http://x")
     monkeypatch.setenv("OWLERY_SESSION_ID", "s")
     monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
+    captured: dict = {}
 
     class R:
         status_code = 200
@@ -727,11 +741,16 @@ def test_mcp_bg_list_empty(monkeypatch):
         def json(self):
             return []
 
+    def fake_get(url, headers=None, timeout=None, trust_env=None):  # noqa: ARG001
+        captured["trust_env"] = trust_env
+        return R()
+
     import httpx
 
-    monkeypatch.setattr(httpx, "get", lambda *a, **k: R())
+    monkeypatch.setattr(httpx, "get", fake_get)
     out = _call("bg_list")
     assert "No background tasks" in out
+    assert captured["trust_env"] is False
 
 
 def test_mcp_bg_list_summary(monkeypatch):

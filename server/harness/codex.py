@@ -29,6 +29,8 @@ from .profile import (
     ParseOutput,
     RuntimeProfile,
     TurnContext,
+    TurnFailure,
+    UsageLimitHit,
     WebCapability,
 )
 from .registry import register
@@ -682,6 +684,98 @@ _CODEX_TRANSIENT_ERROR_PATTERNS = (
 )
 
 
+# The user's-own-limit marker in codex's `error` / `turn.failed` text. Codex
+# renders exactly one phrase for it ("You've hit your usage limit."); a
+# server-side 429 renders "exceeded retry limit, last status: 429 Too Many
+# Requests" instead — no overlap with this string, which is what keeps the
+# limit and transient classifiers disjoint. Captured live from codex-cli
+# 0.142.5; both halves are fixtures under tests/fixtures/.
+_CODEX_USAGE_LIMIT_MARKER = "you've hit your usage limit"
+
+
+def _codex_rollout_reset_at(resume_id: str | None, home_dir: str | None) -> int | None:
+    """The epoch when codex's exhausted window reopens, read from the rollout.
+
+    `codex exec --json` puts NO structured limit state on stdout — only the
+    rendered prose ("try again at 10:23 PM"), which is a localized string we
+    must not parse back (limit-auto-resume.md §4). The machine-readable epoch
+    IS written, to the turn's rollout file, as `token_count.rate_limits`:
+    `{primary: {used_percent, window_minutes, resets_at}}`. So we read it from
+    there — structured data, just out-of-band. Returns None if the rollout is
+    missing or reports no epoch, and the caller falls back to probing.
+    """
+    if not resume_id:
+        return None
+    from pathlib import Path
+
+    home = home_dir or os.path.join(os.path.expanduser("~"), ".codex")
+    rollout = _find_rollout(Path(home) / "sessions", resume_id)
+    if rollout is None:
+        return None
+    reset_at: int | None = None
+    try:
+        with rollout.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = obj.get("payload")
+                if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                    continue
+                limits = payload.get("rate_limits")
+                if not isinstance(limits, dict):
+                    continue
+                # `primary` is the short (5-hour) window, `secondary` the weekly
+                # one. Take the latest record that names an epoch — codex
+                # rewrites this on every token_count, and the one written as the
+                # turn failed carries the exhausted window's reset.
+                for slot in ("primary", "secondary"):
+                    win = limits.get(slot)
+                    if not isinstance(win, dict):
+                        continue
+                    at = win.get("resets_at")
+                    if isinstance(at, (int, float)) and at > 0:
+                        reset_at = int(at)
+                        break
+    except OSError:
+        return None
+    return reset_at
+
+
+def _codex_classify_usage_limit(failure: TurnFailure) -> UsageLimitHit | None:
+    """Was this failed codex turn the user's OWN usage limit?
+    (limit-auto-resume.md §4)
+
+    PURE and stream-only — no I/O. Codex states its limit unambiguously in the
+    error text and, unlike claude, uses a phrase its server-side-429 message
+    does not share, so the marker IS the structural discriminator, decided from
+    the stream alone. Codex puts no epoch on `codex exec --json` stdout, so the
+    hit carries none here; `_codex_lookup_usage_limit_reset` fills it from the
+    rollout out of band. The reset never comes from the prose (a rendered local
+    time). Keeping this disk-free is what lets the disjointness proof hold on
+    the captured fixtures alone.
+    """
+    if _CODEX_USAGE_LIMIT_MARKER not in (failure.error_text or "").lower():
+        return None
+    return UsageLimitHit(kind="usage_limit")
+
+
+def _codex_lookup_usage_limit_reset(
+    hit: UsageLimitHit, failure: TurnFailure
+) -> int | None:
+    """Fetch codex's reset epoch from the turn's rollout file — the I/O half of
+    detection, split off from the pure classifier so the verdict stays disk-free
+    (limit-auto-resume.md §4). Codex writes the machine-readable `resets_at`
+    only to the rollout, never to stdout, so this reads it there. It only ever
+    supplies a missing epoch — it never revisits the classification. None (no
+    rollout, or no epoch in it) sends the caller to the probe fallback."""
+    return _codex_rollout_reset_at(failure.resume_id, failure.home_dir)
+
+
 CODEX = RuntimeProfile(
     backend="codex",
     binary="codex",
@@ -690,6 +784,8 @@ CODEX = RuntimeProfile(
     premature_exit_recovery=False,
     auth_error_patterns=_CODEX_AUTH_ERROR_PATTERNS,
     transient_error_patterns=_CODEX_TRANSIENT_ERROR_PATTERNS,
+    classify_usage_limit=_codex_classify_usage_limit,
+    lookup_usage_limit_reset=_codex_lookup_usage_limit_reset,
     # Single combined search-and-read tool, enabled per-leaf via the
     # web_research render path (-c tools.web_search=true). native-deep-research.md §4.
     web=WebCapability(tool_names=("web_search",), combined=True),

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { shouldApplyWsEvent } from "./useWebSocket";
+import { parkedTurnFromSnapshot, shouldApplyWsEvent } from "./useWebSocket";
 
 /** Snapshot-baseline dedup primitive.
  *
@@ -37,5 +37,41 @@ describe("shouldApplyWsEvent", () => {
     // baseline=0 means "seq 0 is in the snapshot, but seq 1+ are not"
     expect(shouldApplyWsEvent(0, 0)).toBe(false);
     expect(shouldApplyWsEvent(1, 0)).toBe(true);
+  });
+});
+
+/** Snapshot → park-banner restore.
+ *
+ * The park banner is otherwise only set by a live `limit_paused` WS event, so
+ * a reload/reconnect would drop it. Both restore paths (reconnect + session
+ * select) map the snapshot's `pending_park` through this pure helper, so
+ * testing it directly is the strongest signal the paused state survives a
+ * refresh (limit-auto-resume.md §4).
+ */
+describe("parkedTurnFromSnapshot", () => {
+  it("returns null when the session isn't parked", () => {
+    expect(parkedTurnFromSnapshot(null)).toBeNull();
+    expect(parkedTurnFromSnapshot(undefined)).toBeNull();
+  });
+
+  it("maps a pending park to the store's ParkedTurn shape", () => {
+    expect(
+      parkedTurnFromSnapshot({
+        resume_at: "2026-07-16T07:00:00+00:00",
+        limit_kind: "five_hour",
+      })
+    ).toEqual({
+      resumeAt: "2026-07-16T07:00:00+00:00",
+      limitKind: "five_hour",
+    });
+  });
+
+  it("still restores the banner for an epoch-less probe park", () => {
+    // No reset epoch (probe fallback) — the banner must still show, just
+    // without an "at HH:MM".
+    expect(parkedTurnFromSnapshot({ resume_at: null })).toEqual({
+      resumeAt: null,
+      limitKind: null,
+    });
   });
 });

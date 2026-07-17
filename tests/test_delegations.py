@@ -738,7 +738,7 @@ async def test_reply_injection_on_result(dm, mgr, db, monkeypatch):
     injected.clear()
 
     cid = rec.delegation_id
-    await dm._on_broadcast({"type": "assistant_text", "session_id": cid, "content": "Reviewed. "})
+    await dm._on_broadcast({"type": "assistant_text", "session_id": cid, "content": "Reviewed."})
     await dm._on_broadcast({"type": "assistant_text", "session_id": cid, "content": "Looks good."})
     await dm._on_broadcast({"type": "result", "session_id": cid, "is_error": False})
 
@@ -748,7 +748,130 @@ async def test_reply_injection_on_result(dm, mgr, db, monkeypatch):
     target_sid, prompt = injected[0]
     assert target_sid == parent.id
     assert prompt.startswith(f"[agent-reply:Vera delegation={cid}]")
-    assert "Reviewed. Looks good." in prompt
+    # Blocks must be separated, never fused into "Reviewed.Looks good."
+    assert "Reviewed.\nLooks good." in prompt
+
+
+@pytest.mark.asyncio
+async def test_reply_blocks_are_not_fused_into_one_line(dm, mgr, db, monkeypatch):
+    """Multi-block replies stay multi-line.
+
+    Regression: `_inject_terminal` used `"".join(captured_text)`. Real
+    assistant text blocks end at a sentence boundary with NO trailing
+    newline, so every block got glued to the next ("...version.Crit...")
+    and the whole reply collapsed into one multi-thousand-character line,
+    which the parent's delegation card then rendered as a wall of text.
+    """
+    injected: list[tuple[str, str]] = []
+
+    async def capture(sid, prompt, attachment_ids=None):
+        injected.append((sid, prompt))
+
+    monkeypatch.setattr(mgr, "start_message", capture)
+    octo = await db.get_system_agent()
+    await _make_agent(db, "Vera")
+    parent = await _make_session(mgr, octo["id"], name="parent")
+    rec = await dm.start_delegation(
+        parent_session_id=parent.id, agent_name="vera", request="r",
+    )
+    injected.clear()
+    cid = rec.delegation_id
+
+    # Shape of a real reply: complete blocks, none ending in a newline.
+    blocks = [
+        "I fixed the sys.path bootstrap.",
+        "Now I'll introspect the constructor signature.",
+        "Decisive finding: get_custom_info() does not expose position.",
+    ]
+    for b in blocks:
+        await dm._on_broadcast(
+            {"type": "assistant_text", "session_id": cid, "content": b}
+        )
+    await dm._on_broadcast({"type": "result", "session_id": cid, "is_error": False})
+
+    _, prompt = injected[0]
+    body = prompt.split("\n", 1)[1]
+    # Every block survives intact, on its own line...
+    for b in blocks:
+        assert b in body
+    # ...and none is fused to its neighbour.
+    assert "bootstrap.Now" not in body
+    assert "signature.Decisive" not in body
+    # The longest line is a single block, not the whole reply.
+    assert max(len(line) for line in body.split("\n")) <= max(len(b) for b in blocks)
+
+
+@pytest.mark.asyncio
+async def test_reply_preserves_block_interior_whitespace(dm, mgr, db, monkeypatch):
+    """Joining must not rewrite a block's interior.
+
+    Regression on the FIX: stripping each block before joining would eat
+    meaningful leading whitespace — an indented Markdown code block comes
+    out dedented and stops being code. Blocks are joined verbatim; only the
+    assembled body is trimmed at its outer edges.
+    """
+    injected: list[tuple[str, str]] = []
+
+    async def capture(sid, prompt, attachment_ids=None):
+        injected.append((sid, prompt))
+
+    monkeypatch.setattr(mgr, "start_message", capture)
+    octo = await db.get_system_agent()
+    await _make_agent(db, "Vera")
+    parent = await _make_session(mgr, octo["id"], name="parent")
+    rec = await dm.start_delegation(
+        parent_session_id=parent.id, agent_name="vera", request="r",
+    )
+    injected.clear()
+    cid = rec.delegation_id
+
+    for content in ["Here's the repro:", "    print(1)", "That's the whole bug."]:
+        await dm._on_broadcast(
+            {"type": "assistant_text", "session_id": cid, "content": content}
+        )
+    await dm._on_broadcast({"type": "result", "session_id": cid, "is_error": False})
+
+    _, prompt = injected[0]
+    body = prompt.split("\n", 1)[1]
+    # The code block keeps its indent — it is still a code block.
+    assert "\n    print(1)\n" in body
+    assert "print(1)" in body.split("\n")[1]  # the line itself is indented
+    assert body.split("\n")[1].startswith("    ")
+
+
+@pytest.mark.asyncio
+async def test_reply_does_not_loosen_a_tight_list(dm, mgr, db, monkeypatch):
+    """A block boundary is not necessarily a paragraph boundary.
+
+    Regression on the FIX: joining with a BLANK line would turn two list-item
+    blocks into a loose list, changing both the Markdown rendering and what
+    the parent's model reads. A single newline is the right separator.
+    """
+    injected: list[tuple[str, str]] = []
+
+    async def capture(sid, prompt, attachment_ids=None):
+        injected.append((sid, prompt))
+
+    monkeypatch.setattr(mgr, "start_message", capture)
+    octo = await db.get_system_agent()
+    await _make_agent(db, "Vera")
+    parent = await _make_session(mgr, octo["id"], name="parent")
+    rec = await dm.start_delegation(
+        parent_session_id=parent.id, agent_name="vera", request="r",
+    )
+    injected.clear()
+    cid = rec.delegation_id
+
+    for content in ["- first", "- second"]:
+        await dm._on_broadcast(
+            {"type": "assistant_text", "session_id": cid, "content": content}
+        )
+    await dm._on_broadcast({"type": "result", "session_id": cid, "is_error": False})
+
+    _, prompt = injected[0]
+    body = prompt.split("\n", 1)[1]
+    assert body == "- first\n- second"
+    assert "\n\n" not in body  # tight list stays tight
 
 
 @pytest.mark.asyncio
@@ -1894,3 +2017,66 @@ async def test_route_answer_409_when_no_pending(client, monkeypatch):
         headers=HEADERS,
     )
     assert r.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_parked_child_stays_pending_not_failed(dm, mgr, db, monkeypatch):
+    """A child parked on the user's usage limit is PENDING, not failed
+    (limit-auto-resume.md §4).
+
+    The park marker rides the `error` event shape, and the delegation handler
+    finalises on `error` — so without the `limit_paused` guard a parked child
+    would inject a bogus `[agent-error]` into its parent AND then resume hours
+    later to answer a delegation nobody is waiting on any more.
+    """
+    monkeypatch.setattr(mgr, "start_message", _noop_start_message)
+    octo = await db.get_system_agent()
+    await _make_agent(db, "Vera")
+    parent = await _make_session(mgr, octo["id"])
+    rec = await dm.start_delegation(
+        parent_session_id=parent.id, agent_name="vera", request="r",
+    )
+
+    await dm._on_broadcast({
+        "type": "error",
+        "code": "limit_paused",
+        "session_id": rec.delegation_id,
+        "message": "(usage limit reached — auto-resuming at 22:30)",
+    })
+
+    # Still running: the parent keeps waiting through the park.
+    assert rec.state == "running"
+    assert rec.error is None
+    # The child is alive — it has a turn to come back to.
+    assert mgr.get_session(rec.delegation_id) is not None
+
+    # The resumed turn ends the delegation for real.
+    await dm._on_broadcast({
+        "type": "result", "session_id": rec.delegation_id, "is_error": False,
+    })
+    assert rec.state == "completed"
+
+
+@pytest.mark.asyncio
+async def test_a_genuine_child_error_still_fails_the_delegation(
+    dm, mgr, db, monkeypatch
+):
+    """The park guard must be narrow: an ordinary error (and the terminal
+    'gave up after N resumes' marker) must still fail the delegation, or a
+    broken child would hang its parent forever."""
+    monkeypatch.setattr(mgr, "start_message", _noop_start_message)
+    octo = await db.get_system_agent()
+    await _make_agent(db, "Vera")
+    parent = await _make_session(mgr, octo["id"])
+    rec = await dm.start_delegation(
+        parent_session_id=parent.id, agent_name="vera", request="r",
+    )
+
+    await dm._on_broadcast({
+        "type": "error",
+        "code": "limit_exhausted",
+        "session_id": rec.delegation_id,
+        "message": "Still usage-limited after 3 automatic resumes.",
+    })
+
+    assert rec.state == "failed"

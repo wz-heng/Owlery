@@ -39,6 +39,7 @@ exactly as it would if `--resume` regressed.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import pathlib
@@ -82,6 +83,18 @@ def _state_dir() -> pathlib.Path:
     )
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _limit_flag_path(prompt: str) -> pathlib.Path:
+    """Where the `limit` op records "this prompt has already been limited once".
+
+    Keyed on the PROMPT, not the session id: the no-output resume mode re-runs
+    the original prompt and deliberately discards the failed attempt's session
+    id (harness-transient-retry.md §4), so the id is not stable across the park.
+    The prompt is — and it's what distinguishes concurrent specs from each other.
+    """
+    digest = hashlib.sha256(prompt.encode()).hexdigest()[:16]
+    return _state_dir() / f"limit-{digest}.flag"
 
 
 def _load_state(session_id: str) -> dict:
@@ -288,6 +301,15 @@ def run_bg_result_turn(prompt: str, state: dict) -> None:
     _emit_text(rule["v"])
 
 
+class _UsageLimited(Exception):
+    """The `limit` op fired: abandon the turn and fail it the way a real
+    usage-limit rejection does (limit-auto-resume.md §4)."""
+
+    def __init__(self, reset_at: int) -> None:
+        super().__init__("usage limit")
+        self.reset_at = reset_at
+
+
 def run_ops(ops: list[dict], parsed: dict, state: dict) -> None:
     mcp_servers = parsed["mcp_servers"]
 
@@ -335,6 +357,40 @@ def run_ops(ops: list[dict], parsed: dict, state: dict) -> None:
                 "require": op.get("require"),
             }
 
+        elif kind == "limit":
+            # Fail the turn on the USER'S OWN usage limit, exactly as the real
+            # CLI does (limit-auto-resume.md §4). The shape here is copied from
+            # a live capture (tests/fixtures/limit_claude_user_5h.jsonl): the
+            # `rate_limit_event` carrying the window claim + epoch is the ONLY
+            # thing separating this from a server-side 429, and it lands BEFORE
+            # the terminal result. `reset_in` seconds from now keeps the epoch
+            # live so the wake-up is schedulable in test time.
+            #
+            # Limits ONCE per working dir, then lets the turn through — the
+            # window really does reopen, so an auto-resumed turn must be able to
+            # succeed. Without this the resumed turn (which re-runs the original
+            # prompt, directive and all) would re-park forever. The flag lives
+            # on disk, not in the session state, because the no-output resume
+            # mode deliberately discards the failed attempt's session id.
+            already = _limit_flag_path(parsed["prompt"])
+            if already.exists():
+                already.unlink()
+                _emit_text("Resumed after the limit reset.")
+                continue
+            already.parent.mkdir(parents=True, exist_ok=True)
+            already.write_text("1")
+            reset_at = int(time.time()) + int(op.get("reset_in", 3600))
+            _emit({
+                "type": "rate_limit_event",
+                "rate_limit_info": {
+                    "status": "rejected",
+                    "resetsAt": reset_at,
+                    "rateLimitType": op.get("kind", "five_hour"),
+                    "isUsingOverage": False,
+                },
+            })
+            raise _UsageLimited(reset_at)
+
         else:
             sys.stderr.write(f"fake-claude: unknown op {kind!r}\n")
 
@@ -365,12 +421,26 @@ def run_turn(parsed: dict) -> int:
     })
 
     ops = parse_directive(prompt)
-    if prompt.lstrip().startswith("[bg-task-result]"):
-        run_bg_result_turn(prompt, state)
-    elif ops:
-        run_ops(ops, parsed, state)
-    else:
-        _emit_text("Acknowledged.")
+    try:
+        if prompt.lstrip().startswith("[bg-task-result]"):
+            run_bg_result_turn(prompt, state)
+        elif ops:
+            run_ops(ops, parsed, state)
+        else:
+            _emit_text("Acknowledged.")
+    except _UsageLimited:
+        # The real CLI's user-limit failure: an is_error result whose prose is
+        # the rendered reset ("You've hit your session limit · resets 10:22pm"),
+        # captured live. The prose is deliberately UNPARSEABLE for a machine —
+        # the server must take the epoch from the rate_limit_event above.
+        _save_state(session_id, state)
+        _emit({
+            "type": "result", "subtype": "success", "is_error": True,
+            "api_error_status": 429, "session_id": session_id,
+            "duration_ms": 12, "num_turns": 1,
+            "result": "You've hit your session limit · resets 10:22pm (Asia/Shanghai)",
+        })
+        return 0
 
     _save_state(session_id, state)
 

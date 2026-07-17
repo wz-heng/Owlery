@@ -124,6 +124,7 @@ def ask_user(questions: list[dict[str, Any]]) -> str:
             json={"questions": questions},
             headers=hdrs,
             timeout=10.0,
+            trust_env=False,
         )
     except httpx.HTTPError as e:
         return f"Error: failed to reach Owlery to create question: {e}"
@@ -147,6 +148,7 @@ def ask_user(questions: list[dict[str, Any]]) -> str:
                 # the host's 408 rather than tripping our own timeout
                 # mid-flight.
                 timeout=_PER_POLL_TIMEOUT + 5.0,
+                trust_env=False,
             )
         except httpx.HTTPError as e:
             logger.warning("long-poll failed transiently: %s", e)

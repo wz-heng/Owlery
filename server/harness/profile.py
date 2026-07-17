@@ -96,6 +96,49 @@ class ParseOutput:
     end_of_stream: bool = False
 
 
+@dataclass(frozen=True)
+class UsageLimitHit:
+    """A failed turn was the USER'S OWN usage limit — park it and resume when
+    the window resets (limit-auto-resume.md §4), as opposed to a server-side
+    throttle (transient, retry in seconds) or an auth rejection (stop).
+
+    `kind` is the backend's own name for the window it exhausted ("five_hour",
+    "primary", …) — carried for the UI/logs, never branched on outside the
+    harness. `reset_at` is a UTC epoch (seconds) when the window reopens, or
+    None when the backend didn't report one, in which case the caller falls
+    back to probing.
+    """
+
+    kind: str
+    reset_at: int | None = None
+
+
+@dataclass
+class TurnFailure:
+    """What the usage-limit classifier gets to look at for one failed turn.
+
+    Deliberately NOT just a string: the captured samples proved both CLIs
+    answer a server-side throttle and the user's own limit with the same HTTP
+    429 and overlapping prose, so text alone cannot separate them
+    (limit-auto-resume.md §4). The structured fields are the discriminator;
+    `error_text` is only ever used for a backend's own unambiguous marker,
+    never to parse a reset time out of rendered prose.
+    """
+
+    error_text: str = ""
+    # Whatever structured limit state the run latched off the stream — the
+    # claude parser's `rate_limit_event.rate_limit_info`, verbatim. None when
+    # the backend emits no such record.
+    rate_limit_info: dict[str, Any] | None = None
+    # The backend's resume id for this turn, when one was captured. Lets a
+    # backend that reports its limit state out-of-band (codex writes it to the
+    # rollout file, not stdout) go find it.
+    resume_id: str | None = None
+    # Where the backend's home/state dir lives for this run, when it differs
+    # from the host default (per-credential codex homes).
+    home_dir: str | None = None
+
+
 class EventParser(ABC):
     """Per-turn stdout normalizer. A fresh instance is created for each run
     (`profile.new_event_parser()`), so it may hold the small per-turn state
@@ -106,6 +149,15 @@ class EventParser(ABC):
     def parse(self, obj: dict[str, Any]) -> ParseOutput:
         """Map one parsed stdout JSON object to zero+ events, flagging
         end-of-stream when the turn's terminal event (result) lands."""
+
+    @property
+    def rate_limit_info(self) -> dict[str, Any] | None:
+        """The latest structured rate-limit state seen on this turn's stream,
+        for backends that emit one (claude's `rate_limit_event`); None
+        otherwise. Latched rather than surfaced as an event: it arrives BEFORE
+        the terminal error and is the only thing that tells the user's own
+        limit apart from a server-side 429 (limit-auto-resume.md §4)."""
+        return None
 
 
 class TranscriptCodec(Protocol):
@@ -159,6 +211,33 @@ class RuntimeProfile:
     # turn matching these is retried with backoff. Must stay free of auth
     # phrases (handled separately) and quota/credit phrases (never retried).
     transient_error_patterns: tuple[str, ...] = ()
+    # Whether a failed turn was the USER'S OWN usage limit (limit-auto-resume.md
+    # §4). NOT a pattern set: both CLIs answer a server-side throttle and the
+    # user's real limit with the same 429 and overlapping prose, so this is a
+    # structural check over the latched stream state.
+    #
+    # PURE and STREAM-ONLY — no I/O, ever. The verdict must depend on nothing
+    # but the turn's own stream, so the disjointness proof (limit vs transient
+    # vs auth) holds on the captured fixtures alone, with no disk state that
+    # could silently change the answer. The hit carries whatever epoch the
+    # stream itself supplied (claude's `resetsAt`; always None for codex, whose
+    # stdout has no epoch at all).
+    #
+    # None = this backend has no limit detection, and a limit failure surfaces
+    # as-is (the pre-existing behaviour).
+    classify_usage_limit: "Callable[[TurnFailure], UsageLimitHit | None] | None" = None
+    # Fill in a reset epoch the STREAM could not supply (limit-auto-resume.md
+    # §4). This one MAY do I/O: codex writes its machine-readable `resets_at`
+    # only to the turn's rollout file, never to stdout, so the epoch has to be
+    # fetched from disk. Claude needs no lookup (its epoch is on the stream) and
+    # leaves this None.
+    #
+    # It may ONLY supply a missing `reset_at` — it must never revisit the
+    # verdict. A hit whose epoch is still missing afterwards falls to the probe
+    # fallback, so a failed lookup degrades rather than breaks.
+    lookup_usage_limit_reset: (
+        "Callable[[UsageLimitHit, TurnFailure], int | None] | None"
+    ) = None
     # Whether the composed system prompt should carry the agent-memory blurb
     # (docs/plans/memory.md §3). Codex: True (no native memory — it reads/
     # writes the canonical dir with file tools by instruction). Claude: False

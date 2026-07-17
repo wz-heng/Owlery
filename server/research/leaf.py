@@ -27,6 +27,7 @@ from ..harness import (
     OneShotContext,
     RunConfig,
     TokenUsage,
+    join_text_blocks,
 )
 
 logger = logging.getLogger(__name__)
@@ -114,7 +115,7 @@ async def run_web_leaf(
         except Exception:
             logger.exception("web research leaf stop() failed")
     return LeafResult(
-        text="".join(parts).strip(), cost=cost or None, usage=usage, error=error
+        text=join_text_blocks(parts), cost=cost or None, usage=usage, error=error
     )
 
 

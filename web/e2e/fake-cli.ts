@@ -36,7 +36,14 @@ export type FakeOp =
    * `require`, when set, must appear in the injected prompt (or, when it was
    * spilled, in the file the pointer names) or the fake says so instead.
    */
-  | { t: "on_bg"; v: string; require?: string };
+  | { t: "on_bg"; v: string; require?: string }
+  /**
+   * Fail the turn on the USER'S OWN usage limit (limit-auto-resume.md §4),
+   * emitting the real CLI's `rate_limit_event` + failed `result`. `reset_in`
+   * seconds from now sets the reset epoch, so a spec can park a turn and have
+   * it wake in test time instead of five real hours.
+   */
+  | { t: "limit"; reset_in?: number; kind?: string };
 
 /** Render ops into the directive the fake parses out of the prompt. */
 export function fake(...ops: FakeOp[]): string {

@@ -2,10 +2,14 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from ..auth import verify_token
 from ..harness import BackendForkNotSupported
-from ..models import CreateSessionRequest, DuplicateSessionRequest, ForkSessionRequest, ImportSessionRequest, MessageContent, PendingQuestionInfo, SessionDetail, SessionInfo, SessionStatus
+from ..models import CreateSessionRequest, DuplicateSessionRequest, ForkSessionRequest, ImportSessionRequest, MessageContent, PendingParkInfo, PendingQuestionInfo, SessionDetail, SessionInfo, SessionStatus
 from ..session_manager import ForkError, fork_info_fields, session_manager
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
+
+# The ParkedTurnRunner, wired in by main.py's lifespan (like schedules._runner).
+# None outside a booted app — the cancel route 404s rather than exploding.
+_parked_turns = None
 
 
 def _fork_fields(s) -> dict:
@@ -157,6 +161,17 @@ async def get_session(session_id: str, _: str = Depends(verify_token)):
     if s is not None:
         messages_raw = await session_manager.db.load_messages(s.id)
         messages = [MessageContent(**m) for m in messages_raw]
+        # A pending usage-limit park (limit-auto-resume.md §4): surfaced on the
+        # snapshot so a reload/reconnect restores the "auto-resumes at HH:MM"
+        # banner rather than showing the paused session as ordinary idle.
+        park = await session_manager.get_pending_park(s.id)
+        pending_park = (
+            PendingParkInfo(
+                resume_at=park.get("wake_at"), limit_kind=park.get("limit_kind")
+            )
+            if park is not None
+            else None
+        )
         return SessionDetail(
             id=s.id,
             name=s.name,
@@ -178,6 +193,7 @@ async def get_session(session_id: str, _: str = Depends(verify_token)):
                 PendingQuestionInfo(question_id=q.question_id, questions=q.questions)
                 for q in s._pending_questions.values()
             ],
+            pending_park=pending_park,
             # High-water mark: clients use this as the dedup baseline so any
             # WS event with seq < next_message_seq is treated as already
             # applied (it's in the messages list above).
@@ -285,6 +301,20 @@ async def reset_session(session_id: str, _: str = Depends(verify_token)):
     except ValueError:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Session not found")
     return {"status": "ok"}
+
+
+@router.delete("/{session_id}/parked-turn", status_code=status.HTTP_204_NO_CONTENT)
+async def cancel_parked_turn(session_id: str, _: str = Depends(verify_token)):
+    """Cancel a pending usage-limit auto-resume (limit-auto-resume.md §4).
+
+    Drops the record and its wake-up job, so the parked turn will not fire when
+    the limit resets. The queued prompts behind it are released to drain
+    normally — the user is taking the wheel back."""
+    if _parked_turns is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No parked turn")
+    if not await _parked_turns.cancel(session_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No parked turn")
+    await session_manager.release_parked_queue(session_id)
 
 
 @router.post(

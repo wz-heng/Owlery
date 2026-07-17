@@ -41,8 +41,9 @@ def test_context_token_fetch_and_cache(monkeypatch):
     monkeypatch.setenv("OWLERY_INSTALLATION_ID", "i-1")
     calls = {"n": 0}
 
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, timeout=None, trust_env=None):
         calls["n"] += 1
+        calls["trust_env"] = trust_env
         assert url.endswith("/api/connectors/i-1/token")
         return FakeResp(json_body={"access_token": "AT", "expires_at_epoch": 0})
 
@@ -51,6 +52,10 @@ def test_context_token_fetch_and_cache(monkeypatch):
     assert ctx.access_token() == "AT"
     assert ctx.access_token() == "AT"  # cached → no second HTTP
     assert calls["n"] == 1
+    # Never honor a system proxy for this loopback callback — an
+    # http_proxy/https_proxy in the environment (e.g. Clash) must not
+    # hijack the request and hand back a bogus response.
+    assert calls["trust_env"] is False
 
 
 def test_context_token_401_returns_none(monkeypatch):
@@ -72,8 +77,8 @@ def test_mark_needs_reconnect_posts_and_clears_cache(monkeypatch):
     monkeypatch.setenv("OWLERY_INSTALLATION_ID", "i-1")
     cap = {}
 
-    def fake_post(url, params=None, headers=None, timeout=None):
-        cap["url"], cap["params"] = url, params
+    def fake_post(url, params=None, headers=None, timeout=None, trust_env=None):
+        cap["url"], cap["params"], cap["trust_env"] = url, params, trust_env
         return FakeResp()
 
     monkeypatch.setattr(_shared.httpx, "post", fake_post)
@@ -83,6 +88,7 @@ def test_mark_needs_reconnect_posts_and_clears_cache(monkeypatch):
     ctx.mark_needs_reconnect("invalid_grant")
     assert cap["url"].endswith("/api/connectors/i-1/mark-needs-reconnect")
     assert cap["params"] == {"error_code": "invalid_grant"}
+    assert cap["trust_env"] is False
     assert ctx._access_token is None  # cache dropped
 
 

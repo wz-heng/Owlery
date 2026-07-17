@@ -192,7 +192,9 @@ def ask_agent(
         )
         body: dict[str, object] = {"request": request}
         try:
-            r = httpx.post(url, json=body, headers=hdrs, timeout=10.0)
+            r = httpx.post(
+                url, json=body, headers=hdrs, timeout=10.0, trust_env=False
+            )
         except httpx.HTTPError as e:
             return (
                 f"Error: failed to reach Owlery to continue "
@@ -235,7 +237,9 @@ def ask_agent(
     if files:
         body["files"] = files
     try:
-        r = httpx.post(url, json=body, headers=hdrs, timeout=10.0)
+        r = httpx.post(
+            url, json=body, headers=hdrs, timeout=10.0, trust_env=False
+        )
     except httpx.HTTPError as e:
         return f"Error: failed to reach Owlery to start the delegation: {e}"
     if r.status_code == 404:
@@ -285,7 +289,9 @@ def cancel_agent_task(delegation_id: str, reason: str | None = None) -> str:
     )
     body = {"reason": reason} if reason else {}
     try:
-        r = httpx.post(url, json=body, headers=hdrs, timeout=10.0)
+        r = httpx.post(
+            url, json=body, headers=hdrs, timeout=10.0, trust_env=False
+        )
     except httpx.HTTPError as e:
         return f"Error: failed to reach Owlery to cancel {delegation_id}: {e}"
     if r.status_code == 404:
@@ -346,7 +352,9 @@ def answer_agent_question(delegation_id: str, choice: str) -> str:
     )
     body = {"choice": choice}
     try:
-        r = httpx.post(url, json=body, headers=hdrs, timeout=10.0)
+        r = httpx.post(
+            url, json=body, headers=hdrs, timeout=10.0, trust_env=False
+        )
     except httpx.HTTPError as e:
         return f"Error: failed to reach Owlery to answer {delegation_id}: {e}"
     if r.status_code == 404:
@@ -388,7 +396,7 @@ def list_agent_tasks() -> str:
         return "Error: ask_agent server is misconfigured (env vars missing)."
     url = f"{api}/api/sessions/{sid}/delegations"
     try:
-        r = httpx.get(url, headers=hdrs, timeout=10.0)
+        r = httpx.get(url, headers=hdrs, timeout=10.0, trust_env=False)
     except httpx.HTTPError as e:
         return f"Error: failed to reach Owlery to list delegations: {e}"
     if r.status_code != 200:
