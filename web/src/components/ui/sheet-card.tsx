@@ -5,26 +5,33 @@
  * Before round 3 these were six unrelated designs that happened to share
  * a border radius.
  *
- * Two scales, one grammar:
+ * Both scales are the same three parts — a seal, a ruled header, a body —
+ * and differ only in how much room they have to say it:
  *
- *   sheet  a ruled surface with a seal straddling its top edge. For
- *          anything that is a *statement*: an approval, a question, a
- *          reply from another agent.
- *   chip   an inline strip with the seal sitting in the header row. For
- *          anything that is a *status*: a bg task, a research job, an
- *          outbound request. At 16px the wax is a blob, not an
- *          impression, so the chip carries no glyph and no rule.
+ *   SheetCard  the STATEMENT scale. The seal straddles the top edge, the
+ *              letterhead is a full-bleed rule. For an approval, a
+ *              question, a reply from another agent.
+ *   SealChip   the STATUS scale. Inline strip; the seal sits at the head
+ *              of the rule rather than straddling an edge a 16px-tall
+ *              thing doesn't really have. For a bg task, a research job,
+ *              an outbound request.
  *
- * Status accents stay on the round-1 state colours — `attention` is still
- * plum. The grammar changes form, never state-colour semantics.
+ * Every surface tone and every wax colour below is an existing round-1
+ * token. The grammar changes form, never state-colour semantics: an
+ * `attention` card is still plum, a `destructive` one still wax red.
  */
-import type { ReactNode } from "react";
+import type { HTMLAttributes, ReactNode } from "react";
 
 import { Seal, type SealTone } from "./seal";
 import { cn } from "../../lib/utils";
 
 /** Surface tones. Each pairs a border and a fill that already exist. */
-export type CardTone = "brand" | "neutral" | "attention" | "success" | "destructive";
+export type CardTone =
+  | "brand"
+  | "neutral"
+  | "attention"
+  | "success"
+  | "destructive";
 
 const TONE_SURFACE: Record<CardTone, string> = {
   brand: "border-primary/40 bg-primary-50",
@@ -43,7 +50,23 @@ const TONE_WAX: Record<CardTone, SealTone> = {
   destructive: "destructive",
 };
 
-export interface SheetCardProps {
+/** The letterhead's right-hand end: a timestamp, an id, a tool name, a
+ * status. It truncates rather than pushing the rule open — a long MCP
+ * tool name would otherwise blow the header apart on a phone. Callers
+ * pass plain strings so we can hand the full value to `title`. */
+function RuleMeta({ meta }: { meta: ReactNode }) {
+  return (
+    <span
+      className="sheet-rule-meta"
+      title={typeof meta === "string" ? meta : undefined}
+    >
+      {meta}
+    </span>
+  );
+}
+
+export interface SheetCardProps
+  extends Omit<HTMLAttributes<HTMLDivElement>, "title"> {
   tone?: CardTone;
   /** The author's side — where the seal hangs. */
   side?: "left" | "right";
@@ -75,6 +98,7 @@ export function SheetCard({
   subdued = false,
   surfaceClassName,
   elevated = true,
+  ...rest
 }: SheetCardProps) {
   return (
     <div
@@ -85,52 +109,89 @@ export function SheetCard({
         className
       )}
       data-tone={tone}
+      {...rest}
     >
       <Seal side={side} tone={TONE_WAX[tone]} subdued={subdued}>
         {glyph}
       </Seal>
       <div className="sheet-rule">
         <span className="truncate">{title}</span>
-        {meta != null && <span className="sheet-rule-meta">{meta}</span>}
+        {meta != null && <RuleMeta meta={meta} />}
       </div>
       {children}
     </div>
   );
 }
 
-export interface SealChipProps {
+export interface SealChipProps
+  extends Omit<HTMLAttributes<HTMLDivElement>, "title"> {
   tone?: CardTone;
-  /** Live state gets a spinner or an icon in place of the wax; the seal
-   * is for identity, not for motion. */
-  icon?: ReactNode;
-  children: ReactNode;
+  /**
+   * Replaces the seal at the head of the rule. Callers pass a live icon
+   * here while something is actually running: motion is the information,
+   * and the ornament budget is one mark per surface, so a spinner
+   * outranks a monogram. Settle, and the wax comes back.
+   */
+  head?: ReactNode;
+  /** Impressed into the wax when `head` is not given. */
+  glyph?: ReactNode;
+  /** The rule's content — the chip's letterhead. May contain the caller's
+   * own expand toggle. */
+  title: ReactNode;
+  /** The rule's right-hand end. Truncates. */
+  meta?: ReactNode;
+  /** Trailing controls. Deliberately a separate slot from `title`: these
+   * sit OUTSIDE any toggle button the caller puts in the rule, because
+   * nesting <button> inside <button> is invalid HTML and breaks a11y. */
+  actions?: ReactNode;
+  /** Below the rule. Absent → the rule carries no border, because a rule
+   * under nothing is just a line. */
+  children?: ReactNode;
   className?: string;
+  /** Sit inline with surrounding content rather than filling the column. */
+  inline?: boolean;
 }
 
-/**
- * The status scale. A chip is a strip, so the seal sits inline at its
- * head rather than straddling an edge it doesn't have. Callers that have
- * a live status icon pass it as `icon` and get no seal — one mark per
- * surface is the ornament budget, and a spinner outranks a monogram when
- * something is actually running.
- */
+/** The status scale. Same three parts as SheetCard, one size down. */
 export function SealChip({
   tone = "neutral",
-  icon,
+  head,
+  glyph,
+  title,
+  meta,
+  actions,
   children,
   className,
+  inline = false,
+  ...rest
 }: SealChipProps) {
   return (
     <div
       className={cn(
-        "seal-chip flex items-center gap-2 rounded-md border px-2.5 py-1.5 text-xs",
+        "chip border",
+        inline ? "inline-block" : "block",
         TONE_SURFACE[tone],
         className
       )}
       data-tone={tone}
+      {...rest}
     >
-      {icon ?? <Seal side="left" tone={TONE_WAX[tone]} scale="chip" straddle={false} />}
-      {children}
+      <div className={cn("chip-rule", children != null && "chip-rule-ruled")}>
+        {head ?? (
+          <Seal
+            side="left"
+            tone={TONE_WAX[tone]}
+            scale="chip"
+            straddle={false}
+          >
+            {glyph}
+          </Seal>
+        )}
+        <div className="min-w-0 flex-1">{title}</div>
+        {meta != null && <RuleMeta meta={meta} />}
+        {actions}
+      </div>
+      {children != null && <div className="chip-body">{children}</div>}
     </div>
   );
 }

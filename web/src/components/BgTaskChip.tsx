@@ -26,8 +26,7 @@ import {
 } from "@tabler/icons-react";
 
 import { useSessionStore, type BgTask } from "../stores/sessionStore";
-import { Seal, type SealTone } from "./ui/seal";
-import { cn } from "../lib/utils";
+import { SealChip, type CardTone } from "./ui/sheet-card";
 
 interface Props {
   sessionId: string;
@@ -44,38 +43,28 @@ const STATUS_LABEL: Record<BgTask["status"], string> = {
 };
 
 /** A chip's wax follows its status, on the round-1 state colours. */
-const STATUS_WAX: Record<BgTask["status"], SealTone> = {
-  pending: "ink",
+const STATUS_TONE: Record<BgTask["status"], CardTone> = {
+  pending: "neutral",
   running: "brand",
   completed: "success",
   failed: "destructive",
-  cancelled: "ink",
-  interrupted: "ink",
+  cancelled: "neutral",
+  interrupted: "neutral",
 };
 
+/** The live icon. Only ever shown while something is actually moving. */
+function StatusIcon() {
+  return <IconLoader2 size={14} className="animate-spin text-primary shrink-0" />;
+}
+
 /**
- * While the task is live the spinner wins: motion is the information, and
- * the ornament budget is one mark per surface. The moment it settles, the
- * result gets sealed — which is exactly what a bg task delivering back
- * into the transcript *is*.
+ * What gets impressed into the wax once the task settles — which is
+ * exactly what a bg task delivering back into the transcript *is*.
  */
-function StatusIcon({ status }: { status: BgTask["status"] }) {
-  if (status === "running" || status === "pending") {
-    return <IconLoader2 size={14} className="animate-spin text-primary shrink-0" />;
-  }
-  const glyph =
-    status === "completed" ? (
-      <IconCheck />
-    ) : status === "cancelled" || status === "interrupted" ? (
-      <IconHandStop />
-    ) : (
-      <IconExclamationCircle />
-    );
-  return (
-    <Seal side="left" tone={STATUS_WAX[status]} scale="chip" straddle={false}>
-      {glyph}
-    </Seal>
-  );
+function StatusGlyph({ status }: { status: BgTask["status"] }) {
+  if (status === "completed") return <IconCheck />;
+  if (status === "cancelled" || status === "interrupted") return <IconHandStop />;
+  return <IconExclamationCircle />;
 }
 
 function lastLine(text: string): string {
@@ -152,76 +141,73 @@ export function BgTaskChip({ sessionId, taskId }: Props) {
     }
   };
 
-  const headerStyle: Record<BgTask["status"], string> = {
-    pending: "border-ink-300 bg-ink-100",
-    running: "border-primary/40 bg-primary-50",
-    completed: "border-success/40 bg-success-surface",
-    failed: "border-destructive/40 bg-destructive-surface",
-    cancelled: "border-ink-300 bg-ink-100",
-    interrupted: "border-ink-300 bg-ink-100",
-  };
-
   const lastOut = lastLine(task.stdout) || lastLine(task.stderr);
 
   return (
-    <div
-      className={cn(
-        "octo-bgtask-chip mt-2 rounded-md border overflow-hidden",
-        headerStyle[task.status]
-      )}
-    >
-      <div className="flex items-center gap-2 px-2.5 py-1.5 text-xs">
-        {/* The expand-toggle is its own button — siblings (exit-code
-         * badge, cancel button) live outside so we don't nest <button>
-         * inside <button>, which is invalid HTML and breaks a11y. */}
+    <SealChip
+      className="octo-bgtask-chip mt-2"
+      tone={STATUS_TONE[task.status]}
+      // While it runs, the spinner takes the wax's place: motion is the
+      // information, and the budget is one mark per surface.
+      head={
+        task.status === "running" || task.status === "pending" ? (
+          <StatusIcon />
+        ) : undefined
+      }
+      glyph={<StatusGlyph status={task.status} />}
+      title={
+        // The expand-toggle is its own button — the exit-code badge and
+        // the cancel button live in `actions`, outside it, so we never
+        // nest <button> inside <button>.
         <button
           type="button"
           onClick={() => setExpanded((e) => !e)}
-          className="flex flex-1 min-w-0 items-center gap-2 text-left hover:bg-accent/40 -mx-1 px-1 py-0.5 rounded transition-colors"
+          className="flex w-full min-w-0 items-center gap-2 text-left hover:bg-accent/40 -mx-1 px-1 py-0.5 rounded transition-colors"
           aria-expanded={expanded}
           aria-label={expanded ? "Collapse bg task" : "Expand bg task"}
         >
           <span className="text-muted-foreground shrink-0">
             {expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
           </span>
-          <StatusIcon status={task.status} />
-          <span className="font-semibold uppercase tracking-wider text-[10px] shrink-0">
-            bg · {STATUS_LABEL[task.status]}
-          </span>
-          {task.description && (
+          <span className="chip-label">bg · {STATUS_LABEL[task.status]}</span>
+          {task.description ? (
             <span className="truncate text-foreground">{task.description}</span>
-          )}
-          {!task.description && (
+          ) : (
             <code className="truncate font-mono text-muted-foreground">
               {task.command}
             </code>
           )}
         </button>
-        {task.exit_code !== null && task.exit_code !== 0 && (
-          <span className="shrink-0 rounded bg-destructive/10 px-1.5 py-0.5 text-[10px] font-mono text-destructive">
-            exit {task.exit_code}
-          </span>
-        )}
-        {isRunning && (
-          <button
-            type="button"
-            onClick={cancel}
-            disabled={cancelling}
-            className="shrink-0 inline-flex items-center gap-1 rounded border border-border bg-card px-1.5 py-0.5 text-[10px] text-muted-foreground hover:text-foreground hover:border-destructive/50 transition-colors disabled:opacity-50"
-            title="Cancel this background task"
-          >
-            <IconX size={10} />
-            Cancel
-          </button>
-        )}
-      </div>
+      }
+      actions={
+        <>
+          {task.exit_code !== null && task.exit_code !== 0 && (
+            <span className="shrink-0 rounded bg-destructive/10 px-1.5 py-0.5 text-[10px] font-mono text-destructive">
+              exit {task.exit_code}
+            </span>
+          )}
+          {isRunning && (
+            <button
+              type="button"
+              onClick={cancel}
+              disabled={cancelling}
+              className="shrink-0 inline-flex items-center gap-1 rounded border border-border bg-card px-1.5 py-0.5 text-[10px] text-muted-foreground hover:text-foreground hover:border-destructive/50 transition-colors disabled:opacity-50"
+              title="Cancel this background task"
+            >
+              <IconX size={10} />
+              Cancel
+            </button>
+          )}
+        </>
+      }
+    >
       {!expanded && lastOut && (
-        <div className="border-t border-border/60 px-3 py-1 font-mono text-[11px] text-muted-foreground truncate">
+        <div className="font-mono text-[11px] text-muted-foreground truncate">
           {lastOut}
         </div>
       )}
       {expanded && (
-        <div className="border-t border-border/60 bg-card/60 px-3 py-2 space-y-2">
+        <div className="space-y-2">
           <div className="text-[11px] text-muted-foreground">
             <span className="font-semibold">command</span>{" "}
             <code className="font-mono">{task.command}</code>
@@ -256,6 +242,6 @@ export function BgTaskChip({ sessionId, taskId }: Props) {
           )}
         </div>
       )}
-    </div>
+    </SealChip>
   );
 }

@@ -116,13 +116,36 @@
   color: hsl(var(--muted-foreground));
 }
 
-/* The right-hand end of a letterhead: a timestamp, an id, a status. It
- * is metadata, so it drops the display-caps treatment. */
+/* The right-hand end of a letterhead: a timestamp, an id, a tool name, a
+ * status. It is metadata, so it drops the display-caps treatment.
+ *
+ * It also YIELDS. `white-space: nowrap` alone made this slot un-shrinkable,
+ * so a long MCP tool name (`mcp__ask_agent__ask`) pushed the rule wider than
+ * the sheet on a 375px screen. `min-width: 0` is the load-bearing half:
+ * without it a flex item refuses to shrink below its content, and the
+ * ellipsis never fires. The full value stays reachable via `title`. */
 .sheet-rule-meta {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
   font-weight: 400;
   text-transform: none;
   letter-spacing: normal;
   white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* Same reason: the title half must be allowed to shrink too, or the two
+ * halves fight instead of sharing. The gap collapses on narrow screens —
+ * 2rem of air is a luxury a phone doesn't have. */
+.sheet-rule > * {
+  min-width: 0;
+}
+
+@media (max-width: 480px) {
+  .sheet-rule {
+    gap: 0.75rem;
+  }
 }
 
 /* ── The echo ──────────────────────────────────────────────────────── */
@@ -185,4 +208,47 @@
  * content needs to clear the half that hangs inside. */
 .dialog-sheet .seal-straddle {
   top: calc(var(--seal-dialog) / -2);
+}
+
+
+/* ── The chip ──────────────────────────────────────────────────────── */
+
+/* The status scale of the card skeleton: the same seal + rule + body as a
+ * sheet, one size down. A chip is short enough that a straddling seal
+ * would be taller than the thing it seals, so the wax sits at the head of
+ * the rule instead — the grammar's position rule (the author's edge) is
+ * kept, its overhang is not.
+ *
+ * The rule only draws a border when there is a body under it: a rule
+ * under nothing is just a line. */
+.chip {
+  --chip-gutter: 10px;
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.chip-rule {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 6px var(--chip-gutter);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.chip-rule-ruled {
+  border-bottom: 1px solid var(--rule-color);
+}
+
+.chip-body {
+  padding: 6px var(--chip-gutter);
+}
+
+/* A chip's letterhead label — the caps half, same voice as .sheet-rule. */
+.chip-label {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
 }

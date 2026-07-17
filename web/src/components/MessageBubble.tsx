@@ -121,6 +121,7 @@ export function MessageBubble({
   onFork,
 }: MessageBubbleProps) {
   const assistantLabel = agentName || "Assistant";
+  const assistantMonogram = monogram(assistantLabel);
   switch (message.type) {
     case "text":
       if (message.role === "user") {
@@ -194,8 +195,10 @@ export function MessageBubble({
            * stuck on. The emoji avatar still identifies the agent in the
            * sidebar rail, where nothing is being sealed. */}
           <div className="msg-content sheet markdown border border-border bg-card text-sm leading-relaxed shadow-[var(--elevation-raised)]">
-            <Seal side="left" tone="ink">
-              {monogram(assistantLabel)}
+            {/* No monogram to be had (an emoji-only agent name) → impress
+             * the owl rather than stamping "?" into the wax. */}
+            <Seal side="left" tone="ink" mark={assistantMonogram === null}>
+              {assistantMonogram}
             </Seal>
             <div className="msg-label sheet-rule">
               <span>{assistantLabel}</span>

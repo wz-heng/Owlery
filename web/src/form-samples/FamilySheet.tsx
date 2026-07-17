@@ -23,6 +23,7 @@ import { ToolApproval } from "../components/ToolApproval";
 import { QuestionPrompt } from "../components/QuestionPrompt";
 import { ResearchCard } from "../components/ResearchCard";
 import { BgTaskChip } from "../components/BgTaskChip";
+import { AgentDelegationRequestCard } from "../components/AgentDelegationRequestCard";
 import { AgentList } from "../components/AgentList";
 import { OwleryLogo } from "../components/OwleryLogo";
 import { Button } from "../components/ui/button";
@@ -186,14 +187,14 @@ export function FamilySheet() {
         <Family
           n="2"
           title="Card family"
-          note="six surfaces, one skeleton — state colour untouched (plum stays plum)"
+          note="all six, one skeleton — state colour untouched (plum stays plum)"
         >
           <div className="space-y-4">
             <AgentDelegationEventCard event={delegationEvent} />
             <ToolApproval
               message={msg({
                 type: "tool_approval_request",
-                tool_name: "Bash",
+                tool_name: "mcp__ask_agent__ask",
                 tool_use_id: "t1",
                 tool_input: { command: "rm -rf ./dist && bun run build" },
               })}
@@ -218,6 +219,13 @@ export function FamilySheet() {
             />
             <ResearchCard sessionId={SESSION_ID} />
             <BgTaskChip sessionId={SESSION_ID} taskId="bg1" />
+            <AgentDelegationRequestCard
+              sessionId={SESSION_ID}
+              toolUseId="t2"
+              agentName="Snape"
+              request="复核 fix/mcp-callback-trust-env 分支"
+              files={["server/mcp_servers/_shared.py"]}
+            />
           </div>
         </Family>
 

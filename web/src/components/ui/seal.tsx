@@ -57,9 +57,11 @@ export interface SealProps {
    * sits inline in the header row, because a chip has no top edge worth
    * breaking. */
   straddle?: boolean;
-  /** Impress the owl itself into the wax instead of taking a glyph. This
-   * is the Owlery mark, so it is reserved for the app speaking in its own
-   * voice — dialogs — and never used to stand in for an agent. */
+  /** Impress the owl itself into the wax instead of taking a glyph. Two
+   * callers, both legitimate: the app speaking in its own voice (dialogs),
+   * and the fallback when a name yields no monogram — see `monogram()`.
+   * The owl stands in for *an impression we couldn't take*, never for a
+   * specific agent's identity. */
   mark?: boolean;
 }
 
@@ -113,11 +115,21 @@ export function Seal({
   );
 }
 
-/** First letter of a name, as a monogram. Falls back to the owl when the
- * name has no letter to give (an emoji-only agent name, say) — the app's
- * own mark is always a legitimate impression. */
-export function monogram(name: string | undefined | null): string {
-  if (!name) return "?";
+/**
+ * First letter or digit of a name, as a monogram — or `null` when the name
+ * has none to give.
+ *
+ * `null` is the whole point of the signature. Agent names are free text and
+ * are routinely pure emoji ("🦉"), pure punctuation, or empty; this used to
+ * answer `"?"` for all of them, which stamped a *question mark* into the wax
+ * on every one of that agent's turns — the seal, the most identity-carrying
+ * mark in the app, reading as "who?". Callers must handle `null` by
+ * impressing the owl instead (`<Seal mark />`): the app's own mark is always
+ * a legitimate impression, and an unreadable name is not an error worth
+ * shouting about on every bubble.
+ */
+export function monogram(name: string | undefined | null): string | null {
+  if (!name) return null;
   const m = name.match(/\p{L}|\p{N}/u);
-  return m ? m[0].toUpperCase() : "?";
+  return m ? m[0].toUpperCase() : null;
 }

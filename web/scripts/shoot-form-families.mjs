@@ -84,6 +84,56 @@ async function main() {
       await page.keyboard.press("Escape");
       await page.waitForTimeout(300);
     }
+    // 375px. The letterhead's meta slot holds free-text tool names, and a
+    // long one (`mcp__ask_agent__ask`) used to shove the rule wider than the
+    // sheet that contains it.
+    //
+    // The harness's columns are fixed-width, so merely shrinking the
+    // viewport squeezes nothing — the honest test is to force the column to
+    // phone width and then ask the real question: does any rule overflow the
+    // sheet it lives in? That is viewport-independent and it is precisely
+    // the bug. `SHOW_META_BUG=1` re-breaks the CSS to prove this assertion
+    // can actually go red.
+    await page.setViewportSize({ width: 375, height: 1600 });
+    await page.addStyleTag({
+      content: `
+        /* The grayscale pass above left its filter on the page. This shot is
+         * about the letterhead, not about colour, so take it in colour. */
+        html { filter: none !important; }
+        section { width: 343px !important; }
+        .min-h-screen { padding-left: 16px !important; padding-right: 16px !important; }
+      `,
+    });
+    if (process.env.SHOW_META_BUG) {
+      await page.addStyleTag({
+        content: `.sheet-rule-meta, .sheet-rule > * {
+          min-width: auto !important; flex: 0 0 auto !important; overflow: visible !important;
+        }`,
+      });
+    }
+    await page.waitForTimeout(400);
+    await page.locator("section").nth(1).screenshot({
+      path: `${OUT}/2-cards-375.png`,
+    });
+    const overflow = await page.evaluate(() => {
+      const bad = [];
+      for (const rule of document.querySelectorAll(".sheet-rule, .chip-rule")) {
+        // A rule whose content is wider than its own box means a child
+        // refused to shrink — the meta slot shoving the header open.
+        if (rule.scrollWidth > rule.clientWidth + 1) {
+          bad.push(
+            `${rule.className.toString().slice(0, 40)}: content ${rule.scrollWidth}px in ${rule.clientWidth}px box`
+          );
+        }
+      }
+      return bad;
+    });
+    if (overflow.length) {
+      console.error("FAIL: letterhead overflow at 375px:\n  " + overflow.join("\n  "));
+      process.exitCode = 1;
+    } else {
+      console.log("OK: no letterhead overflows its sheet at 375px");
+    }
     console.log(`\nwrote ${OUT}`);
   } finally {
     await browser.close();

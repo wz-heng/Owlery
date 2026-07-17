@@ -1,6 +1,6 @@
 import { IconWorldSearch, IconX, IconCheck, IconAlertTriangle } from "@tabler/icons-react";
 import { useSessionStore, type ResearchJob } from "../stores/sessionStore";
-import { Seal } from "./ui/seal";
+import { SealChip, type CardTone } from "./ui/sheet-card";
 
 const API = window.location.origin;
 
@@ -11,6 +11,14 @@ const PHASE_LABEL: Record<string, string> = {
   verify: "Verifying claims",
   synthesize: "Writing the report",
   done: "Done",
+};
+
+const STATUS_TONE: Record<string, CardTone> = {
+  running: "brand",
+  completed: "success",
+  failed: "destructive",
+  cancelled: "neutral",
+  interrupted: "neutral",
 };
 
 /** Live deep-research progress for the active session (native-deep-research.md
@@ -38,50 +46,54 @@ export function ResearchCard({ sessionId }: { sessionId: string }) {
         const running = job.status === "running";
         const phaseIdx = PHASES.indexOf(job.phase ?? "scope");
         return (
-          <div
+          <SealChip
             key={job.id}
+            className="research-card"
             data-research-id={job.id}
             data-status={job.status}
-            className="research-card rounded-lg border border-ink-300 bg-ink-100 px-3 py-2 text-sm"
-          >
-            <div className="flex items-center gap-2">
-              {/* A running job shows the live icon; a settled one gets the
-               * wax. One mark per surface — a spinner outranks a seal
-               * while something is actually moving. */}
-              {running ? (
+            tone={STATUS_TONE[job.status] ?? "neutral"}
+            // A running job shows the live icon in place of the wax: motion
+            // is the information, and the ornament budget is one mark per
+            // surface. It settles, and the seal comes back.
+            head={
+              running ? (
                 <IconWorldSearch
                   size={15}
                   className="text-primary animate-pulse shrink-0"
                 />
-              ) : (
-                <Seal side="left" tone="ink" scale="chip" straddle={false}>
-                  <IconWorldSearch />
-                </Seal>
-              )}
-              <span className="research-question flex-1 truncate font-medium text-foreground">
+              ) : undefined
+            }
+            glyph={<IconWorldSearch />}
+            title={
+              <span className="research-question block truncate font-medium text-foreground">
                 {job.question}
               </span>
-              {job.status === "completed" && (
-                <IconCheck size={15} className="text-success shrink-0" />
-              )}
-              {(job.status === "failed" ||
-                job.status === "cancelled" ||
-                job.status === "interrupted") && (
-                <IconAlertTriangle size={15} className="text-destructive shrink-0" />
-              )}
-              {running && (
-                <button
-                  type="button"
-                  className="btn-research-cancel inline-flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
-                  onClick={() => cancel(job)}
-                  title="Cancel research"
-                  aria-label="Cancel research"
-                >
-                  <IconX size={13} />
-                </button>
-              )}
-            </div>
-            <div className="research-status mt-1 text-xs text-muted-foreground">
+            }
+            actions={
+              <>
+                {job.status === "completed" && (
+                  <IconCheck size={15} className="text-success shrink-0" />
+                )}
+                {(job.status === "failed" ||
+                  job.status === "cancelled" ||
+                  job.status === "interrupted") && (
+                  <IconAlertTriangle size={15} className="text-destructive shrink-0" />
+                )}
+                {running && (
+                  <button
+                    type="button"
+                    className="btn-research-cancel inline-flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                    onClick={() => cancel(job)}
+                    title="Cancel research"
+                    aria-label="Cancel research"
+                  >
+                    <IconX size={13} />
+                  </button>
+                )}
+              </>
+            }
+          >
+            <div className="research-status text-xs text-muted-foreground">
               {running ? (
                 <span className="research-phase">
                   {PHASE_LABEL[job.phase ?? "scope"] ?? job.phase}
@@ -106,7 +118,7 @@ export function ResearchCard({ sessionId }: { sessionId: string }) {
                 </span>
               )}
             </div>
-          </div>
+          </SealChip>
         );
       })}
     </div>

@@ -25,7 +25,7 @@ import {
   IconX,
 } from "@tabler/icons-react";
 
-import { Seal } from "./ui/seal";
+import { SealChip, type CardTone } from "./ui/sheet-card";
 import { useSessionStore, type Delegation } from "../stores/sessionStore";
 
 const STATUS_LABEL: Record<Delegation["state"], string> = {
@@ -202,32 +202,27 @@ export function AgentDelegationRequestCard({
   };
 
   const state = match?.state ?? "running";
+  const tone: CardTone =
+    state === "completed"
+      ? "brand"
+      : state === "running" || state === "cancelled"
+      ? "neutral"
+      : "destructive";
   const label = STATUS_LABEL[state];
   const delegationIdShort = match?.delegation_id?.slice(0, 8) ?? "…";
 
   return (
-    <div
-      className={`agent-delegation-request inline-flex items-start gap-2 rounded-md border px-2.5 py-1.5 text-xs ${
-        state === "completed"
-          ? "border-primary/40 bg-primary/5"
-          : state === "running"
-          ? "border-border bg-card"
-          : state === "cancelled"
-          ? "border-border bg-muted/40 text-muted-foreground"
-          : "border-destructive/40 bg-destructive/5"
-      }`}
+    <SealChip
+      className="agent-delegation-request"
+      inline
+      tone={tone}
       data-delegation-state={state}
-    >
-      {/* Outbound: the request we sealed and sent. The reply comes back
-       * as an AgentDelegationEventCard wearing the same wax. */}
-      <Seal side="left" tone="brand" scale="chip" straddle={false} className="mt-0.5">
-        <IconSubtask />
-      </Seal>
-      <div className="flex-1 min-w-0 space-y-0.5">
+      // Outbound: the request we sealed and sent. The reply comes back as
+      // an AgentDelegationEventCard wearing the same wax.
+      glyph={<IconSubtask />}
+      title={
         <div className="flex items-center gap-2 flex-wrap">
-          <span className="font-medium truncate">
-            Asked {agentName}
-          </span>
+          <span className="font-medium truncate">Asked {agentName}</span>
           <span className="inline-flex items-center gap-1 text-muted-foreground">
             <StatusIcon state={state} />
             <span>{label}</span>
@@ -238,38 +233,41 @@ export function AgentDelegationRequestCard({
             </span>
           )}
         </div>
-        <div className="text-muted-foreground truncate" title={request}>
-          “{request}”
+      }
+      actions={
+        <>
+          {match && (
+            <button
+              type="button"
+              onClick={openChild}
+              className="btn-open inline-flex items-center justify-center h-6 px-1.5 rounded text-muted-foreground hover:text-foreground hover:bg-accent"
+              title={`Open ${agentName}'s session`}
+            >
+              <IconExternalLink size={12} />
+            </button>
+          )}
+          {state === "running" && match && (
+            <button
+              type="button"
+              onClick={cancel}
+              disabled={cancelling}
+              className="btn-cancel inline-flex items-center justify-center h-6 px-1.5 rounded text-muted-foreground hover:text-destructive hover:bg-destructive/10 disabled:opacity-50"
+              title="Cancel delegation"
+            >
+              <IconX size={12} />
+            </button>
+          )}
+        </>
+      }
+    >
+      <div className="text-muted-foreground truncate" title={request}>
+        “{request}”
+      </div>
+      {files && files.length > 0 && (
+        <div className="text-[10px] text-muted-foreground/80">
+          files: {files.join(", ")}
         </div>
-        {files && files.length > 0 && (
-          <div className="text-[10px] text-muted-foreground/80">
-            files: {files.join(", ")}
-          </div>
-        )}
-      </div>
-      <div className="flex items-center gap-1 shrink-0">
-        {match && (
-          <button
-            type="button"
-            onClick={openChild}
-            className="btn-open inline-flex items-center justify-center h-6 px-1.5 rounded text-muted-foreground hover:text-foreground hover:bg-accent"
-            title={`Open ${agentName}'s session`}
-          >
-            <IconExternalLink size={12} />
-          </button>
-        )}
-        {state === "running" && match && (
-          <button
-            type="button"
-            onClick={cancel}
-            disabled={cancelling}
-            className="btn-cancel inline-flex items-center justify-center h-6 px-1.5 rounded text-muted-foreground hover:text-destructive hover:bg-destructive/10 disabled:opacity-50"
-            title="Cancel delegation"
-          >
-            <IconX size={12} />
-          </button>
-        )}
-      </div>
-    </div>
+      )}
+    </SealChip>
   );
 }
