@@ -237,6 +237,49 @@ describe("sessionStore", () => {
     expect(useSessionStore.getState().agents.map((a) => a.id)).toEqual(["a1"]);
   });
 
+  it("keeps archived agents in the identity catalog but off the live rail", () => {
+    const { setAgents, setAgentCatalog, upsertAgent, removeAgent } =
+      useSessionStore.getState();
+    const mk = (id: string, name: string, extra = {}) => ({
+      id,
+      name,
+      description: "",
+      system_prompt: "",
+      model: null,
+      credential_id: null,
+      backend: "claude-code" as const,
+      mcp_servers: ["ask", "bg"],
+      tool_allow: "",
+      tool_deny: "",
+      archived: false,
+      created_at: "2026-01-01",
+      updated_at: "2026-01-01",
+      active_session_count: 0,
+      ...extra,
+    });
+    setAgents([]);
+    setAgentCatalog([]);
+
+    // A live agent lands on both the rail and the catalog.
+    upsertAgent(mk("a1", "Owl"));
+    expect(useSessionStore.getState().agents.map((a) => a.id)).toEqual(["a1"]);
+    expect(useSessionStore.getState().agentCatalog.map((a) => a.id)).toEqual([
+      "a1",
+    ]);
+
+    // Archiving it (upsert with archived:true) drops it from the rail but its
+    // identity survives in the catalog, so history/usage still resolve it.
+    upsertAgent(mk("a1", "Owl", { archived: true }));
+    expect(useSessionStore.getState().agents).toHaveLength(0);
+    const cat = useSessionStore.getState().agentCatalog;
+    expect(cat.map((a) => a.id)).toEqual(["a1"]);
+    expect(cat[0].archived).toBe(true);
+
+    // Hard delete removes it from both.
+    removeAgent("a1");
+    expect(useSessionStore.getState().agentCatalog).toHaveLength(0);
+  });
+
   it("keeps messages separate per session", () => {
     const { addMessage } = useSessionStore.getState();
     addMessage("s1", { role: "user", type: "text", content: "msg for s1" });

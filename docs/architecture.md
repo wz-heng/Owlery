@@ -59,11 +59,14 @@ In development, Vite serves the SPA on port 5173 with HMR and proxies `/api`,
 
 ## The agent model
 
-An **Agent** is the durable definition of an assistant: name/avatar, system
+An **Agent** is the durable definition of an assistant: name, system
 prompt, model, default backend (`claude-code` | `codex`), an attached credential,
 its MCP/tool set, tool allow/deny policy, and enabled connectors. Agents **own**
-their Sessions, Schedules, and bridge bindings. A protected **Default Agent**
-("Octo", `is_system=1`) always exists.
+their Sessions, Schedules, and bridge bindings. A brand-new install seeds one
+ordinary agent (`Owl`); there is no protected/system agent — every agent can be
+archived, and an agent with no sessions can be deleted (agent-identity.md). An
+agent's visual identity is its wax seal (monogram + a colour assigned from its
+id), not an emoji avatar.
 
 - A **Session** is one conversation thread (an instance of talking to an agent).
   It carries the backend resume id, working dir, origin (`user` | `schedule` |
@@ -376,7 +379,7 @@ SQLite, WAL, foreign-key cascade; additive `ALTER`s go through idempotent
 migrations (never re-create or duplicate the schema in docs).
 
 - **`agents`** — durable assistant definition (prompt, model, backend,
-  credential, `mcp_servers`, tool allow/deny, `is_system`, `archived`). Owns the rest.
+  credential, `mcp_servers`, tool allow/deny, `archived`). Owns the rest.
 - **`sessions`** — one thread: `working_dir`, `claude_session_id` (backend
   resume id, name kept for back-compat), `agent_id`, `origin`
   (`user`|`schedule`|`bridge`|`delegation`|`fork`), `backend`, `credential_id`,

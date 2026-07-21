@@ -38,7 +38,6 @@ export function AgentSettings({ open, onOpenChange, initialAgentId }: Props) {
   const agents = useSessionStore((s) => s.agents);
   const credentials = useSessionStore((s) => s.credentials);
   const upsertAgent = useSessionStore((s) => s.upsertAgent);
-  const removeAgent = useSessionStore((s) => s.removeAgent);
   const setActiveAgentId = useSessionStore((s) => s.setActiveAgentId);
   const sessions = useSessionStore((s) => s.sessions);
   const setSessions = useSessionStore((s) => s.setSessions);
@@ -216,8 +215,9 @@ export function AgentSettings({ open, onOpenChange, initialAgentId }: Props) {
     if (res.ok) {
       // The backend cascade-archives this agent's sessions; mirror that in the
       // store so they vanish from the sidebar, and clear the active session if
-      // it was one of them. Re-selecting a fallback agent (Octo) is handled by
-      // AgentList's auto-select effect once activeAgentId is cleared.
+      // it was one of them. Re-selecting a fallback agent (the first live one)
+      // is handled by AgentList's auto-select effect once activeAgentId is
+      // cleared.
       const orphaned = new Set(
         sessions.filter((s) => s.agent_id === selected.id).map((s) => s.id)
       );
@@ -227,7 +227,10 @@ export function AgentSettings({ open, onOpenChange, initialAgentId }: Props) {
       if (activeSessionId && orphaned.has(activeSessionId)) {
         setActiveSessionId(null);
       }
-      removeAgent(selected.id);
+      // Archive, not delete: drop it from the live rail but keep its identity
+      // in the catalog so its archived sessions still resolve its name + seal
+      // (agent-identity.md).
+      upsertAgent({ ...selected, archived: true });
       setActiveAgentId(null);
       onOpenChange(false);
     } else {

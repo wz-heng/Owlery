@@ -107,7 +107,10 @@ export function ChatView({
   const messages = activeSessionId ? (messagesMap[activeSessionId] ?? EMPTY_MESSAGES) : EMPTY_MESSAGES;
   const sessions = useSessionStore((s) => s.sessions);
   const archivedSessions = useSessionStore((s) => s.archivedSessions);
-  const agents = useSessionStore((s) => s.agents);
+  // Identity resolution uses the catalog (incl. archived owners) so an
+  // archived agent's session still shows its name + seal, not "Assistant"
+  // (agent-identity.md).
+  const agentCatalog = useSessionStore((s) => s.agentCatalog);
   const activeSession = useMemo(
     () =>
       sessions.find((s) => s.id === activeSessionId) ??
@@ -115,8 +118,8 @@ export function ChatView({
     [sessions, archivedSessions, activeSessionId]
   );
   const activeAgent = useMemo(
-    () => agents.find((a) => a.id === activeSession?.agent_id),
-    [agents, activeSession?.agent_id]
+    () => agentCatalog.find((a) => a.id === activeSession?.agent_id),
+    [agentCatalog, activeSession?.agent_id]
   );
   // Display name for assistant attribution throughout the chat. Harness-
   // neutral fallback when the session has no owning agent.
@@ -280,6 +283,7 @@ export function ChatView({
           message={msg}
           sessionId={activeSessionId ?? ""}
           agentName={activeAgent?.name}
+          agentId={activeAgent?.id}
           onFork={(seq) => setForkDialog({ seq })}
         />
       );
@@ -934,8 +938,8 @@ export function ChatView({
     [activeSession?.parent_session_id, sessions, archivedSessions]
   );
   const parentAgent = useMemo(
-    () => agents.find((a) => a.id === parentSession?.agent_id),
-    [agents, parentSession?.agent_id]
+    () => agentCatalog.find((a) => a.id === parentSession?.agent_id),
+    [agentCatalog, parentSession?.agent_id]
   );
   const openParent = () => {
     if (!parentSession) return;

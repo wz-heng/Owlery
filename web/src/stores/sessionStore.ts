@@ -90,6 +90,14 @@ interface SessionStore {
   // drives the session/schedule filters.
   agents: Agent[];
   setAgents: (a: Agent[]) => void;
+  // Every agent incl. archived — the identity catalog. The rail shows only
+  // `agents` (live), but a session/usage/schedule row whose owner was since
+  // archived still needs to resolve that owner's identity (name + wax seal)
+  // instead of degrading to "Unknown agent" (agent-identity.md). Lookups by
+  // id for *display of an existing row's owner* read this; anything that
+  // lists selectable agents reads `agents`.
+  agentCatalog: Agent[];
+  setAgentCatalog: (a: Agent[]) => void;
   upsertAgent: (a: Agent) => void;
   removeAgent: (id: string) => void;
   activeAgentId: string | null;
@@ -277,17 +285,30 @@ export const useSessionStore = create<SessionStore>((set) => ({
 
   agents: [],
   setAgents: (agents) => set({ agents }),
+  agentCatalog: [],
+  setAgentCatalog: (agentCatalog) => set({ agentCatalog }),
   upsertAgent: (agent) =>
     set((s) => {
-      const idx = s.agents.findIndex((a) => a.id === agent.id);
-      const agents =
-        idx >= 0
-          ? [...s.agents.slice(0, idx), agent, ...s.agents.slice(idx + 1)]
-          : [...s.agents, agent];
-      return { agents };
+      const upsert = (list: Agent[]) => {
+        const idx = list.findIndex((a) => a.id === agent.id);
+        return idx >= 0
+          ? [...list.slice(0, idx), agent, ...list.slice(idx + 1)]
+          : [...list, agent];
+      };
+      // Catalog always carries the agent (incl. when archived). The rail
+      // carries live agents only, so an archived upsert drops it there while
+      // its identity survives in the catalog for history/usage/schedules.
+      const agents = agent.archived
+        ? s.agents.filter((a) => a.id !== agent.id)
+        : upsert(s.agents);
+      return { agents, agentCatalog: upsert(s.agentCatalog) };
     }),
+  // Hard delete — gone from the rail and the identity catalog alike.
   removeAgent: (id) =>
-    set((s) => ({ agents: s.agents.filter((a) => a.id !== id) })),
+    set((s) => ({
+      agents: s.agents.filter((a) => a.id !== id),
+      agentCatalog: s.agentCatalog.filter((a) => a.id !== id),
+    })),
   activeAgentId: null,
   setActiveAgentId: (activeAgentId) => set({ activeAgentId }),
 

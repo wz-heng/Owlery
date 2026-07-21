@@ -61,7 +61,9 @@ interface Props {
  * later limit-awareness work owns anything fancier. */
 export function UsageDialog({ open, onOpenChange }: Props) {
   const token = useSessionStore((s) => s.token);
-  const agents = useSessionStore((s) => s.agents);
+  // Catalog (incl. archived) so usage rows for an archived agent resolve to
+  // its name + seal, not a truncated id (agent-identity.md).
+  const agents = useSessionStore((s) => s.agentCatalog);
   const sessions = useSessionStore((s) => s.sessions);
   const archivedSessions = useSessionStore((s) => s.archivedSessions);
   const [groupBy, setGroupBy] = useState<GroupBy>("agent");

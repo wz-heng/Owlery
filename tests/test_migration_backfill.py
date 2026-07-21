@@ -212,5 +212,56 @@ async def test_legacy_db_drops_columns_and_does_not_reseed(tmp_path):
         mgr = AgentManager(db)
         await mgr.archive_agent("octo01")  # must not raise
         assert (await db.get_agent("octo01"))["archived"] is True
+
+        # Re-running migrations after archiving the only agent must NOT
+        # reseed 'Owl': the table is non-empty (an archived row still counts),
+        # so a restart never resurrects a default (agent-identity.md §6).
+        await db._apply_migrations()
+        names = [a["name"] for a in await db.load_agents(include_archived=True)]
+        assert names == ["Octo"]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_backfill_targets_oldest_live_not_archived(tmp_path):
+    """A populated table with a stray NULL-owner row backfills onto the oldest
+    LIVE agent — matching runtime get_default_agent — never an older archived
+    one, and it does not reseed 'Owl' (agent-identity.md)."""
+    db = Database(str(tmp_path / "mixed.db"))
+    await db.initialize()
+    try:
+        # An OLDER archived agent and a NEWER live agent (the seed is removed
+        # so the population is exactly these two).
+        await db.conn.execute("DELETE FROM agents")
+        await db.conn.execute(
+            "INSERT INTO agents (id, name, archived, created_at, updated_at) "
+            "VALUES ('old1', 'Archived', 1, '2025-01-01T00:00:00+00:00', "
+            "'2025-01-01T00:00:00+00:00')"
+        )
+        await db.conn.execute(
+            "INSERT INTO agents (id, name, archived, created_at, updated_at) "
+            "VALUES ('new1', 'Live', 0, '2025-06-01T00:00:00+00:00', "
+            "'2025-06-01T00:00:00+00:00')"
+        )
+        # A stray session with no owner.
+        await db.conn.execute(
+            "INSERT INTO sessions (id, name, working_dir, created_at) "
+            "VALUES ('s1', 'orphan', '/tmp', '2025-01-01T00:00:00+00:00')"
+        )
+        await db.conn.commit()
+
+        await db._apply_migrations()
+
+        # No reseed — still exactly the two agents.
+        names = sorted(
+            a["name"] for a in await db.load_agents(include_archived=True)
+        )
+        assert names == ["Archived", "Live"]
+        # The orphan lands on the oldest LIVE agent, not the older archived one.
+        sessions = await db.load_sessions()
+        assert next(s for s in sessions if s["id"] == "s1")["agent_id"] == "new1"
+        # And that is exactly what the runtime default resolves to.
+        assert (await db.get_default_agent())["id"] == "new1"
     finally:
         await db.close()

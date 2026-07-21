@@ -1150,8 +1150,9 @@ test.describe("agent-name message labels", () => {
     page,
     request,
   }) => {
-    // Imported sessions fall back to the system agent (default "Owl"),
-    // so the assistant label should read "Owl", never the old "Claude".
+    // Imported sessions fall back to the default agent (the seeded "Owl",
+    // the oldest live one), so the assistant label should read "Owl", never
+    // the old "Claude".
     await importSessionApi(request, "Agent Label Probe", [
       { role: "user", type: "text", content: "hi there" },
       { role: "assistant", type: "text", content: "hello back" },

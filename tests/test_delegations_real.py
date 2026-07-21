@@ -119,9 +119,9 @@ async def test_real_two_hop_claude_to_claude(tmp_path, monkeypatch):
     `[agent-reply:Vera delegation=… ]` carrying her assistant text."""
     db, mgr, dm, am, wd = await _bootstrap(tmp_path, monkeypatch)
     try:
-        # The system Default Agent is "Octo" — created by the
-        # migration. Reuse it as the parent rather than colliding on
-        # the unique name index.
+        # The seeded default agent is "Owl" (the oldest live agent) —
+        # created by the migration. Reuse it as the parent rather than
+        # colliding on the unique name index.
         octo = await db.get_default_agent()
         assert octo is not None
         await am.create_agent(name="Vera", model="haiku", backend="claude-code")

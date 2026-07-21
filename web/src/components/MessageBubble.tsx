@@ -31,6 +31,7 @@ import {
 } from "./AgentDelegationEventCard";
 import { AgentDelegationRequestCard } from "./AgentDelegationRequestCard";
 import { Seal, monogram } from "./ui/seal";
+import { waxColorForId } from "../lib/seal";
 
 // Marker the backend prepends to the synthesized user message it
 // injects when a bg task completes. Used to render those messages
@@ -41,12 +42,14 @@ const BG_TASK_RESULT_PREFIX = "[bg-task-result]";
 interface MessageBubbleProps {
   message: Message;
   sessionId: string;
-  // Name of the agent that owns this session, used to label assistant
-  // turns. Falls back to a harness-neutral "Assistant" when the session
-  // has no owning agent. The avatar is deliberately absent: the grammar
-  // seals a turn with the agent's monogram, and emoji don't get impressed
-  // into wax (messenger-form.md §4.1).
+  // Identity of the agent that owns this session, used to seal + label its
+  // assistant turns: the monogram from `agentName` (harness-neutral
+  // "Assistant" when the session has no owning agent), impressed in the
+  // agent's own wax colour keyed by `agentId` — the SAME colour the rail and
+  // headers use, so an agent looks identical everywhere (agent-identity.md).
+  // No emoji: the grammar seals a turn, it doesn't stick a sticker on it.
   agentName?: string;
+  agentId?: string;
   // "Fork from here" affordance (session-rewind.md §6.1): rendered on
   // user messages when set + the message has a known seq. Called with the
   // rewind target seq.
@@ -118,10 +121,14 @@ export function MessageBubble({
   message,
   sessionId,
   agentName,
+  agentId,
   onFork,
 }: MessageBubbleProps) {
   const assistantLabel = agentName || "Assistant";
   const assistantMonogram = monogram(assistantLabel);
+  // The agent's wax — same deterministic colour as its rail/header seal.
+  // Undefined (no owning agent) falls back to the seal's default ink wax.
+  const assistantWax = agentId ? waxColorForId(agentId) : undefined;
   switch (message.type) {
     case "text":
       if (message.role === "user") {
@@ -198,7 +205,12 @@ export function MessageBubble({
           <div className="msg-content sheet markdown border border-border bg-card text-sm leading-relaxed shadow-[var(--elevation-raised)]">
             {/* No monogram to be had (an emoji-only agent name) → impress
              * the owl rather than stamping "?" into the wax. */}
-            <Seal side="left" tone="ink" mark={assistantMonogram === null}>
+            <Seal
+              side="left"
+              tone="ink"
+              wax={assistantWax}
+              mark={assistantMonogram === null}
+            >
               {assistantMonogram}
             </Seal>
             <div className="msg-label sheet-rule">

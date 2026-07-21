@@ -681,15 +681,13 @@ class Database:
                 pass
 
         # 2. Seed a starter agent — only on a brand-new install, when the
-        #    agents table is completely empty. An existing instance keeps
-        #    whatever agents it already has (including a legacy 'Octo', now
-        #    an ordinary deletable agent); nothing is seeded and no agent is
+        #    agents table is completely EMPTY (any row, archived or not,
+        #    counts as "already populated"). An existing instance keeps
+        #    whatever agents it has (including a legacy 'Octo', now an
+        #    ordinary deletable agent); nothing is seeded and no agent is
         #    "protected". The seed name is 'Owl', matching the app's world.
-        cursor = await self._conn.execute(
-            "SELECT id FROM agents ORDER BY created_at LIMIT 1"
-        )
-        row = await cursor.fetchone()
-        if row is None:
+        cursor = await self._conn.execute("SELECT id FROM agents LIMIT 1")
+        if await cursor.fetchone() is None:
             default_id = uuid.uuid4().hex[:12]
             now = datetime.now(timezone.utc).isoformat()
             await self._conn.execute(
@@ -701,10 +699,18 @@ class Database:
             )
         else:
             # Non-empty table: the backfill fallbacks below (orphan sessions /
-            # schedules / bridges) land on the oldest existing agent. In
-            # practice a non-empty table means the agent refactor already ran,
-            # so there are no orphans left and this id is never used.
-            default_id = row[0]
+            # schedules / bridges) land on the SAME agent the runtime would
+            # pick as default — the oldest LIVE one (get_default_agent), with
+            # a stable created_at,id tiebreak. In practice a non-empty table
+            # means the agent refactor already ran, so there are no orphans
+            # and this id is never consumed; None (every agent archived) makes
+            # the orphan backfills no-op rather than resurrect a dead owner.
+            cur = await self._conn.execute(
+                "SELECT id FROM agents WHERE archived = 0 "
+                "ORDER BY created_at, id LIMIT 1"
+            )
+            r = await cur.fetchone()
+            default_id = r[0] if r else None
 
         # 3. Backfill sessions → Default Agent. (origin defaults to 'user'.)
         await self._conn.execute(
@@ -1949,7 +1955,7 @@ class Database:
         )
         if not include_archived:
             query += " WHERE a.archived = 0"
-        query += " ORDER BY a.created_at"
+        query += " ORDER BY a.created_at, a.id"
         cursor = await self._conn.execute(query)
         rows = await cursor.fetchall()
         return [self._row_to_agent(row) for row in rows]
@@ -1990,7 +1996,7 @@ class Database:
         cols = ", ".join(f"a.{c}" for c in self._AGENT_COLS.split(", "))
         cursor = await self._conn.execute(
             f"SELECT {cols}, {self._ACTIVE_SESSION_COUNT} FROM agents a "
-            "WHERE a.archived = 0 ORDER BY a.created_at LIMIT 1"
+            "WHERE a.archived = 0 ORDER BY a.created_at, a.id LIMIT 1"
         )
         row = await cursor.fetchone()
         return self._row_to_agent(row) if row else None

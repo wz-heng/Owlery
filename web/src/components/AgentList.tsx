@@ -15,6 +15,7 @@ export function AgentList({ onCreateAgent }: { onCreateAgent: () => void }) {
   const token = useSessionStore((s) => s.token);
   const agents = useSessionStore((s) => s.agents);
   const setAgents = useSessionStore((s) => s.setAgents);
+  const setAgentCatalog = useSessionStore((s) => s.setAgentCatalog);
   const activeAgentId = useSessionStore((s) => s.activeAgentId);
   const setActiveAgentId = useSessionStore((s) => s.setActiveAgentId);
   const setSessions = useSessionStore((s) => s.setSessions);
@@ -33,11 +34,18 @@ export function AgentList({ onCreateAgent }: { onCreateAgent: () => void }) {
   const headers = { Authorization: `Bearer ${token}` };
 
   const fetchAgents = useCallback(async () => {
-    const res = await fetch(`${API}/api/agents`, { headers });
+    // One fetch feeds both stores: the catalog (all agents, incl. archived —
+    // for resolving the identity of a session/usage row whose owner was since
+    // archived) and the rail (live agents only). agent-identity.md.
+    const res = await fetch(`${API}/api/agents?include_archived=true`, {
+      headers,
+    });
     if (!res.ok) return;
-    setAgents((await res.json()) as Agent[]);
+    const all = (await res.json()) as Agent[];
+    setAgentCatalog(all);
+    setAgents(all.filter((a) => !a.archived));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token, setAgents]);
+  }, [token, setAgents, setAgentCatalog]);
 
   const fetchSessions = useCallback(async () => {
     try {

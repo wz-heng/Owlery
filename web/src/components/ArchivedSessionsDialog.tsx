@@ -26,7 +26,10 @@ interface Props {
  * the sidebar). "View" opens it read-only; "Unarchive" brings it back live. */
 export function ArchivedSessionsDialog({ open, onOpenChange }: Props) {
   const token = useSessionStore((s) => s.token);
-  const agents = useSessionStore((s) => s.agents);
+  // Resolve owners from the catalog (incl. archived): an archived agent's
+  // archived sessions should group under its name + seal, not "Unknown agent"
+  // (agent-identity.md).
+  const agents = useSessionStore((s) => s.agentCatalog);
   const sessions = useSessionStore((s) => s.sessions);
   const setSessions = useSessionStore((s) => s.setSessions);
   const archived = useSessionStore((s) => s.archivedSessions);

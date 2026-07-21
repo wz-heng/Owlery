@@ -25,7 +25,9 @@ interface Props {
  * all in one place and toggle/delete them. Grouped by owning agent. */
 export function SchedulesDialog({ open, onOpenChange }: Props) {
   const token = useSessionStore((s) => s.token);
-  const agents = useSessionStore((s) => s.agents);
+  // Catalog (incl. archived) so a schedule owned by an archived agent still
+  // groups under its identity, not "Unknown agent" (agent-identity.md).
+  const agents = useSessionStore((s) => s.agentCatalog);
   const schedules = useSessionStore((s) => s.schedules);
   const setSchedules = useSessionStore((s) => s.setSchedules);
 

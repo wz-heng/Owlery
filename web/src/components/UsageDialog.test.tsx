@@ -65,6 +65,8 @@ beforeEach(() => {
   useSessionStore.setState({
     token: "tok",
     agents: [agent],
+    // UsageDialog resolves owner identity from the catalog (incl. archived).
+    agentCatalog: [agent],
     sessions: [],
     archivedSessions: [],
   });
