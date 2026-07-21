@@ -78,12 +78,12 @@ async def test_backfill_from_old_schema(tmp_path):
     db = Database(db_path)
     await db.initialize()  # runs _apply_migrations once
     try:
-        # Exactly one protected Default Agent.
+        # A brand-new agents table (the old schema had none) seeds exactly
+        # one ordinary starter agent named 'Owl' (agent-identity.md).
         agents = await db.load_agents()
-        system = [a for a in agents if a["is_system"]]
-        assert len(system) == 1
-        default = system[0]
-        assert default["name"] == "Octo"
+        owls = [a for a in agents if a["name"] == "Owl"]
+        assert len(owls) == 1
+        default = owls[0]
         # The built-in backfill (agent-collaboration.md §5.1 ask_agent;
         # native-deep-research.md §7 research) runs alongside the other
         # migrations and appends to every existing agent's mcp_servers list.
@@ -114,7 +114,7 @@ async def test_backfill_from_old_schema(tmp_path):
         # Idempotency: a second migration run changes nothing.
         await db._apply_migrations()
         agents2 = await db.load_agents()
-        assert len([a for a in agents2 if a["is_system"]]) == 1
+        assert len([a for a in agents2 if a["name"] == "Owl"]) == 1
         assert (await db.get_agent(default["id"]))["id"] == default["id"]
         assert len(await db.load_schedules()) == 1
         assert len(await db.load_bridge_mappings()) == 1
@@ -126,21 +126,24 @@ async def test_backfill_from_old_schema(tmp_path):
 
 @pytest.mark.asyncio
 async def test_fresh_db_gets_default_agent(tmp_path):
-    """A brand-new DB is born with the new shape and one Default Agent."""
+    """A brand-new DB is born with the new shape and one seeded 'Owl'."""
     db = Database(str(tmp_path / "fresh.db"))
     await db.initialize()
     try:
-        system = await db.get_system_agent()
+        system = await db.get_default_agent()
         assert system is not None
-        assert system["name"] == "Octo"
+        assert system["name"] == "Owl"
+        # The dropped columns are gone from the fresh table.
+        assert "is_system" not in await _column_names(db, "agents")
+        assert "avatar" not in await _column_names(db, "agents")
         # No session_id leftover on the freshly-created tables.
         assert "session_id" not in await _column_names(db, "schedules")
         assert not await db._column_is_not_null("bridge_mappings", "session_id")
 
-        # Second run no-ops (still exactly one system agent).
+        # Second run no-ops (still exactly one seeded agent).
         await db._apply_migrations()
         agents = await db.load_agents(include_archived=True)
-        assert len([a for a in agents if a["is_system"]]) == 1
+        assert len([a for a in agents if a["name"] == "Owl"]) == 1
     finally:
         await db.close()
 
@@ -163,9 +166,51 @@ async def test_orphan_schedule_falls_back_to_default(tmp_path):
     db = Database(db_path)
     await db.initialize()
     try:
-        default = await db.get_system_agent()
+        default = await db.get_default_agent()
         schedules = await db.load_schedules()
         assert len(schedules) == 1
         assert schedules[0]["agent_id"] == default["id"]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_db_drops_columns_and_does_not_reseed(tmp_path):
+    """An existing instance (legacy is_system/avatar shape, its own 'Octo')
+    keeps its agents untouched, has both retired columns dropped, is NOT
+    reseeded with 'Owl', and its 'Octo' is now an ordinary archivable agent
+    (agent-identity.md §6)."""
+    from server.agent_manager import AgentManager
+
+    db = Database(str(tmp_path / "legacy.db"))
+    await db.initialize()
+    try:
+        # Reconstruct a legacy population: re-add the retired columns and a
+        # user's own 'Octo' (the protected default of the old world), and
+        # remove the just-seeded Owl so the population is exactly [Octo].
+        await db.conn.execute(
+            "ALTER TABLE agents ADD COLUMN is_system INTEGER NOT NULL DEFAULT 0"
+        )
+        await db.conn.execute("ALTER TABLE agents ADD COLUMN avatar TEXT")
+        await db.conn.execute("DELETE FROM agents")
+        await db.conn.execute(
+            "INSERT INTO agents (id, name, created_at, updated_at, is_system, avatar) "
+            "VALUES ('octo01', 'Octo', '2025-01-01T00:00:00+00:00', "
+            "'2025-01-01T00:00:00+00:00', 1, '🐙')"
+        )
+        await db.conn.commit()
+
+        # Re-run migrations: columns dropped, no reseed.
+        await db._apply_migrations()
+        cols = await _column_names(db, "agents")
+        assert "is_system" not in cols
+        assert "avatar" not in cols
+        agents = await db.load_agents(include_archived=True)
+        assert [a["name"] for a in agents] == ["Octo"]  # no 'Owl' seeded
+
+        # The legacy 'Octo' is archivable now — no protection guard.
+        mgr = AgentManager(db)
+        await mgr.archive_agent("octo01")  # must not raise
+        assert (await db.get_agent("octo01"))["archived"] is True
     finally:
         await db.close()

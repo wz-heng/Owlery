@@ -28,7 +28,7 @@ async def manager():
 
 async def _new(manager, name="S", working_dir=None, credential_id=None, origin="user"):
     """Create a session under the Default Agent (created by migration)."""
-    agent = await manager.db.get_system_agent()
+    agent = await manager.db.get_default_agent()
     _create = manager.create_session
     return await _create(
         agent["id"], name, working_dir, credential_id=credential_id, origin=origin
@@ -943,7 +943,7 @@ async def test_make_run_dispatches_on_backend(manager):
     recovery (a Claude-CLI bug workaround)."""
     from server.harness import HarnessRun, get_harness
 
-    agent = await manager.db.get_system_agent()
+    agent = await manager.db.get_default_agent()
     claude_s = await manager.create_session(agent["id"], name="C", backend="claude-code")
     codex_s = await manager.create_session(agent["id"], name="X", backend="codex")
 
@@ -1483,7 +1483,7 @@ async def test_auth_error_in_stderr_flags_credential_and_emits(manager, monkeypa
     blob matches the claude harness patterns, so the bound credential is
     flagged and an `auth_expired` event is emitted."""
     cid = await _bind_credential(manager, "claude-code")
-    agent = await manager.db.get_system_agent()
+    agent = await manager.db.get_default_agent()
     session = await manager.create_session(
         agent["id"], "Auth", None, credential_id=cid, backend="claude-code"
     )
@@ -1512,7 +1512,7 @@ async def test_auth_error_codex_result_content_flags_credential(manager, monkeyp
     from server.harness import HarnessEvent
 
     cid = await _bind_credential(manager, "codex", secret="/tmp/home")
-    agent = await manager.db.get_system_agent()
+    agent = await manager.db.get_default_agent()
     session = await manager.create_session(
         agent["id"], "AuthCodex", None, credential_id=cid, backend="codex"
     )
@@ -1539,7 +1539,7 @@ async def test_clean_turn_does_not_flag_credential(manager, monkeypatch):
     from server.harness import HarnessEvent
 
     cid = await _bind_credential(manager, "claude-code")
-    agent = await manager.db.get_system_agent()
+    agent = await manager.db.get_default_agent()
     session = await manager.create_session(
         agent["id"], "Clean", None, credential_id=cid, backend="claude-code"
     )
@@ -1564,7 +1564,7 @@ async def test_failed_codex_turn_with_tool_unauthorized_does_not_flag(manager, m
     from server.harness import HarnessEvent
 
     cid = await _bind_credential(manager, "codex", secret="/tmp/home")
-    agent = await manager.db.get_system_agent()
+    agent = await manager.db.get_default_agent()
     session = await manager.create_session(
         agent["id"], "ToolFail", None, credential_id=cid, backend="codex"
     )
@@ -1629,7 +1629,7 @@ async def test_transient_error_retries_same_prompt_then_succeeds(manager, monkey
     from server.harness import HarnessEvent
 
     monkeypatch.setattr(type(manager), "_TRANSIENT_RETRY_BASE_DELAY", 0.0)
-    agent = await manager.db.get_system_agent()
+    agent = await manager.db.get_default_agent()
     session = await manager.create_session(
         agent["id"], "Transient", None, backend="claude-code"
     )
@@ -1662,7 +1662,7 @@ async def test_transient_retry_ignores_failed_attempts_resume_id(manager, monkey
     from server.harness import HarnessEvent
 
     monkeypatch.setattr(type(manager), "_TRANSIENT_RETRY_BASE_DELAY", 0.0)
-    agent = await manager.db.get_system_agent()
+    agent = await manager.db.get_default_agent()
     # Fresh session: no resume id at turn start.
     session = await manager.create_session(
         agent["id"], "TransientResume", None, backend="claude-code"
@@ -1693,7 +1693,7 @@ async def test_transient_error_bounded_then_surfaces(manager, monkeypatch):
     from server.harness import HarnessEvent
 
     monkeypatch.setattr(type(manager), "_TRANSIENT_RETRY_BASE_DELAY", 0.0)
-    agent = await manager.db.get_system_agent()
+    agent = await manager.db.get_default_agent()
     session = await manager.create_session(
         agent["id"], "TransientBounded", None, backend="claude-code"
     )
@@ -1720,7 +1720,7 @@ async def test_transient_error_after_output_resumes_with_continue(manager, monke
     from server.harness import HarnessEvent
 
     monkeypatch.setattr(type(manager), "_TRANSIENT_RETRY_BASE_DELAY", 0.0)
-    agent = await manager.db.get_system_agent()
+    agent = await manager.db.get_default_agent()
     session = await manager.create_session(
         agent["id"], "TransientAfterOutput", None, backend="claude-code"
     )

@@ -159,13 +159,14 @@ class BridgeManager:
         await self.db.delete_bridge_mapping(platform, chat_id)
 
     async def _ensure_bound(self, platform: str, chat_id: str) -> str | None:
-        """Return the chat's agent_id, binding it to the Default Agent on
-        first contact. None only if no agent exists at all (shouldn't
-        happen — migration always creates the Default Agent)."""
+        """Return the chat's agent_id, binding it to the default agent (the
+        oldest live one) on first contact. None only if the instance has no
+        agent at all — the caller then replies that none is configured yet
+        (agent-identity.md; there is no longer a guaranteed system agent)."""
         binding = self._binding(platform, chat_id)
         if binding is not None:
             return binding.agent_id
-        agent = await self.db.get_system_agent()
+        agent = await self.db.get_default_agent()
         if agent is None:
             return None
         await self.bind_agent(platform, chat_id, agent["id"], None)

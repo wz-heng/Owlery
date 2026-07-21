@@ -30,7 +30,7 @@ async function login(page: Page) {
  * same flow app.spec.ts uses. */
 async function newSession(page: Page) {
   await page
-    .locator(".agent-item", { hasText: "Octo" })
+    .locator(".agent-item", { hasText: "Owl" })
     .locator(".btn-session-add")
     .click();
   await page

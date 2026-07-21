@@ -139,3 +139,26 @@ After the owner picks, apply the grammar everywhere, by family:
 - **Chat content surfaces** (code blocks, tables, markdown body):
   already the strongest screens; the grammar frames them (bubble,
   card) but does not restyle their internals.
+
+## 7. Round-4 revision — the seal is an agent's identity
+
+Superseded by `docs/plans/agent-identity.md`. Round 3 shipped a
+narrower reading of the seal: it stamped chat turns, while agent
+avatars stayed emoji in the sidebar lists ("nothing is being sealed
+there"), and the ornament budget was phrased as *one seal per
+surface*. Round 4 corrects both, and this doc follows the code so the
+two don't disagree:
+
+- **An agent's identity IS its seal.** Wherever an agent appears — a
+  chat turn, a sidebar row, a dialog header, the chat header, the
+  usage table — it appears as its wax seal: its monogram (name's
+  first letter) impressed in a wax colour assigned deterministically
+  from its id (`--wax-*` palette, six non-red tones; red stays
+  reserved for `destructive`). There is no emoji avatar anywhere; the
+  `agents.avatar` column and its picker are retired.
+- **Ornament budget, restated:** *one seal per identity*, not per
+  surface. A list row carries the one identity it names; session rows
+  and controls still get the `seal-dot` echo, never a second full
+  seal. `<Seal>` (and its identity wrapper `<AgentSeal>`) is the app's
+  one avatar primitive, at a new `--seal-avatar` (~20px) scale for
+  rows and headers.

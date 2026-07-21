@@ -13,7 +13,7 @@ import {
 } from "./ui/dialog";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
-import { AVATAR_CHOICES, DEFAULT_AGENT_AVATAR } from "../lib/agentAvatar";
+import { AgentSeal } from "./ui/seal";
 
 const API = `${window.location.origin}/api/agents`;
 const BUILTIN_MCP = ["ask", "bg"] as const;
@@ -59,7 +59,6 @@ export function AgentSettings({ open, onOpenChange, initialAgentId }: Props) {
 
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
-  const [avatar, setAvatar] = useState("");
   const [systemPrompt, setSystemPrompt] = useState("");
   const [model, setModel] = useState("");
   const [credentialId, setCredentialId] = useState("");
@@ -91,7 +90,6 @@ export function AgentSettings({ open, onOpenChange, initialAgentId }: Props) {
       : null;
     setName(a?.name ?? "");
     setDescription(a?.description ?? "");
-    setAvatar(a?.avatar ?? "");
     setSystemPrompt(a?.system_prompt ?? "");
     setModel(a?.model ?? "");
     setCredentialId(a?.credential_id ?? "");
@@ -131,7 +129,6 @@ export function AgentSettings({ open, onOpenChange, initialAgentId }: Props) {
   const dirty =
     name !== (selected?.name ?? "") ||
     description !== (selected?.description ?? "") ||
-    avatar !== (selected?.avatar ?? "") ||
     systemPrompt !== (selected?.system_prompt ?? "") ||
     model !== (selected?.model ?? "") ||
     credentialId !== (selected?.credential_id ?? "") ||
@@ -175,7 +172,6 @@ export function AgentSettings({ open, onOpenChange, initialAgentId }: Props) {
     const body = {
       name: name.trim(),
       description,
-      avatar: avatar.trim() || null,
       system_prompt: systemPrompt,
       model: model.trim() || null,
       credential_id: credentialId || null,
@@ -282,9 +278,7 @@ export function AgentSettings({ open, onOpenChange, initialAgentId }: Props) {
                 onClick={() => selectAgent(a.id)}
                 title={a.name}
               >
-                <span className="shrink-0 text-base leading-none">
-                  {a.avatar || DEFAULT_AGENT_AVATAR}
-                </span>
+                <AgentSeal agent={a} className="shrink-0" />
                 <span className="truncate">{a.name}</span>
               </button>
             ))}
@@ -302,37 +296,6 @@ export function AgentSettings({ open, onOpenChange, initialAgentId }: Props) {
                 className="h-9"
                 autoFocus
               />
-            </div>
-
-            {/* Icon — pick a preset or type any emoji in the custom box. */}
-            <div className="space-y-1.5">
-              <Label>Icon</Label>
-              <div className="agent-avatar-picker flex flex-wrap items-center gap-1.5">
-                {AVATAR_CHOICES.map((emoji) => (
-                  <button
-                    key={emoji}
-                    type="button"
-                    aria-label={`Icon ${emoji}`}
-                    aria-pressed={avatar === emoji}
-                    className={`btn-avatar inline-flex h-9 w-9 items-center justify-center rounded-md border text-lg leading-none transition-colors ${
-                      avatar === emoji
-                        ? "border-primary bg-primary/10"
-                        : "border-border hover:bg-accent"
-                    }`}
-                    onClick={() => setAvatar(emoji)}
-                  >
-                    {emoji}
-                  </button>
-                ))}
-                <Input
-                  id="agent-avatar"
-                  value={avatar}
-                  onChange={(e) => setAvatar(e.target.value)}
-                  placeholder={DEFAULT_AGENT_AVATAR}
-                  aria-label="Custom icon"
-                  className="h-9 w-14 text-center"
-                />
-              </div>
             </div>
 
             <div className="space-y-1.5">
@@ -522,7 +485,7 @@ export function AgentSettings({ open, onOpenChange, initialAgentId }: Props) {
         </div>
 
         <DialogFooter className="flex items-center justify-between gap-2 sm:justify-between">
-          {selected && !selected.is_system ? (
+          {selected ? (
             <Button variant="destructive" size="sm" onClick={archive}>
               Archive agent
             </Button>

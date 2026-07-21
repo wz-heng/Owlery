@@ -68,7 +68,7 @@ async def update_agent(
     agent_id: str, req: AgentUpdate, _: str = Depends(verify_token)
 ):
     # exclude_unset so omitting a field leaves it untouched while explicitly
-    # passing null clears a nullable field (model/credential_id/avatar).
+    # passing null clears a nullable field (model/credential_id).
     fields = req.model_dump(exclude_unset=True)
     try:
         agent = await _get_manager().update_agent(agent_id, **fields)

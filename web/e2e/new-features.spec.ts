@@ -32,13 +32,13 @@ const ASK_QUESTION_PROMPT = `I need your input ${fake({
   ],
 })}`;
 
-/** Click the new-session "+" on the default "Octo" agent's row. The button is
+/** Click the new-session "+" on the default "Owl" agent's row. The button is
  * per-agent, and specs share one in-memory backend DB, so a bare
  * ".btn-session-add" turns ambiguous once a concurrent spec creates another
- * agent. Scoping to Octo keeps it unambiguous. */
-const addOctoSession = (page: Page) =>
+ * agent. Scoping to Owl keeps it unambiguous. */
+const addOwlSession = (page: Page) =>
   page
-    .locator(".agent-item", { hasText: "Octo" })
+    .locator(".agent-item", { hasText: "Owl" })
     .locator(".btn-session-add")
     .click();
 
@@ -668,7 +668,7 @@ test.describe("Credentials Panel", () => {
     await login(page);
 
     // Open the create-session form via the default agent's "+" button.
-    await addOctoSession(page);
+    await addOwlSession(page);
 
     // Selector is rendered, default option is "Default auth (CLI login)",
     // and our seeded credential is selectable.
@@ -724,10 +724,10 @@ test.describe("AskUserQuestion rendering", () => {
     await expect(page.locator(".chat-header h3")).toHaveText("Asked Question");
 
     // The historical question renders as the dashed-border summary,
-    // attributed to the owning agent (default "Octo"), not "Claude".
+    // attributed to the owning agent (default "Owl"), not "Claude".
     const summary = page.locator(".msg-question-done");
     await expect(summary).toBeVisible();
-    await expect(summary).toContainText("Octo asked");
+    await expect(summary).toContainText("Owl asked");
     await expect(summary).toContainText("Which database should we use?");
 
     // The user's answer renders as a user bubble with italic body
@@ -1150,8 +1150,8 @@ test.describe("agent-name message labels", () => {
     page,
     request,
   }) => {
-    // Imported sessions fall back to the system agent (default "Octo"),
-    // so the assistant label should read "Octo", never the old "Claude".
+    // Imported sessions fall back to the system agent (default "Owl"),
+    // so the assistant label should read "Owl", never the old "Claude".
     await importSessionApi(request, "Agent Label Probe", [
       { role: "user", type: "text", content: "hi there" },
       { role: "assistant", type: "text", content: "hello back" },
@@ -1166,7 +1166,7 @@ test.describe("agent-name message labels", () => {
       "hello back"
     );
     const label = page.locator(".msg-assistant .msg-label");
-    await expect(label).toContainText("Octo");
+    await expect(label).toContainText("Owl");
     await expect(label).not.toContainText("Claude");
   });
 });

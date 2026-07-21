@@ -191,9 +191,10 @@ export function MessageBubble({
       }
       return (
         <div className="msg msg-assistant">
-          {/* The agent's monogram, not its emoji: a seal is impressed, not
-           * stuck on. The emoji avatar still identifies the agent in the
-           * sidebar rail, where nothing is being sealed. */}
+          {/* The agent's monogram in wax — a seal is impressed, not stuck
+           * on. The same seal is the agent's identity everywhere it appears
+           * (rail, headers, here); there is no emoji avatar anymore
+           * (agent-identity.md). */}
           <div className="msg-content sheet markdown border border-border bg-card text-sm leading-relaxed shadow-[var(--elevation-raised)]">
             {/* No monogram to be had (an emoji-only agent name) → impress
              * the owl rather than stamping "?" into the wax. */}

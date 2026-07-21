@@ -36,7 +36,7 @@ async def _seed_parent(mgr, *, backend="claude-code", working_dir="/repo",
                        n_user=3, git=(None, None)):
     """Parent with n_user user/assistant turn pairs; user rows carry the git
     anchor tuple so revert preflight has data."""
-    agent = await mgr.db.get_system_agent()
+    agent = await mgr.db.get_default_agent()
     parent = await mgr.create_session(
         agent["id"], "Parent", working_dir, backend=backend
     )
@@ -457,7 +457,7 @@ async def test_fork_with_revert_restores_files(manager, tmp_path, monkeypatch):
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
                           capture_output=True, text=True).stdout.strip()
 
-    agent = await manager.db.get_system_agent()
+    agent = await manager.db.get_default_agent()
     parent = await manager.create_session(agent["id"], "P", str(repo),
                                           backend="claude-code")
     # seq 0 user msg with clean git anchor at fork point; seq 1 the agent edits a.py.
@@ -485,7 +485,7 @@ async def test_fork_with_revert_refused_non_git(manager, tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     wd = tmp_path / "plain"
     wd.mkdir()
-    agent = await manager.db.get_system_agent()
+    agent = await manager.db.get_default_agent()
     parent = await manager.create_session(agent["id"], "P", str(wd),
                                           backend="claude-code")
     await manager.db.append_message(session_id=parent.id, seq=0, role="user",

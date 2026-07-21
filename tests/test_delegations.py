@@ -109,7 +109,7 @@ async def test_schema_has_new_columns(db):
 
 @pytest.mark.asyncio
 async def test_origin_delegation_round_trips(mgr, db):
-    parent_agent = await db.get_system_agent()
+    parent_agent = await db.get_default_agent()
     child_agent = await _make_agent(db, "Vera")
     parent = await _make_session(mgr, parent_agent["id"], name="parent")
     child = await mgr.create_session(
@@ -134,7 +134,7 @@ async def test_origin_delegation_round_trips(mgr, db):
 
 @pytest.mark.asyncio
 async def test_parent_delete_sets_null_on_child(mgr, db):
-    parent_agent = await db.get_system_agent()
+    parent_agent = await db.get_default_agent()
     child_agent = await _make_agent(db, "Vera")
     parent = await _make_session(mgr, parent_agent["id"])
     child = await mgr.create_session(
@@ -198,7 +198,7 @@ async def test_files_resolved_against_working_dir(
     abs_real = tmp_path / "abs.txt"
     abs_real.write_text("there")
 
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await mgr.create_session(
         agent_id=octo["id"], name="parent", working_dir=str(wd),
@@ -233,7 +233,7 @@ async def test_delegation_session_archived_after_terminal_inject(
     itself, so the chain work is genuinely complete by the time the
     archive runs."""
     monkeypatch.setattr(mgr, "start_message", _noop_start_message)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"])
     rec = await dm.start_delegation(
@@ -267,7 +267,7 @@ async def test_idle_handler_does_not_archive_delegation_child(
     archives after terminal inject), but the idle path no longer
     calls it for delegation children."""
     monkeypatch.setattr(mgr, "start_message", _noop_start_message)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"])
     rec = await dm.start_delegation(
@@ -293,7 +293,7 @@ async def test_auto_archive_skips_user_origin_sessions(mgr, db, monkeypatch):
     """Sanity check: the auto-archive helper still respects origin —
     user-origin sessions must NOT be auto-archived even when the
     helper is called directly."""
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     sess = await _make_session(mgr, octo["id"], origin="user")
     sess._active_task = None
     ok = await mgr.auto_archive_scheduled_session(sess.id)
@@ -315,7 +315,7 @@ async def test_orphaned_delegation_archived_on_restart(db):
     # the process dies).
     m1 = SessionManager()
     await m1.initialize(db)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     vera = await _make_agent(db, "Vera")
     parent = await _make_session(m1, octo["id"], name="parent")
     child = await m1.create_session(
@@ -358,7 +358,7 @@ async def test_nested_chain_intermediate_stays_alive_while_grandchild_runs(
     the assertion via the captured exception list, not silently
     succeed.
     """
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     await _make_agent(db, "Pete")
     octo_sess = await _make_session(mgr, octo["id"], name="octo-user")
@@ -466,7 +466,7 @@ async def test_start_delegation_happy_path(dm, mgr, db, monkeypatch):
 
     monkeypatch.setattr(mgr, "start_message", fake_start_message)
 
-    parent_agent = await db.get_system_agent()
+    parent_agent = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, parent_agent["id"], name="parent")
 
@@ -494,7 +494,7 @@ async def test_start_delegation_happy_path(dm, mgr, db, monkeypatch):
     assert started, "expected start_message to be called on the child"
     sid, prompt = started[0]
     assert sid == rec.delegation_id
-    assert "Octo" in prompt  # default system agent's name
+    assert "Owl" in prompt  # the seeded default agent's name
     assert "review the dashboard" in prompt
     assert "web/src/Dashboard.tsx" in prompt
 
@@ -503,7 +503,7 @@ async def test_start_delegation_happy_path(dm, mgr, db, monkeypatch):
 async def test_start_delegation_rejects_empty_request(dm, mgr, db, monkeypatch):
     monkeypatch.setattr(mgr, "start_message", _noop_start_message)
     await _make_agent(db, "Vera")
-    parent_agent = await db.get_system_agent()
+    parent_agent = await db.get_default_agent()
     parent = await _make_session(mgr, parent_agent["id"])
     with pytest.raises(DelegationError) as excinfo:
         await dm.start_delegation(
@@ -528,7 +528,7 @@ async def test_start_delegation_unknown_parent(dm):
 @pytest.mark.asyncio
 async def test_start_delegation_unknown_target(dm, mgr, db, monkeypatch):
     monkeypatch.setattr(mgr, "start_message", _noop_start_message)
-    parent_agent = await db.get_system_agent()
+    parent_agent = await db.get_default_agent()
     parent = await _make_session(mgr, parent_agent["id"])
     with pytest.raises(DelegationError) as excinfo:
         await dm.start_delegation(
@@ -542,7 +542,7 @@ async def test_start_delegation_unknown_target(dm, mgr, db, monkeypatch):
 @pytest.mark.asyncio
 async def test_start_delegation_rejects_self(dm, mgr, db, monkeypatch):
     monkeypatch.setattr(mgr, "start_message", _noop_start_message)
-    parent_agent = await db.get_system_agent()
+    parent_agent = await db.get_default_agent()
     parent = await _make_session(mgr, parent_agent["id"])
     with pytest.raises(DelegationError) as excinfo:
         await dm.start_delegation(
@@ -558,7 +558,7 @@ async def test_start_delegation_rejects_self(dm, mgr, db, monkeypatch):
 async def test_cycle_rejected(dm, mgr, db, monkeypatch):
     """Octo → Vera → Octo is rejected at the cycle check."""
     monkeypatch.setattr(mgr, "start_message", _noop_start_message)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     vera = await _make_agent(db, "Vera")
 
     # Octo's user session
@@ -592,7 +592,7 @@ async def test_chain_walk_rejects_session_id_cycle(dm, mgr, db, monkeypatch):
     parent_session_id (which would catch the obvious construction
     error) doesn't apply."""
     monkeypatch.setattr(mgr, "start_message", _noop_start_message)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     a = await _make_agent(db, "A")
     # Build a valid 2-session chain first so the FK is satisfied.
@@ -626,7 +626,7 @@ async def test_chain_walk_falls_back_to_db_for_archived_ancestor(
     every fresh delegation from an unarchived child would 409 with
     "no longer exists"."""
     monkeypatch.setattr(mgr, "start_message", _noop_start_message)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     vera = await _make_agent(db, "Vera")
     pete = await _make_agent(db, "Pete")
     # Build a valid chain Octo (root) → Vera-child (delegation).
@@ -658,7 +658,7 @@ async def test_chain_walk_rejects_truly_missing_ancestor(
     row still produces a 409 — that's actual corruption, not a
     legitimate archived state."""
     monkeypatch.setattr(mgr, "start_message", _noop_start_message)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     ancestor = await _make_session(mgr, octo["id"], name="ancestor")
     child = await mgr.create_session(
@@ -681,7 +681,7 @@ async def test_chain_walk_rejects_truly_missing_ancestor(
 async def test_depth_cap_rejected(dm, mgr, db, monkeypatch):
     """A 4th delegation hop is rejected (DEPTH_CAP=3)."""
     monkeypatch.setattr(mgr, "start_message", _noop_start_message)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     a = await _make_agent(db, "A")
     b = await _make_agent(db, "B")
     c = await _make_agent(db, "C")
@@ -727,7 +727,7 @@ async def test_reply_injection_on_result(dm, mgr, db, monkeypatch):
         injected.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", capture)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"], name="parent")
     rec = await dm.start_delegation(
@@ -768,7 +768,7 @@ async def test_reply_blocks_are_not_fused_into_one_line(dm, mgr, db, monkeypatch
         injected.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", capture)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"], name="parent")
     rec = await dm.start_delegation(
@@ -816,7 +816,7 @@ async def test_reply_preserves_block_interior_whitespace(dm, mgr, db, monkeypatc
         injected.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", capture)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"], name="parent")
     rec = await dm.start_delegation(
@@ -853,7 +853,7 @@ async def test_reply_does_not_loosen_a_tight_list(dm, mgr, db, monkeypatch):
         injected.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", capture)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"], name="parent")
     rec = await dm.start_delegation(
@@ -883,7 +883,7 @@ async def test_error_injection_on_result_error(dm, mgr, db, monkeypatch):
         injected.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", capture)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"])
     rec = await dm.start_delegation(
@@ -909,7 +909,7 @@ async def test_error_injection_on_error_event(dm, mgr, db, monkeypatch):
         injected.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", capture)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"])
     rec = await dm.start_delegation(
@@ -931,7 +931,7 @@ async def test_error_injection_on_error_event(dm, mgr, db, monkeypatch):
 async def test_post_terminal_events_ignored(dm, mgr, db, monkeypatch):
     """Once a delegation is terminal, late events don't reopen it."""
     monkeypatch.setattr(mgr, "start_message", _noop_start_message)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"])
     rec = await dm.start_delegation(
@@ -955,7 +955,7 @@ async def test_empty_reply_gets_placeholder(dm, mgr, db, monkeypatch):
         injected.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", capture)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"])
     rec = await dm.start_delegation(
@@ -985,7 +985,7 @@ async def test_cancel_delegation(dm, mgr, db, monkeypatch):
 
     monkeypatch.setattr(mgr, "start_message", capture)
     monkeypatch.setattr(mgr, "interrupt", fake_interrupt)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"])
     rec = await dm.start_delegation(
@@ -1021,7 +1021,7 @@ async def test_follow_up_happy_path(dm, mgr, db, monkeypatch):
         injected.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", capture)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"], name="octo")
     rec = await dm.start_delegation(
@@ -1076,7 +1076,7 @@ async def test_follow_up_happy_path(dm, mgr, db, monkeypatch):
 @pytest.mark.asyncio
 async def test_follow_up_rejects_while_running(dm, mgr, db, monkeypatch):
     monkeypatch.setattr(mgr, "start_message", _noop_start_message)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"])
     rec = await dm.start_delegation(
@@ -1096,7 +1096,7 @@ async def test_follow_up_rejects_while_running(dm, mgr, db, monkeypatch):
 @pytest.mark.asyncio
 async def test_follow_up_rejects_unknown_delegation(dm, mgr, db, monkeypatch):
     monkeypatch.setattr(mgr, "start_message", _noop_start_message)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     parent = await _make_session(mgr, octo["id"])
     with pytest.raises(DelegationError) as ex:
         await dm.follow_up_delegation(
@@ -1112,7 +1112,7 @@ async def test_follow_up_rejects_wrong_parent(dm, mgr, db, monkeypatch):
     """A delegation can only be followed up by its OWN parent — a
     different session can't continue someone else's conversation."""
     monkeypatch.setattr(mgr, "start_message", _noop_start_message)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent_a = await _make_session(mgr, octo["id"], name="A")
     parent_b = await _make_session(mgr, octo["id"], name="B")
@@ -1134,7 +1134,7 @@ async def test_follow_up_rejects_wrong_parent(dm, mgr, db, monkeypatch):
 @pytest.mark.asyncio
 async def test_follow_up_rejects_empty_request(dm, mgr, db, monkeypatch):
     monkeypatch.setattr(mgr, "start_message", _noop_start_message)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"])
     rec = await dm.start_delegation(
@@ -1165,7 +1165,7 @@ async def test_route_follow_up_requires_live_parent(client, monkeypatch):
     monkeypatch.setattr(session_manager, "start_message", noop)
 
     agents = (await client.get("/api/agents", headers=HEADERS)).json()
-    octo = next(a for a in agents if a["is_system"])
+    octo = next(a for a in agents if a["name"] == "Owl")
     await _post_agent(client, "Vera")
     parent = await _post_session(client, octo["id"])
     create = await client.post(
@@ -1205,7 +1205,7 @@ async def test_route_follow_up(client, monkeypatch):
     monkeypatch.setattr(session_manager, "start_message", noop)
 
     agents = (await client.get("/api/agents", headers=HEADERS)).json()
-    octo = next(a for a in agents if a["is_system"])
+    octo = next(a for a in agents if a["name"] == "Owl")
     await _post_agent(client, "Vera")
     parent = await _post_session(client, octo["id"])
     create = await client.post(
@@ -1251,7 +1251,7 @@ async def test_cancel_cascades_to_descendants(dm, mgr, db, monkeypatch):
 
     monkeypatch.setattr(mgr, "start_message", capture)
     monkeypatch.setattr(mgr, "interrupt", fake_interrupt)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     await _make_agent(db, "Pete")
     octo_sess = await _make_session(mgr, octo["id"], name="octo")
@@ -1321,7 +1321,7 @@ async def test_cancel_delegation_single_inject_under_interrupt_broadcast(
         return True
 
     monkeypatch.setattr(mgr, "interrupt", fake_interrupt)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"])
     rec = await dm.start_delegation(
@@ -1356,7 +1356,7 @@ async def test_terminal_injection_is_idempotent(dm, mgr, db, monkeypatch):
         injected.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", capture)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"])
     rec = await dm.start_delegation(
@@ -1373,7 +1373,7 @@ async def test_terminal_injection_is_idempotent(dm, mgr, db, monkeypatch):
 @pytest.mark.asyncio
 async def test_list_delegations_newest_first(dm, mgr, db, monkeypatch):
     monkeypatch.setattr(mgr, "start_message", _noop_start_message)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     await _make_agent(db, "Pete")
     parent = await _make_session(mgr, octo["id"])
@@ -1397,7 +1397,7 @@ async def test_concurrent_delegations_to_same_target(dm, mgr, db, monkeypatch):
         injected.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", capture)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"])
 
@@ -1443,7 +1443,7 @@ async def test_bridge_manager_skips_delegation_session(mgr, db, monkeypatch):
 
     # A chat bound to Vera but to the user-origin session of Vera, NOT
     # to a delegation child of Vera.
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     vera = await _make_agent(db, "Vera")
     vera_user_sess = await _make_session(mgr, vera["id"], name="vera-user")
     # Hand-register a binding to that user session id.
@@ -1535,7 +1535,7 @@ async def test_route_start_delegation(client, monkeypatch):
     monkeypatch.setattr(session_manager, "start_message", _noop_start_message)
 
     agents = (await client.get("/api/agents", headers=HEADERS)).json()
-    octo = next(a for a in agents if a["is_system"])
+    octo = next(a for a in agents if a["name"] == "Owl")
     await _post_agent(client, "Vera")
     parent = await _post_session(client, octo["id"])
 
@@ -1569,7 +1569,7 @@ async def test_route_list_and_cancel(client, monkeypatch):
     monkeypatch.setattr(session_manager, "interrupt", fake_interrupt)
 
     agents = (await client.get("/api/agents", headers=HEADERS)).json()
-    octo = next(a for a in agents if a["is_system"])
+    octo = next(a for a in agents if a["name"] == "Owl")
     await _post_agent(client, "Vera")
     parent = await _post_session(client, octo["id"])
 
@@ -1609,7 +1609,7 @@ async def test_route_404s(client, monkeypatch):
 
     # Known parent, unknown agent.
     agents = (await client.get("/api/agents", headers=HEADERS)).json()
-    octo = next(a for a in agents if a["is_system"])
+    octo = next(a for a in agents if a["name"] == "Owl")
     parent = await _post_session(client, octo["id"])
     r = await client.post(
         f"/api/sessions/{parent['id']}/delegations",
@@ -1631,7 +1631,7 @@ async def test_route_404s(client, monkeypatch):
 async def test_route_self_delegation_409(client, monkeypatch):
     monkeypatch.setattr(session_manager, "start_message", _noop_start_message)
     agents = (await client.get("/api/agents", headers=HEADERS)).json()
-    octo = next(a for a in agents if a["is_system"])
+    octo = next(a for a in agents if a["name"] == "Owl")
     parent = await _post_session(client, octo["id"])
     r = await client.post(
         f"/api/sessions/{parent['id']}/delegations",
@@ -1658,7 +1658,7 @@ async def test_question_request_routed_to_parent(dm, mgr, db, monkeypatch):
         injected.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", capture)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"])
     rec = await dm.start_delegation(
@@ -1719,7 +1719,7 @@ async def test_question_with_empty_questions_does_not_crash(
         captured.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", capture)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"])
     rec = await dm.start_delegation(
@@ -1743,7 +1743,7 @@ async def test_terminated_delegations_ignore_questions(
     """A late question event after a child finished is dropped — the
     parent's reply has already been injected."""
     monkeypatch.setattr(mgr, "start_message", _noop_start_message)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"])
     rec = await dm.start_delegation(
@@ -1792,7 +1792,7 @@ def _seed_pending_question(
 @pytest.mark.asyncio
 async def test_answer_pending_question_happy(dm, mgr, db, monkeypatch):
     monkeypatch.setattr(mgr, "start_message", _noop_start_message)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"])
     rec = await dm.start_delegation(
@@ -1827,7 +1827,7 @@ async def test_answer_pending_question_pads_multi_question_batch(
     dm, mgr, db, monkeypatch
 ):
     monkeypatch.setattr(mgr, "start_message", _noop_start_message)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"])
     rec = await dm.start_delegation(
@@ -1865,7 +1865,7 @@ async def test_answer_pending_question_rejects_empty_choice(
     dm, mgr, db, monkeypatch
 ):
     monkeypatch.setattr(mgr, "start_message", _noop_start_message)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"])
     rec = await dm.start_delegation(
@@ -1883,7 +1883,7 @@ async def test_answer_pending_question_when_no_pending(
     dm, mgr, db, monkeypatch
 ):
     monkeypatch.setattr(mgr, "start_message", _noop_start_message)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"])
     rec = await dm.start_delegation(
@@ -1899,7 +1899,7 @@ async def test_answer_pending_question_after_terminal(
     dm, mgr, db, monkeypatch
 ):
     monkeypatch.setattr(mgr, "start_message", _noop_start_message)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"])
     rec = await dm.start_delegation(
@@ -1920,7 +1920,7 @@ async def test_answer_pending_question_human_race_409(
     """If session_manager.answer_question returns False (the human UI
     drained the queue first) we surface 409."""
     monkeypatch.setattr(mgr, "start_message", _noop_start_message)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"])
     rec = await dm.start_delegation(
@@ -1948,7 +1948,7 @@ async def test_route_answer_happy(client, monkeypatch):
     monkeypatch.setattr(session_manager, "start_message", _noop_start_message)
 
     agents = (await client.get("/api/agents", headers=HEADERS)).json()
-    octo = next(a for a in agents if a["is_system"])
+    octo = next(a for a in agents if a["name"] == "Owl")
     await _post_agent(client, "Vera")
     parent = await _post_session(client, octo["id"])
 
@@ -1988,7 +1988,7 @@ async def test_route_answer_happy(client, monkeypatch):
 async def test_route_answer_404_for_unknown_delegation(client, monkeypatch):
     monkeypatch.setattr(session_manager, "start_message", _noop_start_message)
     agents = (await client.get("/api/agents", headers=HEADERS)).json()
-    octo = next(a for a in agents if a["is_system"])
+    octo = next(a for a in agents if a["name"] == "Owl")
     parent = await _post_session(client, octo["id"])
     r = await client.post(
         f"/api/sessions/{parent['id']}/delegations/nope/answer",
@@ -2002,7 +2002,7 @@ async def test_route_answer_404_for_unknown_delegation(client, monkeypatch):
 async def test_route_answer_409_when_no_pending(client, monkeypatch):
     monkeypatch.setattr(session_manager, "start_message", _noop_start_message)
     agents = (await client.get("/api/agents", headers=HEADERS)).json()
-    octo = next(a for a in agents if a["is_system"])
+    octo = next(a for a in agents if a["name"] == "Owl")
     await _post_agent(client, "Vera")
     parent = await _post_session(client, octo["id"])
     create = await client.post(
@@ -2030,7 +2030,7 @@ async def test_parked_child_stays_pending_not_failed(dm, mgr, db, monkeypatch):
     later to answer a delegation nobody is waiting on any more.
     """
     monkeypatch.setattr(mgr, "start_message", _noop_start_message)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"])
     rec = await dm.start_delegation(
@@ -2065,7 +2065,7 @@ async def test_a_genuine_child_error_still_fails_the_delegation(
     'gave up after N resumes' marker) must still fail the delegation, or a
     broken child would hang its parent forever."""
     monkeypatch.setattr(mgr, "start_message", _noop_start_message)
-    octo = await db.get_system_agent()
+    octo = await db.get_default_agent()
     await _make_agent(db, "Vera")
     parent = await _make_session(mgr, octo["id"])
     rec = await dm.start_delegation(

@@ -14,7 +14,7 @@ async def db():
 
 
 async def _agent_id(db: Database) -> str:
-    agent = await db.get_system_agent()
+    agent = await db.get_default_agent()
     return agent["id"]
 
 

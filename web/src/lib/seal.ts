@@ -91,3 +91,42 @@ export function owlFacePaths(cx: number, cy: number, s: number): string {
 
 /** The full mark: rim with the owl impressed into it, one evenodd path. */
 export const SEAL_MARK_PATH = SEAL_RIM_PATH + owlFacePaths(16, 15.4, 1.06);
+
+/**
+ * Wax colours — the second half of an agent's identity (the monogram is the
+ * first). Defined as HSL triplets in `tokens.css` (`--wax-*`, every one
+ * WCAG-AA against a white monogram); this array is the order the id hash
+ * indexes into. Red is deliberately absent: it stays reserved for the
+ * `destructive` state and is never an identity colour.
+ */
+export const WAX_TONES = [
+  "plum",
+  "indigo",
+  "teal",
+  "bronze",
+  "forest",
+  "slate",
+] as const;
+
+export type WaxTone = (typeof WAX_TONES)[number];
+
+/**
+ * The wax an agent is sealed in — deterministic from its id, so the same
+ * agent is always the same colour and the palette stays globally balanced
+ * without a per-agent picker. A small FNV-1a hash over the id keeps the
+ * distribution stable across reloads and machines (no `Math.random`, no
+ * dependence on insertion order).
+ */
+export function waxToneForId(id: string): WaxTone {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < id.length; i++) {
+    h ^= id.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return WAX_TONES[(h >>> 0) % WAX_TONES.length];
+}
+
+/** An agent's wax as a ready-to-use CSS colour (for `color` / `fill`). */
+export function waxColorForId(id: string): string {
+  return `hsl(var(--wax-${waxToneForId(id)}))`;
+}

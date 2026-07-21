@@ -59,7 +59,7 @@ test.describe("Agents", () => {
 
   test("the Default Agent is present", async ({ page }) => {
     await expect(
-      page.locator(".agent-item .agent-name", { hasText: "Octo" })
+      page.locator(".agent-item .agent-name", { hasText: "Owl" })
     ).toBeVisible();
   });
 
@@ -134,13 +134,14 @@ test.describe("Agents", () => {
     await expect(page.locator("#agent-name")).toHaveValue("E2E Rail");
     await expect(page.locator(".agent-rail-new")).toBeVisible();
 
-    // Switch to the system agent in the rail — the form reseeds and the
-    // Archive button disappears (system agents can't be archived).
-    await page.locator(".agent-rail-item", { hasText: "Octo" }).click();
-    await expect(page.locator("#agent-name")).toHaveValue("Octo");
+    // Switch to the seeded agent in the rail — the form reseeds. Every
+    // agent is ordinary now (no protected "system" agent), so Archive is
+    // available here too (agent-identity.md).
+    await page.locator(".agent-rail-item", { hasText: "Owl" }).click();
+    await expect(page.locator("#agent-name")).toHaveValue("Owl");
     await expect(
       page.locator(".agent-settings button", { hasText: "Archive agent" })
-    ).toHaveCount(0);
+    ).toBeVisible();
 
     // Switch back to our agent — Archive returns; then "New agent" clears it.
     await page.locator(".agent-rail-item", { hasText: "E2E Rail" }).click();
@@ -181,16 +182,20 @@ test.describe("Agents", () => {
     );
   });
 
-  test("the Default Agent cannot be archived from settings", async ({ page }) => {
-    const def = page.locator(".agent-item", { hasText: "Octo" });
-    // Select Octo, then open its settings from the account menu.
+  test("the seeded agent is ordinary — it exposes an Archive button", async ({
+    page,
+  }) => {
+    // The retired "protected system agent" gated this button off; every
+    // agent is archivable now (agent-identity.md). We assert the button is
+    // present but do NOT click it — all specs share one backend, and
+    // archiving the seed would remove it for everyone.
+    const def = page.locator(".agent-item", { hasText: "Owl" });
     await def.click();
     await expect(def).toHaveClass(/active/);
     await openAgentSettings(page);
-    await expect(page.locator(".agent-settings #agent-name")).toHaveValue("Octo");
-    // is_system agents expose no "Archive agent" button.
+    await expect(page.locator(".agent-settings #agent-name")).toHaveValue("Owl");
     await expect(
       page.locator(".agent-settings button", { hasText: "Archive agent" })
-    ).toHaveCount(0);
+    ).toBeVisible();
   });
 });

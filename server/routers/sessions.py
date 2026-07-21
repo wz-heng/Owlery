@@ -79,11 +79,11 @@ async def create_session(
     req: CreateSessionRequest, _: str = Depends(verify_token)
 ):
     # A session is owned by an agent. agent_id is required, but for exactly
-    # one release we fall back to the Default Agent when the client omits it
+    # one release we fall back to the default agent when the client omits it
     # (agent-refactor.md §5.4).
     agent_id = req.agent_id
     if agent_id is None:
-        sys_agent = await session_manager.db.get_system_agent()
+        sys_agent = await session_manager.db.get_default_agent()
         agent_id = sys_agent["id"] if sys_agent else None
     # Inherit the owning agent's default backend when none is pinned.
     agent = await session_manager.db.get_agent(agent_id) if agent_id else None
@@ -112,7 +112,7 @@ async def import_session(
 ):
     agent_id = req.agent_id
     if agent_id is None:
-        sys_agent = await session_manager.db.get_system_agent()
+        sys_agent = await session_manager.db.get_default_agent()
         agent_id = sys_agent["id"] if sys_agent else None
     s = await session_manager.import_session(
         name=req.name,

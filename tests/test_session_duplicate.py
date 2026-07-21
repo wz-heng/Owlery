@@ -31,7 +31,7 @@ async def manager():
 
 
 async def _seed_parent(mgr, working_dir, *, backend="claude-code", n_user=3):
-    agent = await mgr.db.get_system_agent()
+    agent = await mgr.db.get_default_agent()
     parent = await mgr.create_session(
         agent["id"], "Parent", str(working_dir), backend=backend
     )

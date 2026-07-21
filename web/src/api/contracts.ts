@@ -1274,8 +1274,6 @@ export interface components {
              * @default
              */
             description: string;
-            /** Avatar */
-            avatar?: string | null;
             /**
              * System Prompt
              * @default
@@ -1317,8 +1315,6 @@ export interface components {
              * @default
              */
             description: string;
-            /** Avatar */
-            avatar?: string | null;
             /**
              * System Prompt
              * @default
@@ -1346,11 +1342,6 @@ export interface components {
              */
             tool_deny: string;
             /**
-             * Is System
-             * @default false
-             */
-            is_system: boolean;
-            /**
              * Archived
              * @default false
              */
@@ -1371,8 +1362,6 @@ export interface components {
             name?: string | null;
             /** Description */
             description?: string | null;
-            /** Avatar */
-            avatar?: string | null;
             /** System Prompt */
             system_prompt?: string | null;
             /** Model */

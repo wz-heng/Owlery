@@ -193,7 +193,7 @@ def test_ask_agent_409_surfaced_with_reason(monkeypatch):
     import httpx
 
     monkeypatch.setattr(httpx, "post", lambda *a, **k: R())
-    out = _call("ask_agent", name="Octo", request="r")
+    out = _call("ask_agent", name="Owl", request="r")
     assert "cycle" in out.lower()
 
 

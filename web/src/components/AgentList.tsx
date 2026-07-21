@@ -3,7 +3,7 @@ import { IconChevronRight, IconPlus } from "@tabler/icons-react";
 import { fetchInstallations } from "../api/connectors";
 import { useSessionStore, type Agent, type SessionInfo } from "../stores/sessionStore";
 import { SessionList } from "./SessionList";
-import { DEFAULT_AGENT_AVATAR } from "../lib/agentAvatar";
+import { AgentSeal } from "./ui/seal";
 
 const API = window.location.origin;
 
@@ -72,11 +72,11 @@ export function AgentList({ onCreateAgent }: { onCreateAgent: () => void }) {
 
   // Keep a valid agent selected: on first load, and again whenever the active
   // agent disappears (e.g. it was archived from the account menu). Defaults to
-  // the system agent and unfolds it so its sessions are visible.
+  // the first agent (oldest by creation) and unfolds it so its sessions show.
   useEffect(() => {
     if (!agents.length) return;
     if (activeAgentId && agents.some((a) => a.id === activeAgentId)) return;
-    const def = agents.find((a) => a.is_system) ?? agents[0];
+    const def = agents[0];
     setActiveAgentId(def.id);
     setExpanded((prev) => new Set(prev).add(def.id));
   }, [agents, activeAgentId, setActiveAgentId]);
@@ -134,15 +134,12 @@ export function AgentList({ onCreateAgent }: { onCreateAgent: () => void }) {
                     isExpanded ? "rotate-90" : ""
                   }`}
                 />
-                {/* Emoji stays here: the rail is a list of people, not a
-                 * stack of letters, and nothing is being sealed. The agent
-                 * row gets no seal of its own either — the session rows
-                 * nested under it already carry one each, and a second
-                 * mark on the parent would spend the motif on a row whose
-                 * selected state the fill and weight already say. */}
-                <span className="agent-avatar shrink-0 text-base leading-none w-5 text-center">
-                  {a.avatar || DEFAULT_AGENT_AVATAR}
-                </span>
+                {/* The agent's identity IS its seal (agent-identity.md): its
+                 * monogram in its own wax. The session rows nested under it
+                 * carry only `seal-dot` status echoes, so the budget holds —
+                 * one full seal per identity, dots for state. */}
+                <AgentSeal agent={a} className="agent-avatar shrink-0" />
+
                 <span
                   className={`agent-name truncate text-sm flex-1 ${
                     isActive ? "font-medium" : ""

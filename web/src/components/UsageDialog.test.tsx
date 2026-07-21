@@ -14,7 +14,6 @@ import { useSessionStore, type Agent } from "../stores/sessionStore";
 const agent: Agent = {
   id: "agent-1",
   name: "Octo",
-  avatar: "🐙",
 } as Agent;
 
 function summary(overrides: Partial<UsageSummary> = {}): UsageSummary {
@@ -91,7 +90,9 @@ describe("UsageDialog", () => {
     });
 
     // agent-1 resolves to its store name; unknown agent-2 shows an id tail
-    expect(await screen.findByText("🐙 Octo")).toBeInTheDocument();
+    // The agent label is now its wax seal + name (no emoji); the name
+    // renders in its own span next to the aria-hidden seal.
+    expect(await screen.findByText("Octo")).toBeInTheDocument();
     expect(screen.getByText("agent-2…")).toBeInTheDocument();
     // codex-style null cost renders as an em-dash, real cost as $x.xxxx
     expect(screen.getByText("—")).toBeInTheDocument();
@@ -111,7 +112,7 @@ describe("UsageDialog", () => {
     await act(async () => {
       render(<UsageDialog open onOpenChange={() => {}} />);
     });
-    await screen.findByText("🐙 Octo");
+    await screen.findByText("Octo");
 
     payload = summary({
       group_by: "day",
@@ -190,7 +191,7 @@ describe("UsageDialog", () => {
         })
       );
     });
-    expect(screen.queryByText("🐙 Octo")).not.toBeInTheDocument();
+    expect(screen.queryByText("Octo")).not.toBeInTheDocument();
     expect(screen.getByText("2026-07-01")).toBeInTheDocument();
   });
 });

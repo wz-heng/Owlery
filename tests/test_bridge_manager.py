@@ -164,7 +164,7 @@ class TestBinding:
         assert not any("No session" in str(s) for s in bridge.sent)
         binding = manager._binding("mock", "c1")
         assert binding is not None
-        default = await db.get_system_agent()
+        default = await db.get_default_agent()
         assert binding.agent_id == default["id"]
         assert binding.session_id is not None  # sticky session created
 

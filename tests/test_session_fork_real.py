@@ -121,7 +121,7 @@ async def test_claude_fork_resumes_pre_branch_context(tmp_path, monkeypatch):
     wd = str(tmp_path / "ws")
     os.makedirs(wd, exist_ok=True)
     try:
-        octo = await db.get_system_agent()
+        octo = await db.get_default_agent()
         sess = await mgr.create_session(agent_id=octo["id"], name="s",
                                         working_dir=wd, backend="claude-code")
         # Force the cheap model for these recall turns.
@@ -237,7 +237,7 @@ async def test_claude_fork_safe_revert_real_repo(tmp_path, monkeypatch):
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "init")
     try:
-        octo = await db.get_system_agent()
+        octo = await db.get_default_agent()
         await am.update_agent(octo["id"], model="haiku")
         sess = await mgr.create_session(agent_id=octo["id"], name="s",
                                         working_dir=str(repo), backend="claude-code")

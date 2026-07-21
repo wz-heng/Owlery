@@ -204,7 +204,6 @@ describe("sessionStore", () => {
       id,
       name,
       description: "",
-      avatar: null,
       system_prompt: "",
       model: null,
       credential_id: null,
@@ -212,7 +211,6 @@ describe("sessionStore", () => {
       mcp_servers: ["ask", "bg"],
       tool_allow: "",
       tool_deny: "",
-      is_system: false,
       archived: false,
       created_at: "2026-01-01",
       updated_at: "2026-01-01",
@@ -220,7 +218,7 @@ describe("sessionStore", () => {
       ...extra,
     });
 
-    setAgents([mk("a1", "Default", { is_system: true })]);
+    setAgents([mk("a1", "Default")]);
     expect(useSessionStore.getState().agents).toHaveLength(1);
 
     // upsert appends a new agent, patches an existing one in place.

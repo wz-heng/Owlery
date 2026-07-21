@@ -43,7 +43,7 @@ async def rm(mgr, db):
 
 
 async def _session(mgr, db, *, backend="claude-code"):
-    agent = await db.get_system_agent()
+    agent = await db.get_default_agent()
     return await mgr.create_session(agent["id"], "S", "/tmp", backend=backend)
 
 

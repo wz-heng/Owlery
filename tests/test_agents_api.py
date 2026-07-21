@@ -48,18 +48,19 @@ async def _create_agent(client, name="Researcher", **extra):
 
 @pytest.mark.asyncio
 async def test_default_agent_present(client):
+    """A brand-new DB seeds exactly one ordinary starter agent named 'Owl'
+    (agent-identity.md) — no longer a protected 'Octo'."""
     resp = await client.get("/api/agents", headers=HEADERS)
     assert resp.status_code == 200
     agents = resp.json()
-    system = [a for a in agents if a["is_system"]]
-    assert len(system) == 1
-    assert system[0]["name"] == "Octo"
+    owls = [a for a in agents if a["name"] == "Owl"]
+    assert len(owls) == 1
     # Default built-in MCP set: ask (user questions) + bg (cross-turn
     # shell) + ask_agent (delegate to another agent —
     # agent-collaboration.md §5.1). ask_agent landed alongside the
     # collaboration feature; the migration backfills it into any
     # pre-existing agent rows too.
-    assert system[0]["mcp_servers"] == ["ask", "bg", "ask_agent", "research"]
+    assert owls[0]["mcp_servers"] == ["ask", "bg", "ask_agent", "research"]
 
 
 @pytest.mark.asyncio
@@ -71,7 +72,7 @@ async def test_auth_required(client):
 @pytest.mark.asyncio
 async def test_default_agent_backend_is_claude(client):
     agents = (await client.get("/api/agents", headers=HEADERS)).json()
-    system = next(a for a in agents if a["is_system"])
+    system = next(a for a in agents if a["name"] == "Owl")
     assert system["backend"] == "claude-code"
 
 
@@ -129,7 +130,6 @@ async def test_create_and_get_agent(client):
     assert agent["model"] == "claude-opus-4-7"
     assert agent["tool_allow"] == "Read\nGrep"
     assert agent["tool_deny"] == "Bash"
-    assert agent["is_system"] is False
     assert agent["active_session_count"] == 0
 
     got = await client.get(f"/api/agents/{agent['id']}", headers=HEADERS)
@@ -175,17 +175,21 @@ async def test_patch_duplicate_name_rejected(client):
     assert resp.status_code == 400
 
 
-# --- is_system protection ---
+# --- no protected agent: the seed is ordinary ---
 
 
 @pytest.mark.asyncio
-async def test_default_agent_cannot_be_archived_or_deleted(client):
+async def test_seed_agent_can_be_archived(client):
+    """The seeded 'Owl' is an ordinary agent — archivable like any other,
+    now that the protected-system-agent concept is retired
+    (agent-identity.md). A fresh seed has no sessions, so it can even be
+    deleted; the user-facing path for a seed with history is archive."""
     agents = (await client.get("/api/agents", headers=HEADERS)).json()
-    default = next(a for a in agents if a["is_system"])
-    arch = await client.post(f"/api/agents/{default['id']}/archive", headers=HEADERS)
-    assert arch.status_code == 400
-    dele = await client.delete(f"/api/agents/{default['id']}", headers=HEADERS)
-    assert dele.status_code == 400
+    owl = next(a for a in agents if a["name"] == "Owl")
+    arch = await client.post(f"/api/agents/{owl['id']}/archive", headers=HEADERS)
+    assert arch.status_code == 200
+    live = (await client.get("/api/agents", headers=HEADERS)).json()
+    assert owl["id"] not in [a["id"] for a in live]
 
 
 # --- delete / archive ---
@@ -255,7 +259,7 @@ async def test_session_create_defaults_to_default_agent(client):
     resp = await client.post("/api/sessions", json={"name": "x"}, headers=HEADERS)
     assert resp.status_code == 201
     agents = (await client.get("/api/agents", headers=HEADERS)).json()
-    default = next(a for a in agents if a["is_system"])
+    default = next(a for a in agents if a["name"] == "Owl")
     assert resp.json()["agent_id"] == default["id"]
 
 

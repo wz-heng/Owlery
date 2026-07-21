@@ -29,7 +29,7 @@ import {
 } from "./SlashCommandMenu";
 import { Button } from "./ui/button";
 import { isSessionBusy } from "../lib/deferredFork";
-import { DEFAULT_AGENT_AVATAR } from "../lib/agentAvatar";
+import { AgentSeal } from "./ui/seal";
 
 const EMPTY_MESSAGES: Message[] = [];
 
@@ -291,7 +291,7 @@ export function ChatView({
       answerQuestion,
       pendingQuestions,
       activeAgent?.name,
-      activeAgent?.avatar,
+      activeAgent?.id,
       agentLabel,
     ]
   );
@@ -961,9 +961,8 @@ export function ChatView({
               className="chat-agent inline-flex items-center gap-1.5 text-sm text-muted-foreground shrink-0"
               title={`Agent: ${activeAgent.name}`}
             >
-              <span aria-hidden className="text-base leading-none">
-                {activeAgent.avatar || DEFAULT_AGENT_AVATAR}
-              </span>
+              <AgentSeal agent={activeAgent} />
+
               <span className="hidden sm:inline truncate max-w-[10rem]">
                 {activeAgent.name}
               </span>

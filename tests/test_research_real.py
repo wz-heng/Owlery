@@ -90,7 +90,7 @@ async def test_real_codex_deep_research_end_to_end(tmp_path, monkeypatch):
 
     monkeypatch.setattr(rm_mod, "run_research", small_run)
 
-    agent = await db.get_system_agent()
+    agent = await db.get_default_agent()
     # Bind the session to the directory-backed codex credential id — the
     # manager resolves it to its CODEX_HOME (no DB row needed).
     session = await mgr.create_session(

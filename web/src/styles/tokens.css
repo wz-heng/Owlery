@@ -274,19 +274,39 @@
      *   4. A scalloped wax disc straddles the sheet's top edge, inset
      *      --seal-inset from the author's side. That inset is the only
      *      asymmetry in the system.
-     *   5. The disc is the app's ONE avatar/status primitive.
-     *   6. Ornament budget: one disc per surface. Controls get the dot
-     *      or nothing — they echo the motif, they don't wear it.
+     *   5. The disc is the app's ONE avatar/status primitive — an agent's
+     *      identity IS its seal.
+     *   6. Ornament budget: one disc per identity. Wherever an agent's
+     *      identity appears — a chat turn, a list row, a dialog header —
+     *      it appears as that agent's wax seal, and nowhere else does an
+     *      identity get a second mark. Session rows and controls get the
+     *      dot or nothing: they echo the motif, they don't wear it.
      *
-     * A seal is *impressed*, never stuck on: the disc carries a
-     * monogram or a kind icon, never an emoji. Emoji avatars stay in
-     * the sidebar lists, where nothing is being sealed. */
+     * A seal is *impressed*, never stuck on: the disc carries a monogram
+     * or a kind icon, never an emoji. An agent's wax colour is assigned
+     * deterministically from its id (--wax-*, below) and its monogram is
+     * its name's first letter — that pair is the whole of an agent's
+     * visual identity. There is no emoji avatar anywhere: the seal
+     * replaced it (agent-identity.md). */
     --seal-sheet: 26px;   /* message bubbles, cards */
     --seal-dialog: 32px;  /* the floating sheet — the app's own voice */
+    --seal-avatar: 20px;  /* agent identity in list rows & view headers */
     --seal-chip: 16px;    /* inline chips: bg task, research, request */
     --seal-dot: 9px;      /* controls, tabs, sidebar rows — the echo */
     --seal-inset: 14px;   /* distance from the author's edge */
     --seal-inset-chip: 10px;
+
+    /* Wax palette — an agent's identity colour, assigned deterministically
+     * from its id hash (lib/seal.ts `waxForAgentId`). Six sealing-wax
+     * tones; red is NOT here — it stays reserved for `destructive`. Each is
+     * dark enough that a white monogram clears WCAG AA (≥4.5:1), so these
+     * are fixed colours (identical in both themes), not theme-variant. */
+    --wax-plum: 288 38% 33%;
+    --wax-indigo: 232 42% 34%;
+    --wax-teal: 190 55% 26%;
+    --wax-bronze: 38 60% 30%;
+    --wax-forest: 150 45% 26%;
+    --wax-slate: 212 16% 33%;
 
     /* The rim, as a mask. One source of truth shared by the CSS dot and
      * the React <Seal>: 13 lobes, alternating r=13.4/16.4 on a 32 grid.

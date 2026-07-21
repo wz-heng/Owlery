@@ -1,8 +1,10 @@
 """AgentManager — stateless CRUD + business rules over the `agents` table.
 
 Agents are the durable definition of an assistant (agent-refactor.md §5.1):
-pure DB rows, no in-memory subprocess. This layer enforces name uniqueness,
-`is_system` protection, and the delete/archive guards for the routes.
+pure DB rows, no in-memory subprocess. This layer enforces name uniqueness
+and the "has live sessions → archive, don't delete" guard for the routes.
+No agent is protected: every agent can be archived, and an agent with no
+sessions can be deleted (agent-identity.md).
 SessionManager reads agent rows directly through the Database at spawn time
 (so editing an agent affects its open sessions on their next turn); it does
 not go through this manager.
@@ -35,15 +37,15 @@ class AgentManager:
         return await self.db.get_agent(agent_id)
 
     async def get_default_agent(self) -> dict[str, Any] | None:
-        """The protected Default Agent (is_system=1), created by migration."""
-        return await self.db.get_system_agent()
+        """Some agent to fall back on when none is supplied — the oldest live
+        agent (agent-identity.md). None only if there are no agents at all."""
+        return await self.db.get_default_agent()
 
     async def create_agent(
         self,
         *,
         name: str,
         description: str = "",
-        avatar: str | None = None,
         system_prompt: str = "",
         model: str | None = None,
         credential_id: str | None = None,
@@ -65,7 +67,6 @@ class AgentManager:
             created_at=now,
             updated_at=now,
             description=description,
-            avatar=avatar,
             system_prompt=system_prompt,
             model=model,
             credential_id=credential_id,
@@ -73,7 +74,6 @@ class AgentManager:
             mcp_servers=mcp_servers,
             tool_allow=tool_allow,
             tool_deny=tool_deny,
-            is_system=False,
         )
         agent = await self.db.get_agent(agent_id)
         assert agent is not None
@@ -103,16 +103,12 @@ class AgentManager:
         agent = await self.db.get_agent(agent_id)
         if agent is None:
             raise AgentError("Agent not found")
-        if agent["is_system"]:
-            raise AgentError("The Default Agent cannot be archived")
         await self.db.archive_agent(agent_id)
 
     async def delete_agent(self, agent_id: str) -> None:
         agent = await self.db.get_agent(agent_id)
         if agent is None:
             raise AgentError("Agent not found")
-        if agent["is_system"]:
-            raise AgentError("The Default Agent cannot be deleted")
         if await self.db.count_sessions_for_agent(agent_id) > 0:
             raise AgentError(
                 "Agent still has sessions; archive it instead of deleting"

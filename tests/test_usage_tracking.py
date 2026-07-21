@@ -153,7 +153,7 @@ def _result_event(**kw) -> HarnessEvent:
 
 async def _new_session(mgr):
     """Create a session under the Default Agent (created by migration)."""
-    agent = await mgr.db.get_system_agent()
+    agent = await mgr.db.get_default_agent()
     return await mgr.create_session(agent["id"], "S", "/tmp")
 
 

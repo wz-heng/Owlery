@@ -113,14 +113,14 @@ test.describe("Connectors", () => {
   test("Agent settings shows the per-agent connectors section", async ({
     page,
   }) => {
-    const octo = page.locator(".agent-item", { hasText: "Octo" });
+    const octo = page.locator(".agent-item", { hasText: "Owl" });
     await octo.click();
     await expect(octo).toHaveClass(/active/);
 
     await page.locator(".btn-account").click();
     await page.locator(".menu-agent-settings").click();
     await expect(page.locator(".agent-settings")).toBeVisible();
-    await expect(page.locator("#agent-name")).toHaveValue("Octo");
+    await expect(page.locator("#agent-name")).toHaveValue("Owl");
     await expect(page.locator(".agent-connectors")).toContainText(
       "No connectors installed"
     );

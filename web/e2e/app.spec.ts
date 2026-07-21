@@ -9,13 +9,13 @@ import { fake, realCliDir } from "./fake-cli";
 const TOKEN = "changeme";
 const API = "http://localhost:8765/api/sessions";
 
-/** Click the new-session "+" on the default "Octo" agent's row. The button is
+/** Click the new-session "+" on the default "Owl" agent's row. The button is
  * per-agent now, and specs share one in-memory backend DB, so a bare
  * ".btn-session-add" turns ambiguous (strict-mode violation) the moment a
- * concurrent spec has created another agent. Scoping to Octo is unambiguous. */
-const addOctoSession = (page: Page) =>
+ * concurrent spec has created another agent. Scoping to Owl is unambiguous. */
+const addOwlSession = (page: Page) =>
   page
-    .locator(".agent-item", { hasText: "Octo" })
+    .locator(".agent-item", { hasText: "Owl" })
     .locator(".btn-session-add")
     .click();
 
@@ -81,7 +81,7 @@ test.describe("Session Management", () => {
   });
 
   test("creates a new session", async ({ page }) => {
-    await addOctoSession(page);
+    await addOwlSession(page);
     await page
       .locator('.session-create input[placeholder="Session name"]')
       .fill("E2E Test Session");
@@ -105,7 +105,7 @@ test.describe("Session Management", () => {
 
   test("deletes a session", async ({ page }) => {
     // Create a session first
-    await addOctoSession(page);
+    await addOwlSession(page);
     await page
       .locator('.session-create input[placeholder="Session name"]')
       .fill("To Delete");
@@ -138,7 +138,7 @@ test.describe("Chat", () => {
     await expect(page.locator(".agent-list-header")).toBeVisible();
 
     // Create a session
-    await addOctoSession(page);
+    await addOwlSession(page);
     await page
       .locator('.session-create input[placeholder="Session name"]')
       .fill("Chat Test");
@@ -228,7 +228,7 @@ test.describe("Chat against the real claude CLI @llm", () => {
     await page.locator("button.btn-login").click();
     await expect(page.locator(".agent-list-header")).toBeVisible();
 
-    await addOctoSession(page);
+    await addOwlSession(page);
     await page
       .locator('.session-create input[placeholder="Session name"]')
       .fill("Real Chat Test");

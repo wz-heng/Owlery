@@ -26,7 +26,6 @@ CREATE TABLE IF NOT EXISTS agents (
     id TEXT PRIMARY KEY,                    -- 12-char hex, same scheme as sessions
     name TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
-    avatar TEXT,                            -- emoji or URL, optional
     system_prompt TEXT NOT NULL DEFAULT '',
     model TEXT,                             -- e.g. "claude-opus-4-7"; null = backend default
     credential_id TEXT REFERENCES backend_credentials(id) ON DELETE SET NULL,
@@ -35,7 +34,6 @@ CREATE TABLE IF NOT EXISTS agents (
                                             -- JSON array of built-in Owlery MCP server ids.
     tool_allow TEXT NOT NULL DEFAULT '',    -- newline-separated tool/MCP names; empty = allow all
     tool_deny  TEXT NOT NULL DEFAULT '',    -- newline-separated; deny takes precedence over allow
-    is_system INTEGER NOT NULL DEFAULT 0,   -- 1 = the protected Default Agent (cannot be deleted)
     archived INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -654,10 +652,12 @@ class Database:
         """First-class Agents refactor migration (agent-refactor.md §4.5).
 
         Adds agent ownership to sessions / schedules / bridge_mappings,
-        creates the protected Default Agent, and backfills every
+        seeds a starter agent on a brand-new install, and backfills every
         pre-existing row to it. Idempotent: safe on every boot, a second
-        run no-ops (system agent present, no null agent_id rows, the
-        column-shape rebuilds already applied). `schedules.session_id`
+        run no-ops (agents table non-empty, no null agent_id rows, the
+        column-shape rebuilds and column drops already applied). There is
+        no longer a "protected" agent — the seeded one is an ordinary,
+        deletable agent (agent-identity.md). `schedules.session_id`
         and `bridge_mappings`' NOT NULL `session_id` are removed by
         table-rebuild rather than ALTER … DROP/MODIFY, because SQLite
         forbids dropping a column that's part of a foreign key and can't
@@ -680,9 +680,13 @@ class Database:
             except Exception:
                 pass
 
-        # 2. The protected Default Agent — exactly one, created once.
+        # 2. Seed a starter agent — only on a brand-new install, when the
+        #    agents table is completely empty. An existing instance keeps
+        #    whatever agents it already has (including a legacy 'Octo', now
+        #    an ordinary deletable agent); nothing is seeded and no agent is
+        #    "protected". The seed name is 'Owl', matching the app's world.
         cursor = await self._conn.execute(
-            "SELECT id FROM agents WHERE is_system = 1 LIMIT 1"
+            "SELECT id FROM agents ORDER BY created_at LIMIT 1"
         )
         row = await cursor.fetchone()
         if row is None:
@@ -691,24 +695,16 @@ class Database:
             await self._conn.execute(
                 "INSERT INTO agents "
                 "(id, name, description, system_prompt, mcp_servers, "
-                " is_system, created_at, updated_at) "
-                "VALUES (?, 'Octo', '', '', ?, 1, ?, ?)",
+                " created_at, updated_at) "
+                "VALUES (?, 'Owl', '', '', ?, ?, ?)",
                 (default_id, _DEFAULT_MCP_SERVERS_JSON, now, now),
             )
         else:
+            # Non-empty table: the backfill fallbacks below (orphan sessions /
+            # schedules / bridges) land on the oldest existing agent. In
+            # practice a non-empty table means the agent refactor already ran,
+            # so there are no orphans left and this id is never used.
             default_id = row[0]
-            # One-time rename of the auto-created system agent from its old
-            # 'Default' name to 'Octo'. Guarded on the exact old name so a
-            # user-renamed system agent is left alone; try/except so it no-ops
-            # if an agent named 'Octo' already exists (unique-name index).
-            try:
-                await self._conn.execute(
-                    "UPDATE agents SET name = 'Octo' "
-                    "WHERE id = ? AND name = 'Default'",
-                    (default_id,),
-                )
-            except Exception:
-                pass
 
         # 3. Backfill sessions → Default Agent. (origin defaults to 'user'.)
         await self._conn.execute(
@@ -782,6 +778,16 @@ class Database:
                 ALTER TABLE bridge_mappings__new RENAME TO bridge_mappings;
                 """
             )
+
+        # 6. Retire the "system agent" concept and emoji avatars entirely
+        #    (agent-identity.md): drop both columns. Neither is in an index or
+        #    foreign key, so a plain DROP COLUMN (SQLite ≥3.35) is safe.
+        #    Guarded on presence so it runs exactly once and no-ops on a fresh
+        #    DB whose schema never had the columns.
+        for col in ("is_system", "avatar"):
+            if await self._has_column("agents", col):
+                await self._conn.execute(f"ALTER TABLE agents DROP COLUMN {col}")
+        await self._conn.commit()
 
     async def _ensure_connected(self) -> None:
         # A closed Database is dead — never silently re-open. The
@@ -1860,37 +1866,35 @@ class Database:
     # affects its open sessions on their next turn.
 
     _AGENT_COLS = (
-        "id, name, description, avatar, system_prompt, model, credential_id, "
-        "mcp_servers, tool_allow, tool_deny, is_system, archived, "
+        "id, name, description, system_prompt, model, credential_id, "
+        "mcp_servers, tool_allow, tool_deny, archived, "
         "created_at, updated_at, backend"
     )
 
     @staticmethod
     def _row_to_agent(row: tuple[Any, ...]) -> dict[str, Any]:
         try:
-            mcp_servers = json.loads(row[7]) if row[7] else []
+            mcp_servers = json.loads(row[6]) if row[6] else []
         except (json.JSONDecodeError, TypeError):
             mcp_servers = []
         agent = {
             "id": row[0],
             "name": row[1],
             "description": row[2] or "",
-            "avatar": row[3],
-            "system_prompt": row[4] or "",
-            "model": row[5],
-            "credential_id": row[6],
+            "system_prompt": row[3] or "",
+            "model": row[4],
+            "credential_id": row[5],
             "mcp_servers": mcp_servers,
-            "tool_allow": row[8] or "",
-            "tool_deny": row[9] or "",
-            "is_system": bool(row[10]),
-            "archived": bool(row[11]),
-            "created_at": row[12],
-            "updated_at": row[13],
-            "backend": row[14] or "claude-code",
+            "tool_allow": row[7] or "",
+            "tool_deny": row[8] or "",
+            "archived": bool(row[9]),
+            "created_at": row[10],
+            "updated_at": row[11],
+            "backend": row[12] or "claude-code",
         }
         # Optional active-session count appended by load_agents / get_agent.
-        if len(row) > 15:
-            agent["active_session_count"] = row[15]
+        if len(row) > 13:
+            agent["active_session_count"] = row[13]
         return agent
 
     # Subquery counting live (non-archived) sessions for an agent — shared
@@ -1908,7 +1912,6 @@ class Database:
         created_at: str,
         updated_at: str,
         description: str = "",
-        avatar: str | None = None,
         system_prompt: str = "",
         model: str | None = None,
         credential_id: str | None = None,
@@ -1916,7 +1919,6 @@ class Database:
         mcp_servers: list[str] | None = None,
         tool_allow: str = "",
         tool_deny: str = "",
-        is_system: bool = False,
     ) -> None:
         await self._ensure_connected()
         servers_json = json.dumps(
@@ -1924,14 +1926,14 @@ class Database:
         )
         await self._conn.execute(
             "INSERT INTO agents "
-            "(id, name, description, avatar, system_prompt, model, "
+            "(id, name, description, system_prompt, model, "
             " credential_id, backend, mcp_servers, tool_allow, tool_deny, "
-            " is_system, archived, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+            " archived, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
             (
-                agent_id, name, description, avatar, system_prompt, model,
+                agent_id, name, description, system_prompt, model,
                 credential_id, backend or "claude-code", servers_json,
-                tool_allow, tool_deny, int(bool(is_system)),
+                tool_allow, tool_deny,
                 created_at, updated_at,
             ),
         )
@@ -1947,7 +1949,7 @@ class Database:
         )
         if not include_archived:
             query += " WHERE a.archived = 0"
-        query += " ORDER BY a.is_system DESC, a.created_at"
+        query += " ORDER BY a.created_at"
         cursor = await self._conn.execute(query)
         rows = await cursor.fetchall()
         return [self._row_to_agent(row) for row in rows]
@@ -1979,13 +1981,16 @@ class Database:
         row = await cursor.fetchone()
         return self._row_to_agent(row) if row else None
 
-    async def get_system_agent(self) -> dict[str, Any] | None:
-        """The protected Default Agent (is_system=1), created by migration."""
+    async def get_default_agent(self) -> dict[str, Any] | None:
+        """Some agent to fall back on when a caller supplies none — the first
+        non-archived agent by creation order. Replaces the retired protected
+        system agent (agent-identity.md); there is nothing special about the
+        agent returned beyond being the oldest live one."""
         await self._ensure_connected()
         cols = ", ".join(f"a.{c}" for c in self._AGENT_COLS.split(", "))
         cursor = await self._conn.execute(
             f"SELECT {cols}, {self._ACTIVE_SESSION_COUNT} FROM agents a "
-            "WHERE a.is_system = 1 LIMIT 1"
+            "WHERE a.archived = 0 ORDER BY a.created_at LIMIT 1"
         )
         row = await cursor.fetchone()
         return self._row_to_agent(row) if row else None
@@ -1993,12 +1998,12 @@ class Database:
     async def update_agent(self, agent_id: str, **fields: Any) -> None:
         await self._ensure_connected()
         allowed = {
-            "name", "description", "avatar", "system_prompt", "model",
+            "name", "description", "system_prompt", "model",
             "credential_id", "backend", "mcp_servers", "tool_allow", "tool_deny",
             "archived",
         }
-        # credential_id / model / avatar are nullable and may be cleared.
-        nullable = {"credential_id", "model", "avatar"}
+        # credential_id / model are nullable and may be cleared.
+        nullable = {"credential_id", "model"}
         updates: dict[str, Any] = {}
         for k, v in fields.items():
             if k not in allowed:

@@ -198,7 +198,7 @@ async def session_with_files(client, tmp_path):
     (sub / "note.txt").write_text("nested")
     (root.parent / "outside.md").write_text("escape me")
 
-    agent = await session_manager.db.get_system_agent()
+    agent = await session_manager.db.get_default_agent()
     sess = await session_manager.create_session(
         agent["id"], name="viewer-test", working_dir=str(root)
     )
@@ -406,7 +406,7 @@ async def test_showme_resolve_attached_credential_is_normalized(
     )
     # Attach the credential at the agent level — matches the production path
     # the bug was filed against.
-    agent = await db.get_system_agent()
+    agent = await db.get_default_agent()
     await db.update_agent(agent["id"], credential_id="cred-1")
 
     captured = await _patch_showme(monkeypatch)

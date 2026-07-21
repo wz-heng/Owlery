@@ -7,7 +7,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from "./ui/dialog";
-import { DEFAULT_AGENT_AVATAR } from "../lib/agentAvatar";
+import type { ReactNode } from "react";
+import { AgentSeal } from "./ui/seal";
 import { Skeleton } from "./ui/skeleton";
 
 const API_URL = window.location.origin;
@@ -109,11 +110,17 @@ export function UsageDialog({ open, onOpenChange }: Props) {
     return () => ctrl.abort();
   }, [open, token, groupBy, windowDays]);
 
-  const keyLabel = (key: string | null): string => {
+  const keyLabel = (key: string | null): ReactNode => {
     if (key == null) return "(none)";
     if (groupBy === "agent") {
       const agent = agents.find((a) => a.id === key);
-      return agent ? `${agent.avatar || DEFAULT_AGENT_AVATAR} ${agent.name}` : `${key.slice(0, 8)}…`;
+      if (!agent) return `${key.slice(0, 8)}…`;
+      return (
+        <span className="inline-flex items-center gap-1.5 min-w-0">
+          <AgentSeal agent={agent} />
+          <span className="truncate">{agent.name}</span>
+        </span>
+      );
     }
     if (groupBy === "session") {
       const s =

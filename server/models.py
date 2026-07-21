@@ -294,7 +294,6 @@ class AgentRead(BaseModel):
     id: str
     name: str
     description: str = ""
-    avatar: str | None = None
     system_prompt: str = ""
     model: str | None = None
     credential_id: str | None = None
@@ -306,7 +305,6 @@ class AgentRead(BaseModel):
     # `tool_deny` wins on conflict.
     tool_allow: str = ""
     tool_deny: str = ""
-    is_system: bool = False
     archived: bool = False
     created_at: str
     updated_at: str
@@ -318,7 +316,6 @@ class AgentCreate(BaseModel):
 
     name: str = Field(min_length=1)
     description: str = ""
-    avatar: str | None = None
     system_prompt: str = ""
     model: str | None = None
     credential_id: str | None = None
@@ -336,7 +333,6 @@ class AgentUpdate(BaseModel):
 
     name: str | None = None
     description: str | None = None
-    avatar: str | None = None
     system_prompt: str | None = None
     model: str | None = None
     credential_id: str | None = None

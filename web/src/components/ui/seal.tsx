@@ -3,17 +3,25 @@
  * single avatar/status primitive (`docs/plans/messenger-form.md` §4).
  *
  * A seal is *impressed*, not stuck on. It carries a monogram or a kind
- * icon; it never carries an emoji. Emoji avatars still identify agents in
- * the sidebar lists, where nothing is being sealed — but a chat turn is a
- * letter, and letters get wax.
+ * icon; it never carries an emoji. It is the app's ONE avatar primitive:
+ * an agent's identity is its seal, everywhere it appears (a chat turn, a
+ * list row, a dialog header) — there is no emoji avatar anymore
+ * (agent-identity.md). `<AgentSeal>` below is the identity-shaped wrapper.
  *
  * Tones map onto the round-1 state colours and add nothing: `attention`
  * is still plum, `destructive` is still the wax red it was always
  * reserved for. The grammar changes form, never state-colour semantics.
+ * An agent's identity wax is orthogonal to tone — a colour from the
+ * `--wax-*` palette, passed via the `wax` prop.
  */
 import type { ReactNode } from "react";
 
-import { SEAL_MARK_PATH, SEAL_RIM_PATH, SEAL_RING_PATH } from "../../lib/seal";
+import {
+  SEAL_MARK_PATH,
+  SEAL_RIM_PATH,
+  SEAL_RING_PATH,
+  waxColorForId,
+} from "../../lib/seal";
 import { cn } from "../../lib/utils";
 
 export type SealTone =
@@ -32,11 +40,12 @@ const TONE_WAX: Record<SealTone, string> = {
   destructive: "hsl(var(--destructive))",
 };
 
-export type SealScale = "sheet" | "dialog" | "chip";
+export type SealScale = "sheet" | "dialog" | "avatar" | "chip";
 
 const SCALE_VAR: Record<SealScale, string> = {
   sheet: "var(--seal-sheet)",
   dialog: "var(--seal-dialog)",
+  avatar: "var(--seal-avatar)",
   chip: "var(--seal-chip)",
 };
 
@@ -46,6 +55,10 @@ export interface SealProps {
   side: "left" | "right";
   tone?: SealTone;
   scale?: SealScale;
+  /** An identity wax colour (any CSS colour), overriding `tone`'s wax. Used
+   * for agent-identity seals, where the colour comes from the `--wax-*`
+   * palette by id hash rather than from state semantics. */
+  wax?: string;
   /** A monogram (1 char) or a kind icon. Never an emoji. */
   children?: ReactNode;
   className?: string;
@@ -69,6 +82,7 @@ export function Seal({
   side,
   tone = "brand",
   scale = "sheet",
+  wax,
   children,
   className,
   subdued = false,
@@ -90,7 +104,7 @@ export function Seal({
       <svg
         viewBox="0 0 32 32"
         className="seal-rim"
-        style={{ color: TONE_WAX[tone] }}
+        style={{ color: wax ?? TONE_WAX[tone] }}
       >
         <path
           d={mark ? SEAL_MARK_PATH : SEAL_RIM_PATH}
@@ -112,6 +126,43 @@ export function Seal({
       </svg>
       {children != null && <span className="seal-glyph">{children}</span>}
     </span>
+  );
+}
+
+/**
+ * An agent's identity, sealed — the single way an agent is shown anywhere
+ * in the app (list rows, dialog headers, the chat header). Its monogram
+ * (the name's first letter) is impressed in its own wax, a colour assigned
+ * deterministically from its id (`waxColorForId`); a name that yields no
+ * monogram (pure emoji, punctuation) falls back to the owl mark. Never an
+ * emoji — the seal replaced emoji avatars entirely (agent-identity.md).
+ *
+ * Identity seals sit inline (`straddle={false}`): a list row has no top
+ * edge to break, following the chip precedent.
+ */
+export function AgentSeal({
+  agent,
+  scale = "avatar",
+  side = "left",
+  className,
+}: {
+  agent: { id: string; name: string };
+  scale?: SealScale;
+  side?: "left" | "right";
+  className?: string;
+}) {
+  const mono = monogram(agent.name);
+  return (
+    <Seal
+      side={side}
+      scale={scale}
+      straddle={false}
+      wax={waxColorForId(agent.id)}
+      mark={mono === null}
+      className={className}
+    >
+      {mono}
+    </Seal>
   );
 }
 

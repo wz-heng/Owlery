@@ -20,10 +20,10 @@
  *      session, the request card renders inline with the tool_use, and
  *      transitions running → replied.
  *   2. Vera's reply lands as a `[agent-reply:Vera delegation=…]` turn
- *      injection in Octo's chat, rendered as an
+ *      injection in Owl's chat, rendered as an
  *      `AgentDelegationEventCard`.
  *   3. The "Open Vera's session" link navigates to the child session,
- *      and the "Delegated from Octo" banner appears on the child
+ *      and the "Delegated from Owl" banner appears on the child
  *      header.
  *   4. The sidebar surfaces the hidden delegation pill on Vera (the
  *      child session is `origin='delegation'` so it's hidden behind
@@ -57,7 +57,7 @@ test.afterAll(async ({ request }) => {
         // as "<target> ← <parent>").
         if (
           OWNED_SESSIONS.has(s.name) ||
-          /←\s*Octo$/.test(s.name)
+          /←\s*Owl$/.test(s.name)
         ) {
           await request
             .delete(`${API}/sessions/${s.id}`, { headers })
@@ -148,7 +148,7 @@ test.describe("Agent-to-agent delegation @llm", () => {
     const SENTINEL = "VERAPONG";
     await ensureAgent(request, "E2E DelegTarget");
 
-    // Create the parent session under the default Octo via REST so
+    // Create the parent session under the default Owl via REST so
     // the test starts in a known state (no chance of the form view
     // intercepting our typed prompt).
     const sessRes = await request.post(`${API}/sessions`, {
@@ -214,7 +214,7 @@ test.describe("Agent-to-agent delegation @llm", () => {
 
     // 4. The "Open <target>'s session" button on the reply card
     //    navigates into the child session and the "Delegated from
-    //    Octo" banner appears in the header.
+    //    Owl" banner appears in the header.
     const openBtn = replyEvent.getByRole("button", {
       name: /open e2e delegtarget's session/i,
     });
@@ -223,10 +223,10 @@ test.describe("Agent-to-agent delegation @llm", () => {
     const banner = page.locator('[data-testid="delegation-banner"]');
     await expect(banner).toBeVisible({ timeout: 5_000 });
     await expect(banner).toContainText(/Delegated from/);
-    await expect(banner).toContainText(/Octo/);
+    await expect(banner).toContainText(/Owl/);
     await expect(banner.getByRole("button", { name: /open parent/i })).toBeVisible();
 
-    // 5. Clicking "Open parent" returns to Octo's session.
+    // 5. Clicking "Open parent" returns to Owl's session.
     await banner.getByRole("button", { name: /open parent/i }).click();
     await expect(page.locator(".chat-header h3")).toHaveText("Delegation E2E");
 

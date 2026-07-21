@@ -1224,7 +1224,7 @@ class SessionManager:
         # origin but starts with no claude_session_id (fresh conversation).
         agent_id = old.agent_id
         if agent_id is None and self.db:
-            sys_agent = await self.db.get_system_agent()
+            sys_agent = await self.db.get_default_agent()
             agent_id = sys_agent["id"] if sys_agent else None
         new = await self.create_session(
             agent_id=agent_id,

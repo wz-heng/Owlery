@@ -29,7 +29,7 @@ async def db():
 
 
 async def _seed_session(db, sid="parent"):
-    agent = await db.get_system_agent()
+    agent = await db.get_default_agent()
     await db.save_session(
         session_id=sid, name="P", working_dir="/tmp",
         created_at="2026-06-08T00:00:00+00:00", agent_id=agent["id"],

@@ -130,12 +130,12 @@ function AuthenticatedApp({
     setAgentDialogOpen(true);
   };
   // "Agent settings" in the account menu opens the manager focused on the
-  // active agent (fall back to the system agent, then the new-agent draft if
+  // active agent (fall back to the first agent, then the new-agent draft if
   // there are somehow no agents).
   const openActiveAgentSettings = () => {
     const active =
       agents.find((a) => a.id === activeAgentId) ??
-      agents.find((a) => a.is_system) ??
+      agents[0] ??
       null;
     setAgentInitialId(active?.id ?? null);
     setAgentDialogOpen(true);

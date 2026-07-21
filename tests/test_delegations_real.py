@@ -122,7 +122,7 @@ async def test_real_two_hop_claude_to_claude(tmp_path, monkeypatch):
         # The system Default Agent is "Octo" — created by the
         # migration. Reuse it as the parent rather than colliding on
         # the unique name index.
-        octo = await db.get_system_agent()
+        octo = await db.get_default_agent()
         assert octo is not None
         await am.create_agent(name="Vera", model="haiku", backend="claude-code")
         octo_sess = await mgr.create_session(
@@ -169,7 +169,7 @@ async def test_real_question_loop_claude_to_claude(tmp_path, monkeypatch):
     that's the answer-path the production code takes."""
     db, mgr, dm, am, wd = await _bootstrap(tmp_path, monkeypatch)
     try:
-        octo = await db.get_system_agent()
+        octo = await db.get_default_agent()
         assert octo is not None
         await am.create_agent(name="Vera", model="haiku", backend="claude-code")
         octo_sess = await mgr.create_session(
@@ -252,7 +252,7 @@ async def test_real_two_hop_claude_to_codex(tmp_path, monkeypatch):
     harness-agnostic at the chain level."""
     db, mgr, dm, am, wd = await _bootstrap(tmp_path, monkeypatch)
     try:
-        octo = await db.get_system_agent()
+        octo = await db.get_default_agent()
         assert octo is not None
         # Vera runs codex; we leave model None so codex's default applies.
         await am.create_agent(name="Vera", backend="codex")
@@ -299,7 +299,7 @@ async def test_real_three_hop_chain(tmp_path, monkeypatch):
     """
     db, mgr, dm, am, wd = await _bootstrap(tmp_path, monkeypatch)
     try:
-        octo = await db.get_system_agent()
+        octo = await db.get_default_agent()
         assert octo is not None
         await am.create_agent(name="Vera", model="haiku", backend="claude-code")
         await am.create_agent(name="Pete", model="haiku", backend="claude-code")

@@ -197,7 +197,7 @@ async def test_send_message_hands_backend_pointer_for_huge_prompt(
     await db.initialize()
     try:
         await mgr.initialize(db)
-        agent = await db.get_system_agent()
+        agent = await db.get_default_agent()
         session = await mgr.create_session(agent["id"], name="Huge")
 
         received_prompts: list[str] = []

@@ -8,8 +8,14 @@
 import { render } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
-import { Seal, monogram } from "./seal";
-import { SEAL_MARK_PATH, SEAL_RIM_PATH } from "../../lib/seal";
+import { AgentSeal, Seal, monogram } from "./seal";
+import {
+  SEAL_MARK_PATH,
+  SEAL_RIM_PATH,
+  WAX_TONES,
+  waxColorForId,
+  waxToneForId,
+} from "../../lib/seal";
 
 describe("monogram", () => {
   it("takes the first letter or digit, uppercased", () => {
@@ -61,6 +67,52 @@ describe("Seal", () => {
       <Seal side="left" mark={monogram("🦉") === null}>
         {monogram("🦉")}
       </Seal>
+    );
+    expect(container.querySelector(".seal-glyph")).toBeNull();
+    expect(pathsOf(container)).toContain(SEAL_MARK_PATH);
+  });
+});
+
+describe("waxToneForId", () => {
+  it("is deterministic — one id always yields the same tone/colour", () => {
+    expect(waxToneForId("agent-abc")).toBe(waxToneForId("agent-abc"));
+    expect(waxColorForId("agent-abc")).toBe(waxColorForId("agent-abc"));
+  });
+
+  it("only ever assigns a colour from the wax palette (never red)", () => {
+    for (const id of ["a", "b", "c", "dumbledore", "dobby", "x9", "🦉id"]) {
+      expect(WAX_TONES).toContain(waxToneForId(id));
+    }
+    // Red is reserved for `destructive` state and is not an identity colour.
+    expect(WAX_TONES as readonly string[]).not.toContain("red");
+  });
+
+  it("spreads distinct ids across more than one wax tone", () => {
+    const ids = Array.from({ length: 60 }, (_, i) => `agent-${i}`);
+    expect(new Set(ids.map(waxToneForId)).size).toBeGreaterThan(1);
+  });
+
+  it("returns a ready-to-use CSS custom-property colour", () => {
+    expect(waxColorForId("agent-abc")).toMatch(/^hsl\(var\(--wax-[a-z]+\)\)$/);
+  });
+});
+
+describe("AgentSeal", () => {
+  const pathsOf = (c: HTMLElement) =>
+    Array.from(c.querySelectorAll("path")).map((p) => p.getAttribute("d"));
+
+  it("impresses the agent's monogram in its own wax colour", () => {
+    const { container } = render(
+      <AgentSeal agent={{ id: "a1", name: "Dobby" }} />
+    );
+    expect(container.querySelector(".seal-glyph")?.textContent).toBe("D");
+    const rim = container.querySelector(".seal-rim");
+    expect(rim?.getAttribute("style") ?? "").toContain("--wax-");
+  });
+
+  it("falls back to the owl mark when the name yields no monogram", () => {
+    const { container } = render(
+      <AgentSeal agent={{ id: "a2", name: "🦉" }} />
     );
     expect(container.querySelector(".seal-glyph")).toBeNull();
     expect(pathsOf(container)).toContain(SEAL_MARK_PATH);

@@ -25,7 +25,7 @@ async def test_fire_materializes_scheduled_session_and_auto_archives(
     setup, monkeypatch
 ):
     mgr, db, runner = setup
-    agent = await db.get_system_agent()
+    agent = await db.get_default_agent()
 
     # Stub the turn — no real backend; just record what ran.
     ran: dict = {}
@@ -71,7 +71,7 @@ async def test_fire_uses_agent_id_from_job_args(setup, monkeypatch):
     """The scheduled job carries agent_id (not session_id) and each fire
     creates its own session — no persistent session reuse."""
     mgr, db, runner = setup
-    agent = await db.get_system_agent()
+    agent = await db.get_default_agent()
 
     created_sessions: list[str] = []
     orig_create = mgr.create_session
@@ -102,7 +102,7 @@ async def test_fire_appends_into_live_origin_session(setup, monkeypatch):
     appends each fire into that same, still-live session — queued via
     start_message — and does NOT create or archive a throwaway session."""
     mgr, db, runner = setup
-    agent = await db.get_system_agent()
+    agent = await db.get_default_agent()
 
     # The session the command was issued from (a normal user session).
     origin = await mgr.create_session(agent["id"], name="chat")
@@ -151,7 +151,7 @@ async def test_fire_falls_back_to_fresh_session_when_origin_gone(setup, monkeypa
     fire degrades to materializing a fresh schedule-origin session that
     auto-archives on idle — the schedule keeps working regardless."""
     mgr, db, runner = setup
-    agent = await db.get_system_agent()
+    agent = await db.get_default_agent()
 
     ran: dict = {}
 
@@ -189,7 +189,7 @@ async def test_add_job_carries_origin_session_id_to_fire(setup):
     """`_add_job` threads origin_session_id from the schedule row into the job's
     args so the fire knows which session to append into."""
     mgr, db, runner = setup
-    agent = await db.get_system_agent()
+    agent = await db.get_default_agent()
     await db.save_schedule(
         schedule_id="sch3",
         agent_id=agent["id"],
@@ -215,7 +215,7 @@ async def test_cron_schedule_registers_cron_trigger(setup):
     from apscheduler.triggers.cron import CronTrigger
 
     mgr, db, runner = setup
-    agent = await db.get_system_agent()
+    agent = await db.get_default_agent()
     await db.save_schedule(
         schedule_id="cron1",
         agent_id=agent["id"],
@@ -240,7 +240,7 @@ async def test_initialize_deletes_missed_run_at_schedules(setup):
     while the server was down) are deleted from the DB rather than silently
     dropped by APScheduler."""
     mgr, db, runner = setup
-    agent = await db.get_system_agent()
+    agent = await db.get_default_agent()
 
     # A one-time schedule with a fire time in the distant past.
     await db.save_schedule(
@@ -277,7 +277,7 @@ async def test_run_at_schedule_registers_date_trigger(setup):
     from apscheduler.triggers.date import DateTrigger
 
     mgr, db, runner = setup
-    agent = await db.get_system_agent()
+    agent = await db.get_default_agent()
     run_at = "2030-01-15T09:00:00+00:00"
     await db.save_schedule(
         schedule_id="once1",
@@ -302,7 +302,7 @@ async def test_run_at_schedule_registers_date_trigger(setup):
 async def test_run_at_schedule_deleted_after_fire(setup, monkeypatch):
     """After a one-time (run_at) schedule fires, its DB row is deleted."""
     mgr, db, runner = setup
-    agent = await db.get_system_agent()
+    agent = await db.get_default_agent()
 
     async def fake_send(session_id, prompt):
         if False:
@@ -332,7 +332,7 @@ async def test_run_at_schedule_deleted_after_fire(setup, monkeypatch):
 async def test_run_at_schedule_deleted_after_fire_with_origin_session(setup, monkeypatch):
     """One-time schedule fires into an origin session and is deleted from DB."""
     mgr, db, runner = setup
-    agent = await db.get_system_agent()
+    agent = await db.get_default_agent()
     origin = await mgr.create_session(agent["id"], name="chat")
 
     started: dict = {}
@@ -368,7 +368,7 @@ async def test_repoint_schedules_origin():
     db = Database(":memory:")
     await db.initialize()
     try:
-        agent = await db.get_system_agent()
+        agent = await db.get_default_agent()
         await db.save_schedule(
             schedule_id="a",
             agent_id=agent["id"],
@@ -409,7 +409,7 @@ async def test_schedule_recurrence_columns_roundtrip():
     db = Database(":memory:")
     await db.initialize()
     try:
-        agent = await db.get_system_agent()
+        agent = await db.get_default_agent()
         await db.save_schedule(
             schedule_id="s1",
             agent_id=agent["id"],
@@ -436,7 +436,7 @@ async def test_run_at_column_roundtrip():
     db = Database(":memory:")
     await db.initialize()
     try:
-        agent = await db.get_system_agent()
+        agent = await db.get_default_agent()
         run_at = "2030-01-15T09:00:00+00:00"
         await db.save_schedule(
             schedule_id="once-db",
@@ -462,7 +462,7 @@ async def test_migrate_schedule_recurrence_from_legacy_shape():
     db = Database(":memory:")
     await db.initialize()
     try:
-        agent = await db.get_system_agent()
+        agent = await db.get_default_agent()
         conn = db._conn
         # Recreate the legacy schema + a legacy interval schedule.
         await conn.executescript(
@@ -525,7 +525,7 @@ async def test_migrate_schedule_run_at_from_legacy_shape():
     db = Database(":memory:")
     await db.initialize()
     try:
-        agent = await db.get_system_agent()
+        agent = await db.get_default_agent()
         conn = db._conn
         # Simulate a pre-run_at table by dropping and recreating without run_at.
         await conn.executescript(
