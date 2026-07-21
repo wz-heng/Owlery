@@ -1,7 +1,9 @@
 # Feishu Bridge — 用飞书彻底替换 Telegram
 
-状态:方案定稿,待执行。
+状态:方案 v2,经 Aberforth 评审后修订,待执行。
 决策记录:用户不用 Telegram,选择**彻底替换**(删 telegram,不并存)。
+评审记录:v1 的四个 P0(transport 未闭合、裸 ws.Client 生命周期、
+webhook 默认放行、审批只带 tool_use_id)全部成立,已吸收;本版为定稿。
 
 ## 1. 目标
 
@@ -15,96 +17,179 @@ Telegram bridge 及其全部测试、配置、文档引用一并删除。
 - 用户日常在飞书,不在 Telegram;Telegram 还要翻墙,家用 Mac 上
   proxy 已经造成过一串事故(见 delegation-502 复盘)。飞书直连。
 - bridge 抽象层(`Bridge` 基类、`BridgeManager`、`bridge_mappings`
-  表的 `platform` 列)本来就是平台无关的,替换只动叶子节点。
+  表的 `platform` 列)本来就是平台无关的。注意:替换**不是**纯叶子
+  节点——审批路由的正确性修复(§4.4)要动 `BridgeManager` 接口。
 
-## 3. 入站通道选型(本方案唯一的架构决策)
+## 3. 架构决策
 
-飞书事件订阅有两种投递方式,与 Telegram 的 long-polling 不同,
-必须二选一或并存:
+### 3.1 传输方式:显式 transport 配置
 
-- **方案 A(推荐):长连接为主 + webhook 为辅,双入口喂同一个处理器。**
-  长连接(WebSocket,官方 `lark-oapi` SDK 的 `ws.Client`)是飞书为
-  "无公网地址的自部署工具"设计的通道——正是家用 Mac 场景,等价于
-  Telegram 的 long-polling。webhook 路由(FastAPI 下挂
-  `/api/feishu/events`,处理 URL challenge + verification token +
-  可选 AES 解密)是飞书官方支持的另一种订阅方式,同时天然成为 e2e
-  的入站路径:fake 服务器无法伪造 protobuf 的 ws 协议,但可以直接
-  POST webhook。两种入口收到的事件 JSON 同构,汇入同一个
-  `handle_event_payload`,没有重复逻辑。
-- 方案 B(仅 webhook):代码最少,但真实使用必须有公网 URL(依赖
-  Cloudflare tunnel 常开)。家用场景硬伤,否。
-- 方案 C(仅长连接):真实使用没问题,但 e2e 入站没有任何网络路径
-  可走,bridge e2e 名存实亡,只剩单测级注入。违反本仓"测试是一等
-  公民"的现实,否。
+飞书的「事件订阅」和「回调订阅」在开放平台后台**各自**选择投递
+方式(长连接或 webhook),这不是代码层能悄悄并存的东西。配置:
 
-**出站不用 SDK**:发消息走裸 httpx 调 REST
-(`/im/v1/messages`,tenant_access_token 自缓存自刷新),
-base URL 可配置——这保持了与 Telegram 实现相同的可 fake 性
-(e2e fake 服务器只需要模拟 token 端点 + 发消息端点),也让
-Lark 国际版(`open.larksuite.com`)只是换个 URL 的事。
-`lark-oapi` 依赖仅用于 ws 客户端。
+- `feishu_transport = "ws" | "webhook"`,生产默认 `ws`(长连接,
+  官方为无公网自部署场景提供,正是家用 Mac),e2e 固定 `webhook`。
+- 两种 transport 的事件汇入同一个业务处理器;webhook 路由在
+  `ws` 模式下也不注册(见 §4.2 fail-closed)。
+- 这不是"平台开关"式的过度设计——它是飞书官方本来就要求的选择,
+  代码只是如实映射。
+
+### 3.2 SDK:采用官方 `lark-channel-sdk`,strict 安全模式
+
+v1 的「lark-oapi 只用 ws.Client + 出站裸 httpx」被否,理由成立:
+`ws.Client` 的 `start()` 阻塞、依赖模块级 event loop、无可靠公开
+关闭接口,塞进 FastAPI lifespan 会把启动/重连/shutdown 全变成对
+私有实现的依赖。官方已把机器人能力拆成独立的 `lark-channel-sdk`
+(长连接/webhook 生命周期、事件去重、token 管理、出站、卡片回调、
+FastAPI webhook 适配一体),`lark_oapi.channel` 已进迁移窗口。
+
+- 依赖 `lark-channel-sdk`,**写死具体版本号**(执行时取当时最新
+  稳定版;评审时仓库显示 1.0.0,勿凭记忆写)。
+- `SecurityConfig(mode="strict")` 显式启用——SDK 默认 compat 不够。
+- Owlery 侧只写薄适配层:SDK 事件 → `BridgeManager.handle_incoming`
+  / 卡片回调 → 审批处理;卡片 JSON 仍自己构造。
+- **执行前置 spike(半天内)**:验证两件事——(a) SDK 出站 base
+  URL / domain 可指向 e2e fake 服务器;(b) 在 FastAPI lifespan 里
+  能干净 start/stop。两条都过才继续;任一不过,回退方案为半 SDK
+  形态,但必须:官方 `EventDispatcherHandler` 统一处理解密/签名/
+  challenge、WS 跑专用线程、有界队列投递回 FastAPI loop、写
+  shutdown/reconnect 测试。回退是逃生舱,不是默认路径。
+
+### 3.3 域名:统一 `feishu_domain`
+
+v1 的 `feishu_api_base_url` 只管 REST,WS 仍会连死
+`open.feishu.cn`,并不真正支持 Lark。改为统一的
+`feishu_domain`(默认 `https://open.feishu.cn`,国际版
+`https://open.larksuite.com`,e2e 指 fake 服务器),REST 路径在其
+上追加 `/open-apis`,WS/webhook 相关端点同源派生。
 
 ## 4. 设计要点
 
-**配置**(替换 `telegram_*` 三项):
-- `feishu_app_id` / `feishu_app_secret` — 自建应用凭证,二者齐备
-  即启用 bridge(等价于原 `telegram_bot_token` 的开关语义)。
-- `feishu_verification_token` / `feishu_encrypt_key` — webhook 校验
-  与解密;不配 encrypt_key 则只收明文事件。
-- `feishu_allowed_chat_ids` — open_chat_id 白名单,**空 = 不限制**,
-  与 Telegram 语义一致(自建应用本就只在自己租户内可见,默认放开
-  合理)。
-- `feishu_api_base_url` — 默认 `https://open.feishu.cn/open-apis`,
-  e2e 指向 fake 服务器,Lark 用户指国际版。
+### 4.1 配置(替换 `telegram_*` 三项)
 
-**消息渲染**:飞书 `text` 类型不渲染 markdown,agent 回复里的代码
-块会裸奔。assistant 文本、tool_use/tool_result 一律走 interactive
-卡片的 markdown 元素(`lark_md`);纯状态行(Done/Error/切换确认)
-可用 text。执行时确认单条消息实际长度上限并接到
-`max_message_length`(TextBuffer 分片依赖它,别沿用 Telegram 的
-4096 魔数)。飞书有按 chat 的限频(约 5 QPS/群),`flush_delay`
-据此调,执行时以官方文档为准。
+- `feishu_app_id` / `feishu_app_secret` — 二者齐备才启用;**只配一
+  个 = 启动失败并报明确错误**,不静默禁用。
+- `feishu_transport` — 见 §3.1。
+- `feishu_verification_token` / `feishu_encrypt_key` — webhook 模式
+  必填 verification token(见 §4.2)。
+- `feishu_domain` — 见 §3.3。
+- 授权白名单,**默认 fail-closed**(见 §4.2)。
 
-**交互按钮**(Telegram inline keyboard 的对应物):
-- 工具审批:卡片两按钮,value 带 `{action, tool_use_id}`;回传事件
-  (`card.action.trigger`)从长连接/webhook 同一通道进来,处理后更
-  新原卡片使按钮失效(对应 Telegram 的 `_clear_keyboard`)。
-- `/sessions`:每会话一按钮的卡片,沿用 `SESSION_LIST_LIMIT=30`。
+### 4.2 安全:默认拒绝,不照搬 Telegram 的宽松
 
-**入站事件**:订阅 `im.message.receive_v1` + 卡片回传。单聊直收;
-群里只认 @机器人 的消息。`chat_id` 用事件里的 open_chat_id,
-`platform` 字符串为 `"feishu"`,`BridgeManager` 及以上一行不改。
+Owlery 背后是能执行工具的本机 agent,uvicorn 还常以 `0.0.0.0` 监
+听、可能挂 tunnel。「自建应用只在自己租户所以空白名单合理」不成
+立——租户里可能有别人,群成员都能点审批按钮。
 
-**Telegram 拆除清单**:`server/bridges/telegram.py`、config 三项、
-`main.py` 挂载段、`tests/test_bridge_telegram.py`、
-`web/e2e/telegram-bridge.spec.ts` + `fake-telegram-server.mjs`、
-`playwright.bridge.config.ts` 的 telegram 指向、README / CLAUDE.md /
-`parked_turns.py` 注释里的 Telegram 引用。DB 迁移加一步:删除
-`bridge_mappings` 中 `platform='telegram'` 的行(功能已移除,留着
-是永远匹配不到 bridge 的死数据)。`base.py` 里两处 Telegram 措辞
-(TextBuffer docstring、`max_message_length` 默认值注释)顺手改掉。
+- webhook 模式:未配置 verification token → 路由直接不注册
+  (404),绝不裸收 POST;strict 模式下签名校验、时间戳窗口由 SDK
+  承担,任务书不自己发明「token + AES 就算完」。
+- `feishu_allowed_open_ids` — 发送者与卡片 operator 的 open_id 白
+  名单,**空 = 拒绝一切**(fail-closed),配置文档明确写出如何取
+  自己的 open_id。
+- 群聊:同时校验 chat_id(若配了 chat 白名单)与 operator open_id。
+- 按 `header.event_id` 去重——飞书事件会重推,重复入站等于重复启动
+  agent turn。卡片操作另做一次性消费(见 §4.4 nonce)。
 
-**测试**:单测重写为 `test_bridge_feishu.py`(mock 出站 httpx +
-直接注入事件 dict,覆盖白名单、卡片回传、token 刷新);e2e 换
-`fake-feishu-server.mjs`(记录出站调用)+ 入站走真 webhook 路由,
-条数对齐原 6 条的覆盖面。**借重建之机修掉 CLAUDE.md 记录的 bridge
-e2e 隔离欠账**:新 `playwright.bridge.config.ts` 必须钉死私有端口
-和自己的 `OWLERY_AUTH_TOKEN`,不得再出现"401 于别的 token / 领养
-别人正跑着的 :8000"两种失败模式。
+### 4.3 消息渲染与出站
 
-**用户侧前置**(代码做不了,上线前用户自己在
-open.feishu.cn 完成):创建自建应用 → 开机器人能力 → 申请
-`im:message` 收发权限 → 事件订阅启用**长连接**方式并勾
-`im.message.receive_v1` + 卡片回传 → 发布 → 把机器人拉进目标会话,
-app_id/secret 填进 Owlery 配置。
+- 飞书 `text` 不渲染 markdown:agent 正文、tool_use/tool_result 走
+  interactive 卡片 `lark_md`;纯状态行(Done/Error/切换确认)用 text。
+- 分片上限:卡片限制是**序列化后 ~30KB**,不是字符数;中文与 JSON
+  转义都吃额度。`max_message_length` 按 UTF-8 序列化结果估算留出
+  裕量,不沿用 Telegram 的 4096 字符魔数。
+- 出站错误处理:飞书限流常以 HTTP 400 + 响应体业务 `code` 表示,
+  不能只看 429;按 code 分类,带抖动退避;tenant_access_token 失效
+  → 清缓存重试一次,再失败即报错。
+- 限频(约 5 QPS/chat)决定 `flush_delay`,执行时以官方文档为准。
 
-## 5. 不做
+### 4.4 卡片交互(审批 / 会话切换)
 
-- 不做 Telegram/飞书并存或任何"可切换平台"的配置开关——用户已拍板
-  彻底替换;`Bridge` 抽象本身就是未来再加平台的位置。
-- 不做富卡片花活(进度条、折叠、图片回传):首版对齐 Telegram 现有
-  能力集,一条不多。
+- 卡片回调**可以**走长连接(官方 WS 示例注册
+  `register_p2_card_action_trigger`),但开放平台后台要把「事件订
+  阅」「回调订阅」**分别**设为长连接——用户前置清单里是两步,不是
+  一步。
+- 回调必须 **3 秒内响应且失败不重推**:handler 立即返回(空响应或
+  置灰卡片),业务处理(审批/切换)异步做;需要更新原卡片时在回调
+  响应之后走 REST PATCH。
+- **审批按钮 value 必须携带完整身份**:`{action, session_id,
+  tool_use_id, nonce}`。现 `handle_tool_decision` 只按聊天的 sticky
+  session 找目标——发卡后用户 `/switch` 再点旧卡,审批会投向错误会
+  话,原会话永久挂起。这是 Telegram 实现的存量 bug,本次一并修:
+  处理时校验 session 属于该聊天绑定的 agent、tool_use_id 确在待审
+  批态、operator 已授权、nonce 未消费。`BridgeManager` 接口相应调
+  整——不为「叶子纯洁」牺牲审批正确性。
+- `/sessions` 会话卡片沿用 `SESSION_LIST_LIMIT=30`,按钮 value 同
+  样带 session_id + nonce。
+
+### 4.5 入站范围
+
+- 订阅 `im.message.receive_v1` + 卡片回调。单聊直收;群里只认
+  @机器人 的消息。
+- `chat_id` 用 open_chat_id,`platform = "feishu"`。
+- **话题群(topic/thread)首版明确拒绝**:检测到 thread 消息回一句
+  不支持,不让不同 thread 悄悄共享一个 sticky session。把
+  `thread_id` 纳入 conversation key 属于后续有真实需求再做的事。
+- 非文本消息(语音/图片/文件)回一句不支持。
+
+## 5. Telegram 拆除清单(完整版)
+
+- `server/bridges/telegram.py`;`base.py` 里两处 Telegram 措辞
+  (TextBuffer docstring、`max_message_length` 默认值注释)。
+- config:`telegram_bot_token` / `telegram_allowed_chat_ids` /
+  `telegram_api_base_url`;`main.py` 挂载段。
+- 测试:`tests/test_bridge_telegram.py` 整删;
+  `test_bridge_database.py`、`test_delegations.py`、
+  `test_session_fork.py`、`test_session_manager.py` 中共 ~27 处
+  `"telegram"` 平台字面量改为 `"feishu"` 或中性值;
+  `test_migration_backfill.py` 改为**断言** telegram 行被迁移删除。
+- e2e:`telegram-bridge.spec.ts`、`fake-telegram-server.mjs`、
+  `playwright.bridge.config.ts` 重写;`playwright.config.ts` 的
+  `testIgnore` 与 `OWLERY_TELEGRAM_BOT_TOKEN` env 两处。
+- 文档:README(≥5 处)、CLAUDE.md(4 处)、
+  `docs/architecture.md`(15 处)、`parked_turns.py` 注释。
+- DB 迁移:删除 `bridge_mappings` 中 `platform='telegram'` 的行
+  (功能已移除,留着是永远匹配不到 bridge 的死数据)。
+
+## 6. 测试
+
+### 6.1 bridge e2e 重建 = 还清全部隔离欠账
+
+现 `playwright.bridge.config.ts` 的问题远不止 CLAUDE.md 记的
+token/端口两条:`reuseExistingServer: true`、无临时 DB/home/agents
+隔离、无 fake CLI——理论上会碰真实数据库、删真实 session、调真实模
+型。新配置必须复用主 e2e 的整套护栏:
+
+- 独立临时 DB、home、agents 目录;
+- fake CLI 上 PATH + codex tripwire;
+- `reuseExistingServer: false`;
+- 私有端口 + 自己的 `OWLERY_AUTH_TOKEN`;
+- `OWLERY_LEGACY_HOME_DIR=""`。
+
+### 6.2 覆盖目标(按风险,不按条数)
+
+「对齐原 6 条」是错误目标。新 e2e 至少覆盖:消息往返、真实卡片点
+击切换会话、审批 允许/拒绝 一次性消费(重复点击无效)、签名/
+verification 不合法被拒、重复 event_id 去重、未授权 operator 被
+拒。单测 `test_bridge_feishu.py`:白名单语义(fail-closed)、卡片
+value 校验矩阵(session 不属 agent / tool_use 不在待审批态 / nonce
+已消费)、token 刷新与失效重试、出站业务错误码退避、transport 配
+置矩阵(含只配一半凭证启动失败)。SDK spike 若走回退路径,补
+shutdown/reconnect 测试。
+
+## 7. 用户侧前置(代码做不了)
+
+open.feishu.cn 创建自建应用 → 开机器人能力 → 申请权限:
+`im:message.p2p_msg:readonly`(单聊收)、群聊 @机器人 消息接收、
+`im:message:send_as_bot`(发)→ **「事件订阅」与「回调订阅」分别
+设为长连接方式**,勾 `im.message.receive_v1` 与卡片回调 → 发布 →
+把机器人拉进目标会话 → app_id/secret 填进 Owlery 配置,并把自己的
+open_id 加进 `feishu_allowed_open_ids`。
+
+## 8. 不做
+
+- 不做 Telegram/飞书并存;`Bridge` 抽象本身就是未来再加平台的位置。
+- 不做富卡片花活(进度条、折叠、图片回传):对齐现有能力集。
 - 不做飞书侧多租户/商店应用发布:自建应用、单租户、自用。
-- 不做语音/文件/图片入站:只收文本消息,其余类型回一句不支持。
-- 不迁移既有 telegram 聊天绑定到飞书:平台不同 chat_id 无对应关系,
-  没有可迁之物。
+- 不做语音/文件/图片入站;不做话题群 thread 支持(首版明确拒绝)。
+- 不迁移既有 telegram 聊天绑定:平台不同 chat_id 无对应关系。
