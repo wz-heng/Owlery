@@ -1428,8 +1428,25 @@ async def test_unarchive_refused_when_owner_agent_archived(manager):
     session = await manager.create_session(agent["id"], "Doomed", None)
     # Archiving the agent cascade-archives its sessions.
     await manager.db.archive_agent(agent["id"])
-    with pytest.raises(ValueError, match="agent is archived"):
+    with pytest.raises(ValueError, match="archived or missing"):
         await manager.unarchive_session(session.id)
+
+
+@pytest.mark.asyncio
+async def test_unarchive_refused_when_owner_missing(manager):
+    """Same invariant for a legacy archived session with NULL agent_id (the
+    schema allows it, and all-archived migration preserves NULLs): no live
+    owner → refuse, so it can't become an unreachable orphan
+    (agent-identity.md)."""
+    await manager.db.conn.execute(
+        "INSERT INTO sessions "
+        "(id, name, working_dir, created_at, archived, agent_id) "
+        "VALUES ('null-owner', 'Legacy', '/tmp', "
+        "'2025-01-01T00:00:00+00:00', 1, NULL)"
+    )
+    await manager.db.conn.commit()
+    with pytest.raises(ValueError, match="archived or missing"):
+        await manager.unarchive_session("null-owner")
 
 
 @pytest.mark.asyncio

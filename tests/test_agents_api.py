@@ -43,6 +43,25 @@ async def _create_agent(client, name="Researcher", **extra):
     return resp.json()
 
 
+@pytest.mark.asyncio
+async def test_unarchive_null_owner_session_refused(client):
+    """A legacy archived session with no owning agent (agent_id NULL) can't be
+    revived via the API — a live session with no live owner is an unreachable
+    orphan (agent-identity.md). 400, not 200 or 404."""
+    db = session_manager.db
+    await db.conn.execute(
+        "INSERT INTO sessions "
+        "(id, name, working_dir, created_at, archived, agent_id) "
+        "VALUES ('null-owner', 'Legacy', '/tmp', "
+        "'2025-01-01T00:00:00+00:00', 1, NULL)"
+    )
+    await db.conn.commit()
+    resp = await client.post(
+        "/api/sessions/null-owner/unarchive", headers=HEADERS
+    )
+    assert resp.status_code == 400, resp.text
+
+
 # --- Default Agent ---
 
 
