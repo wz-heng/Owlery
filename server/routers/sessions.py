@@ -346,6 +346,10 @@ async def unarchive_session(session_id: str, _: str = Depends(verify_token)):
     """
     try:
         s = await session_manager.unarchive_session(session_id)
-    except ValueError:
+    except ValueError as e:
+        # The session exists but its agent is archived → 400 (a real conflict,
+        # not a missing row). Any other ValueError is a genuine not-found.
+        if "agent is archived" in str(e):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Session not found")
     return _to_session_info(s)

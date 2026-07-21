@@ -1447,6 +1447,18 @@ class SessionManager:
         )
         if match is None:
             raise ValueError(f"Archived session {session_id} not found")
+        # Refuse to revive a session whose owning agent is archived: it would
+        # land in no agent's rail (the rail lists live agents only) and vanish
+        # from ArchivedSessions once live — an unreachable orphan. Its history
+        # stays viewable read-only in ArchivedSessions instead
+        # (agent-identity.md).
+        owner_id = match.get("agent_id")
+        if owner_id:
+            owner = await self.db.get_agent(owner_id)
+            if owner is not None and owner["archived"]:
+                raise ValueError(
+                    "Cannot unarchive a session whose agent is archived"
+                )
         await self.db.update_session_field(session_id, archived=False)
         # Reload into the in-memory map so writes (sendMessage etc.)
         # immediately route to this session.

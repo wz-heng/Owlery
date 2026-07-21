@@ -1419,6 +1419,20 @@ async def test_archive_unknown_session_raises(manager):
 
 
 @pytest.mark.asyncio
+async def test_unarchive_refused_when_owner_agent_archived(manager):
+    """Reviving a session whose agent is archived would strand it in no rail
+    (the rail lists live agents only) and drop it from ArchivedSessions —
+    an unreachable orphan. unarchive_session refuses it; the history stays
+    viewable read-only instead (agent-identity.md)."""
+    agent = await manager.db.get_default_agent()
+    session = await manager.create_session(agent["id"], "Doomed", None)
+    # Archiving the agent cascade-archives its sessions.
+    await manager.db.archive_agent(agent["id"])
+    with pytest.raises(ValueError, match="agent is archived"):
+        await manager.unarchive_session(session.id)
+
+
+@pytest.mark.asyncio
 async def test_archive_broadcasts_session_archived_event(manager):
     received: list[dict] = []
     manager.on_broadcast("test", lambda m: asyncio.sleep(0, result=received.append(m)))

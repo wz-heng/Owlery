@@ -178,26 +178,35 @@ class TestBinding:
         second = manager.get_session_id("mock", "c1")
         assert second is not None and second != first
 
-    async def test_bound_agent_archived_still_serves(self, manager, bridge, db):
+    async def test_bound_agent_archived_still_serves(
+        self, manager, bridge, db, session_mgr
+    ):
         """Chosen semantics for a bound chat whose agent gets archived
         (agent-identity.md, plan §2 bridge bullet): the binding is RETAINED
-        and the chat CONTINUES to work under that agent — an explicit
+        and the chat CONTINUES under that agent on a fresh thread — an explicit
         "continue usable" result, never a silent black hole and never a forced
         rebind. Locking it here so the choice can't drift."""
         await manager.handle_incoming("mock", "c1", "hello", bridge)
         binding = manager._binding("mock", "c1")
         assert binding is not None
         agent_id = binding.agent_id
+        first = manager.get_session_id("mock", "c1")
 
+        # Simulate the production archive path: the agent is archived AND its
+        # in-memory sessions are evicted (routers/agents.py archive endpoint
+        # calls evict_agent_sessions), so the sticky session is gone.
         await db.archive_agent(agent_id)
+        session_mgr._sessions.pop(first, None)
         bridge.sent.clear()
 
         await manager.handle_incoming("mock", "c1", "again", bridge)
-        # No dead-end; the binding is unchanged and a live thread is served.
+        # No dead-end; the binding is unchanged and a NEW live thread opens
+        # under the (archived) agent.
         assert not any("No agent" in str(s) for s in bridge.sent)
         again = manager._binding("mock", "c1")
         assert again is not None and again.agent_id == agent_id
-        assert manager.get_session_id("mock", "c1") is not None
+        second = manager.get_session_id("mock", "c1")
+        assert second is not None and second != first
 
 
 # --- Command tests ---

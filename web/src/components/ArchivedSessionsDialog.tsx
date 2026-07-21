@@ -158,7 +158,11 @@ export function ArchivedSessionsDialog({ open, onOpenChange }: Props) {
                     <Seal side="left" scale="avatar" straddle={false} tone="ink" mark />
                   )}
                   <span className="truncate">
-                    {agent?.name ?? "Unknown agent"}
+                    {agent
+                      ? agent.archived
+                        ? `${agent.name} (archived)`
+                        : agent.name
+                      : "Unknown agent"}
                   </span>
                 </div>
                 <div className="flex flex-col gap-1">
@@ -178,14 +182,27 @@ export function ArchivedSessionsDialog({ open, onOpenChange }: Props) {
                         <IconEye size={13} />
                         View
                       </button>
-                      <button
-                        className="btn-archived-unarchive inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-primary hover:bg-primary/10"
-                        onClick={() => unarchive(s)}
-                        title="Unarchive — bring this session back as a live session"
-                      >
-                        <IconRestore size={13} />
-                        Unarchive
-                      </button>
+                      {/* Unarchive only when the owner is a live agent —
+                        * reviving a session under an archived (or vanished)
+                        * owner would strand it in no rail (agent-identity.md).
+                        * Its history stays viewable read-only. */}
+                      {agent && !agent.archived ? (
+                        <button
+                          className="btn-archived-unarchive inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-primary hover:bg-primary/10"
+                          onClick={() => unarchive(s)}
+                          title="Unarchive — bring this session back as a live session"
+                        >
+                          <IconRestore size={13} />
+                          Unarchive
+                        </button>
+                      ) : (
+                        <span
+                          className="btn-archived-unarchive-disabled inline-flex items-center gap-1 px-2 py-1 text-xs text-muted-foreground/70"
+                          title="This session's agent is archived — its history is read-only"
+                        >
+                          Read-only
+                        </span>
+                      )}
                     </div>
                   ))}
                 </div>
