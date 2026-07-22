@@ -8,7 +8,7 @@ resume, schedule a wake-up at the reset, and run it unattended.
 
 Everything here is turn-level, so it covers every caller of
 `session_manager._run_backend` uniformly — chat, schedules, delegation
-children, the telegram bridge.
+children, the Feishu bridge.
 """
 
 from __future__ import annotations

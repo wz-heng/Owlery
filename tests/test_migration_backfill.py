@@ -58,6 +58,13 @@ def _seed_old_db(path: str) -> None:
         "INSERT INTO schedules (id, session_id, name, prompt, interval_seconds, created_at) "
         "VALUES ('sch1', 's1', 'daily', 'do it', 3600, '2025-01-01T00:00:00+00:00')"
     )
+    # A live feishu binding (survives the agents-refactor re-ownership) plus a
+    # legacy telegram binding (must be purged by the Feishu-replaces-Telegram
+    # migration, feishu-bridge.md §5). Both are asserted below.
+    conn.execute(
+        "INSERT INTO bridge_mappings (platform, chat_id, session_id) "
+        "VALUES ('feishu', 'oc_c1', 's1')"
+    )
     conn.execute(
         "INSERT INTO bridge_mappings (platform, chat_id, session_id) "
         "VALUES ('telegram', 'c1', 's1')"
@@ -104,12 +111,16 @@ async def test_backfill_from_old_schema(tmp_path):
         assert schedules[0]["agent_id"] == default["id"]
         assert "session_id" not in await _column_names(db, "schedules")
 
-        # Bridge mapping bound to the agent; session_id preserved as the
-        # sticky pointer and is now nullable.
+        # The feishu mapping is bound to the agent; session_id preserved as the
+        # sticky pointer and is now nullable. The legacy telegram row is PURGED
+        # by the Feishu-replaces-Telegram migration (feishu-bridge.md §5), so
+        # exactly one mapping survives and none is on the retired platform.
         mappings = await db.load_bridge_mappings()
         assert len(mappings) == 1
+        assert mappings[0]["platform"] == "feishu"
         assert mappings[0]["agent_id"] == default["id"]
         assert mappings[0]["session_id"] == "s1"
+        assert not any(m["platform"] == "telegram" for m in mappings)
         assert not await db._column_is_not_null("bridge_mappings", "session_id")
 
         # Idempotency: a second migration run changes nothing.

@@ -58,7 +58,10 @@ const FAKE_CLI_DIR = path.join(__dirname, "e2e", "fake-cli");
 
 export default defineConfig({
   testDir: "./e2e",
-  testIgnore: ["telegram-bridge.spec.ts"],
+  // The Feishu bridge suite has its own config (playwright.bridge.config.ts):
+  // its own backend, webhook transport, and fake Feishu server. Keep it out of
+  // the main run.
+  testIgnore: ["feishu-bridge.spec.ts"],
   globalSetup: "./e2e/global-setup.ts",
   globalTeardown: "./e2e/global-teardown.ts",
   timeout: 30_000,
@@ -117,7 +120,8 @@ export default defineConfig({
         // default 8000 would have its callback POSTs hit a dead socket
         // and leave the BgTaskChip stuck in "Waiting for bg task…".
         OWLERY_PORT: "8765",
-        OWLERY_TELEGRAM_BOT_TOKEN: "",
+        // No Feishu credentials here → the bridge stays unmounted for the main
+        // suite (its own config drives the bridge tests).
         OWLERY_DB_PATH: ":memory:",
         // Per-agent memory dirs (docs/plans/memory.md) live under here; keep
         // them out of the developer's real ~/.owlery/agents. Cleaned in

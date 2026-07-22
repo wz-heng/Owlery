@@ -166,7 +166,7 @@ async def test_fork_repoints_schedules_and_clears_bridge(manager):
         interval_seconds=3600, origin_session_id=parent.id,
     )
     await manager.db.save_bridge_mapping(
-        platform="telegram", chat_id="c1", agent_id=parent.agent_id,
+        platform="feishu", chat_id="c1", agent_id=parent.agent_id,
         session_id=parent.id,
     )
 

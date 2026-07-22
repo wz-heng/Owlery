@@ -1,5 +1,6 @@
 import logging
 import os
+from typing import Literal
 
 from pydantic import model_validator
 from pydantic_settings import (
@@ -120,10 +121,30 @@ class Settings(BaseSettings):
     # Cloudflare Tunnel (opt-in)
     enable_tunnel: bool = False
 
-    # Bridge configuration (opt-in)
-    telegram_bot_token: str | None = None
-    telegram_allowed_chat_ids: list[str] = []
-    telegram_api_base_url: str = "https://api.telegram.org"
+    # Feishu bridge (docs/plans/feishu-bridge.md). Opt-in: the bridge only
+    # mounts when BOTH app_id and app_secret are set. Configuring exactly one
+    # is a boot-time error, not a silent disable (build_feishu_bridge).
+    feishu_app_id: str | None = None
+    feishu_app_secret: str | None = None
+    # "ws" (long-connection — the no-public-URL home-Mac case, prod default) or
+    # "webhook". This is the Feishu Open Platform's own event-delivery choice
+    # (§3.1), mirrored here — not a code-level toggle.
+    feishu_transport: Literal["ws", "webhook"] = "ws"
+    # Webhook transport REQUIRES a verification token: without it the webhook
+    # route is not registered at all (fail-closed, §4.2). encrypt_key enables
+    # payload decryption + signature verification when configured on the app.
+    feishu_verification_token: str | None = None
+    feishu_encrypt_key: str | None = None
+    # Unified domain (§3.3): REST base + WS/webhook endpoints derive from it.
+    # Prod default open.feishu.cn; international Lark = open.larksuite.com; e2e
+    # points at a loopback fake. The SDK permits plain http only for loopback.
+    feishu_domain: str = "https://open.feishu.cn"
+    # Authorization allowlists — FAIL-CLOSED (§4.2). An empty open_id allowlist
+    # rejects EVERY sender and card operator; there is no "allow all". Get your
+    # own open_id per the config docs. chat_ids, when non-empty, additionally
+    # gates which group chats may drive the agent.
+    feishu_allowed_open_ids: list[str] = []
+    feishu_allowed_chat_ids: list[str] = []
 
     # If an AskUserQuestion goes unanswered for this long, the server
     # synthesizes an "act autonomously" reply so the session doesn't

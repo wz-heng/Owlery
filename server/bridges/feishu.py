@@ -1,0 +1,682 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import secrets
+import time
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
+
+from lark_channel import FeishuChannel, SecurityConfig, TransportConfig
+
+from .base import Bridge
+from .manager import BridgeManager
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from lark_channel.channel.types import CardActionEvent, InboundMessage
+
+logger = logging.getLogger(__name__)
+
+# Char budget per outbound card. Feishu's real limit is on the SERIALIZED card
+# (~30KB), not a character count (§4.3): multibyte text and JSON escaping both
+# eat into it — a single CJK char can cost 6 bytes once \uXXXX-escaped. 3500
+# chars stays comfortably under 30KB even in that worst case, so we never build
+# a card the API will reject. (This replaces Telegram's 4096-char magic number.)
+MAX_CARD_CHARS = 3500
+
+# Tool input / result previews are truncated before they ever reach a card.
+MAX_PREVIEW_CHARS = 3000
+
+# Cap on live card nonces held in memory. Each approval / session-list button
+# mints one; consuming or evicting bounds the map. FIFO eviction of the oldest
+# only ever drops a nonce for a card old enough that a late click is already
+# stale — the one-time-use guarantee for *recent* cards is untouched.
+MAX_LIVE_NONCES = 2000
+
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _is_loopback(domain: str) -> bool:
+    """True when `domain` points at loopback — the e2e fake-server case."""
+    host = (urlsplit(domain).hostname or "").lower()
+    return host in _LOOPBACK_HOSTS
+
+
+class FeishuConfigError(ValueError):
+    """Raised when Feishu bridge config is incomplete/inconsistent — surfaces
+    as a hard boot failure rather than a silent disable (§4.1/§4.2)."""
+
+
+def build_feishu_bridge(
+    manager: BridgeManager, settings: Any
+) -> "FeishuBridge | None":
+    """Construct a FeishuBridge from settings, or return None when the bridge
+    is simply not configured (neither credential set).
+
+    Fail-loud, not fail-silent (§4.1):
+    - exactly one of app_id / app_secret set → FeishuConfigError (boot fails);
+    - webhook transport without a verification token → FeishuConfigError, so a
+      webhook route is never registered bare (fail-closed, §4.2).
+    """
+    app_id = settings.feishu_app_id
+    app_secret = settings.feishu_app_secret
+    if not app_id and not app_secret:
+        return None
+    if bool(app_id) != bool(app_secret):
+        raise FeishuConfigError(
+            "Feishu bridge needs BOTH feishu_app_id and feishu_app_secret; "
+            "exactly one is set. Configure both, or neither to disable."
+        )
+
+    transport = settings.feishu_transport
+    if transport not in ("ws", "webhook"):
+        raise FeishuConfigError(
+            f"feishu_transport must be 'ws' or 'webhook', got {transport!r}."
+        )
+    if transport == "webhook" and not settings.feishu_verification_token:
+        raise FeishuConfigError(
+            "Feishu webhook transport requires feishu_verification_token — "
+            "without it the webhook route is not registered (fail-closed)."
+        )
+
+    return FeishuBridge(
+        manager,
+        app_id=app_id,
+        app_secret=app_secret,
+        transport=transport,
+        verification_token=settings.feishu_verification_token,
+        encrypt_key=settings.feishu_encrypt_key,
+        domain=settings.feishu_domain,
+        allowed_open_ids=settings.feishu_allowed_open_ids or None,
+        allowed_chat_ids=settings.feishu_allowed_chat_ids or None,
+    )
+
+
+class FeishuBridge(Bridge):
+    """Feishu (Lark) bot integration over the official ``lark-channel-sdk``.
+
+    Transport is the platform's own event-delivery choice (§3.1), mirrored as
+    config: ``ws`` (long connection — no public URL, the home-Mac case) or
+    ``webhook``. Both feed one inbound path; the webhook HTTP route is mounted
+    by ``server.main`` only in webhook mode (and only with a verification
+    token). Outbound resilience — retry, jittered backoff, Retry-After,
+    business-code classification, token refresh — is owned by the SDK by
+    design (feishu-bridge.md §3.2); this bridge configures those knobs and
+    surfaces failures, it does not reimplement them.
+    """
+
+    name = "feishu"
+
+    def __init__(
+        self,
+        manager: BridgeManager,
+        *,
+        app_id: str,
+        app_secret: str,
+        transport: str = "ws",
+        verification_token: str | None = None,
+        encrypt_key: str | None = None,
+        domain: str = "https://open.feishu.cn",
+        allowed_open_ids: list[str] | None = None,
+        allowed_chat_ids: list[str] | None = None,
+    ) -> None:
+        super().__init__(manager)
+        self.transport = transport
+        self._app_id = app_id
+        self._app_secret = app_secret
+        self._domain = domain.rstrip("/")
+        # Fail-closed allowlists (§4.2): an empty/None open_id set means the
+        # `_authorized` gate rejects EVERY sender and operator — there is no
+        # implicit allow-all. A None chat set means "no group restriction".
+        self.allowed_open_ids: frozenset[str] = frozenset(allowed_open_ids or ())
+        self.allowed_chat_ids: frozenset[str] | None = (
+            frozenset(allowed_chat_ids) if allowed_chat_ids else None
+        )
+
+        # Loopback (e2e fake server) must not have its outbound POSTs hijacked
+        # by an ambient http_proxy (Clash on a dev Mac). Mirror Owlery's own
+        # MCP-callback convention (server/harness/assembly.py): loopback target
+        # → trust_env_proxy=False. Real domains keep None (honor env proxy).
+        trust_env_proxy = False if _is_loopback(domain) else None
+
+        self._channel = FeishuChannel(
+            app_id=app_id,
+            app_secret=app_secret,
+            domain=domain,
+            verification_token=verification_token,
+            encrypt_key=encrypt_key,
+            transport=TransportConfig(kind=transport, trust_env_proxy=trust_env_proxy),
+            # SDK default is "compat"; strict turns on the full signature /
+            # timestamp / anti-replay posture the security P0 requires (§3.2).
+            security=SecurityConfig(mode="strict"),
+        )
+        self._channel.on("message", self._on_message)
+        self._channel.on("cardAction", self._on_card_action)
+
+        # nonce -> {"kind", "session_id", "tool_use_id"} for one-time card
+        # consumption (§4.2/§4.4). Insertion-ordered dict; FIFO-evicted at cap.
+        self._nonces: dict[str, dict[str, str]] = {}
+
+        # The FastAPI event loop, captured in start(). The SDK delivers inbound
+        # events on its OWN background loop (a separate thread), but the session
+        # machinery — spawning + reading the agent CLI subprocess, and resolving
+        # tool-approval futures — is bound to the main loop. We marshal manager
+        # calls back onto it (see _run_on_main); without this, an agent turn's
+        # subprocess I/O hangs cross-loop while command replies (loop-agnostic)
+        # still work — the exact split the e2e caught.
+        self._main_loop: asyncio.AbstractEventLoop | None = None
+        self._tick_stop = False  # set True in stop() to end _keepalive_tick
+
+        # Outbound goes through OUR OWN REST calls, NOT the SDK's channel.send.
+        # An agent turn spawns subprocesses (CLI + MCP) on the event loop, and
+        # that corrupts async socket I/O AND the loop's cross-thread wakeup for
+        # any work issued shortly after — the SDK's send hangs, a plain
+        # main-loop httpx send hangs, and even `asyncio.to_thread` never resumes
+        # (the sync work finishes in the thread but the await is never woken).
+        # So outbound uses a BLOCKING `requests` call made directly on the loop
+        # (_sync_request): blocking sockets are immune to the corruption; the
+        # loop stalls only for one fast round-trip. This is the outbound half of
+        # the SDK fallback the plan anticipated (§3.2).
+        self._token: str | None = None
+        self._token_exp: float = 0.0  # monotonic seconds
+        self._token_lock = asyncio.Lock()
+        self._loopback = _is_loopback(domain)
+
+    # --- lifecycle -----------------------------------------------------------
+
+    @property
+    def healthy(self) -> bool:
+        # Webhook mode has no live socket to be "unready"; it's healthy once
+        # constructed. WS mode reports the SDK's readiness flag.
+        if self.transport == "webhook":
+            return True
+        return bool(self._channel.is_ready)
+
+    async def start(self) -> None:
+        # Capture the main loop while we're on it — SDK event handlers run on a
+        # different (background) loop and must hop back here for turn work.
+        self._main_loop = asyncio.get_running_loop()
+        # Async lifecycle designed for exactly this (FastAPI lifespan): webhook
+        # mode returns ready without dialing, WS mode returns once connected.
+        await self._channel.start_background()
+        # Keep the SDK's background loop iterating (see _keepalive_tick) so
+        # cross-thread INBOUND scheduling stays prompt after subprocess churn.
+        self._tick_stop = False
+        self._channel.schedule(self._keepalive_tick())
+        logger.info("Feishu bridge started (transport=%s)", self.transport)
+
+    async def _keepalive_tick(self) -> None:
+        """Keep the SDK's background event loop iterating on a short timer.
+
+        The SDK delivers INBOUND events on a loop in a background thread, which
+        we feed cross-thread (the webhook dispatcher schedules onto it). This
+        backend spawns each agent turn's subprocesses (the ``claude`` CLI + MCP
+        servers) on the MAIN loop, and that churn can break the background
+        loop's self-pipe — the fd ``call_soon_threadsafe`` uses to wake it — so
+        a freshly-queued inbound event sits in the ready-list while the loop
+        ``select``s on a stale timeout. A tiny periodic sleep forces the loop to
+        iterate ~every 50ms off its own timer (unaffected by the broken pipe),
+        draining queued cross-thread work promptly. Cheap; ends on ``stop()``.
+        (Outbound doesn't rely on this — it runs via a thread pool, _api.)
+        """
+        while not self._tick_stop:
+            await asyncio.sleep(0.05)
+
+    async def _run_on_main(self, coro, *, wait: bool = True):
+        """Run `coro` on the main FastAPI loop, from whatever loop we're on.
+
+        SDK inbound handlers run on the SDK's background loop; session_manager
+        turn machinery (subprocess spawn/read, approval futures) is bound to the
+        main loop, so we hop there via run_coroutine_threadsafe.
+
+        ``wait=True`` awaits the result (card actions need it). ``wait=False``
+        is FIRE-AND-FORGET: it returns immediately after scheduling. That is
+        essential for an agent turn — the SDK serializes a chat's outbound
+        behind the *inbound* handler that produced it, so if ``_on_message``
+        blocked on the whole turn, the turn's own reply to that chat would
+        deadlock (the old Telegram bridge likewise dispatched updates as
+        detached tasks). Errors from a detached coro are logged, not lost.
+
+        Unit tests (and the already-on-main case) have no captured loop, so we
+        just await inline — keeping ``wait=False`` observable there too.
+        """
+        loop = self._main_loop
+        if loop is None or loop is asyncio.get_running_loop():
+            return await coro
+        fut = asyncio.run_coroutine_threadsafe(coro, loop)
+        if wait:
+            return await asyncio.wrap_future(fut)
+        fut.add_done_callback(self._log_detached_error)
+        return None
+
+    @staticmethod
+    def _log_detached_error(fut: "concurrent.futures.Future") -> None:
+        try:
+            exc = fut.exception()
+        except Exception:  # cancelled
+            return
+        if exc is not None:
+            logger.error("Feishu: detached inbound handler failed: %r", exc)
+
+    # --- outbound REST (our own client on the main loop) ---------------------
+
+    # Business codes meaning the tenant_access_token is invalid/expired — clear
+    # the cache and retry once (§4.3).
+    _TOKEN_INVALID_CODES = frozenset({99991663, 99991661, 99991664, 99991665})
+    # Codes worth backing off and retrying (rate limit / transient).
+    _RETRY_CODES = frozenset({99991400, 230020, 230098, 11232})
+
+    async def _get_token(self, *, force: bool = False) -> str | None:
+        """Cached tenant_access_token; fetch on miss/expiry. Feishu signals
+        token errors as HTTP 200 + a business ``code`` (§4.3)."""
+        if not force and self._token and time.monotonic() < self._token_exp:
+            return self._token
+        async with self._token_lock:
+            if not force and self._token and time.monotonic() < self._token_exp:
+                return self._token
+            try:
+                data = self._sync_request(
+                    "POST",
+                    f"{self._domain}/open-apis/auth/v3/tenant_access_token/internal",
+                    {"app_id": self._app_id, "app_secret": self._app_secret}, {},
+                )
+            except Exception:
+                logger.exception("Feishu: token fetch failed")
+                return None
+            if data.get("code") != 0 or not data.get("tenant_access_token"):
+                logger.error("Feishu: token fetch error: %s", data)
+                return None
+            self._token = data["tenant_access_token"]
+            # Refresh a few minutes early; expire is seconds.
+            self._token_exp = time.monotonic() + max(60, int(data.get("expire", 7200)) - 300)
+            return self._token
+
+    def _sync_request(self, method: str, url: str, body: dict, headers: dict) -> dict:
+        """One blocking Feishu REST call via ``requests``.
+
+        Called synchronously ON the event loop (not offloaded): ``requests``
+        uses blocking sockets, which are immune to the event-loop async-I/O
+        corruption an agent turn's subprocess spawning causes. The loop is
+        blocked only for this one localhost/Feishu round-trip (normally well
+        under a second); offloading via ``to_thread`` was tried and fails —
+        the loop's broken cross-thread wakeup never resumes the ``await``.
+        """
+        import requests
+        proxies = {"http": None, "https": None} if self._loopback else None
+        r = requests.request(method, url, json=body, headers=headers, timeout=30, proxies=proxies)
+        return r.json()
+
+    async def _api(
+        self, method: str, path: str, body: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Call the Feishu REST API with retry, token-refresh-on-invalid, and
+        jittered backoff on rate-limit/transient codes (§4.3). Returns the
+        parsed body on success, else None (logged)."""
+        for attempt in range(3):
+            token = await self._get_token(force=attempt > 0 and self._token is None)
+            if token is None:
+                return None
+            try:
+                data = self._sync_request(
+                    method, f"{self._domain}{path}", body,
+                    {"Authorization": f"Bearer {token}"},
+                )
+            except Exception:
+                logger.exception("Feishu: %s %s raised", method, path)
+                if attempt < 2:
+                    await asyncio.sleep(0.4 * (attempt + 1) + secrets.randbelow(200) / 1000)
+                    continue
+                return None
+            code = data.get("code", 0)
+            if code == 0:
+                return data
+            if code in self._TOKEN_INVALID_CODES and attempt < 2:
+                self._token = None  # force refresh next iteration
+                continue
+            if code in self._RETRY_CODES and attempt < 2:
+                await asyncio.sleep(0.4 * (attempt + 1) + secrets.randbelow(200) / 1000)
+                continue
+            logger.error("Feishu: %s %s failed code=%s msg=%s", method, path, code, data.get("msg"))
+            return None
+        return None
+
+    async def stop(self) -> None:
+        self._tick_stop = True
+        await self._channel.stop_background()
+
+    async def handle_webhook(
+        self, headers: dict[str, str], body: bytes
+    ) -> tuple[int, bytes]:
+        """Framework-agnostic webhook entry — the mounted FastAPI route hands
+        raw headers+body here. The SDK dispatcher does decrypt / verification
+        token / signature / challenge, then routes to our registered handlers.
+        """
+        return await self._channel.handle_webhook_request(headers, body)
+
+    # --- authorization -------------------------------------------------------
+
+    def _authorized(self, open_id: str | None) -> bool:
+        """Fail-closed sender/operator gate (§4.2): only explicitly-allowlisted
+        open_ids pass; an empty allowlist rejects everyone."""
+        return bool(open_id) and open_id in self.allowed_open_ids
+
+    # --- inbound -------------------------------------------------------------
+
+    async def _on_message(self, msg: "InboundMessage") -> None:
+        chat_id = msg.chat_id
+        sender = msg.sender_id
+
+        if not self._authorized(sender):
+            # Log the open_id so the operator can discover their own id (the
+            # bot stays silent to an unauthorized tenant member — no presence
+            # leak, no spam). This is the documented "how do I get on the
+            # allowlist" path: send once, read it from the server log.
+            logger.warning(
+                "Feishu: rejecting message from unauthorized open_id=%s (chat=%s)",
+                sender,
+                chat_id,
+            )
+            return
+
+        chat_type = msg.chat_type
+        if chat_type == "group":
+            # Groups: only act on messages that @-mention the bot, and honor an
+            # optional chat allowlist alongside the operator check (§4.2/§4.5).
+            if not msg.mentioned_bot:
+                return
+            if self.allowed_chat_ids is not None and chat_id not in self.allowed_chat_ids:
+                logger.warning("Feishu: group chat %s not in allowlist", chat_id)
+                return
+
+        # Topic/thread messages are explicitly unsupported in v1 (§4.5): sharing
+        # one sticky session across threads would silently cross wires.
+        if msg.conversation.thread_id:
+            await self._send_plain(
+                chat_id,
+                "Topic/thread replies aren't supported yet — message me in the "
+                "main chat instead.",
+            )
+            return
+
+        # Text (and rich-text 'post', which renders to markdown) only.
+        if msg.raw_content_type not in ("", "text", "post"):
+            await self._send_plain(
+                chat_id,
+                "I can only read text messages right now (no voice / image / "
+                "file).",
+            )
+            return
+
+        # body_text strips the bot's own @-mention (groups); fall back to the
+        # full content for p2p where there's no mention to strip.
+        text = (msg.body_text or msg.content_text or "").strip()
+        if not text:
+            await self._send_plain(chat_id, "Send me a message and I'll get to work.")
+            return
+
+        # Fire-and-forget on the main loop: this spawns/reads the agent CLI
+        # subprocess and can run for a while. Blocking _on_message on it would
+        # wedge the chat's outbound behind its own inbound (see _run_on_main).
+        await self._run_on_main(
+            self.manager.handle_incoming(self.name, chat_id, text, self),
+            wait=False,
+        )
+
+    # --- card actions (approval / session switch) ----------------------------
+
+    async def _on_card_action(self, event: "CardActionEvent") -> None:
+        """Handle an approve / deny / switch button tap.
+
+        Must return fast — Feishu expects the callback answered within ~3s and
+        will not retry a failure (§4.4). So we do only in-memory work inline
+        (authorize, consume nonce, settle the approval future / repoint the
+        sticky session) and push the cosmetic card update + any confirmation
+        onto a background task.
+        """
+        operator = getattr(event.operator, "open_id", "") or ""
+        chat_id = event.chat_id
+        value = event.action.value if event.action else None
+        if not isinstance(value, dict):
+            return
+
+        if not self._authorized(operator):
+            logger.warning(
+                "Feishu: rejecting card action from unauthorized operator=%s", operator
+            )
+            return
+
+        nonce = value.get("nonce")
+        record = self._consume_nonce(nonce) if isinstance(nonce, str) else None
+        if record is None:
+            # Missing / already-consumed nonce → a stale or duplicate tap. This
+            # is the one-time-use guarantee: a second click is inert (§4.2).
+            logger.info("Feishu: ignoring stale/duplicate card action (chat=%s)", chat_id)
+            return
+
+        action = value.get("action")
+        if action in ("approve", "deny"):
+            session_id = value.get("session_id") or record.get("session_id")
+            tool_use_id = value.get("tool_use_id") or record.get("tool_use_id")
+            if not session_id or not tool_use_id:
+                return
+            # On the main loop: resolves the pending-approval Future the turn
+            # (also on the main loop) is awaiting — cross-loop would be unsafe.
+            await self._run_on_main(
+                self.manager.handle_tool_decision(
+                    self.name, chat_id, session_id, tool_use_id, action == "approve"
+                )
+            )
+            asyncio.create_task(
+                self._settle_card(event.message_id, "Approved." if action == "approve" else "Denied.")
+            )
+        elif action == "switch":
+            session_id = value.get("session_id") or record.get("session_id")
+            if not session_id:
+                return
+            result = await self._run_on_main(
+                self.manager.switch_session(self.name, chat_id, session_id)
+            )
+            asyncio.create_task(self._settle_card(event.message_id, "Switched."))
+            asyncio.create_task(self._send_plain(chat_id, result))
+
+    async def _settle_card(self, message_id: str, note: str) -> None:
+        """Grey out a card after its button is acted on — a REST PATCH made
+        *after* the fast callback ack (§4.4)."""
+        await self._api(
+            "PATCH",
+            f"/open-apis/im/v1/messages/{message_id}",
+            {"content": json.dumps(self._note_card(note), ensure_ascii=False)},
+        )
+
+    # --- nonce lifecycle -----------------------------------------------------
+
+    def _mint_nonce(self, kind: str, **fields: str) -> str:
+        nonce = secrets.token_urlsafe(9)
+        if len(self._nonces) >= MAX_LIVE_NONCES:
+            # Drop the oldest — a card old enough that a click is already stale.
+            oldest = next(iter(self._nonces))
+            self._nonces.pop(oldest, None)
+        self._nonces[nonce] = {"kind": kind, **fields}
+        return nonce
+
+    def _consume_nonce(self, nonce: str | None) -> dict[str, str] | None:
+        if not nonce:
+            return None
+        return self._nonces.pop(nonce, None)
+
+    # --- outbound send methods ----------------------------------------------
+
+    async def _send(self, chat_id: str, message: dict[str, Any]) -> Any:
+        """POST one message to a chat via the Feishu REST API on the main loop.
+
+        ``message`` is ``{"card": <card json>}`` or ``{"text": <str>}``. Cards go
+        as ``msg_type="interactive"``, plain status lines as ``msg_type="text"``
+        (§4.3). ``content`` is the Feishu-required JSON *string*.
+        """
+        if "card" in message:
+            body = {"receive_id": chat_id, "msg_type": "interactive",
+                    "content": json.dumps(message["card"], ensure_ascii=False)}
+        else:
+            body = {"receive_id": chat_id, "msg_type": "text",
+                    "content": json.dumps({"text": message.get("text", "")}, ensure_ascii=False)}
+        return await self._api(
+            "POST", "/open-apis/im/v1/messages?receive_id_type=chat_id", body
+        )
+
+    async def _send_card_md(self, chat_id: str, markdown: str) -> None:
+        for chunk in self._split_chars(markdown, MAX_CARD_CHARS):
+            await self._send(chat_id, {"card": self._md_card(chunk)})
+
+    async def _send_plain(self, chat_id: str, text: str) -> None:
+        for chunk in self._split_chars(text, MAX_CARD_CHARS):
+            await self._send(chat_id, {"text": chunk})
+
+    async def send_text(self, chat_id: str, text: str) -> None:
+        # Agent prose + command replies render as interactive cards (lark_md),
+        # which is the only way to get markdown in Feishu (§4.3).
+        await self._send_card_md(chat_id, text)
+
+    async def send_tool_use(
+        self, chat_id: str, tool_name: str, tool_input: dict[str, Any]
+    ) -> None:
+        preview = ""
+        if isinstance(tool_input, dict):
+            if "command" in tool_input:
+                preview = f": `{str(tool_input['command'])[:80]}`"
+            elif "file_path" in tool_input:
+                preview = f": `{tool_input['file_path']}`"
+        await self._send_card_md(chat_id, f"**{tool_name}**{preview}")
+
+    async def send_tool_result(self, chat_id: str, output: str, is_error: bool) -> None:
+        prefix = "Error" if is_error else "Result"
+        truncated = output[:MAX_PREVIEW_CHARS]
+        if len(output) > MAX_PREVIEW_CHARS:
+            truncated += "\n…"
+        await self._send_card_md(chat_id, f"**{prefix}:**\n```\n{truncated}\n```")
+
+    async def send_tool_approval_request(
+        self,
+        chat_id: str,
+        session_id: str,
+        tool_use_id: str,
+        tool_name: str,
+        tool_input: dict[str, Any],
+    ) -> None:
+        input_str = json.dumps(tool_input, indent=2, ensure_ascii=False)
+        if len(input_str) > MAX_PREVIEW_CHARS:
+            input_str = input_str[:MAX_PREVIEW_CHARS] + "\n…"
+        nonce = self._mint_nonce(
+            "approval", session_id=session_id, tool_use_id=tool_use_id
+        )
+        # Every approval button carries FULL identity, not just tool_use_id, so
+        # a decision routes to the exact session that raised it even after a
+        # /switch moved the chat's sticky pointer (§4.4).
+        base_value = {"session_id": session_id, "tool_use_id": tool_use_id, "nonce": nonce}
+        card = {
+            "config": {"wide_screen_mode": True},
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": f"**{tool_name}** wants to run:\n```\n{input_str}\n```",
+                    },
+                },
+                {
+                    "tag": "action",
+                    "actions": [
+                        self._button("Allow", "primary", {"action": "approve", **base_value}),
+                        self._button("Deny", "danger", {"action": "deny", **base_value}),
+                    ],
+                },
+            ],
+        }
+        await self._send(chat_id, {"card": card})
+
+    async def send_session_list(
+        self,
+        chat_id: str,
+        sessions: list[dict[str, Any]],
+        note: str | None = None,
+    ) -> None:
+        buttons = []
+        for s in sessions:
+            check = " ✓" if s.get("current") else ""
+            label = f"{s['name']} [{s['status']}]{check}"
+            if len(label) > 60:
+                label = label[:57] + "…"
+            nonce = self._mint_nonce("switch", session_id=s["id"])
+            buttons.append(
+                self._button(
+                    label, "default", {"action": "switch", "session_id": s["id"], "nonce": nonce}
+                )
+            )
+        content = "Tap a session to switch:"
+        if note:
+            content += f"\n{note}"
+        card = {
+            "config": {"wide_screen_mode": True},
+            "elements": [
+                {"tag": "div", "text": {"tag": "lark_md", "content": content}},
+                {"tag": "action", "actions": buttons},
+            ],
+        }
+        await self._send(chat_id, {"card": card})
+
+    async def send_status(self, chat_id: str, status: str) -> None:
+        # "running"/"idle" are noise to a phone user; surface only meaningful
+        # status lines (e.g. the usage-limit resume notice) as plain text.
+        if status in ("running", "idle", "waiting_approval", ""):
+            return
+        await self._send_plain(chat_id, status)
+
+    async def send_result(self, chat_id: str, cost: float | None, is_error: bool) -> None:
+        cost_str = f" (${cost:.4f})" if cost is not None else ""
+        label = "Error" if is_error else "Done"
+        await self._send_plain(chat_id, f"{label}{cost_str}")
+
+    async def send_error(self, chat_id: str, message: str) -> None:
+        await self._send_plain(chat_id, f"Error: {message}")
+
+    # --- card helpers --------------------------------------------------------
+
+    @staticmethod
+    def _md_card(content: str) -> dict[str, Any]:
+        return {
+            "config": {"wide_screen_mode": True},
+            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": content}}],
+        }
+
+    @staticmethod
+    def _note_card(note: str) -> dict[str, Any]:
+        """A buttonless card used to replace an acted-on card (greys it out)."""
+        return {
+            "config": {"wide_screen_mode": True},
+            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": note}}],
+        }
+
+    @staticmethod
+    def _button(text: str, style: str, value: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": text},
+            "type": style,
+            "value": value,
+        }
+
+    @staticmethod
+    def _split_chars(text: str, max_len: int) -> list[str]:
+        if len(text) <= max_len:
+            return [text]
+        chunks: list[str] = []
+        while text:
+            if len(text) <= max_len:
+                chunks.append(text)
+                break
+            split_at = text.rfind("\n", 0, max_len)
+            if split_at == -1 or split_at < max_len // 2:
+                split_at = max_len
+            chunks.append(text[:split_at])
+            text = text[split_at:].lstrip("\n")
+        return chunks

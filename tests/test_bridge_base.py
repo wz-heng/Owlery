@@ -33,6 +33,7 @@ class MockBridge(Bridge):
     async def send_tool_approval_request(
         self,
         chat_id: str,
+        session_id: str,
         tool_use_id: str,
         tool_name: str,
         tool_input: dict[str, Any],
@@ -42,6 +43,7 @@ class MockBridge(Bridge):
                 "send_tool_approval_request",
                 {
                     "chat_id": chat_id,
+                    "session_id": session_id,
                     "tool_use_id": tool_use_id,
                     "tool_name": tool_name,
                     "tool_input": tool_input,
@@ -196,6 +198,7 @@ class TestBridgeHandleEvent:
             "c1",
             {
                 "type": "tool_approval_request",
+                "session_id": "s1",
                 "tool_use_id": "tu1",
                 "tool_name": "Write",
                 "tool_input": {"path": "/tmp/f"},
@@ -204,6 +207,7 @@ class TestBridgeHandleEvent:
         assert len(bridge.calls) == 1
         assert bridge.calls[0][0] == "send_tool_approval_request"
         assert bridge.calls[0][1]["tool_use_id"] == "tu1"
+        assert bridge.calls[0][1]["session_id"] == "s1"
 
     async def test_status(self):
         bridge = MockBridge()

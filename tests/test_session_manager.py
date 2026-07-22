@@ -1327,7 +1327,7 @@ async def test_archive_leaves_agent_schedules_and_nulls_bridge_sticky(manager):
         created_at="2026-01-01T00:00:00+00:00",
     )
     await manager.db.save_bridge_mapping(
-        platform="telegram", chat_id="42", agent_id=agent_id, session_id=old.id
+        platform="feishu", chat_id="42", agent_id=agent_id, session_id=old.id
     )
 
     new = await manager.archive_session(old.id)

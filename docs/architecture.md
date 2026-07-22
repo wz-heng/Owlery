@@ -2,7 +2,7 @@
 
 **Owlery is a personal agent platform.** It turns the local **Claude Code**
 and **Codex** CLIs into durable, always-on agents you reach from a browser,
-your phone, or Telegram. It drives the `claude` / `codex` CLIs directly via
+your phone, or Feishu. It drives the `claude` / `codex` CLIs directly via
 their stream-JSON protocols — there is **no `claude-code-sdk` dependency** and
 no extra per-token API cost beyond the CLI's own auth (your subscription or an
 attached API key).
@@ -15,13 +15,13 @@ the data model — this doc describes it conceptually rather than pasting SQL.
 ## System Overview
 
 ```
-        Phone / Browser / Telegram
-              │  REST + WebSocket  │  bot long-poll
+        Phone / Browser / Feishu
+              │  REST + WebSocket  │  long-conn / webhook
               ▼                    ▼
         ┌──────────────────────────────────┐
         │  FastAPI server (uvicorn) :8000   │  serves API + built SPA on one port
         │  ┌────────────┐  ┌──────────────┐ │
-        │  │ REST routers│  │ BridgeManager│ │  Telegram (extensible ABC)
+        │  │ REST routers│  │ BridgeManager│ │  Feishu (extensible ABC)
         │  │  + /ws      │  │              │ │
         │  └─────┬───────┘  └──────┬───────┘ │
         │        └──────┬──────────┘         │
@@ -164,13 +164,15 @@ resolution, and server-side token refresh-on-near-expiry behind a per-install lo
 ### Bridge system (`server/bridges/`)
 
 Messaging-platform integrations behind an extensible `Bridge` ABC. Today:
-Telegram (long-polling `getUpdates` — no webhook/SSL needed).
+Feishu (Lark), over the official `lark-channel-sdk` — long connection (no
+public URL/SSL needed, the home-Mac case) or webhook, chosen by config
+(`feishu-bridge.md`).
 
 | File | Purpose |
 |---|---|
 | `base.py` | `Bridge` ABC + `TextBuffer` (aggregates streamed `assistant_text`, flushes on size/time) + the `handle_event` dispatcher and `QUIET_SUPPRESSED_EVENTS` policy. |
-| `manager.py` | `BridgeManager` — routes inbound messages and slash commands, binds each chat to an **agent** with a sticky session + per-chat `verbose` flag, and fans SessionManager broadcasts back to the right chat. |
-| `telegram.py` | `TelegramBridge` — long-poll loop, Markdown send + 4096-char splitting, inline keyboards (tool approval + the `/sessions` switch picker), rate-limit retry, `allowed_chat_ids` access control. |
+| `manager.py` | `BridgeManager` — routes inbound messages and slash commands, binds each chat to an **agent** with a sticky session + per-chat `verbose` flag, fans SessionManager broadcasts back to the right chat, and validates card-button tool decisions against the chat's bound agent (§4.4). |
+| `feishu.py` | `FeishuBridge` — SDK for **inbound** (strict-security dispatcher, ws/webhook transport, event routing); **outbound** is our own REST layer — a blocking `requests` call made directly on the loop (token cache/refresh + code-based backoff) — because agent-turn subprocess spawning corrupts the event loop's async socket I/O *and* its cross-thread wakeup, hanging the SDK's send, a main-loop httpx send, and even `asyncio.to_thread`; a blocking socket is immune and stalls the loop only for one fast round-trip (feishu-bridge.md §4.3). Fail-closed open_id allowlist; interactive-card send (`lark_md`); card actions (approval / `/sessions` switch) whose button values carry full identity + a one-time nonce. |
 
 A chat binds to an agent on first contact (Default Agent) with a sticky session
 that rolls as threads come and go. **Quiet by default**: only the agent's
@@ -182,7 +184,7 @@ hidden. `/verbose` and `/quiet` toggle this per chat (persisted in
 **Slash commands:** `/new [name]`, `/agent <name|id>`, `/sessions` (tappable
 switch buttons), `/switch <id>`, `/current`, `/quiet`, `/verbose`, `/showme`
 (intercepted with a "browser-only" notice — the viewer modal can't render in
-Telegram), `/rewind` / `/fork` / `/research` (intercepted with a "browser-only"
+a chat app), `/rewind` / `/fork` / `/research` (intercepted with a "browser-only"
 notice — these require the browser UI), `/help`.
 
 ### Frontend (`web/src/`)
@@ -219,15 +221,15 @@ ws.py receives → asyncio.create_task(stream)
     → broadcast status: idle
 ```
 
-### Sending a message (Telegram, quiet by default)
+### Sending a message (Feishu, quiet by default)
 
 ```
-TelegramBridge poll → _handle_update → BridgeManager.handle_incoming
+SDK event (ws / webhook) → FeishuBridge._on_message → BridgeManager.handle_incoming
   → slash command? handle it (/new, /sessions buttons, /switch, /quiet, …)
   → else: ensure chat is bound to an agent + sticky session, then start_message
 SessionManager broadcasts events → BridgeManager._on_broadcast
   → drop QUIET_SUPPRESSED_EVENTS unless the chat is /verbose
-  → bridge.handle_event → TextBuffer-batched replies, errors, approval prompts
+  → bridge.handle_event → TextBuffer-batched card replies, errors, approval prompts
 ```
 
 ### `/showme` — the in-app file viewer (browser only)
@@ -239,15 +241,15 @@ reference to `/api/sessions/{id}/showme/resolve`, and the resolver
 harness) that sees the last few messages of the conversation, returning JSON
 with either `{"path"}` or `{"message"}`. On `path`, the client opens
 `FileViewerDialog` directly — no model turn appears in the chat, no MCP tool
-fires. Telegram intercepts `/showme` with a "browser-only" notice (the modal
-can't render there). The agent is **never** instructed to open the viewer on
+fires. The Feishu bridge intercepts `/showme` with a "browser-only" notice (the
+modal can't render there). The agent is **never** instructed to open the viewer on
 its own: it can't tell whether anyone is at the screen.
 
 ### Questions & tool approval
 
 The `mcp__ask__user` MCP tool POSTs questions to
 `/api/sessions/{id}/questions`; SessionManager broadcasts a `question_request`
-(Web UI renders `QuestionPrompt`; Telegram surfaces it) and long-polls for the
+(Web UI renders `QuestionPrompt`; the Feishu bridge surfaces it) and long-polls for the
 answer, which is delivered back to the model. An unanswered question
 auto-answers after `ask_user_question_timeout_seconds` so headless
 bridge/scheduled sessions never wedge. (Native CLI tool-approval also exists via
@@ -441,7 +443,9 @@ provisioned on agent create, kept on archive, removed on hard delete.
 | `legacy_home_dir` | `~/.octopus` | Pre-rename home, migrated on first boot. `""` disables (see below). |
 | `attachments_dir` / `large_prompts_dir` / `agents_dir` / `codex_home_dir` | under `home_dir` | Upload cache · large-prompt spill · agent memory roots · per-credential Codex auth. |
 | `enable_tunnel` | `false` | Start a Cloudflare Tunnel. |
-| `telegram_bot_token` / `telegram_allowed_chat_ids` / `telegram_api_base_url` | — | Telegram bridge (enabled when token set). |
+| `feishu_app_id` / `feishu_app_secret` | — | Feishu bridge (mounts only when BOTH set; exactly one is a boot error). |
+| `feishu_transport` / `feishu_verification_token` / `feishu_encrypt_key` / `feishu_domain` | `ws` / — / — / `open.feishu.cn` | Transport (`ws` long-conn or `webhook`); webhook needs a verification token (else no route); domain (Lark = `open.larksuite.com`). |
+| `feishu_allowed_open_ids` / `feishu_allowed_chat_ids` | — | Authorization allowlists — **fail-closed**: an empty open_id list rejects every sender and card operator. |
 | `ask_user_question_timeout_seconds` | `1800` | Auto-answer an unanswered question (so headless sessions don't wedge). |
 | `public_base_url` | computed | Stable public host for connector OAuth redirect URIs (tunnel). |
 | `gmail_/github_oauth_client_id`/`_secret` | — | Optional env fallback for connector OAuth clients (in-app config takes precedence). |
@@ -510,7 +514,7 @@ do, since they boot the real lifespan against the developer's real `$HOME`).
 - **`ask` MCP over permission prompts.** Structured questions are an MCP tool
   with a UI form + long-poll + auto-answer timeout — robust for headless
   bridge/scheduled sessions where no human may be watching.
-- **Quiet bridges.** Telegram chats see only the agent's replies by default;
+- **Quiet bridges.** Feishu chats see only the agent's replies by default;
   tool chatter is opt-in via `/verbose` (persisted per chat).
 - **Session branching — two commands.** `/rewind` forks a
   conversation to any prior user message; the harness layer owns the per-backend
@@ -558,9 +562,10 @@ cd web && bun run build && cd ..    # build the SPA (once)
 owlery serve                       # API + UI on :8000
 owlery serve --tunnel              # + public HTTPS via Cloudflare Tunnel
 
-# With the Telegram bridge — add to .env, then `owlery serve`:
-#   OWLERY_TELEGRAM_BOT_TOKEN=...
-#   OWLERY_TELEGRAM_ALLOWED_CHAT_IDS=123,456     # optional access control
+# With the Feishu bridge — add to .env, then `owlery serve`:
+#   OWLERY_FEISHU_APP_ID=cli_...
+#   OWLERY_FEISHU_APP_SECRET=...
+#   OWLERY_FEISHU_ALLOWED_OPEN_IDS=["ou_yourself"]   # fail-closed: empty rejects all
 
 # Development (hot reload)
 .venv/bin/uvicorn server.main:app --host 0.0.0.0 --port 8000 --reload   # backend

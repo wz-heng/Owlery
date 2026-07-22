@@ -506,6 +506,19 @@ class Database:
         except Exception:
             pass
 
+        # Feishu replaced Telegram (feishu-bridge.md §5). Purge leftover
+        # telegram chat bindings: the platform is gone, so these rows can never
+        # match a live bridge again — dead data that would only confuse
+        # broadcast routing. Explicit commit so the purge persists regardless
+        # of ambient transaction state; idempotent (a DB with none is a no-op).
+        try:
+            await self._conn.execute(
+                "DELETE FROM bridge_mappings WHERE platform = 'telegram'"
+            )
+            await self._conn.commit()
+        except Exception:
+            pass
+
         # Agent-to-agent collaboration (agent-collaboration.md §4.1). A
         # delegation child session points at the parent session via
         # parent_session_id (SET NULL on parent delete — orphaning beats

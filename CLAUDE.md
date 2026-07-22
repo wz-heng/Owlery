@@ -68,13 +68,16 @@ model is canned.
   `test_backend_codex_real` / `test_codex_login_real`; **both** for
   `test_agent_memory_real` and the claude→codex delegation case. They
   *error* rather than skip if a binary is missing — see Conventions.
-- Telegram bridge e2e has its own config: `bun run test:e2e:bridge` (6). It
-  is **currently red on a dev box** and predates this suite's isolation work:
-  its config pins neither `OWLERY_AUTH_TOKEN` nor a private port, while the
-  spec hardcodes `changeme` and `localhost:8000`. So it 401s against any
-  backend whose token differs, and with `reuseExistingServer: true` it will
-  happily adopt a *running `owlery serve`* on :8000 instead of booting its
-  own. Fix the harness before trusting a red run here.
+- Feishu bridge e2e has its own config: `bun run test:e2e:bridge` (6,
+  `playwright.bridge.config.ts`). It carries the SAME isolation guardrails as
+  the main suite — its own temp DB/home/agents dirs, the fake `claude` + codex
+  tripwire on PATH, `reuseExistingServer: false`, a private port (8766) with
+  its own `OWLERY_AUTH_TOKEN`, and `OWLERY_LEGACY_HOME_DIR=""`. Transport is
+  webhook (§3.1): the spec POSTs Feishu-shaped events at `/feishu/webhook` and
+  asserts outbound via the fake Feishu server (`fake-feishu-server.mjs`). The
+  bridge sets `trust_env_proxy=False` for its loopback domain and the config
+  also exports `no_proxy` — so an ambient Clash proxy can't swallow the
+  outbound (feishu-bridge.md §4.3).
 
 Two traps. The `.owlery-real-cli` marker is a property of a *directory* and
 all specs share one backend, so never drop it in a shared dir (`/tmp`) —
@@ -106,8 +109,9 @@ What each suite covers; detail lives in the linked plan docs.
 **Backend unit** (pytest, 967) — config, models, session manager, REST API,
 DB persistence (credential split, refresh-error codes), JSONL parser/writer,
 CLI handoff/pull, import API, schedules CRUD + scheduler (interval + cron),
-NL `/schedule` parsing, telegram bridge (per-chat verbosity, `/sessions`
-picker), tunnel, OAuth registry, agents • harness layer
+NL `/schedule` parsing, Feishu bridge (fail-closed allowlist, card-value
+validation, one-time nonce, per-chat verbosity, `/sessions` picker), tunnel,
+OAuth registry, agents • harness layer
 (`harness-layer.md`) • Codex in-app login (`codex-backend.md`) • connectors
 (`connectors.md`) • agent memory (`memory.md`) • delegation
 (`agent-collaboration.md`) • usage tracking (`usage-tracking.md`) •
@@ -124,7 +128,7 @@ layout, CLI handoff/pull + roundtrip, schedules, archived sessions, message
 queue + Esc interrupt, virtualized chat, OAuth + Codex device-code sign-in,
 credential override, agents rail/settings, connectors, `/research`,
 `/rewind` + deferred fork, usage page, cross-turn `mcp__bg__run` + spill
-pointer, `/showme`. Plus 6 telegram-bridge tests under their own config.
+pointer, `/showme`. Plus 6 Feishu-bridge tests under their own config.
 
 ## Project Structure
 
@@ -148,8 +152,8 @@ pointer, `/showme`. Plus 6 telegram-bridge tests under their own config.
 - `server/connectors/` + `connector_manager.py` + `mcp_servers/connectors/` —
   connector framework, business logic, per-kind stdio MCP servers
   (`connectors.md`)
-- `server/bridges/` — messaging platforms (telegram); a chat binds to an agent
-  with a sticky session and a per-chat `verbose` flag
+- `server/bridges/` — messaging platforms (Feishu, `feishu-bridge.md`); a chat
+  binds to an agent with a sticky session and a per-chat `verbose` flag
 - `server/legacy_rename.py` — one-shot Octopus→Owlery first-boot migration;
   idempotent, marker-gated, disabled by `OWLERY_LEGACY_HOME_DIR=""`, which
   tests and e2e set since they boot the real lifespan against the real `$HOME`

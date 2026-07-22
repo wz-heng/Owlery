@@ -22,9 +22,9 @@ QUIET_SUPPRESSED_EVENTS = frozenset(
 class TextBuffer:
     """Aggregates text chunks and flushes based on size or time.
 
-    Claude sends many small assistant_text events. Platforms like Telegram
-    have message length limits (4096 chars) and rate limits, so we buffer
-    and flush periodically.
+    Claude sends many small assistant_text events. Chat platforms cap message
+    size and rate-limit sends, so we buffer chunks and flush periodically —
+    on a size threshold or after a short idle delay.
     """
 
     max_size: int
@@ -76,15 +76,15 @@ class Bridge(ABC):
     """Abstract base for messaging platform integrations.
 
     Bridges run in-process inside the FastAPI event loop and interact
-    with SessionManager directly. Each platform (Telegram, Discord, etc.)
-    implements this interface.
+    with SessionManager directly. Each messaging platform (Feishu, and any
+    future one) implements this interface.
 
     The base class handles:
     - Event dispatching (handle_event routes to abstract send methods)
     - Text buffering (aggregates assistant_text, flushes before other events)
     """
 
-    name: str  # Platform identifier, e.g. "telegram"
+    name: str  # Platform identifier, e.g. "feishu"
 
     def __init__(self, manager: Any) -> None:  # Any to avoid circular import
         self.manager = manager
@@ -125,11 +125,18 @@ class Bridge(ABC):
     async def send_tool_approval_request(
         self,
         chat_id: str,
+        session_id: str,
         tool_use_id: str,
         tool_name: str,
         tool_input: dict[str, Any],
     ) -> None:
-        """Send a tool approval request with approve/deny buttons."""
+        """Send a tool approval request with approve/deny buttons.
+
+        `session_id` is the session that raised the approval; platforms embed
+        it in the button payload so a decision routes to the *right* session
+        even after the chat's sticky pointer has moved on (`/switch`) — see
+        BridgeManager.handle_tool_decision and feishu-bridge.md §4.4.
+        """
 
     @abstractmethod
     async def send_tool_use(
@@ -167,7 +174,7 @@ class Bridge(ABC):
 
         Each item is ``{id, name, status, current}``. The base implementation
         is plain text + a ``/switch <id>`` hint; platforms with rich UI (e.g.
-        Telegram inline buttons) override this. ``note`` is an optional
+        Feishu interactive-card buttons) override this. ``note`` is an optional
         trailing line, e.g. a truncation notice. Callers guarantee a non-empty
         list.
         """
@@ -185,7 +192,9 @@ class Bridge(ABC):
 
     @property
     def max_message_length(self) -> int:
-        """Override per platform. Default 4096 (Telegram)."""
+        """Buffer flush threshold, in characters. Override per platform to
+        match its real send limit (Feishu's is a serialized-bytes cap, so its
+        bridge derives a character budget — see FeishuBridge)."""
         return 4096
 
     @property
@@ -241,6 +250,7 @@ class Bridge(ABC):
                 await self._flush_buffer(chat_id)
                 await self.send_tool_approval_request(
                     chat_id,
+                    event["session_id"],
                     event["tool_use_id"],
                     event["tool_name"],
                     event.get("tool_input", {}),

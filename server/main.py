@@ -8,7 +8,8 @@ from pathlib import Path
 os.environ.pop("CLAUDECODE", None)
 
 import uvicorn
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request, Response
+from fastapi.routing import APIRoute
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -55,16 +56,39 @@ async def lifespan(app: FastAPI):
     await bridge_manager.initialize()
     await bridge_manager.register_broadcast()
 
-    if settings.telegram_bot_token:
-        from .bridges.telegram import TelegramBridge
+    from .bridges.feishu import build_feishu_bridge
 
-        telegram = TelegramBridge(
-            bridge_manager,
-            token=settings.telegram_bot_token,
-            allowed_chat_ids=settings.telegram_allowed_chat_ids or None,
-            api_base_url=settings.telegram_api_base_url,
-        )
-        bridge_manager.register_bridge(telegram)
+    # Fail-loud on half-config (one credential set), fail-closed on webhook
+    # without a verification token — both raise here and abort boot (§4.1/4.2).
+    feishu = build_feishu_bridge(bridge_manager, settings)
+    if feishu is not None:
+        bridge_manager.register_bridge(feishu)
+        if feishu.transport == "webhook":
+            # Only mounted in webhook mode WITH a verification token (guaranteed
+            # by build_feishu_bridge). In ws mode, or unconfigured, this route
+            # is never added — a bare POST falls through to the SPA catch-all
+            # and is rejected without ever reaching bridge code (§4.2).
+            async def feishu_webhook(request: Request) -> Response:
+                body = await request.body()
+                status, content = await feishu.handle_webhook(
+                    dict(request.headers), body
+                )
+                return Response(
+                    content=content,
+                    status_code=status,
+                    media_type="application/json",
+                )
+
+            # INSERT at the front of the router, not append: the SPA
+            # `StaticFiles` catch-all is mounted at "/" at import time, and it
+            # matches every path (returning 405 for a POST). Appending would
+            # let that mount shadow this route; inserting ahead of it makes
+            # POST /feishu/webhook resolve here first.
+            app.router.routes.insert(
+                0,
+                APIRoute("/feishu/webhook", feishu_webhook, methods=["POST"]),
+            )
+            logger.info("Feishu webhook route mounted at /feishu/webhook")
 
     await bridge_manager.start_all()
     app.state.bridge_manager = bridge_manager

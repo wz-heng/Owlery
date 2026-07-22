@@ -35,12 +35,12 @@ class TestBridgeMappings:
     async def test_save_and_load(self, db: Database):
         agent_id = await _agent_id(db)
         await _create_session(db, "sess1", agent_id)
-        await db.save_bridge_mapping("telegram", "12345", agent_id, "sess1")
+        await db.save_bridge_mapping("feishu", "12345", agent_id, "sess1")
 
         rows = await db.load_bridge_mappings()
         assert len(rows) == 1
         assert rows[0] == {
-            "platform": "telegram",
+            "platform": "feishu",
             "chat_id": "12345",
             "agent_id": agent_id,
             "session_id": "sess1",
@@ -49,7 +49,7 @@ class TestBridgeMappings:
 
     async def test_bind_without_sticky_session(self, db: Database):
         agent_id = await _agent_id(db)
-        await db.save_bridge_mapping("telegram", "12345", agent_id)
+        await db.save_bridge_mapping("feishu", "12345", agent_id)
         rows = await db.load_bridge_mappings()
         assert rows[0]["agent_id"] == agent_id
         assert rows[0]["session_id"] is None
@@ -59,8 +59,8 @@ class TestBridgeMappings:
         await _create_session(db, "sess1", agent_id)
         await _create_session(db, "sess2", agent_id)
 
-        await db.save_bridge_mapping("telegram", "12345", agent_id, "sess1")
-        await db.save_bridge_mapping("telegram", "12345", agent_id, "sess2")
+        await db.save_bridge_mapping("feishu", "12345", agent_id, "sess1")
+        await db.save_bridge_mapping("feishu", "12345", agent_id, "sess2")
 
         rows = await db.load_bridge_mappings()
         assert len(rows) == 1
@@ -69,22 +69,22 @@ class TestBridgeMappings:
     async def test_set_sticky_session(self, db: Database):
         agent_id = await _agent_id(db)
         await _create_session(db, "sess1", agent_id)
-        await db.save_bridge_mapping("telegram", "12345", agent_id)
-        await db.set_bridge_sticky_session("telegram", "12345", "sess1")
+        await db.save_bridge_mapping("feishu", "12345", agent_id)
+        await db.set_bridge_sticky_session("feishu", "12345", "sess1")
         rows = await db.load_bridge_mappings()
         assert rows[0]["session_id"] == "sess1"
 
     async def test_delete_mapping(self, db: Database):
         agent_id = await _agent_id(db)
         await _create_session(db, "sess1", agent_id)
-        await db.save_bridge_mapping("telegram", "12345", agent_id, "sess1")
-        await db.delete_bridge_mapping("telegram", "12345")
+        await db.save_bridge_mapping("feishu", "12345", agent_id, "sess1")
+        await db.delete_bridge_mapping("feishu", "12345")
 
         rows = await db.load_bridge_mappings()
         assert len(rows) == 0
 
     async def test_delete_nonexistent_is_noop(self, db: Database):
-        await db.delete_bridge_mapping("telegram", "99999")
+        await db.delete_bridge_mapping("feishu", "99999")
         rows = await db.load_bridge_mappings()
         assert len(rows) == 0
 
@@ -94,7 +94,7 @@ class TestBridgeMappings:
         thread under the same agent."""
         agent_id = await _agent_id(db)
         await _create_session(db, "sess1", agent_id)
-        await db.save_bridge_mapping("telegram", "12345", agent_id, "sess1")
+        await db.save_bridge_mapping("feishu", "12345", agent_id, "sess1")
 
         await db.delete_session("sess1")
 
@@ -106,7 +106,7 @@ class TestBridgeMappings:
     async def test_clear_bridge_sticky_for_session(self, db: Database):
         agent_id = await _agent_id(db)
         await _create_session(db, "sess1", agent_id)
-        await db.save_bridge_mapping("telegram", "111", agent_id, "sess1")
+        await db.save_bridge_mapping("feishu", "111", agent_id, "sess1")
         await db.save_bridge_mapping("discord", "222", agent_id, "sess1")
 
         nulled = await db.clear_bridge_sticky_for_session("sess1")
@@ -121,7 +121,7 @@ class TestBridgeMappings:
 
         now = datetime.now(timezone.utc).isoformat()
         await db.save_agent(agent_id="ag1", name="Temp", created_at=now, updated_at=now)
-        await db.save_bridge_mapping("telegram", "12345", "ag1")
+        await db.save_bridge_mapping("feishu", "12345", "ag1")
         await db.save_bridge_mapping("discord", "67890", "ag1")
 
         await db.delete_agent("ag1")
@@ -134,9 +134,9 @@ class TestBridgeMappings:
         await _create_session(db, "sess1", agent_id)
         await _create_session(db, "sess2", agent_id)
 
-        await db.save_bridge_mapping("telegram", "111", agent_id, "sess1")
+        await db.save_bridge_mapping("feishu", "111", agent_id, "sess1")
         await db.save_bridge_mapping("discord", "222", agent_id, "sess2")
-        await db.save_bridge_mapping("telegram", "333", agent_id, "sess2")
+        await db.save_bridge_mapping("feishu", "333", agent_id, "sess2")
 
         rows = await db.load_bridge_mappings()
         assert len(rows) == 3
@@ -149,17 +149,17 @@ class TestBridgeMappings:
 class TestBridgeVerbose:
     async def test_defaults_to_quiet(self, db: Database):
         agent_id = await _agent_id(db)
-        await db.save_bridge_mapping("telegram", "12345", agent_id)
+        await db.save_bridge_mapping("feishu", "12345", agent_id)
         rows = await db.load_bridge_mappings()
         assert rows[0]["verbose"] is False
 
     async def test_set_and_load(self, db: Database):
         agent_id = await _agent_id(db)
-        await db.save_bridge_mapping("telegram", "12345", agent_id)
-        await db.set_bridge_verbose("telegram", "12345", True)
+        await db.save_bridge_mapping("feishu", "12345", agent_id)
+        await db.set_bridge_verbose("feishu", "12345", True)
         rows = await db.load_bridge_mappings()
         assert rows[0]["verbose"] is True
-        await db.set_bridge_verbose("telegram", "12345", False)
+        await db.set_bridge_verbose("feishu", "12345", False)
         rows = await db.load_bridge_mappings()
         assert rows[0]["verbose"] is False
 
@@ -170,11 +170,11 @@ class TestBridgeVerbose:
         now = datetime.now(timezone.utc).isoformat()
         agent_id = await _agent_id(db)
         await db.save_agent(agent_id="ag2", name="Helper", created_at=now, updated_at=now)
-        await db.save_bridge_mapping("telegram", "12345", agent_id)
-        await db.set_bridge_verbose("telegram", "12345", True)
+        await db.save_bridge_mapping("feishu", "12345", agent_id)
+        await db.set_bridge_verbose("feishu", "12345", True)
 
         # Rebind to a different agent, clearing the sticky session.
-        await db.save_bridge_mapping("telegram", "12345", "ag2", None)
+        await db.save_bridge_mapping("feishu", "12345", "ag2", None)
 
         rows = await db.load_bridge_mappings()
         assert rows[0]["agent_id"] == "ag2"

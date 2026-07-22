@@ -1449,7 +1449,7 @@ async def test_bridge_manager_skips_delegation_session(mgr, db, monkeypatch):
     # Hand-register a binding to that user session id.
     from server.bridges.manager import ChatBinding
 
-    bm._mappings["telegram:42"] = ChatBinding(
+    bm._mappings["feishu:42"] = ChatBinding(
         agent_id=vera["id"], session_id=vera_user_sess.id, verbose=False
     )
 
@@ -1469,7 +1469,7 @@ async def test_bridge_manager_skips_delegation_session(mgr, db, monkeypatch):
         async def handle_event(self, chat_id, msg):
             leaked.append((chat_id, msg))
 
-    bm._bridges["telegram"] = FakeBridge()
+    bm._bridges["feishu"] = FakeBridge()
 
     await bm._on_broadcast({
         "type": "assistant_text", "session_id": delegation_child.id,

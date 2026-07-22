@@ -58,8 +58,8 @@ class BridgeManager:
     - Manages bridge lifecycle (start/stop)
     """
 
-    # Most-recent sessions to render as tappable buttons in /sessions. Telegram
-    # caps inline keyboards; older sessions stay reachable via /switch <id>.
+    # Most-recent sessions to render as tappable buttons in /sessions. Card
+    # button lists are bounded; older sessions stay reachable via /switch <id>.
     SESSION_LIST_LIMIT = 30
 
     def __init__(self, session_mgr: SessionManager, db: Database) -> None:
@@ -217,18 +217,40 @@ class BridgeManager:
         self,
         platform: str,
         chat_id: str,
+        session_id: str,
         tool_use_id: str,
         approved: bool,
         reason: str = "",
-    ) -> None:
-        session_id = self.get_session_id(platform, chat_id)
-        if not session_id:
-            return
+    ) -> bool:
+        """Apply a tool-approval decision from a card button. Returns True iff
+        it was applied to a live pending approval.
+
+        The card's button value carries the ``session_id`` the approval was
+        raised for (feishu-bridge.md §4.4) rather than us re-reading the chat's
+        sticky pointer. That closes a real bug: if the user `/switch`ed after
+        the card was sent, the sticky pointer now names a *different* session,
+        and approving there would settle the wrong tool call and wedge the
+        original session forever. Guards (all must hold, else no-op → False):
+
+        - the chat is bound, and ``session_id`` belongs to the bound agent
+          (a card for another agent's session is not honored here);
+        - the tool_use is still awaiting approval — enforced by SessionManager,
+          which returns False for an unknown or already-settled approval.
+
+        Operator authorization (allowlist) and the card's one-time nonce are
+        enforced by the bridge *before* it calls here — those are platform
+        card mechanics, not session routing.
+        """
+        binding = self._binding(platform, chat_id)
+        if binding is None:
+            return False
+        session = self.session_mgr.get_session(session_id)
+        if session is None or session.agent_id != binding.agent_id:
+            return False
 
         if approved:
-            self.session_mgr.approve_tool(session_id, tool_use_id)
-        else:
-            self.session_mgr.deny_tool(session_id, tool_use_id, reason)
+            return await self.session_mgr.approve_tool(session_id, tool_use_id)
+        return await self.session_mgr.deny_tool(session_id, tool_use_id, reason)
 
     # --- Broadcast handler ---
 
@@ -401,12 +423,12 @@ class BridgeManager:
 
         elif command == "/showme":
             # The viewer modal lives only in the browser; intercept here so a
-            # Telegram user doesn't get a baffling "Unknown command" from the
+            # chat user doesn't get a baffling "Unknown command" from the
             # CLI (which eats `/<word>` messages before the model sees them).
             await bridge.send_text(
                 chat_id,
                 "/showme only works in the browser — the in-app file viewer "
-                "can't render in Telegram. Open Owlery in a web session to "
+                "can't render in a chat app. Open Owlery in a web session to "
                 "use it.",
             )
 

@@ -37,7 +37,9 @@ class MockBridge(Bridge):
     async def send_text(self, chat_id: str, text: str) -> None:
         self.sent.append(("send_text", chat_id, {"text": text}))
 
-    async def send_tool_approval_request(self, chat_id, tool_use_id, tool_name, tool_input):
+    async def send_tool_approval_request(
+        self, chat_id, session_id, tool_use_id, tool_name, tool_input
+    ):
         self.sent.append(("send_tool_approval_request", chat_id, {}))
 
     async def send_tool_use(self, chat_id, tool_name, tool_input):
