@@ -284,6 +284,17 @@ class UpdateScheduleRequest(BaseModel):
 
 # Agents — the durable definition of an assistant (agent-refactor.md §4).
 
+# Every built-in in-app MCP server, in the order the harness renders them.
+# The default an agent is born with when a create omits `mcp_servers`; must
+# stay in sync with the `agents.mcp_servers` column default in database.py and
+# with the frontend's BUILTIN_MCP list (web/src/components/AgentSettings.tsx).
+# Historically this default lagged behind the column — it stayed `["ask",
+# "bg"]` after `ask_agent` (delegation — agent-collaboration.md §5.1) and
+# `research` (native-deep-research.md §7) shipped, so every API-created agent
+# was born without a delegation channel and only the startup backfill (which
+# touches pre-existing rows) could rescue it, on the next restart.
+DEFAULT_MCP_SERVERS = ["ask", "bg", "ask_agent", "research"]
+
 
 class AgentRead(BaseModel):
     # use_enum_values keeps `backend` as the plain string ("claude-code")
@@ -320,7 +331,7 @@ class AgentCreate(BaseModel):
     model: str | None = None
     credential_id: str | None = None
     backend: BackendKind = BackendKind.claude_code
-    mcp_servers: list[str] = ["ask", "bg"]
+    mcp_servers: list[str] = Field(default_factory=lambda: list(DEFAULT_MCP_SERVERS))
     tool_allow: str = ""
     tool_deny: str = ""
 

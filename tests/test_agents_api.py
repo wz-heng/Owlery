@@ -157,6 +157,19 @@ async def test_create_and_get_agent(client):
 
 
 @pytest.mark.asyncio
+async def test_create_agent_defaults_to_all_builtin_mcp_servers(client):
+    """A create that omits `mcp_servers` must enrol the agent in the FULL
+    built-in set — including `ask_agent` (delegation) and `research`. The
+    stale `["ask", "bg"]` default silently born every new agent without a
+    delegation channel; the startup backfill only rescues pre-existing rows,
+    so a freshly created agent stayed broken until the next server restart.
+    This default is the single source of truth alongside the DB column
+    default in database.py (keep the two in sync)."""
+    agent = await _create_agent(client, name="Fresh")
+    assert agent["mcp_servers"] == ["ask", "bg", "ask_agent", "research"]
+
+
+@pytest.mark.asyncio
 async def test_get_unknown_agent_404(client):
     resp = await client.get("/api/agents/nope", headers=HEADERS)
     assert resp.status_code == 404

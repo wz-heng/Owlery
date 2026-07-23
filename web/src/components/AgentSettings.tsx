@@ -16,7 +16,14 @@ import { Label } from "./ui/label";
 import { AgentSeal } from "./ui/seal";
 
 const API = `${window.location.origin}/api/agents`;
-const BUILTIN_MCP = ["ask", "bg"] as const;
+// Every built-in in-app MCP server the form can toggle — also the default set
+// a new agent is born with. Must stay in sync with the backend defaults
+// (DEFAULT_MCP_SERVERS in server/models.py + the agents.mcp_servers column in
+// server/database.py). `ask_agent` = agent-to-agent delegation
+// (agent-collaboration.md §5.1); `research` = native deep research
+// (native-deep-research.md §7). Both were long missing here, so new agents
+// defaulted without a delegation channel and the UI offered no way to add one.
+const BUILTIN_MCP = ["ask", "bg", "ask_agent", "research"] as const;
 
 interface Props {
   open: boolean;
