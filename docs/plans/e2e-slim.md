@@ -26,7 +26,7 @@ cost far more than the quota they burn.
   `codex` binary emitting canned stream-json, injected via the PATH
   override the server already supports — the real spawn path is still
   exercised, only the model is canned. The codebase has this pattern
-  already: `codex_login` tests use a fake CLI; telegram bridge tests use
+  already: `codex_login` tests use a fake CLI; Feishu bridge tests use
   a fake API server. Extend it, don't invent a new one.
 - **Zero assertion loss**: every converted test keeps its assertions
   verbatim; only the model responses become deterministic fixtures.
@@ -48,7 +48,7 @@ lives in the plan docs it points to.
 
 - Backend pytest real-CLI tests (they stay; they're the cheap layer that
   covers real-CLI behavior).
-- Telegram bridge e2e (own config, already isolated).
+- Feishu bridge e2e (own config, already isolated).
 - Any product code changes beyond what the fake-CLI fixture needs.
 
 ### A fake `codex` — deferred until it has a consumer

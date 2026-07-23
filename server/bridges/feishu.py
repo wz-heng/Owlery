@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import queue
 import secrets
+import threading
 import time
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
@@ -167,6 +169,7 @@ class FeishuBridge(Bridge):
         # still work — the exact split the e2e caught.
         self._main_loop: asyncio.AbstractEventLoop | None = None
         self._tick_stop = False  # set True in stop() to end _keepalive_tick
+        self._tick_future: "concurrent.futures.Future | None" = None
 
         # Outbound goes through OUR OWN REST calls, NOT the SDK's channel.send.
         # An agent turn spawns subprocesses (CLI + MCP) on the event loop, and
@@ -174,14 +177,22 @@ class FeishuBridge(Bridge):
         # any work issued shortly after — the SDK's send hangs, a plain
         # main-loop httpx send hangs, and even `asyncio.to_thread` never resumes
         # (the sync work finishes in the thread but the await is never woken).
-        # So outbound uses a BLOCKING `requests` call made directly on the loop
-        # (_sync_request): blocking sockets are immune to the corruption; the
-        # loop stalls only for one fast round-trip. This is the outbound half of
-        # the SDK fallback the plan anticipated (§3.2).
+        # So outbound runs on a DEDICATED worker thread: the event loop only
+        # `queue.put`s a request (instant, no cross-thread wakeup needed — a
+        # plain thread-safe queue, not an asyncio primitive) and the worker
+        # sends serially with a BLOCKING `requests` call. The loop is NEVER
+        # blocked on the network; blocking sockets are immune to the corruption.
+        # This is the outbound half of the SDK fallback the plan anticipated
+        # (§3.2). Send failures are logged, not surfaced (fire-and-forget).
         self._token: str | None = None
         self._token_exp: float = 0.0  # monotonic seconds
-        self._token_lock = asyncio.Lock()
+        self._token_lock = threading.Lock()  # guards token; held by the worker
         self._loopback = _is_loopback(domain)
+        # Per-request timeouts (connect, read). Tight so a stuck send can't wedge
+        # the outbound queue for long; the loop is unaffected either way.
+        self._timeout: tuple[float, float] = (5.0, 15.0)
+        self._out_q: "queue.Queue[tuple | None]" = queue.Queue(maxsize=1000)
+        self._worker: threading.Thread | None = None
 
     # --- lifecycle -----------------------------------------------------------
 
@@ -202,8 +213,17 @@ class FeishuBridge(Bridge):
         await self._channel.start_background()
         # Keep the SDK's background loop iterating (see _keepalive_tick) so
         # cross-thread INBOUND scheduling stays prompt after subprocess churn.
+        # Save the future so stop() can cancel/await it, and never stack a second
+        # tick on a re-start.
         self._tick_stop = False
-        self._channel.schedule(self._keepalive_tick())
+        if self._tick_future is None or self._tick_future.done():
+            self._tick_future = self._channel.schedule(self._keepalive_tick())
+        # Dedicated outbound worker (see __init__): the loop enqueues, it sends.
+        if self._worker is None or not self._worker.is_alive():
+            self._worker = threading.Thread(
+                target=self._outbound_worker, name="feishu-outbound", daemon=True
+            )
+            self._worker.start()
         logger.info("Feishu bridge started (transport=%s)", self.transport)
 
     async def _keepalive_tick(self) -> None:
@@ -218,7 +238,7 @@ class FeishuBridge(Bridge):
         ``select``s on a stale timeout. A tiny periodic sleep forces the loop to
         iterate ~every 50ms off its own timer (unaffected by the broken pipe),
         draining queued cross-thread work promptly. Cheap; ends on ``stop()``.
-        (Outbound doesn't rely on this — it runs via a thread pool, _api.)
+        (Outbound doesn't rely on this — it runs on its own worker thread.)
         """
         while not self._tick_stop:
             await asyncio.sleep(0.05)
@@ -259,20 +279,42 @@ class FeishuBridge(Bridge):
         if exc is not None:
             logger.error("Feishu: detached inbound handler failed: %r", exc)
 
-    # --- outbound REST (our own client on the main loop) ---------------------
+    # --- outbound REST (dedicated worker thread; loop only enqueues) ---------
 
     # Business codes meaning the tenant_access_token is invalid/expired — clear
     # the cache and retry once (§4.3).
     _TOKEN_INVALID_CODES = frozenset({99991663, 99991661, 99991664, 99991665})
     # Codes worth backing off and retrying (rate limit / transient).
     _RETRY_CODES = frozenset({99991400, 230020, 230098, 11232})
+    _MAX_ATTEMPTS = 3
 
-    async def _get_token(self, *, force: bool = False) -> str | None:
-        """Cached tenant_access_token; fetch on miss/expiry. Feishu signals
-        token errors as HTTP 200 + a business ``code`` (§4.3)."""
-        if not force and self._token and time.monotonic() < self._token_exp:
-            return self._token
-        async with self._token_lock:
+    def _enqueue(self, method: str, path: str, body: dict[str, Any]) -> None:
+        """Hand one REST call to the outbound worker. Non-blocking; never waits
+        on the network from the event loop."""
+        try:
+            self._out_q.put_nowait((method, path, body))
+        except queue.Full:
+            logger.error("Feishu: outbound queue full, dropping %s %s", method, path)
+
+    def _outbound_worker(self) -> None:
+        """Serial outbound sender, on its own thread. Blocking `requests` here
+        never touches the event loop, so it is immune to the async-I/O
+        corruption agent-turn subprocess spawning causes on the loop."""
+        while True:
+            item = self._out_q.get()
+            if item is None:  # sentinel from stop()
+                return
+            method, path, body = item
+            try:
+                self._api_sync(method, path, body)
+            except Exception:
+                logger.exception("Feishu: outbound worker failed on %s %s", method, path)
+
+    def _get_token_sync(self, *, force: bool = False) -> str | None:
+        """Cached tenant_access_token; fetch on miss/expiry. Runs on the worker
+        thread (blocking). Feishu signals token errors as HTTP 200 + a business
+        ``code`` (§4.3)."""
+        with self._token_lock:
             if not force and self._token and time.monotonic() < self._token_exp:
                 return self._token
             try:
@@ -288,33 +330,35 @@ class FeishuBridge(Bridge):
                 logger.error("Feishu: token fetch error: %s", data)
                 return None
             self._token = data["tenant_access_token"]
-            # Refresh a few minutes early; expire is seconds.
             self._token_exp = time.monotonic() + max(60, int(data.get("expire", 7200)) - 300)
             return self._token
 
     def _sync_request(self, method: str, url: str, body: dict, headers: dict) -> dict:
-        """One blocking Feishu REST call via ``requests``.
+        """One blocking Feishu REST call via ``requests`` (worker thread only).
 
-        Called synchronously ON the event loop (not offloaded): ``requests``
-        uses blocking sockets, which are immune to the event-loop async-I/O
-        corruption an agent turn's subprocess spawning causes. The loop is
-        blocked only for this one localhost/Feishu round-trip (normally well
-        under a second); offloading via ``to_thread`` was tried and fails —
-        the loop's broken cross-thread wakeup never resumes the ``await``.
+        Loopback (e2e fake) uses a ``trust_env=False`` session so NO ambient
+        proxy — including ``ALL_PROXY`` (which requests would otherwise merge to
+        an ``all`` entry that a ``{"http": None}`` override doesn't cover) — can
+        swallow the localhost POST (§4.3, should-1). Real domains honor env.
         """
         import requests
-        proxies = {"http": None, "https": None} if self._loopback else None
-        r = requests.request(method, url, json=body, headers=headers, timeout=30, proxies=proxies)
+        if self._loopback:
+            with requests.Session() as s:
+                s.trust_env = False
+                r = s.request(method, url, json=body, headers=headers, timeout=self._timeout)
+        else:
+            r = requests.request(method, url, json=body, headers=headers, timeout=self._timeout)
         return r.json()
 
-    async def _api(
+    def _api_sync(
         self, method: str, path: str, body: dict[str, Any]
     ) -> dict[str, Any] | None:
-        """Call the Feishu REST API with retry, token-refresh-on-invalid, and
-        jittered backoff on rate-limit/transient codes (§4.3). Returns the
-        parsed body on success, else None (logged)."""
-        for attempt in range(3):
-            token = await self._get_token(force=attempt > 0 and self._token is None)
+        """One Feishu REST call with token-refresh-on-invalid + code-based
+        backoff (§4.3), on the worker thread. Total wall-clock is bounded by the
+        per-request (connect, read) timeout × a few attempts plus short sleeps —
+        and, being off the event loop, it never freezes the server."""
+        for attempt in range(self._MAX_ATTEMPTS):
+            token = self._get_token_sync(force=attempt > 0 and self._token is None)
             if token is None:
                 return None
             try:
@@ -324,18 +368,18 @@ class FeishuBridge(Bridge):
                 )
             except Exception:
                 logger.exception("Feishu: %s %s raised", method, path)
-                if attempt < 2:
-                    await asyncio.sleep(0.4 * (attempt + 1) + secrets.randbelow(200) / 1000)
+                if attempt < self._MAX_ATTEMPTS - 1:
+                    time.sleep(0.4 * (attempt + 1) + secrets.randbelow(200) / 1000)
                     continue
                 return None
             code = data.get("code", 0)
             if code == 0:
                 return data
-            if code in self._TOKEN_INVALID_CODES and attempt < 2:
+            if code in self._TOKEN_INVALID_CODES and attempt < self._MAX_ATTEMPTS - 1:
                 self._token = None  # force refresh next iteration
                 continue
-            if code in self._RETRY_CODES and attempt < 2:
-                await asyncio.sleep(0.4 * (attempt + 1) + secrets.randbelow(200) / 1000)
+            if code in self._RETRY_CODES and attempt < self._MAX_ATTEMPTS - 1:
+                time.sleep(0.4 * (attempt + 1) + secrets.randbelow(200) / 1000)
                 continue
             logger.error("Feishu: %s %s failed code=%s msg=%s", method, path, code, data.get("msg"))
             return None
@@ -343,6 +387,13 @@ class FeishuBridge(Bridge):
 
     async def stop(self) -> None:
         self._tick_stop = True
+        if self._tick_future is not None:
+            self._tick_future.cancel()
+            self._tick_future = None
+        if self._worker is not None and self._worker.is_alive():
+            self._out_q.put(None)  # sentinel: drain and exit
+            self._worker.join(timeout=5)
+        self._worker = None
         await self._channel.stop_background()
 
     async def handle_webhook(
@@ -446,8 +497,15 @@ class FeishuBridge(Bridge):
             )
             return
 
+        # Validate the click against the nonce's stored record BEFORE consuming
+        # (§4.4). The card's `value` is attacker-controllable; only the nonce
+        # record (minted when WE built the card) is trusted. So we take
+        # session_id / tool_use_id from the RECORD, require the action to match
+        # the record's kind, and consume the nonce only on a valid match — a
+        # `/sessions` switch nonce replayed with an `approve` value (Snape's PoC)
+        # hits a kind mismatch and is rejected without consuming the nonce.
         nonce = value.get("nonce")
-        record = self._consume_nonce(nonce) if isinstance(nonce, str) else None
+        record = self._nonces.get(nonce) if isinstance(nonce, str) else None
         if record is None:
             # Missing / already-consumed nonce → a stale or duplicate tap. This
             # is the one-time-use guarantee: a second click is inert (§4.2).
@@ -455,11 +513,13 @@ class FeishuBridge(Bridge):
             return
 
         action = value.get("action")
-        if action in ("approve", "deny"):
-            session_id = value.get("session_id") or record.get("session_id")
-            tool_use_id = value.get("tool_use_id") or record.get("tool_use_id")
+        kind = record.get("kind")
+        if action in ("approve", "deny") and kind == "approval":
+            session_id = record.get("session_id")
+            tool_use_id = record.get("tool_use_id")
             if not session_id or not tool_use_id:
                 return
+            self._consume_nonce(nonce)
             # On the main loop: resolves the pending-approval Future the turn
             # (also on the main loop) is awaiting — cross-loop would be unsafe.
             await self._run_on_main(
@@ -467,23 +527,31 @@ class FeishuBridge(Bridge):
                     self.name, chat_id, session_id, tool_use_id, action == "approve"
                 )
             )
-            asyncio.create_task(
-                self._settle_card(event.message_id, "Approved." if action == "approve" else "Denied.")
-            )
-        elif action == "switch":
-            session_id = value.get("session_id") or record.get("session_id")
+            self._settle_card(event.message_id, "Approved." if action == "approve" else "Denied.")
+        elif action == "switch" and kind == "switch":
+            session_id = record.get("session_id")
             if not session_id:
                 return
+            self._consume_nonce(nonce)
             result = await self._run_on_main(
                 self.manager.switch_session(self.name, chat_id, session_id)
             )
-            asyncio.create_task(self._settle_card(event.message_id, "Switched."))
-            asyncio.create_task(self._send_plain(chat_id, result))
+            self._settle_card(event.message_id, "Switched.")
+            await self._send_plain(chat_id, result)
+        else:
+            # Action doesn't match the nonce's kind (or is unknown) — reject
+            # WITHOUT consuming the nonce, so a later legitimate click still
+            # works. This is the integrity gate against card-value tampering.
+            logger.warning(
+                "Feishu: card action/kind mismatch (action=%r kind=%r chat=%s) — rejected",
+                action, kind, chat_id,
+            )
+            return
 
-    async def _settle_card(self, message_id: str, note: str) -> None:
-        """Grey out a card after its button is acted on — a REST PATCH made
+    def _settle_card(self, message_id: str, note: str) -> None:
+        """Grey out a card after its button is acted on — a REST PATCH queued
         *after* the fast callback ack (§4.4)."""
-        await self._api(
+        self._enqueue(
             "PATCH",
             f"/open-apis/im/v1/messages/{message_id}",
             {"content": json.dumps(self._note_card(note), ensure_ascii=False)},
@@ -507,12 +575,13 @@ class FeishuBridge(Bridge):
 
     # --- outbound send methods ----------------------------------------------
 
-    async def _send(self, chat_id: str, message: dict[str, Any]) -> Any:
-        """POST one message to a chat via the Feishu REST API on the main loop.
+    async def _send(self, chat_id: str, message: dict[str, Any]) -> None:
+        """Queue one message to a chat for the outbound worker (§4.3).
 
         ``message`` is ``{"card": <card json>}`` or ``{"text": <str>}``. Cards go
-        as ``msg_type="interactive"``, plain status lines as ``msg_type="text"``
-        (§4.3). ``content`` is the Feishu-required JSON *string*.
+        as ``msg_type="interactive"``, plain status lines as ``msg_type="text"``.
+        ``content`` is the Feishu-required JSON *string*. Async only to match the
+        base ``Bridge`` send interface — enqueue itself is instant/non-blocking.
         """
         if "card" in message:
             body = {"receive_id": chat_id, "msg_type": "interactive",
@@ -520,9 +589,7 @@ class FeishuBridge(Bridge):
         else:
             body = {"receive_id": chat_id, "msg_type": "text",
                     "content": json.dumps({"text": message.get("text", "")}, ensure_ascii=False)}
-        return await self._api(
-            "POST", "/open-apis/im/v1/messages?receive_id_type=chat_id", body
-        )
+        self._enqueue("POST", "/open-apis/im/v1/messages?receive_id_type=chat_id", body)
 
     async def _send_card_md(self, chat_id: str, markdown: str) -> None:
         for chunk in self._split_chars(markdown, MAX_CARD_CHARS):

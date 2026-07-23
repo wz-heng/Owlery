@@ -1038,10 +1038,10 @@ Found while researching. Calling these out so we don't break them.
   `session_connectors` are enabled for that session — same
   connectors the user would see if they ran the prompt manually.
   No special handling needed.
-- **`server/bridges/telegram.py` inbound.** A Telegram-routed
+- **`server/bridges/feishu.py` inbound.** A Feishu-routed
   user-message goes through the same session, so the same connector
   set applies. The model can call `mcp__gmail__search` in response
-  to a Telegram message; the result is delivered to Telegram as
+  to a Feishu message; the result is delivered to Feishu as
   text. Nothing to change.
 - **`server/cli.py handoff` / `pull`.** Round-trip a session as
   JSONL. Connector installations are machine-local secrets — we do

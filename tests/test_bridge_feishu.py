@@ -1,13 +1,13 @@
 """Tests for the Feishu bridge (docs/plans/feishu-bridge.md).
 
-Outbound is patched at the bridge's own `_send` / `_api` boundary (the
-thread-pool REST layer), and the low-level HTTP (`_sync_request`) is mocked in
-the REST-layer tests — no network is touched. We drive `_on_message` /
+Outbound is patched at the bridge's own `_send` boundary (which enqueues to the
+worker thread), and the low-level HTTP (`_sync_request`) is mocked in the
+REST-layer tests — no network is touched. We drive `_on_message` /
 `_on_card_action` with constructed SDK events. Covers the §6.2 unit matrix:
-fail-closed allowlist, card-value validation (session not on agent / tool not
-pending / consumed nonce), one-time nonce, transport config matrix (incl.
-half-cred boot failure), and the REST layer (token fetch, refresh-on-invalid,
-backoff-retry on transient codes, hard-fail → None).
+fail-closed allowlist, card-action integrity (nonce bound to its kind + record
+fields, replay/tamper rejected without consuming), one-time nonce, transport
+config matrix (incl. half-cred boot failure), the REST layer (token fetch,
+refresh-on-invalid, backoff-retry, hard-fail → None), and start/stop lifecycle.
 """
 
 from __future__ import annotations
@@ -63,10 +63,9 @@ def _make_bridge(**over) -> FeishuBridge:
     )
     bridge = build_feishu_bridge(manager, _settings(**over))
     assert bridge is not None
-    # Outbound goes through _send / _api (thread-pool REST). Mock at that
-    # boundary so card-building and routing are captured without real HTTP.
-    bridge._send = AsyncMock(return_value={"code": 0, "data": {"message_id": "om_x"}})
-    bridge._api = AsyncMock(return_value={"code": 0, "data": {"message_id": "om_x"}})
+    # Outbound enqueues via _send; mock it so card-building and routing are
+    # captured without touching the worker/network.
+    bridge._send = AsyncMock(return_value=None)
     return bridge
 
 
@@ -403,9 +402,11 @@ class TestOutbound:
 
 
 # --------------------------------------------------------------------------
-# REST layer (§4.3): thread-pool _api — token fetch, refresh-on-invalid,
-# backoff-retry on transient codes, hard-fail → None. _sync_request (the
-# actual blocking HTTP) is mocked; everything above it runs for real.
+# REST layer (§4.3): the worker-thread `_api_sync` — token fetch,
+# refresh-on-invalid, backoff-retry on transient codes, hard-fail → None. The
+# blocking HTTP (`_sync_request`) is mocked; everything above it runs for real.
+# `_api_sync` is synchronous (it runs on the outbound worker), so these tests
+# call it directly. `_send` only enqueues (fire-and-forget), verified separately.
 # --------------------------------------------------------------------------
 
 _TOKEN_OK = {"code": 0, "tenant_access_token": "t-1", "expire": 7200}
@@ -421,45 +422,196 @@ def _http_bridge(responses: list) -> FeishuBridge:
 
 
 class TestApiLayer:
-    async def test_send_fetches_token_then_posts(self):
+    def test_fetches_token_then_posts(self):
         b = _http_bridge([_TOKEN_OK, _MSG_OK])
-        assert await b._send("oc_1", {"text": "hi"}) == _MSG_OK
+        assert b._api_sync("POST", "/open-apis/im/v1/messages", {"x": 1}) == _MSG_OK
         urls = [c.args[1] for c in b._sync_request.call_args_list]
         assert "tenant_access_token" in urls[0]
         assert "/im/v1/messages" in urls[1]
 
-    async def test_card_send_uses_interactive_msg_type(self):
-        b = _http_bridge([_TOKEN_OK, _MSG_OK])
-        await b._send("oc_1", {"card": {"elements": []}})
-        body = b._sync_request.call_args_list[1].args[2]
-        assert body["msg_type"] == "interactive"
-
-    async def test_invalid_token_refreshes_and_retries(self):
+    def test_invalid_token_refreshes_and_retries(self):
         b = _http_bridge([_TOKEN_OK, {"code": 99991663, "msg": "invalid"}, _TOKEN_OK, _MSG_OK])
-        assert await b._send("oc_1", {"text": "hi"}) == _MSG_OK
+        assert b._api_sync("POST", "/x", {}) == _MSG_OK
         assert b._sync_request.call_count == 4
 
-    async def test_transient_code_backs_off_and_retries(self):
+    def test_transient_code_backs_off_and_retries(self):
         b = _http_bridge([_TOKEN_OK, {"code": 230020, "msg": "rate"}, _MSG_OK])
-        assert await b._send("oc_1", {"text": "hi"}) == _MSG_OK
+        assert b._api_sync("POST", "/x", {}) == _MSG_OK
 
-    async def test_hard_error_returns_none(self):
+    def test_hard_error_returns_none(self):
         b = _http_bridge([_TOKEN_OK, {"code": 99999, "msg": "nope"}])
-        assert await b._send("oc_1", {"text": "hi"}) is None
+        assert b._api_sync("POST", "/x", {}) is None
 
-    async def test_sync_request_exception_returns_none(self):
+    def test_sync_request_exception_returns_none(self):
         b = _http_bridge([_TOKEN_OK, RuntimeError("boom"), RuntimeError("boom"), RuntimeError("boom")])
-        assert await b._send("oc_1", {"text": "hi"}) is None
+        assert b._api_sync("POST", "/x", {}) is None
 
-    async def test_token_is_cached_across_sends(self):
+    def test_token_is_cached_across_calls(self):
         b = _http_bridge([_TOKEN_OK, _MSG_OK, _MSG_OK])
-        await b._send("oc_1", {"text": "a"})
-        await b._send("oc_1", {"text": "b"})
+        b._api_sync("POST", "/x", {})
+        b._api_sync("POST", "/y", {})
         urls = [c.args[1] for c in b._sync_request.call_args_list]
         assert sum("tenant_access_token" in u for u in urls) == 1
 
-    async def test_token_fetch_failure_aborts_send(self):
+    def test_token_fetch_failure_aborts(self):
         b = _http_bridge([{"code": 99991400, "msg": "bad app"}])
-        assert await b._send("oc_1", {"text": "hi"}) is None
-        # No message POST attempted when no token.
+        assert b._api_sync("POST", "/open-apis/im/v1/messages", {}) is None
         assert all("/im/v1/messages" not in c.args[1] for c in b._sync_request.call_args_list)
+
+    async def test_send_enqueues_text_not_blocking(self):
+        b = _http_bridge([])  # _sync_request never called — send only enqueues
+        await b._send("oc_1", {"text": "hi"})
+        method, path, body = b._out_q.get_nowait()
+        assert method == "POST" and "/im/v1/messages" in path
+        assert body["receive_id"] == "oc_1" and body["msg_type"] == "text"
+        b._sync_request.assert_not_called()
+
+    async def test_send_card_enqueues_interactive(self):
+        b = _http_bridge([])
+        await b._send("oc_1", {"card": {"elements": []}})
+        _, _, body = b._out_q.get_nowait()
+        assert body["msg_type"] == "interactive"
+
+    def test_loopback_sync_request_disables_env_proxy(self, monkeypatch):
+        # should-1: loopback must use a trust_env=False session (defeats ALL_PROXY).
+        import server.bridges.feishu as feishu_mod
+        captured = {}
+
+        class _FakeResp:
+            def json(self): return _MSG_OK
+
+        class _FakeSession:
+            def __init__(self): self.trust_env = True
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def request(self, *a, **k):
+                captured["trust_env"] = self.trust_env
+                return _FakeResp()
+
+        monkeypatch.setattr(feishu_mod, "_is_loopback", lambda d: True)
+        b = build_feishu_bridge(SimpleNamespace(), _settings())
+        monkeypatch.setattr("requests.Session", _FakeSession)
+        b._sync_request("POST", "http://127.0.0.1:9/x", {}, {})
+        assert captured["trust_env"] is False
+
+
+# --------------------------------------------------------------------------
+# Card-action integrity (§4.4, Snape blocker-2): the nonce record is trusted,
+# the card `value` is not. Action must match the nonce's kind; session_id /
+# tool_use_id come from the RECORD; a mismatch is rejected WITHOUT consuming
+# the nonce (so a legit later click still works).
+# --------------------------------------------------------------------------
+
+
+class TestCardActionSecurity:
+    async def _mint_switch(self, b) -> dict:
+        await b.send_session_list(
+            "oc_1", [{"id": "s1", "name": "One", "status": "idle", "current": False}]
+        )
+        return _button_value(b._send)
+
+    async def _mint_approval(self, b) -> dict:
+        await b.send_tool_approval_request("oc_1", "REAL-sess", "REAL-tool", "Bash", {})
+        return _button_value(b._send)
+
+    async def test_switch_nonce_cannot_be_replayed_as_approval(self):
+        # Snape PoC: take a /sessions switch nonce, forge an approve payload.
+        b = _make_bridge()
+        switch_value = await self._mint_switch(b)
+        forged = {"action": "approve", "session_id": "victim-sess",
+                  "tool_use_id": "victim-tool", "nonce": switch_value["nonce"]}
+        await b._on_card_action(_card_event(forged))
+        b.manager.handle_tool_decision.assert_not_awaited()  # attack blocked
+        # nonce NOT consumed → the legitimate switch click still works
+        await b._on_card_action(_card_event(switch_value))
+        b.manager.switch_session.assert_awaited_once_with("feishu", "oc_1", "s1")
+
+    async def test_approval_nonce_cannot_be_replayed_as_switch(self):
+        b = _make_bridge()
+        appr = await self._mint_approval(b)
+        forged = {"action": "switch", "session_id": "other", "nonce": appr["nonce"]}
+        await b._on_card_action(_card_event(forged))
+        b.manager.switch_session.assert_not_awaited()
+        # legit approval still works (nonce not consumed)
+        await b._on_card_action(_card_event(appr))
+        b.manager.handle_tool_decision.assert_awaited_once_with(
+            "feishu", "oc_1", "REAL-sess", "REAL-tool", True
+        )
+
+    async def test_approval_uses_record_fields_not_value(self):
+        # Tampered value session/tool are IGNORED; record's are used.
+        b = _make_bridge()
+        appr = await self._mint_approval(b)
+        tampered = {**appr, "session_id": "ATTACK", "tool_use_id": "ATTACK"}
+        await b._on_card_action(_card_event(tampered))
+        b.manager.handle_tool_decision.assert_awaited_once_with(
+            "feishu", "oc_1", "REAL-sess", "REAL-tool", True
+        )
+
+    async def test_unknown_action_rejected_without_consuming(self):
+        b = _make_bridge()
+        appr = await self._mint_approval(b)
+        await b._on_card_action(_card_event({**appr, "action": "rm -rf"}))
+        b.manager.handle_tool_decision.assert_not_awaited()
+        # nonce survived → real approve still works
+        await b._on_card_action(_card_event(appr))
+        b.manager.handle_tool_decision.assert_awaited_once()
+
+    async def test_switch_on_approval_nonce_does_not_consume(self):
+        # A switch action against an approval nonce is a kind mismatch: rejected,
+        # nonce preserved for the real approval click.
+        b = _make_bridge()
+        appr = await self._mint_approval(b)
+        await b._on_card_action(_card_event({"action": "switch", "nonce": appr["nonce"]}))
+        b.manager.switch_session.assert_not_awaited()
+        assert appr["nonce"] in b._nonces  # not consumed
+
+
+# --------------------------------------------------------------------------
+# Lifecycle (§ should-3): keepalive tick + outbound worker start/stop.
+# --------------------------------------------------------------------------
+
+
+class TestLifecycle:
+    def _stubbed(self):
+        b = _make_bridge()
+        b._channel.start_background = AsyncMock()
+        b._channel.stop_background = AsyncMock()
+        fake_future = Mock()
+        fake_future.done.return_value = False
+        # Close the tick coroutine we're handed (we don't run it here) so no
+        # "coroutine was never awaited" warning; return the fake future.
+        b._channel.schedule = Mock(side_effect=lambda coro: (coro.close(), fake_future)[1])
+        return b, fake_future
+
+    async def test_start_starts_worker_and_saves_tick(self):
+        b, fake_future = self._stubbed()
+        await b.start()
+        try:
+            assert b._tick_future is fake_future
+            assert b._worker is not None and b._worker.is_alive()
+        finally:
+            await b.stop()
+
+    async def test_restart_does_not_stack_tick_or_worker(self):
+        b, fake_future = self._stubbed()
+        await b.start()
+        w1 = b._worker
+        b._channel.schedule.reset_mock()
+        await b.start()  # re-start
+        try:
+            assert b._tick_future is fake_future  # not re-scheduled
+            b._channel.schedule.assert_not_called()
+            assert b._worker is w1  # same worker, not stacked
+        finally:
+            await b.stop()
+
+    async def test_stop_cancels_tick_and_joins_worker(self):
+        b, fake_future = self._stubbed()
+        await b.start()
+        w = b._worker
+        await b.stop()
+        fake_future.cancel.assert_called_once()
+        assert b._worker is None
+        w.join(timeout=2)
+        assert not w.is_alive()

@@ -39,7 +39,7 @@ sets stay exactly as they are.
 Any turn that fails because of the user's own usage limit resumes
 automatically after the limit resets, unattended, and picks up where it
 left off. Uniform coverage: chat turns, scheduled runs, delegation
-children, telegram-bridge turns — everything flows through
+children, Feishu-bridge turns — everything flows through
 `session_manager._run_backend`, so one turn-level mechanism covers all
 of them. Both backends (claude-code and codex; codex has its own 5-hour
 and weekly windows) via the same `RuntimeProfile` pattern machinery —
@@ -146,7 +146,7 @@ exhausted window.
 **User-visible and cancellable.** The session shows a "limit reached —
 auto-resumes at HH:MM" state (persisted marker + WS broadcast, same
 pattern as retry markers); the user can cancel a pending resume from the
-UI, which deletes the record and the job. The telegram bridge relays the
+UI, which deletes the record and the job. The Feishu bridge relays the
 park and the eventual resume, so an unattended phone user isn't staring
 at silence.
 

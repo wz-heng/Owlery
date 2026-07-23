@@ -10,7 +10,7 @@
 > attachment fallback/blit) and frontend (store `buildForkTree`,
 > sidebar fork tree, fork banner, prefilled input, `ForkDialog`
 > picker/confirm, per-message "Fork from here" button, `/rewind` slash
-> command, Telegram browser-only notice) are implemented and
+> command, Feishu browser-only notice) are implemented and
 > tested (`tests/test_fork_helpers.py`, `tests/test_session_fork.py`,
 > `tests/test_session_fork_real.py`, `web/src/lib/forkTree.test.ts`,
 > `web/src/components/ForkDialog.test.tsx`, `web/e2e/fork.spec.ts`).
@@ -123,7 +123,7 @@ capability.
 - **Cross-agent forks.** Fork inherits the parent's agent. Switching
   agents mid-fork is just "create a new session with that agent" —
   no shared semantics needed.
-- **Forking inside bridges (Telegram).** v1 is browser-only. A
+- **Forking inside bridges (Feishu).** v1 is browser-only. A
   bridge `/rewind` would need a way to pick the message id without a
   scroll UI, which is its own problem.
 - **Backing out a fork (un-fork).** The fork is a session; delete
@@ -649,7 +649,7 @@ used.
   message. (`@<id>` resolves via the existing message-anchor
   scheme.)
 
-Both POST to the same `/fork` route. The Telegram bridge
+Both POST to the same `/fork` route. The Feishu bridge
 intercepts `/rewind` with a "browser-only" notice, matching how
 `/showme` already handles that case.
 
@@ -1253,9 +1253,9 @@ pre-filled — same popover the per-message button opens, so the
 disclosure + revert-checkbox affordances are identical
 regardless of entry point.
 
-The Telegram bridge intercepts `/rewind` with a "browser-only"
+The Feishu bridge intercepts `/rewind` with a "browser-only"
 notice, matching how `/showme` already handles that case
-(`server/bridges/telegram.py` is the precedent).
+(`server/bridges/feishu.py` is the precedent).
 
 ### 6.3 Fork tree in the sidebar
 
@@ -1593,7 +1593,7 @@ Five phases, each ends with the full verification suite green.
   with that text. Once the user sends, the harness call clears
   `fork_metadata` on the backend (so the prefill doesn't re-appear
   on subsequent loads of the same session).
-- Telegram bridge intercepts `/rewind` with a browser-only notice
+- Feishu bridge intercepts `/rewind` with a browser-only notice
   (mirror `/showme`).
 
 ### Phase 5 — Real-CLI verification (both backends) + Playwright e2e
@@ -1828,7 +1828,7 @@ Five phases, each ends with the full verification suite green.
   turn turns out not to matter in practice, this stays deferred
   indefinitely. The harness contract supports the swap with
   zero plan changes when/if it ships.
-- **Forking inside Telegram (bridge UX).** Browser-only in v1.
+- **Forking inside Feishu (bridge UX).** Browser-only in v1.
 - **Visual diff between two forks of the same parent.** Possible
   but pure polish — users can open both forks side-by-side.
 - **Cleanup of orphaned synthesized JSONLs.** If the user deletes
