@@ -549,13 +549,23 @@ class Database:
         except Exception:
             pass
 
-        # Backfill default built-in MCP servers into every existing agent's
-        # mcp_servers list as new ones land (`ask_agent` —
+        # One-time catch-up: enrol every pre-existing agent in the built-in MCP
+        # servers that shipped after it was created (`ask_agent` —
         # agent-collaboration.md §5.1; `research` — native-deep-research.md §7).
-        # The CREATE TABLE default applies only to brand-new rows on fresh
-        # databases — pre-existing rows already have a stored value and need
-        # this catch-up. Idempotent: set-membership means re-running is a no-op.
-        await self._backfill_builtin_mcp_servers(("ask_agent", "research"))
+        # The CREATE TABLE default already covers brand-new rows; this rescues
+        # older rows that stored the narrower list.
+        #
+        # Gated by PRAGMA user_version so it runs ONCE, not on every boot: the
+        # agent-settings UI now lets a user deselect any built-in server, and a
+        # per-boot re-add would silently overturn that choice on the next
+        # restart. The membership check is still additive (re-running would add
+        # nothing new), but the gate is what makes a deliberate *removal* stick.
+        # A future new built-in gets its own gated step at the next version.
+        cursor = await self._conn.execute("PRAGMA user_version")
+        (user_version,) = await cursor.fetchone()
+        if user_version < 1:
+            await self._backfill_builtin_mcp_servers(("ask_agent", "research"))
+            await self._conn.execute("PRAGMA user_version = 1")
 
     async def _backfill_builtin_mcp_servers(self, names: tuple[str, ...]) -> None:
         cursor = await self._conn.execute("SELECT id, mcp_servers FROM agents")

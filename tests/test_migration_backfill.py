@@ -7,6 +7,7 @@ ownership graph is rebuilt onto a Default Agent, idempotently. See
 docs/plans/agent-refactor.md §4.5.
 """
 
+import json
 import sqlite3
 
 import pytest
@@ -120,6 +121,49 @@ async def test_backfill_from_old_schema(tmp_path):
         assert len(await db.load_bridge_mappings()) == 1
         sessions2 = await db.load_sessions()
         assert all(s["agent_id"] == default["id"] for s in sessions2)
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_builtin_mcp_backfill_runs_once_and_respects_removals(tmp_path):
+    """The built-in MCP backfill enrols a pre-existing agent in newly-shipped
+    servers exactly once. After that a user's deliberate removal of a built-in
+    (now possible from the settings UI) survives a restart: the per-boot re-add
+    that would overturn it is gated by PRAGMA user_version."""
+    db = Database(str(tmp_path / "once.db"))
+    await db.initialize()
+    try:
+        aid = (await db.get_default_agent())["id"]
+        # Rewind to a pre-backfill world: the agent stored the narrow legacy
+        # set and the version marker is unset, exactly as on an instance that
+        # predates ask_agent/research.
+        await db.conn.execute(
+            "UPDATE agents SET mcp_servers = ? WHERE id = ?",
+            (json.dumps(["ask", "bg"]), aid),
+        )
+        await db.conn.execute("PRAGMA user_version = 0")
+        await db.conn.commit()
+
+        # The first upgrade run backfills the shipped built-ins.
+        await db._apply_migrations()
+        assert set((await db.get_agent(aid))["mcp_servers"]) == {
+            "ask",
+            "bg",
+            "ask_agent",
+            "research",
+        }
+
+        # The user deselects delegation in the settings UI and saves.
+        await db.conn.execute(
+            "UPDATE agents SET mcp_servers = ? WHERE id = ?",
+            (json.dumps(["ask", "bg", "research"]), aid),
+        )
+        await db.conn.commit()
+
+        # A later restart must NOT resurrect the removed server.
+        await db._apply_migrations()
+        assert "ask_agent" not in (await db.get_agent(aid))["mcp_servers"]
     finally:
         await db.close()
 
