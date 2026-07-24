@@ -196,6 +196,10 @@ class FeishuBridge(Bridge):
         # Set in stop() to end the worker even when the queue is full (a plain
         # blocking `put(None)` sentinel could otherwise wedge shutdown).
         self._worker_stop = threading.Event()
+        # How long stop()/start() wait off-loop for the worker thread to exit
+        # before giving up (stop) or failing loud (start). An attribute so the
+        # lifecycle tests can shrink it and drive a real join-timeout quickly.
+        self._worker_join_timeout: float = 5.0
 
     # --- lifecycle -----------------------------------------------------------
 
@@ -211,6 +215,11 @@ class FeishuBridge(Bridge):
         # Capture the main loop while we're on it — SDK event handlers run on a
         # different (background) loop and must hop back here for turn work.
         self._main_loop = asyncio.get_running_loop()
+        # Bring the outbound worker up FIRST, then the SDK channel + keepalive
+        # tick. The only thing that can fail here is a stuck lingering worker
+        # (_ensure_worker raises); doing it before channel/tick means such a
+        # failure happens with NOTHING half-started to roll back.
+        await self._ensure_worker()
         # Async lifecycle designed for exactly this (FastAPI lifespan): webhook
         # mode returns ready without dialing, WS mode returns once connected.
         await self._channel.start_background()
@@ -221,30 +230,53 @@ class FeishuBridge(Bridge):
         self._tick_stop = False
         if self._tick_future is None or self._tick_future.done():
             self._tick_future = self._channel.schedule(self._keepalive_tick())
-        # Dedicated outbound worker (see __init__): the loop enqueues, it sends.
-        # A prior stop() whose join timed out can leave a worker still draining a
-        # slow in-flight send with the stop-flag set — it WILL exit once that
-        # send returns. If we checked only is_alive() we'd see it "up", skip
-        # startup, and return a bridge whose sole worker is on its way to death
-        # (outbound permanently dead, flag stuck set) — a silent "started" lie.
-        # So when such a lingering, being-stopped worker is present, wait it out
-        # off-loop first; if it still refuses to exit, fail loud rather than run
-        # a second worker racing the same queue.
+        logger.info("Feishu bridge started (transport=%s)", self.transport)
+
+    async def _ensure_worker(self) -> None:
+        """Bring the dedicated outbound worker (see __init__) to a known-live
+        state, cleanly and idempotently.
+
+        - A healthy running worker (alive, not being stopped) → no-op, so a
+          re-start doesn't stack a second worker or drop in-flight sends.
+        - A lingering worker from a stop() whose join timed out (alive AND the
+          stop-flag set) is still draining a slow in-flight send and WILL exit
+          once it returns. Wait it out off-loop; if it truly refuses to die,
+          raise rather than run two workers on one queue. (start() calls this
+          before the channel/tick, so the raise leaves nothing half-started.)
+        - Otherwise (no worker, or the old one has exited): discard any stale
+          queue state — a leftover sentinel a timed-out stop() could not have
+          the worker consume — so the fresh worker doesn't immediately read a
+          stale None and die; then clear the flag and spawn.
+        """
         worker = self._worker
+        if worker is not None and worker.is_alive() and not self._worker_stop.is_set():
+            return  # already running and healthy
         if worker is not None and worker.is_alive() and self._worker_stop.is_set():
-            await asyncio.to_thread(worker.join, 5)
+            await asyncio.to_thread(worker.join, self._worker_join_timeout)
             if worker.is_alive():
                 raise RuntimeError(
                     "Feishu outbound worker did not exit after stop(); refusing "
                     "to start a second worker on the same queue"
                 )
-        if worker is None or not worker.is_alive():
-            self._worker_stop.clear()
-            self._worker = threading.Thread(
-                target=self._outbound_worker, name="feishu-outbound", daemon=True
-            )
-            self._worker.start()
-        logger.info("Feishu bridge started (transport=%s)", self.transport)
+        self._drain_queue()
+        self._worker_stop.clear()
+        self._worker = threading.Thread(
+            target=self._outbound_worker, name="feishu-outbound", daemon=True
+        )
+        self._worker.start()
+
+    def _drain_queue(self) -> None:
+        """Discard every pending outbound item, INCLUDING any stale sentinel.
+
+        Fire-and-forget outbound is intentionally NOT replayed across a
+        stop/start lifecycle: a shutdown-era card update for a since-gone
+        session must not resurrect on the next boot, and a leftover ``None``
+        sentinel must not kill a freshly-spawned worker."""
+        while True:
+            try:
+                self._out_q.get_nowait()
+            except queue.Empty:
+                return
 
     async def _keepalive_tick(self) -> None:
         """Keep the SDK's background event loop iterating on a short timer.
@@ -412,26 +444,30 @@ class FeishuBridge(Bridge):
         return None
 
     async def stop(self) -> None:
+        # Tear the outbound worker down first, then the tick + SDK channel.
+        worker = self._worker
+        if worker is not None and worker.is_alive():
+            # Flag first so the worker's timed `get` exits even on a full queue.
+            self._worker_stop.set()
+            # Drop every pending fire-and-forget send (not replayed across a
+            # lifecycle), then drop a best-effort sentinel to wake an idle
+            # worker at once. Never block the event loop: the put is
+            # non-blocking and the join runs off-loop.
+            self._drain_queue()
+            try:
+                self._out_q.put_nowait(None)  # sentinel: exit promptly if idle
+            except queue.Full:
+                pass
+            await asyncio.to_thread(worker.join, self._worker_join_timeout)
+        # Only drop the reference once the worker has actually exited — else a
+        # later start() would spawn a SECOND worker racing this one. If the join
+        # timed out, the reference is kept and start() reaps it (or fails loud).
+        if worker is None or not worker.is_alive():
+            self._worker = None
         self._tick_stop = True
         if self._tick_future is not None:
             self._tick_future.cancel()
             self._tick_future = None
-        worker = self._worker
-        if worker is not None and worker.is_alive():
-            # Signal via a flag (the worker's timed `get` sees it even if the
-            # queue is full) AND drop a best-effort sentinel to wake it
-            # immediately when there IS room. Never block the event loop: the
-            # sentinel put is non-blocking, and the join runs off-loop.
-            self._worker_stop.set()
-            try:
-                self._out_q.put_nowait(None)  # sentinel: drain and exit
-            except queue.Full:
-                pass
-            await asyncio.to_thread(worker.join, 5)
-        # Only drop the reference once the worker has actually exited — else a
-        # later start() would spawn a SECOND worker racing this one on the queue.
-        if worker is None or not worker.is_alive():
-            self._worker = None
         await self._channel.stop_background()
 
     async def handle_webhook(

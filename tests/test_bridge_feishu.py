@@ -12,6 +12,8 @@ refresh-on-invalid, backoff-retry, hard-fail → None), and start/stop lifecycle
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -99,6 +101,16 @@ def _card_event(value, *, operator: str = "ou_me", chat_id: str = "oc_1") -> Car
         operator=EventOperator(open_id=operator),
         action=CardActionPayload(value=value, tag="button"),
     )
+
+
+async def _poll(cond, timeout: float = 2.0) -> None:
+    """Await until `cond()` is truthy, polling the running worker thread's
+    progress. Raises if it never becomes true within `timeout`."""
+    for _ in range(int(timeout / 0.02)):
+        if cond():
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("condition not met within timeout")
 
 
 def _button_value(send_mock, index: int = 0, button: int = 0) -> dict:
@@ -686,26 +698,84 @@ class TestLifecycle:
         w.join(timeout=2)
         assert not w.is_alive()
 
-    async def test_start_after_stop_timeout_replaces_dead_worker(self):
-        # Snape should-2: if a prior stop()'s join timed out and left a worker
-        # alive with the stop-flag set, a naive start() would see it "alive",
-        # skip startup, and return a bridge whose only worker is dying (flag
-        # stuck set → outbound permanently dead) — a silent "started" lie.
+    async def test_slow_send_stop_timeout_then_start_yields_working_worker(self):
+        # Snape blocker (real in-flight repro, not a manual flag set): a worker
+        # stuck in a slow _api_sync makes stop()'s join time out and leaves a
+        # stale sentinel in the queue. The prior implementation let the fresh
+        # worker read that stale None and die immediately. A correct start()
+        # drains the queue first, so the new worker is genuinely live and
+        # processes new messages.
         b, _ = self._stubbed()
+        b._worker_join_timeout = 0.3  # make the join time out fast
+        gate = threading.Event()
+        in_flight = threading.Event()
+
+        def slow_api(method, path, body):
+            in_flight.set()
+            gate.wait(3.0)  # hold the worker in-flight past the join timeout
+            return None
+
+        b._api_sync = slow_api
         await b.start()
-        first = b._worker
-        # Reproduce the post-timeout state: flag set while the worker is still
-        # alive. (The real worker, being idle, then exits within its 0.5s poll —
-        # exactly the "in-flight send finished, thread exiting" case.)
-        b._worker_stop.set()
-        # A correct start() must wait the lingering worker out and spawn a fresh
-        # one with the flag cleared — never leave the bridge with a dead worker.
+        old = b._worker
+        b._enqueue("POST", "/slow", {})       # worker dequeues and blocks in slow_api
+        await _poll(in_flight.is_set)          # ensure it's really in-flight before stop
+        await b.stop()                         # join(0.3) times out; worker still alive
+        assert old.is_alive()                  # confirm the stop-timeout state
+        assert b._worker is old                # reference kept (not a clean exit)
+        gate.set()                             # let the slow send finish → worker exits
+
+        # Immediate restart must reap the corpse, drain the stale sentinel, and
+        # spawn a fresh, working worker.
+        processed = threading.Event()
+
+        def ok_api(method, path, body):
+            processed.set()
+            return None
+
+        b._api_sync = ok_api
         await b.start()
         try:
-            assert b._worker_stop.is_set() is False  # flag cleared for the new worker
-            assert b._worker is not None and b._worker.is_alive()  # really running
-            assert b._worker is not first  # a genuinely new worker, not the corpse
+            assert b._worker is not None and b._worker.is_alive()
+            assert b._worker is not old          # genuinely new worker
+            assert b._worker_stop.is_set() is False
+            b._enqueue("POST", "/new", {})       # must be processed, not eaten by a stale None
+            await _poll(processed.is_set)
+            assert processed.is_set()
         finally:
             await b.stop()
-        first.join(timeout=2)
-        assert not first.is_alive()
+        old.join(timeout=2)
+        assert not old.is_alive()
+
+    async def test_start_raises_and_leaves_channel_untouched_when_worker_stuck(self):
+        # Snape should (real in-flight repro): if the lingering worker refuses to
+        # exit, start() must fail loud BEFORE bringing up the channel/tick — no
+        # half-started state to roll back.
+        b, _ = self._stubbed()
+        b._worker_join_timeout = 0.2
+        gate = threading.Event()               # never set → worker stays stuck
+        in_flight = threading.Event()
+
+        def stuck_api(method, path, body):
+            in_flight.set()
+            gate.wait()                        # blocks indefinitely
+            return None
+
+        b._api_sync = stuck_api
+        await b.start()
+        b._enqueue("POST", "/stuck", {})
+        await _poll(in_flight.is_set)
+        await b.stop()                         # join times out; worker stays stuck-alive
+        assert b._worker is not None and b._worker.is_alive()
+
+        b._channel.start_background.reset_mock()
+        b._channel.schedule.reset_mock()
+        with pytest.raises(RuntimeError):
+            await b.start()                    # join times out again → raise
+        # The failure happened before channel/tick were (re)started.
+        b._channel.start_background.assert_not_called()
+        b._channel.schedule.assert_not_called()
+        assert b._tick_future is None
+        # cleanup: release the stuck worker so the thread can exit.
+        gate.set()
+        b._worker.join(timeout=2)
