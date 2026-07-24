@@ -222,7 +222,23 @@ class FeishuBridge(Bridge):
         if self._tick_future is None or self._tick_future.done():
             self._tick_future = self._channel.schedule(self._keepalive_tick())
         # Dedicated outbound worker (see __init__): the loop enqueues, it sends.
-        if self._worker is None or not self._worker.is_alive():
+        # A prior stop() whose join timed out can leave a worker still draining a
+        # slow in-flight send with the stop-flag set — it WILL exit once that
+        # send returns. If we checked only is_alive() we'd see it "up", skip
+        # startup, and return a bridge whose sole worker is on its way to death
+        # (outbound permanently dead, flag stuck set) — a silent "started" lie.
+        # So when such a lingering, being-stopped worker is present, wait it out
+        # off-loop first; if it still refuses to exit, fail loud rather than run
+        # a second worker racing the same queue.
+        worker = self._worker
+        if worker is not None and worker.is_alive() and self._worker_stop.is_set():
+            await asyncio.to_thread(worker.join, 5)
+            if worker.is_alive():
+                raise RuntimeError(
+                    "Feishu outbound worker did not exit after stop(); refusing "
+                    "to start a second worker on the same queue"
+                )
+        if worker is None or not worker.is_alive():
             self._worker_stop.clear()
             self._worker = threading.Thread(
                 target=self._outbound_worker, name="feishu-outbound", daemon=True
@@ -559,9 +575,16 @@ class FeishuBridge(Bridge):
             )
             self._settle_card(event.message_id, "Approved." if approve else "Denied.")
         elif kind == "switch":
-            if value.get("session_id") != record.get("session_id"):
+            # Both the action AND the session must match the record. Checking
+            # only session_id would let a switch nonce be replayed with an
+            # `approve`/`deny` value (session_id kept correct) — it would still
+            # consume the nonce and fire a switch, a cross-action replay.
+            if (
+                value.get("action") != "switch"
+                or value.get("session_id") != record.get("session_id")
+            ):
                 logger.warning(
-                    "Feishu: switch session mismatch (chat=%s) — rejected", chat_id
+                    "Feishu: switch action/session mismatch (chat=%s) — rejected", chat_id
                 )
                 return
             self._consume_nonce(nonce)

@@ -545,6 +545,35 @@ class TestCardActionSecurity:
         await b._on_card_action(_card_event(switch_value))
         b.manager.switch_session.assert_awaited_once_with("feishu", "oc_1", "s1")
 
+    async def test_switch_nonce_action_tamper_rejected(self):
+        # Snape blocker: the switch branch must check value.action=="switch" too,
+        # not just session_id. Keep the session_id CORRECT (so it can't be a
+        # session mismatch) and only flip the action — the click must still be
+        # rejected without consuming the nonce, and the real switch still works.
+        b = _make_bridge()
+        switch_value = await self._mint_switch(b)  # {action:switch, session_id:s1}
+        for bad_action in ("approve", "deny"):
+            forged = {**switch_value, "action": bad_action}  # session_id kept = s1
+            await b._on_card_action(_card_event(forged))
+        b.manager.switch_session.assert_not_awaited()
+        b.manager.handle_tool_decision.assert_not_awaited()
+        assert switch_value["nonce"] in b._nonces  # never consumed
+        # The genuine switch click still routes.
+        await b._on_card_action(_card_event(switch_value))
+        b.manager.switch_session.assert_awaited_once_with("feishu", "oc_1", "s1")
+
+    async def test_approval_missing_action_rejected(self):
+        # Symmetric to the switch action check: an approval value with no action
+        # key (None) mismatches record.action ("approve") — rejected, unconsumed.
+        b = _make_bridge()
+        appr = await self._mint_approval(b)
+        forged = {k: v for k, v in appr.items() if k != "action"}  # drop action
+        await b._on_card_action(_card_event(forged))
+        b.manager.handle_tool_decision.assert_not_awaited()
+        assert appr["nonce"] in b._nonces  # not consumed
+        await b._on_card_action(_card_event(appr))
+        b.manager.handle_tool_decision.assert_awaited_once()
+
     async def test_approval_nonce_cannot_be_replayed_as_switch(self):
         b = _make_bridge()
         appr = await self._mint_approval(b)
@@ -656,3 +685,27 @@ class TestLifecycle:
         assert b._worker is None
         w.join(timeout=2)
         assert not w.is_alive()
+
+    async def test_start_after_stop_timeout_replaces_dead_worker(self):
+        # Snape should-2: if a prior stop()'s join timed out and left a worker
+        # alive with the stop-flag set, a naive start() would see it "alive",
+        # skip startup, and return a bridge whose only worker is dying (flag
+        # stuck set → outbound permanently dead) — a silent "started" lie.
+        b, _ = self._stubbed()
+        await b.start()
+        first = b._worker
+        # Reproduce the post-timeout state: flag set while the worker is still
+        # alive. (The real worker, being idle, then exits within its 0.5s poll —
+        # exactly the "in-flight send finished, thread exiting" case.)
+        b._worker_stop.set()
+        # A correct start() must wait the lingering worker out and spawn a fresh
+        # one with the flag cleared — never leave the bridge with a dead worker.
+        await b.start()
+        try:
+            assert b._worker_stop.is_set() is False  # flag cleared for the new worker
+            assert b._worker is not None and b._worker.is_alive()  # really running
+            assert b._worker is not first  # a genuinely new worker, not the corpse
+        finally:
+            await b.stop()
+        first.join(timeout=2)
+        assert not first.is_alive()
