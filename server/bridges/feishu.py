@@ -193,6 +193,9 @@ class FeishuBridge(Bridge):
         self._timeout: tuple[float, float] = (5.0, 15.0)
         self._out_q: "queue.Queue[tuple | None]" = queue.Queue(maxsize=1000)
         self._worker: threading.Thread | None = None
+        # Set in stop() to end the worker even when the queue is full (a plain
+        # blocking `put(None)` sentinel could otherwise wedge shutdown).
+        self._worker_stop = threading.Event()
 
     # --- lifecycle -----------------------------------------------------------
 
@@ -220,6 +223,7 @@ class FeishuBridge(Bridge):
             self._tick_future = self._channel.schedule(self._keepalive_tick())
         # Dedicated outbound worker (see __init__): the loop enqueues, it sends.
         if self._worker is None or not self._worker.is_alive():
+            self._worker_stop.clear()
             self._worker = threading.Thread(
                 target=self._outbound_worker, name="feishu-outbound", daemon=True
             )
@@ -299,9 +303,15 @@ class FeishuBridge(Bridge):
     def _outbound_worker(self) -> None:
         """Serial outbound sender, on its own thread. Blocking `requests` here
         never touches the event loop, so it is immune to the async-I/O
-        corruption agent-turn subprocess spawning causes on the loop."""
-        while True:
-            item = self._out_q.get()
+        corruption agent-turn subprocess spawning causes on the loop. Polls the
+        queue with a short timeout so a `stop()` flag ends the thread promptly
+        even when the queue is full (a plain blocking `get` could never see the
+        sentinel then and would wedge shutdown)."""
+        while not self._worker_stop.is_set():
+            try:
+                item = self._out_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
             if item is None:  # sentinel from stop()
                 return
             method, path, body = item
@@ -390,10 +400,22 @@ class FeishuBridge(Bridge):
         if self._tick_future is not None:
             self._tick_future.cancel()
             self._tick_future = None
-        if self._worker is not None and self._worker.is_alive():
-            self._out_q.put(None)  # sentinel: drain and exit
-            self._worker.join(timeout=5)
-        self._worker = None
+        worker = self._worker
+        if worker is not None and worker.is_alive():
+            # Signal via a flag (the worker's timed `get` sees it even if the
+            # queue is full) AND drop a best-effort sentinel to wake it
+            # immediately when there IS room. Never block the event loop: the
+            # sentinel put is non-blocking, and the join runs off-loop.
+            self._worker_stop.set()
+            try:
+                self._out_q.put_nowait(None)  # sentinel: drain and exit
+            except queue.Full:
+                pass
+            await asyncio.to_thread(worker.join, 5)
+        # Only drop the reference once the worker has actually exited — else a
+        # later start() would spawn a SECOND worker racing this one on the queue.
+        if worker is None or not worker.is_alive():
+            self._worker = None
         await self._channel.stop_background()
 
     async def handle_webhook(
@@ -499,11 +521,12 @@ class FeishuBridge(Bridge):
 
         # Validate the click against the nonce's stored record BEFORE consuming
         # (§4.4). The card's `value` is attacker-controllable; only the nonce
-        # record (minted when WE built the card) is trusted. So we take
-        # session_id / tool_use_id from the RECORD, require the action to match
-        # the record's kind, and consume the nonce only on a valid match — a
-        # `/sessions` switch nonce replayed with an `approve` value (Snape's PoC)
-        # hits a kind mismatch and is rejected without consuming the nonce.
+        # record (minted when WE built the card) is trusted. We dispatch by the
+        # RECORD's kind and require EVERY identity field of the click to match
+        # what we bound to that nonce; execution then uses the RECORD's fields.
+        # Any mismatch — a forged action, a tampered session/tool, a switch
+        # nonce replayed as approve (Snape's PoC) — is rejected WITHOUT
+        # consuming the nonce, so a later legitimate click still works.
         nonce = value.get("nonce")
         record = self._nonces.get(nonce) if isinstance(nonce, str) else None
         if record is None:
@@ -512,39 +535,45 @@ class FeishuBridge(Bridge):
             logger.info("Feishu: ignoring stale/duplicate card action (chat=%s)", chat_id)
             return
 
-        action = value.get("action")
         kind = record.get("kind")
-        if action in ("approve", "deny") and kind == "approval":
-            session_id = record.get("session_id")
-            tool_use_id = record.get("tool_use_id")
-            if not session_id or not tool_use_id:
+        if kind == "approval":
+            # Allow and Deny have SEPARATE nonces, each bound to its action; the
+            # click's action, session, and tool must all match the record.
+            if (
+                value.get("action") != record.get("action")
+                or value.get("session_id") != record.get("session_id")
+                or value.get("tool_use_id") != record.get("tool_use_id")
+            ):
+                logger.warning(
+                    "Feishu: approval action/identity mismatch (chat=%s) — rejected", chat_id
+                )
                 return
             self._consume_nonce(nonce)
+            approve = record.get("action") == "approve"
             # On the main loop: resolves the pending-approval Future the turn
             # (also on the main loop) is awaiting — cross-loop would be unsafe.
             await self._run_on_main(
                 self.manager.handle_tool_decision(
-                    self.name, chat_id, session_id, tool_use_id, action == "approve"
+                    self.name, chat_id, record["session_id"], record["tool_use_id"], approve
                 )
             )
-            self._settle_card(event.message_id, "Approved." if action == "approve" else "Denied.")
-        elif action == "switch" and kind == "switch":
-            session_id = record.get("session_id")
-            if not session_id:
+            self._settle_card(event.message_id, "Approved." if approve else "Denied.")
+        elif kind == "switch":
+            if value.get("session_id") != record.get("session_id"):
+                logger.warning(
+                    "Feishu: switch session mismatch (chat=%s) — rejected", chat_id
+                )
                 return
             self._consume_nonce(nonce)
             result = await self._run_on_main(
-                self.manager.switch_session(self.name, chat_id, session_id)
+                self.manager.switch_session(self.name, chat_id, record["session_id"])
             )
             self._settle_card(event.message_id, "Switched.")
             await self._send_plain(chat_id, result)
         else:
-            # Action doesn't match the nonce's kind (or is unknown) — reject
-            # WITHOUT consuming the nonce, so a later legitimate click still
-            # works. This is the integrity gate against card-value tampering.
+            # Unknown nonce kind — reject WITHOUT consuming.
             logger.warning(
-                "Feishu: card action/kind mismatch (action=%r kind=%r chat=%s) — rejected",
-                action, kind, chat_id,
+                "Feishu: unknown nonce kind %r (chat=%s) — rejected", kind, chat_id
             )
             return
 
@@ -633,13 +662,19 @@ class FeishuBridge(Bridge):
         input_str = json.dumps(tool_input, indent=2, ensure_ascii=False)
         if len(input_str) > MAX_PREVIEW_CHARS:
             input_str = input_str[:MAX_PREVIEW_CHARS] + "\n…"
-        nonce = self._mint_nonce(
-            "approval", session_id=session_id, tool_use_id=tool_use_id
+        # Allow and Deny each get their OWN nonce, bound to that exact action
+        # PLUS full identity (session + tool). The nonce record — not the
+        # attacker-controllable card `value` — is the source of truth, and a
+        # nonce fires only the action it was minted for: a `deny` value can't
+        # replay the `approve` nonce, and neither can be re-pointed at another
+        # session/tool. A decision therefore routes to the exact session that
+        # raised it even after a /switch moved the chat's sticky pointer (§4.4).
+        allow_nonce = self._mint_nonce(
+            "approval", action="approve", session_id=session_id, tool_use_id=tool_use_id
         )
-        # Every approval button carries FULL identity, not just tool_use_id, so
-        # a decision routes to the exact session that raised it even after a
-        # /switch moved the chat's sticky pointer (§4.4).
-        base_value = {"session_id": session_id, "tool_use_id": tool_use_id, "nonce": nonce}
+        deny_nonce = self._mint_nonce(
+            "approval", action="deny", session_id=session_id, tool_use_id=tool_use_id
+        )
         card = {
             "config": {"wide_screen_mode": True},
             "elements": [
@@ -653,8 +688,14 @@ class FeishuBridge(Bridge):
                 {
                     "tag": "action",
                     "actions": [
-                        self._button("Allow", "primary", {"action": "approve", **base_value}),
-                        self._button("Deny", "danger", {"action": "deny", **base_value}),
+                        self._button("Allow", "primary", {
+                            "action": "approve", "session_id": session_id,
+                            "tool_use_id": tool_use_id, "nonce": allow_nonce,
+                        }),
+                        self._button("Deny", "danger", {
+                            "action": "deny", "session_id": session_id,
+                            "tool_use_id": tool_use_id, "nonce": deny_nonce,
+                        }),
                     ],
                 },
             ],

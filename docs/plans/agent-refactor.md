@@ -249,7 +249,7 @@ Owlery has two third-party-integration surfaces, and they must stay **separate c
 
 **What we *do* consolidate** (the legitimate anti-silo concern):
 
-1. **One inbound framework.** `server/bridges/` is the single inbound abstraction; Slack-inbound, when added, is a new `Bridge` subclass next to Telegram — not a parallel subsystem.
+1. **One inbound framework.** `server/bridges/` is the single inbound abstraction; Slack-inbound, when added, is a new `Bridge` subclass next to Feishu — not a parallel subsystem.
 2. **One credential vault.** Bridges (bot tokens) and connectors (OAuth tokens) reuse the same encrypted storage + `needs_reconnect` flow (`backend_credentials` / `credential_secrets`). That shared plumbing is the *only* thing they share.
 3. **Both bind to the Agent.** Bridge binding → agent (§4.4, §5.5); connector grant → agent (future, §5.7). Same ownership tier, opposite directions.
 

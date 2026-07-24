@@ -101,12 +101,15 @@ def _card_event(value, *, operator: str = "ou_me", chat_id: str = "oc_1") -> Car
     )
 
 
-def _button_value(send_mock, index: int = 0) -> dict:
-    """Extract the first button's `value` dict from a captured card send."""
+def _button_value(send_mock, index: int = 0, button: int = 0) -> dict:
+    """Extract a button's `value` dict from a captured card send.
+
+    `index` picks which send (call), `button` picks which action button within
+    that card (0 = Allow / first, 1 = Deny / second)."""
     _, message = send_mock.await_args_list[index].args
     card = message["card"]
     action_el = next(e for e in card["elements"] if e["tag"] == "action")
-    return action_el["actions"][0]["value"]
+    return action_el["actions"][button]["value"]
 
 
 # --------------------------------------------------------------------------
@@ -261,15 +264,30 @@ class TestCardActions:
         await b._on_card_action(_card_event(value))
         b.manager.handle_tool_decision.assert_not_awaited()
 
+    async def test_allow_and_deny_have_independent_nonces(self):
+        # Each button carries its OWN nonce, bound to its own action.
+        b = _make_bridge()
+        await b.send_tool_approval_request("oc_1", "sess-A", "tu-1", "Bash", {})
+        allow = _button_value(b._send, button=0)
+        deny = _button_value(b._send, button=1)
+        assert allow["action"] == "approve" and deny["action"] == "deny"
+        assert allow["nonce"] and deny["nonce"] and allow["nonce"] != deny["nonce"]
+        assert b._nonces[allow["nonce"]]["action"] == "approve"
+        assert b._nonces[deny["nonce"]]["action"] == "deny"
+
     async def test_deny_click_routes(self):
         b = _make_bridge()
         await b.send_tool_approval_request("oc_1", "sess-A", "tu-1", "Bash", {})
-        value = _button_value(b._send)
-        value = {**value, "action": "deny"}  # tap the Deny button (same nonce)
+        value = _button_value(b._send, button=1)  # tap the Deny button (own nonce)
+        assert value["action"] == "deny"
         await b._on_card_action(_card_event(value))
         b.manager.handle_tool_decision.assert_awaited_once_with(
             "feishu", "oc_1", "sess-A", "tu-1", False
         )
+        # One-time: a second identical deny click is inert (§4.2).
+        b.manager.handle_tool_decision.reset_mock()
+        await b._on_card_action(_card_event(value))
+        b.manager.handle_tool_decision.assert_not_awaited()
 
     async def test_unauthorized_operator_rejected(self):
         b = _make_bridge()
@@ -497,9 +515,10 @@ class TestApiLayer:
 
 # --------------------------------------------------------------------------
 # Card-action integrity (§4.4, Snape blocker-2): the nonce record is trusted,
-# the card `value` is not. Action must match the nonce's kind; session_id /
-# tool_use_id come from the RECORD; a mismatch is rejected WITHOUT consuming
-# the nonce (so a legit later click still works).
+# the card `value` is not. EVERY identity field of the click (action, session,
+# tool) must match the nonce record; execution uses the RECORD's fields. Any
+# mismatch is rejected WITHOUT consuming the nonce (so a legit later click still
+# works).
 # --------------------------------------------------------------------------
 
 
@@ -538,12 +557,34 @@ class TestCardActionSecurity:
             "feishu", "oc_1", "REAL-sess", "REAL-tool", True
         )
 
-    async def test_approval_uses_record_fields_not_value(self):
-        # Tampered value session/tool are IGNORED; record's are used.
+    async def test_tampered_identity_rejected_without_consuming(self):
+        # A value whose session/tool differ from the nonce record is a forgery:
+        # rejected, nonce preserved, handler NOT called. (This test previously —
+        # wrongly — asserted the tampered click STILL approved the real record,
+        # baking the vulnerability into the suite; reversed here.)
         b = _make_bridge()
         appr = await self._mint_approval(b)
         tampered = {**appr, "session_id": "ATTACK", "tool_use_id": "ATTACK"}
         await b._on_card_action(_card_event(tampered))
+        b.manager.handle_tool_decision.assert_not_awaited()
+        assert appr["nonce"] in b._nonces  # not consumed
+        # The untampered click still routes to the REAL session/tool.
+        await b._on_card_action(_card_event(appr))
+        b.manager.handle_tool_decision.assert_awaited_once_with(
+            "feishu", "oc_1", "REAL-sess", "REAL-tool", True
+        )
+
+    async def test_approve_nonce_cannot_be_used_to_deny(self):
+        # The Allow button's nonce is bound to action="approve"; a value that
+        # flips it to "deny" (keeping that nonce) is an action mismatch —
+        # rejected without consuming, so the real Allow click still works.
+        b = _make_bridge()
+        appr = await self._mint_approval(b)  # the Allow button's value
+        forged = {**appr, "action": "deny"}
+        await b._on_card_action(_card_event(forged))
+        b.manager.handle_tool_decision.assert_not_awaited()
+        assert appr["nonce"] in b._nonces  # not consumed
+        await b._on_card_action(_card_event(appr))
         b.manager.handle_tool_decision.assert_awaited_once_with(
             "feishu", "oc_1", "REAL-sess", "REAL-tool", True
         )

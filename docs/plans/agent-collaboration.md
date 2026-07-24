@@ -275,7 +275,7 @@ except two:
   Vera's archived-sessions list.
 - **No bridge fan-out.** Bridges only broadcast to `origin='user'` (and
   maybe `bridge`) sessions; a delegation must not also notify the
-  user's Telegram chat. Single line in `BridgeManager._on_broadcast`.
+  user's Feishu chat. Single line in `BridgeManager._on_broadcast`.
 
 Otherwise: same harness, same MCP set, same credentials, same memory
 dir as Vera's other sessions. Memory writes from concurrent
@@ -767,7 +767,7 @@ where they are cheaper and less flaky.
 - **Tool approval requests inside the child stay in the child.**
   Only `ask`-shaped questions bubble. Tool policy is the agent's
   decision, not the caller's.
-- **Bridges don't fan out delegation sessions.** Telegram (and any
+- **Bridges don't fan out delegation sessions.** Feishu (and any
   future bridge) ignores `origin='delegation'`.
 - **Cascade-cancel is part of v1.** Cancelling Vera also cancels
   Pete if Vera asked Pete and Pete is still running. Each hop still
