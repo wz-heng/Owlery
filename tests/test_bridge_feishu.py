@@ -779,3 +779,29 @@ class TestLifecycle:
         # cleanup: release the stuck worker so the thread can exit.
         gate.set()
         b._worker.join(timeout=2)
+
+    async def test_channel_startup_failure_rolls_back_the_live_worker(self):
+        # Snape should: start() is worker-first (_ensure_worker brings the
+        # outbound worker up BEFORE the channel/tick). If the channel/tick then
+        # fails, the already-live worker must be rolled back — otherwise a failed
+        # start leaves a healthy outbound worker spinning against a dead channel,
+        # and BridgeManager.start_all() swallows the start error so nobody cleans
+        # it up. start() must re-raise the ORIGINAL error and leave nothing
+        # half-started (no live worker, no residual tick).
+        b, fake_future = self._stubbed()
+        b._channel.start_background = AsyncMock(side_effect=RuntimeError("dial failed"))
+
+        with pytest.raises(RuntimeError, match="dial failed"):
+            await b.start()
+
+        # The worker _ensure_worker() spawned must have been torn down: no live
+        # feishu-outbound thread survives, and the reference is cleared.
+        live_workers = [
+            t for t in threading.enumerate()
+            if t.name == "feishu-outbound" and t.is_alive()
+        ]
+        assert live_workers == []
+        assert b._worker is None
+        # No residual tick, and the channel/tick were never left half-started.
+        assert b._tick_future is None
+        b._channel.schedule.assert_not_called()  # start_background died first

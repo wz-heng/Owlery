@@ -220,16 +220,32 @@ class FeishuBridge(Bridge):
         # (_ensure_worker raises); doing it before channel/tick means such a
         # failure happens with NOTHING half-started to roll back.
         await self._ensure_worker()
-        # Async lifecycle designed for exactly this (FastAPI lifespan): webhook
-        # mode returns ready without dialing, WS mode returns once connected.
-        await self._channel.start_background()
-        # Keep the SDK's background loop iterating (see _keepalive_tick) so
-        # cross-thread INBOUND scheduling stays prompt after subprocess churn.
-        # Save the future so stop() can cancel/await it, and never stack a second
-        # tick on a re-start.
-        self._tick_stop = False
-        if self._tick_future is None or self._tick_future.done():
-            self._tick_future = self._channel.schedule(self._keepalive_tick())
+        # From here on the worker is already live, so any failure bringing up the
+        # channel/tick must roll it (and any partial tick/channel) back — else a
+        # failed start leaves a healthy outbound worker spinning against a dead
+        # channel. That matters because BridgeManager.start_all() swallows a
+        # bridge's start error and moves on, so nobody else cleans this up. Tear
+        # down via stop() (best-effort; the ORIGINAL error still propagates).
+        try:
+            # Async lifecycle designed for exactly this (FastAPI lifespan):
+            # webhook mode returns ready without dialing, WS returns once
+            # connected.
+            await self._channel.start_background()
+            # Keep the SDK's background loop iterating (see _keepalive_tick) so
+            # cross-thread INBOUND scheduling stays prompt after subprocess
+            # churn. Save the future so stop() can cancel/await it, and never
+            # stack a second tick on a re-start.
+            self._tick_stop = False
+            if self._tick_future is None or self._tick_future.done():
+                self._tick_future = self._channel.schedule(self._keepalive_tick())
+        except Exception:
+            try:
+                await self.stop()
+            except Exception:
+                logger.exception(
+                    "Feishu bridge rollback after failed start also failed"
+                )
+            raise
         logger.info("Feishu bridge started (transport=%s)", self.transport)
 
     async def _ensure_worker(self) -> None:
