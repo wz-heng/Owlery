@@ -26,6 +26,9 @@ design rationale. **Code comments cite these by filename + section** (e.g.
 - **[plans/agent-collaboration.md](plans/agent-collaboration.md)** —
   agent-to-agent delegation (the `mcp__ask_agent__*` tools). Reverses
   the explicit "no A2A" carve-out in `agent-refactor.md` §40-41.
+- **[plans/durable-session-injections.md](plans/durable-session-injections.md)** —
+  per-round delegation execution records plus the crash-safe, deduplicated
+  session-injection outbox shared by delegation, bg tasks, and research.
 - **[plans/session-rewind.md](plans/session-rewind.md)** — `/rewind`
   (also `/tree`): branch a conversation to any prior user message, with optional
   git revert of the working tree. The conversation-rewind feature.

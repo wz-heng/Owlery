@@ -3,6 +3,12 @@
 > **Post-implementation refresh.** This document now describes the
 > shipped feature; see commit history for the review-driven fixes that
 > closed the plan/implementation drift.
+>
+> **2026-07-24 durability refresh.** Delegation execution is now persisted per
+> round in `delegation_runs`, and questions/terminal events use the durable
+> `session_injections` outbox. The public delegation id remains the child
+> session id. See `durable-session-injections.md`; its persistence and delivery
+> contracts supersede the older in-memory details in §3/§5 below.
 
 ## 0. What we're building, and the mental model
 
@@ -83,9 +89,11 @@ needed: a delegation is a normal `Session` row with a
 - **No synchronous mode.** The MCP tool never blocks. (Considered
   briefly; bg-task-style is strictly better — parallel fan-out, the
   user can keep talking, the same plumbing handles everything.)
-- **No new top-level "delegation" table.** A delegation *is* a child
-  Session row. The session id is the delegation id. We do not invent
-  a parallel id space.
+- **No parallel public delegation entity.** A delegation is still a child
+  Session row and the session id remains its public continuation handle.
+  `delegation_runs` is an internal append-only execution ledger because one
+  child session can contain multiple follow-up rounds; `run_id` is not an
+  alternative user-facing delegation id.
 - **No new `Run` table.** Same reasoning as `agent-refactor.md`: a
   turn stays implicit inside a session. The async wakeup mechanism
   already exists for bg-tasks; we reuse it.

@@ -396,9 +396,26 @@ migrations (never re-create or duplicate the schema in docs).
   crash recovery — see [`plans/session-rewind.md`](plans/session-rewind.md) §4 and
   [`plans/session-fork.md`](plans/session-fork.md).
 - **`messages`** — ordered history per session (`role`, `type`, `content`, tool
-  fields, `cost`, `attachments`). User-message rows additionally record
+  fields, `cost`, `attachments`). A system-produced user turn carries an
+  optional, unique `injection_id`, which is the durable delivery receipt for
+  `session_injections`. User-message rows additionally record
   `git_head` and `git_status_clean` (captured at turn-start) so the fork
   safe-revert preflight can verify the working tree was clean at the branch point.
+- **`delegation_runs`** — append-only execution ledger for each initial and
+  follow-up round within a delegation child session. `start_seq` identifies the
+  durable slice of assistant text in `messages`; a boot sweep changes orphaned
+  `running` rounds to `interrupted` rather than guessing whether their external
+  effects succeeded. See
+  [`plans/durable-session-injections.md`](plans/durable-session-injections.md).
+- **`session_injections`** — narrow transactional outbox shared only by
+  delegation, bg-task, and research result delivery. An intent is persisted
+  before queueing; a SQLite trigger makes it `delivered` inside the statement
+  that inserts the corresponding `messages.injection_id` row. Pending intents
+  are replayed only after all domain managers finish boot recovery; shutdown
+  pauses dispatch before producers terminate. Nested delegation events aimed
+  at parents that are also interrupted are materialized transcript-only before
+  the recovered tree archives. The unique message index prevents duplicate
+  transcript turns.
 - **`schedules`** — recurring prompts owned by an agent: `interval_seconds` **or**
   `cron`+`timezone`, `recurrence_label`, `origin_session_id`, `enabled`.
 - **`bridge_mappings`** — `(platform, chat_id)` → `agent_id` + sticky `session_id`
@@ -410,8 +427,11 @@ migrations (never re-create or duplicate the schema in docs).
   the connector tables (see Connector system).
 - **`notifiers`** — notification destinations.
 - **`bg_tasks`** — cross-turn background task state (`status`, `exit_code`,
-  captured stdio, timestamps).
-- **`research_jobs`** — native deep-research job state: `question`, `status` (`running`|`completed`|`cancelled`|`failed`|`interrupted`), `phase`, `completed_at`, `injection_status` / `injected_at` / `delivery_error` (delivery tracked separately from completion so a job can be "done but report queued"), `report_path`, and per-phase progress counters. A boot sweep marks any `running` row `interrupted`.
+  captured stdio, timestamps). Post-outbox tasks set `delivery_required`; boot
+  recovery creates any missing `bg:<task_id>` source after terminalization,
+  while migrated historical terminal rows remain exempt from replay. Migrated
+  in-flight rows opt in so their `interrupted` outcome is still delivered.
+- **`research_jobs`** — native deep-research job state: `question`, `status` (`running`|`completed`|`cancelled`|`failed`|`interrupted`), `phase`, `completed_at`, `report_path`, and per-phase progress counters. A boot sweep marks any `running` row `interrupted`; completed report delivery is owned by `session_injections`. The legacy `injection_status` / `injected_at` fields remain a compatibility mirror for one release.
 - **`turn_usage`** — per-turn consumption ledger ([`plans/usage-tracking.md`](plans/usage-tracking.md)): one row per completed turn (`origin='turn'`, error results included) and one per finished deep-research job (`origin='research'`), with `created_at`, denormalized `agent_id`/`backend`/`model`, `cost`, the five normalized token columns + denormalized `total_tokens`, and Claude's `modelUsage` JSON verbatim. `session_id` is a plain ref (no FK) — rows survive session deletion. Aggregated by `GET /api/usage/summary` (group by agent/session/day/backend over a window); surfaced in the account-menu Usage dialog.
 
 ## Memory

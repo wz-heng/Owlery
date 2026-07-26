@@ -49,6 +49,17 @@ async def lifespan(app: FastAPI):
     await db.initialize()
     await rewrite_legacy_paths(db, settings)
     await session_manager.initialize(db)
+    # Boot is a two-phase recovery. Domain managers may create/repair durable
+    # outbox intents below, but no consuming model turn may start until every
+    # listener is bound and every prior-process execution state is reconciled.
+    session_manager.pause_session_injection_dispatch()
+    bg_task_manager.bind(
+        db=db,
+        deliver_cb=session_manager.deliver_bg_result,
+        broadcast_cb=session_manager._broadcast,
+    )
+    delegation_manager.bind(session_mgr=session_manager, db=db)
+    research_manager.bind(session_mgr=session_manager, db=db)
 
     # Initialize bridge manager
     bridge_manager = BridgeManager(session_manager, db)
@@ -66,12 +77,10 @@ async def lifespan(app: FastAPI):
         )
         bridge_manager.register_bridge(telegram)
 
-    await bridge_manager.start_all()
     app.state.bridge_manager = bridge_manager
 
     # Initialize scheduler
     schedule_runner = ScheduleRunner(session_manager, db)
-    await schedule_runner.initialize()
     app.state.schedule_runner = schedule_runner
     session_manager.set_schedule_runner(schedule_runner)
     schedules._db = db
@@ -81,7 +90,6 @@ async def lifespan(app: FastAPI):
     # restart destroyed — a park is a multi-hour wait, so the DB records are the
     # source of truth and the scheduler jobs are derived state.
     parked_turn_runner = ParkedTurnRunner(session_manager, db)
-    await parked_turn_runner.initialize()
     app.state.parked_turn_runner = parked_turn_runner
     session_manager.set_parked_turn_runner(parked_turn_runner)
     sessions._parked_turns = parked_turn_runner
@@ -98,22 +106,29 @@ async def lifespan(app: FastAPI):
     # subprocesses survive any per-turn `claude --print` lifetime. The
     # deliver callback synthesizes a user message into the session; the
     # broadcast callback pushes status events to all WS clients.
-    bg_task_manager.bind(
-        db=db,
-        deliver_cb=session_manager.deliver_bg_result,
-        broadcast_cb=session_manager._broadcast,
-    )
     await bg_task_manager.start()
-
-    # Agent-to-agent delegations (agent-collaboration.md). Subscribes to
-    # the session-manager broadcast bus and routes child-session
-    # replies/errors back into the parent session as injected turns.
-    delegation_manager.bind(session_mgr=session_manager, db=db)
 
     # Native deep research (native-deep-research.md). Tracks research jobs as
     # async tasks; injects the final report back into the session.
-    research_manager.bind(session_mgr=session_manager, db=db)
     await research_manager.recover_interrupted()
+
+    # Delegation recovery runs last among domain recoveries because it
+    # transcript-materializes every pending bg/research/child event aimed at a
+    # delegation parent before archiving the interrupted delegation tree.
+    await delegation_manager.recover_interrupted()
+
+    # Domain recovery is now complete and all broadcast listeners are live.
+    # Drain only after that barrier; a replay can immediately start a model
+    # turn, so moving this earlier reintroduces the boot race.
+    await session_manager.resume_session_injection_dispatch()
+
+    # Only now start autonomous producers. A due parked turn, schedule, or
+    # bridge message can call start_message directly (outside the injection
+    # outbox), so starting any of them before the recovery barrier would bypass
+    # paused injection dispatch.
+    await schedule_runner.initialize()
+    await parked_turn_runner.initialize()
+    await bridge_manager.start_all()
 
     # Start Cloudflare Tunnel if enabled
     tunnel: CloudflareTunnel | None = None
@@ -128,6 +143,10 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # No system-produced result may start a fresh model turn once teardown
+    # begins. Producers below may still persist terminal state/outbox rows;
+    # those pending intents are deliberately replayed on the next boot.
+    session_manager.pause_session_injection_dispatch()
     if tunnel:
         await tunnel.stop()
 
@@ -137,12 +156,14 @@ async def lifespan(app: FastAPI):
     from .codex_login import codex_login_manager
     await codex_login_manager.shutdown()
 
-    await bg_task_manager.shutdown()
-    delegation_manager.shutdown()
     await schedule_runner.shutdown()
     await parked_turn_runner.shutdown()
     await bridge_manager.stop_all()
     await bridge_manager.unregister_broadcast()
+    await research_manager.shutdown()
+    await bg_task_manager.shutdown()
+    delegation_manager.shutdown()
+    await session_manager.shutdown_session_injections()
     await db.close()
 
 

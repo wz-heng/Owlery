@@ -1,30 +1,25 @@
 """Agent-to-agent delegation manager (agent-collaboration.md).
 
 The shape mirrors `server/bg_tasks.py`: an asynchronous, fire-and-forget
-operation on the parent agent's behalf, whose terminal result is
-delivered back to the parent session as a *new* injected user message
-(routed through `SessionManager.start_message`, the same path bg-task
-results use). That parent-injection is what gives the parent agent a
-fresh turn to react to the child's reply.
+operation on the parent agent's behalf, whose terminal result is delivered
+back as a crash-safe `session_injections` user turn. That parent injection is
+what gives the caller a fresh turn to react to the child's reply.
 
-For agent collaboration, the operation is "spawn a child Session under
-another agent and run one turn there". A delegation is **not** a new
-persistence concept — it is a normal `Session` row with
-``origin='delegation'`` and ``parent_session_id`` set. The delegation id
-*is* the child session id; we don't invent a parallel id space.
+For agent collaboration, the public delegation is a normal child `Session`
+with ``origin='delegation'`` and ``parent_session_id`` set. Its id remains the
+continuation handle. Each initial/follow-up execution inside that session is an
+append-only `delegation_runs` row with an internal `run_id`.
 
 What this module owns:
 
-  - The in-memory registry of live (and recently-finished) delegations,
-    keyed by child-session id.
+  - A hot in-memory registry of the latest round, backed by durable rows.
   - The broadcast subscriber that watches the child's event stream and
     captures the events that matter for delivery (the same filter
     bridges use for quiet mode: assistant_text + result + error).
   - The cycle and depth guards that walk the parent chain.
   - The agent-name lookup (case-insensitive, ambiguity-rejecting).
   - The injection formatter: ``[agent-reply|agent-error:<name>
-    delegation=<id>]`` plus the body, fed through
-    ``SessionManager.start_message(parent_session_id, …)``.
+    delegation=<id>]`` plus a durable, deduplicated delivery intent.
 
 What this module does NOT own:
 
@@ -43,6 +38,7 @@ to invoke this yet — only the REST API does.
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
@@ -81,16 +77,20 @@ class DelegationRunState:
     window so ``list_agent_tasks`` can show recently-finished items.
     """
 
-    # The id is the child session id — see module docstring.
+    # `delegation_id` remains the public child-session continuation handle;
+    # `run_id` identifies this particular round inside that session.
+    run_id: str
     delegation_id: str
-    parent_session_id: str
+    round_no: int
+    start_seq: int
+    parent_session_id: str | None
     target_agent_id: str
     target_agent_name: str
     request: str
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
-    state: str = "running"  # "running" | "completed" | "failed" | "cancelled"
+    state: str = "running"  # running|completed|failed|cancelled|interrupted
     captured_text: list[str] = field(default_factory=list)
     finished_at: str | None = None
     error: str | None = None
@@ -107,8 +107,10 @@ class DelegationRunState:
         ``ask_agent`` tool's return value. Hides ``captured_text``
         (that goes into the parent's transcript, not the JSON API)."""
         return {
+            "run_id": self.run_id,
             "delegation_id": self.delegation_id,
             "sub_session_id": self.delegation_id,
+            "round_no": self.round_no,
             "parent_session_id": self.parent_session_id,
             "target_agent_id": self.target_agent_id,
             "target_agent_name": self.target_agent_name,
@@ -121,12 +123,13 @@ class DelegationRunState:
 
 
 class DelegationManager:
-    """In-process owner of delegation state.
+    """Coordinator and hot cache for durable delegation rounds.
 
     Wired in by ``main.py`` lifespan after ``SessionManager.initialize``:
     we register a broadcast listener so the per-session WS events the
-    SessionManager already produces become our event source. No extra
-    subprocess, no extra polling.
+    SessionManager already produces become our event source. The database is
+    authoritative across restarts; ``_records`` only avoids repeated reads for
+    currently active rounds. No extra subprocess, no extra polling.
     """
 
     BROADCAST_KEY = "delegation_manager"
@@ -153,6 +156,194 @@ class DelegationManager:
     def shutdown(self) -> None:
         if self.session_mgr is not None:
             self.session_mgr.remove_broadcast(self.BROADCAST_KEY)
+
+    @staticmethod
+    def _record_from_row(row: dict[str, Any]) -> DelegationRunState:
+        return DelegationRunState(
+            run_id=row["run_id"],
+            delegation_id=row["delegation_id"],
+            round_no=int(row["round_no"]),
+            start_seq=int(row["start_seq"]),
+            parent_session_id=row["parent_session_id"],
+            target_agent_id=row["target_agent_id"],
+            target_agent_name=row["target_agent_name"],
+            request=row["request"],
+            created_at=row["created_at"],
+            state=row["state"],
+            finished_at=row.get("finished_at"),
+            error=row.get("error"),
+        )
+
+    async def _load_latest_record(
+        self, delegation_id: str, *, refresh: bool = False
+    ) -> DelegationRunState | None:
+        rec = None if refresh else self._records.get(delegation_id)
+        if rec is not None:
+            return rec
+        if self.db is None:
+            return None
+        row = await self.db.get_latest_delegation_run(delegation_id)
+        if row is None:
+            return None
+        rec = self._record_from_row(row)
+        self._records[delegation_id] = rec
+        return rec
+
+    async def recover_interrupted(self) -> int:
+        """Make restart-orphaned delegation rounds truthful and notify callers.
+
+        No delegated model process survives the Owlery process, but external
+        side effects may already have happened.  Therefore a running round
+        becomes `interrupted` (outcome unknown), never `failed` and never an
+        automatic retry.
+
+        Recovery is deliberately phased while session-injection dispatch is
+        paused by main.py:
+
+        1. terminalise every running/legacy round without archiving anything;
+        2. create every missing terminal outbox source, deepest-first;
+        3. materialise pending events aimed at delegation parents directly into
+           their transcripts without reviving a model turn;
+        4. only then archive the recovered delegation sessions.
+
+        Keeping archive as the final phase prevents Octo→Vera→Pete recovery
+        from deleting Vera before Pete's terminal event is durably recorded.
+        """
+        if self.session_mgr is None or self.db is None:
+            return 0
+        if not self.session_mgr.session_injection_dispatch_paused:
+            raise RuntimeError(
+                "delegation restart recovery requires paused injection dispatch"
+            )
+        now = datetime.now(timezone.utc).isoformat()
+        recovered = 0
+        live_delegations = {
+            session.id: session
+            for session in self.session_mgr.sessions.values()
+            if session.origin == "delegation"
+        }
+
+        # Phase 1a: terminalise all durable running rounds. Do not inject or
+        # archive in this loop; every parent in the restart tree must remain
+        # available until descendant delivery intents are materialised.
+        for row in await self.db.list_running_delegation_runs():
+            changed = await self.db.finish_delegation_run(
+                row["run_id"],
+                state="interrupted",
+                error="server restarted; work may have partially completed",
+                finished_at=now,
+            )
+            if not changed:
+                continue
+            row["state"] = "interrupted"
+            row["error"] = "server restarted; work may have partially completed"
+            row["finished_at"] = now
+            rec = self._record_from_row(row)
+            self._records[rec.delegation_id] = rec
+            await self._cancel_park_for_recovery(rec.delegation_id)
+            recovered += 1
+
+        # Phase 1b: compatibility rescue for an upgrade while an old-version
+        # delegation was live. Historical archived sessions remain untouched;
+        # only live sessions with no ledger receive an interrupted round.
+        for session in live_delegations.values():
+            if await self.db.delegation_session_has_runs(session.id):
+                continue
+            run_id = uuid.uuid4().hex[:12]
+            request = session.delegation_request or "(legacy delegation request unavailable)"
+            await self.db.create_delegation_run(
+                run_id=run_id,
+                delegation_id=session.id,
+                round_no=1,
+                request=request,
+                start_seq=-1,
+                created_at=session.created_at,
+                state="interrupted",
+                error="server restarted; legacy work may have partially completed",
+                finished_at=now,
+            )
+            row = await self.db.get_latest_delegation_run(session.id)
+            if row is None:
+                continue
+            rec = self._record_from_row(row)
+            self._records[rec.delegation_id] = rec
+            await self._cancel_park_for_recovery(rec.delegation_id)
+            recovered += 1
+
+        def session_depth(session_id: str) -> int:
+            """Depth inside the live delegation-session tree."""
+            value = 0
+            session = live_delegations.get(session_id)
+            parent_id = session.parent_session_id if session else None
+            seen: set[str] = set()
+            while parent_id in live_delegations and parent_id not in seen:
+                seen.add(parent_id)
+                value += 1
+                parent_id = live_delegations[parent_id].parent_session_id
+            return value
+
+        # Phase 2: completion and delivery intent are separate facts. Every
+        # post-ledger terminal round with a live parent must have one source.
+        # Deepest-first is both easier to audit and preserves child-before-
+        # ancestor transcript order; archive still waits for phase 4.
+        missing = await self.db.list_terminal_delegation_runs_missing_delivery()
+        missing.sort(
+            key=lambda row: (
+                session_depth(row["delegation_id"]),
+                row.get("finished_at") or "",
+                row["run_id"],
+            ),
+            reverse=True,
+        )
+        for row in missing:
+            rec = self._record_from_row(row)
+            latest = self._records.get(rec.delegation_id)
+            if latest is None or rec.round_no >= latest.round_no:
+                self._records[rec.delegation_id] = rec
+            await self._inject_terminal(rec, archive=False)
+
+        # Phase 3: these parents are themselves interrupted and will be
+        # archived. Preserve child/bg/research events in their transcript but
+        # never restart a model turn whose outcome we have declared unknown.
+        materialized = (
+            await self.session_mgr.materialize_pending_injections_for_sessions(
+                set(live_delegations)
+            )
+        )
+
+        # Phase 4: all descendant delivery receipts now exist below the model
+        # layer, so the whole recovered tree can be archived safely.
+        for session_id in sorted(
+            live_delegations,
+            key=session_depth,
+            reverse=True,
+        ):
+            await self.session_mgr.auto_archive_scheduled_session(session_id)
+
+        if recovered:
+            logger.info("delegation recovery: interrupted %d round(s)", recovered)
+        if missing:
+            logger.info(
+                "delegation recovery: repaired %d terminal delivery intent(s)",
+                len(missing),
+            )
+        if materialized:
+            logger.info(
+                "delegation recovery: materialized %d nested transcript event(s)",
+                materialized,
+            )
+        return recovered
+
+    async def _cancel_park_for_recovery(self, session_id: str) -> None:
+        if self.session_mgr is None or self.session_mgr._parked_turns is None:
+            return
+        try:
+            await self.session_mgr._parked_turns.cancel(session_id)
+        except Exception:
+            logger.exception(
+                "delegation recovery: failed to cancel parked child %s",
+                session_id,
+            )
 
     # --------------------------------------------------------- public API
 
@@ -217,12 +408,27 @@ class DelegationManager:
             delegation_request=request,
         )
 
-        rec = DelegationRunState(
+        run_id = uuid.uuid4().hex[:12]
+        start_seq = await self.db.max_message_seq(child.id)
+        created_at = datetime.now(timezone.utc).isoformat()
+        await self.db.create_delegation_run(
+            run_id=run_id,
             delegation_id=child.id,
+            round_no=1,
+            request=request,
+            start_seq=start_seq,
+            created_at=created_at,
+        )
+        rec = DelegationRunState(
+            run_id=run_id,
+            delegation_id=child.id,
+            round_no=1,
+            start_seq=start_seq,
             parent_session_id=parent.id,
             target_agent_id=target["id"],
             target_agent_name=target["name"],
             request=request,
+            created_at=created_at,
         )
         # Register BEFORE start_message: the broadcast may fire
         # synchronously from inside start_message on a fast harness
@@ -248,6 +454,12 @@ class DelegationManager:
             rec.state = "failed"
             rec.error = f"failed to start child session: {exc}"
             rec.finished_at = datetime.now(timezone.utc).isoformat()
+            await self.db.finish_delegation_run(
+                rec.run_id,
+                state=rec.state,
+                error=rec.error,
+                finished_at=rec.finished_at,
+            )
             await self._inject_terminal(rec)
             raise DelegationError(
                 f"failed to start delegation: {exc}", status_code=500
@@ -269,11 +481,11 @@ class DelegationManager:
         silently dropped. Cascade unwinds the chain top-down so the
         terminal injections to each parent stay meaningful.
         """
-        if self.session_mgr is None:
+        if self.session_mgr is None or self.db is None:
             raise DelegationError(
                 "DelegationManager not bound", status_code=500
             )
-        rec = self._records.get(delegation_id)
+        rec = await self._load_latest_record(delegation_id)
         if rec is None:
             raise DelegationError(
                 f"No delegation {delegation_id!r}", status_code=404
@@ -292,6 +504,18 @@ class DelegationManager:
         rec.state = "cancelled"
         rec.error = reason or "cancelled by caller"
         rec.finished_at = datetime.now(timezone.utc).isoformat()
+        changed = await self.db.finish_delegation_run(
+            rec.run_id,
+            state=rec.state,
+            error=rec.error,
+            finished_at=rec.finished_at,
+        )
+        if not changed:
+            # Another terminal transition won the compare-and-set. Refresh
+            # from durable truth; returning the locally-mutated cancelled
+            # object would lie about the actual outcome.
+            latest = await self._load_latest_record(delegation_id, refresh=True)
+            return latest or rec
         try:
             await self.session_mgr.interrupt(delegation_id)
         except Exception:
@@ -337,18 +561,12 @@ class DelegationManager:
           archived, we unarchive it. A hard-deleted child can't be
           followed up — start a fresh delegation instead
 
-        Round-reset on the record:
-        - state → ``"running"``
-        - ``_terminal_injected`` → False (so the next terminal turn
-          fires, and is idempotent within the new round)
-        - ``captured_text`` cleared, ``error`` cleared,
-          ``finished_at`` cleared
-        - ``request`` updated to the new round's text so list_tasks
-          reflects the latest ask
-        - identity (``delegation_id``, ``parent_session_id``,
-          ``target_agent_id``, ``target_agent_name``) stable
+        Each follow-up appends a new run row. The public delegation/session id
+        and agent identity stay stable; run_id, round_no, request, timestamps,
+        and terminal state belong to that one round and never overwrite prior
+        audit history.
         """
-        if self.session_mgr is None:
+        if self.session_mgr is None or self.db is None:
             raise DelegationError(
                 "DelegationManager not bound", status_code=500
             )
@@ -356,44 +574,59 @@ class DelegationManager:
             raise DelegationError(
                 "request must be a non-empty string", status_code=400
             )
-        rec = self._records.get(delegation_id)
-        if rec is None or rec.parent_session_id != parent_session_id:
+        prior = await self._load_latest_record(delegation_id)
+        if prior is None or prior.parent_session_id != parent_session_id:
             raise DelegationError(
                 f"No delegation {delegation_id!r} owned by this session",
                 status_code=404,
             )
-        if rec.state == "running":
+        if prior.state == "running":
             raise DelegationError(
                 f"Delegation {delegation_id!r} is still running; "
                 f"wait for its reply before following up",
                 status_code=409,
             )
 
-        child = self.session_mgr.get_session(rec.delegation_id)
+        child = self.session_mgr.get_session(prior.delegation_id)
         if child is None:
             # Try unarchive — the round-2 auto-archive policy means
             # any terminal delegation child sits in the archived
             # state by the time we get here.
             try:
                 child = await self.session_mgr.unarchive_session(
-                    rec.delegation_id
+                    prior.delegation_id
                 )
             except ValueError as exc:
                 raise DelegationError(
-                    f"Child session {rec.delegation_id!r} is gone and "
+                    f"Child session {prior.delegation_id!r} is gone and "
                     f"can't be reused; start a fresh delegation",
                     status_code=409,
                 ) from exc
 
-        # Round-reset the record. Update last-write fields so the
-        # registry view (and any /list_agent_tasks consumer) reflects
-        # the new round's ask without losing the chain identity.
-        rec.state = "running"
-        rec.captured_text = []
-        rec.error = None
-        rec.finished_at = None
-        rec._terminal_injected = False
-        rec.request = request
+        # Append a new durable round; never overwrite the prior outcome.
+        start_seq = await self.db.max_message_seq(prior.delegation_id)
+        created_at = datetime.now(timezone.utc).isoformat()
+        run_id = uuid.uuid4().hex[:12]
+        await self.db.create_delegation_run(
+            run_id=run_id,
+            delegation_id=prior.delegation_id,
+            round_no=prior.round_no + 1,
+            request=request,
+            start_seq=start_seq,
+            created_at=created_at,
+        )
+        rec = DelegationRunState(
+            run_id=run_id,
+            delegation_id=prior.delegation_id,
+            round_no=prior.round_no + 1,
+            start_seq=start_seq,
+            parent_session_id=prior.parent_session_id,
+            target_agent_id=prior.target_agent_id,
+            target_agent_name=prior.target_agent_name,
+            request=request,
+            created_at=created_at,
+        )
+        self._records[rec.delegation_id] = rec
 
         # Compose a thin reopen-the-conversation prompt. We don't
         # repeat the original briefing — the child already has it in
@@ -422,6 +655,12 @@ class DelegationManager:
             rec.state = "failed"
             rec.error = f"failed to start follow-up: {exc}"
             rec.finished_at = datetime.now(timezone.utc).isoformat()
+            await self.db.finish_delegation_run(
+                rec.run_id,
+                state=rec.state,
+                error=rec.error,
+                finished_at=rec.finished_at,
+            )
             await self._inject_terminal(rec)
             raise DelegationError(
                 f"failed to start follow-up: {exc}", status_code=500
@@ -478,20 +717,45 @@ class DelegationManager:
                     next_frontier.append(child_rec.delegation_id)
             frontier = next_frontier
 
-    def list_delegations(
+    async def list_delegations(
         self, parent_session_id: str, *, limit: int = 25
     ) -> list[DelegationRunState]:
-        """Recent delegations spawned by a parent session, newest first."""
-        rows = [
-            r
-            for r in self._records.values()
-            if r.parent_session_id == parent_session_id
-        ]
-        rows.sort(key=lambda r: r.created_at, reverse=True)
-        return rows[:limit]
+        """Latest durable round for each child delegation, newest first."""
+        if self.db is None:
+            return []
+        rows = await self.db.list_latest_delegation_runs_for_parent(
+            parent_session_id, limit=limit
+        )
+        result: list[DelegationRunState] = []
+        for row in rows:
+            live = self._records.get(row["delegation_id"])
+            if live is not None and live.run_id == row["run_id"]:
+                result.append(live)
+            else:
+                result.append(self._record_from_row(row))
+        return result
 
     def get_delegation(self, delegation_id: str) -> DelegationRunState | None:
         return self._records.get(delegation_id)
+
+    async def get_delegation_record(
+        self, delegation_id: str
+    ) -> DelegationRunState | None:
+        return await self._load_latest_record(delegation_id)
+
+    async def list_delegation_rounds(
+        self, *, parent_session_id: str, delegation_id: str
+    ) -> list[DelegationRunState]:
+        """Complete append-only execution history for one child session."""
+        if self.db is None:
+            return []
+        latest = await self.db.get_latest_delegation_run(delegation_id)
+        if latest is None or latest["parent_session_id"] != parent_session_id:
+            raise DelegationError("Delegation not found", status_code=404)
+        return [
+            self._record_from_row(row)
+            for row in await self.db.list_delegation_runs(delegation_id)
+        ]
 
     def has_active_delegation_for_parent(self, parent_session_id: str) -> bool:
         """True if `parent_session_id` has any still-running delegation
@@ -754,6 +1018,15 @@ class DelegationManager:
             else:
                 rec.state = "completed"
             rec.finished_at = datetime.now(timezone.utc).isoformat()
+            assert self.db is not None
+            changed = await self.db.finish_delegation_run(
+                rec.run_id,
+                state=rec.state,
+                error=rec.error,
+                finished_at=rec.finished_at,
+            )
+            if not changed:
+                return
             await self._inject_terminal(rec)
             return
         if kind == "error":
@@ -769,6 +1042,15 @@ class DelegationManager:
             rec.state = "failed"
             rec.error = str(msg.get("message") or "child session error")
             rec.finished_at = datetime.now(timezone.utc).isoformat()
+            assert self.db is not None
+            changed = await self.db.finish_delegation_run(
+                rec.run_id,
+                state=rec.state,
+                error=rec.error,
+                finished_at=rec.finished_at,
+            )
+            if not changed:
+                return
             await self._inject_terminal(rec)
             return
 
@@ -798,8 +1080,12 @@ class DelegationManager:
             f"`mcp__ask_agent__cancel`."
         )
         try:
-            await self.session_mgr.start_message(
-                rec.parent_session_id, prompt
+            await self.session_mgr.enqueue_session_injection(
+                source_key=(
+                    f"delegation:{rec.run_id}:question:{question_id or 'unknown'}"
+                ),
+                session_id=rec.parent_session_id,
+                prompt=prompt,
             )
         except Exception:
             logger.exception(
@@ -901,17 +1187,18 @@ class DelegationManager:
             "ok": True,
         }
 
-    async def _inject_terminal(self, rec: DelegationRunState) -> None:
-        """Push the terminal turn into the parent session.
+    async def _inject_terminal(
+        self, rec: DelegationRunState, *, archive: bool = True
+    ) -> dict[str, Any] | None:
+        """Persist and schedule the terminal turn into the parent session.
 
-        Routed through ``start_message`` so it queues behind any
-        in-flight parent turn (the same property bg-task delivery
-        relies on). The marker prefix is structured text so the
+        The marker prefix is structured text so the
         parent's model can disambiguate when multiple delegations are
         live concurrently, and so the frontend can detect and render
         it as a special card once Phase 4 lands.
 
-        Idempotent. The ``_terminal_injected`` flag ensures that
+        Idempotent. The unique outbox source key is authoritative; the
+        ``_terminal_injected`` flag additionally ensures that
         even if two terminal-producing events race (a `result` from
         the child + a `cancel_delegation` from the parent, or a
         `result` and an `error` from a crashing child), exactly one
@@ -919,15 +1206,25 @@ class DelegationManager:
         """
         assert self.session_mgr is not None
         if rec._terminal_injected:
-            return
-        rec._terminal_injected = True
+            return None
+        assert self.db is not None
+        injection: dict[str, Any] | None = None
+        text_blocks = await self.db.load_delegation_output(
+            rec.delegation_id, after_seq=rec.start_seq
+        )
+        # Real SessionManager ordering guarantees the DB rows exist before the
+        # broadcast reaches us.  Lightweight unit fakes sometimes call the
+        # broadcast subscriber directly; retain the live cache as a harmless
+        # fallback without making it the recovery source of truth.
+        if not text_blocks and rec.captured_text:
+            text_blocks = list(rec.captured_text)
         if rec.state == "completed":
             # Each captured entry is one COMPLETE assistant text block, and
             # blocks carry no trailing newline — `"".join` would fuse them
             # into one multi-thousand-character line, which the parent's
             # card then renders as a wall of pre-wrap text. See
             # `join_text_blocks`, which both this and the research leaf use.
-            body = join_text_blocks(rec.captured_text)
+            body = join_text_blocks(text_blocks)
             if not body:
                 body = "(child session ended without producing any text)"
             prompt = (
@@ -936,45 +1233,57 @@ class DelegationManager:
             )
         else:
             reason = rec.error or rec.state
+            partial = join_text_blocks(text_blocks)
+            partial_note = (
+                "\n\nOutput captured before interruption/failure:\n" + partial
+                if partial else ""
+            )
             prompt = (
                 f"[agent-error:{rec.target_agent_name} "
                 f"delegation={rec.delegation_id} reason={reason}]\n"
-                f"(child session ended in state {rec.state!r})"
+                f"(child session ended in state {rec.state!r}; do not retry "
+                f"automatically because external side effects may already "
+                f"have happened.){partial_note}"
             )
-        try:
-            await self.session_mgr.start_message(
-                rec.parent_session_id, prompt
+        if not rec.parent_session_id:
+            logger.info(
+                "delegation %s round %s has no parent; terminal delivery skipped",
+                rec.delegation_id, rec.round_no,
             )
-        except Exception:
-            # The parent may have been deleted while the child was
-            # running; that's a tolerable race — we just log it. The
-            # record stays in our registry so the API can still report
-            # the terminal state.
-            logger.exception(
-                "Failed to inject delegation %s terminal into parent %s",
-                rec.delegation_id,
-                rec.parent_session_id,
-            )
-        # Regardless of whether the parent notification above
-        # succeeded (it may not, if the parent itself was deleted
-        # while the child was running — in which case we already
-        # logged), the delegation child is now done with the chain
-        # and can be archived (plan §5.2). We deliberately archive
-        # HERE, not from session_manager's idle hook, because an
-        # intermediate delegation parent (Vera in Octo→Vera→Pete) is
-        # "idle" while waiting for its own child's reply — archiving
-        # on idle would break the nested chain (Vera would vanish
-        # before Pete's reply could reach her).
-        try:
-            await self.session_mgr.auto_archive_scheduled_session(
-                rec.delegation_id
-            )
-        except Exception:
-            logger.exception(
-                "Failed to auto-archive delegation child %s after "
-                "terminal injection",
-                rec.delegation_id,
-            )
+            rec._terminal_injected = True
+        else:
+            try:
+                injection = await self.session_mgr.enqueue_session_injection(
+                    source_key=f"delegation:{rec.run_id}:terminal",
+                    session_id=rec.parent_session_id,
+                    prompt=prompt,
+                )
+                rec._terminal_injected = True
+            except Exception:
+                # The outbox insert may already have committed.  Its source key
+                # makes a later recovery/enqueue idempotent, so leave the local
+                # guard false unless enqueue returned successfully.
+                logger.exception(
+                    "Failed to enqueue delegation %s round %s terminal for %s",
+                    rec.delegation_id,
+                    rec.round_no,
+                    rec.parent_session_id,
+                )
+        # In live operation, archive after the parent intent exists. Restart
+        # recovery passes archive=False and performs one tree-wide archive
+        # phase only after nested pending events have been materialised.
+        if archive:
+            try:
+                await self.session_mgr.auto_archive_scheduled_session(
+                    rec.delegation_id
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to auto-archive delegation child %s after "
+                    "terminal injection",
+                    rec.delegation_id,
+                )
+        return injection
 
 
 # Module-level singleton (mirrors the session_manager / bg_tasks

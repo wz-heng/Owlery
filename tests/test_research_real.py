@@ -75,7 +75,7 @@ async def test_real_codex_deep_research_end_to_end(tmp_path, monkeypatch):
 
     injected: list[str] = []
 
-    async def fake_start_message(session_id, prompt):
+    async def fake_start_message(session_id, prompt, attachment_ids=None, injection_id=None):
         injected.append(prompt)
 
     monkeypatch.setattr(mgr, "start_message", fake_start_message)
