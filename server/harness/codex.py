@@ -77,7 +77,14 @@ again but pass the PRIOR `delegation_id` (and omit `name`) — the \
 same child session is reused so the other agent keeps their \
 transcript and doesn't re-read from scratch. Exactly one of (`name`, \
 `delegation_id`) must be set. Related: `mcp__ask_agent__cancel`, \
-`mcp__ask_agent__list`."""
+`mcp__ask_agent__list`.
+
+[4] `mcp__tasks__*` — durable multi-agent Task Board work. Use delegation for \
+a bounded RPC returning to this conversation; use Task Board for work that \
+must survive restarts, has dependencies/attempts, needs human handoff, or \
+belongs on the Kanban. Begin with `list` / `show`, create explicit outcomes, \
+and change lifecycle state through the task tools rather than prose. Worker \
+sessions receive a trusted `complete` / `block` terminal protocol."""
 
 
 def _toml_basic_string(value: str) -> str:

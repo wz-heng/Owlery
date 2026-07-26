@@ -214,7 +214,7 @@ class Session:
     # created post-refactor; left optional on the dataclass so legacy
     # in-memory construction paths don't break mid-migration.
     agent_id: str | None = None
-    # Who created this session: 'user' | 'schedule' | 'bridge' | 'delegation'.
+    # Who created this session: user|schedule|bridge|delegation|fork|task.
     # Scheduler fires auto-archive on idle (§5.6); bridge/user sessions
     # persist. 'delegation' sessions auto-archive on idle too — they're a
     # transient child spawned by an agent-to-agent ask_agent call
@@ -230,6 +230,11 @@ class Session:
     # The original delegation prompt, kept verbatim for UI display on
     # delegation sessions. NULL elsewhere.
     delegation_request: str | None = None
+    # Trusted in-process identity for a Task Board worker. The durable source
+    # of truth is task_runs.session_id; these are intentionally not session
+    # columns because boot interrupts task runs before any worker can resume.
+    task_id: str | None = None
+    task_run_id: str | None = None
     # Session tree-rewind / fork (session-rewind.md §4). All NULL/False
     # on non-fork sessions. fork_metadata / fork_revert_record hold raw JSON
     # strings (parsed lazily); fork_status drives crash recovery.
@@ -1065,6 +1070,8 @@ class SessionManager:
         backend: str = "claude-code",
         parent_session_id: str | None = None,
         delegation_request: str | None = None,
+        task_id: str | None = None,
+        task_run_id: str | None = None,
     ) -> Session:
         """Create a conversation thread owned by `agent_id`.
 
@@ -1100,6 +1107,8 @@ class SessionManager:
             backend=backend,
             parent_session_id=parent_session_id,
             delegation_request=delegation_request,
+            task_id=task_id,
+            task_run_id=task_run_id,
         )
         self.sessions[sid] = session
         if self.db:
@@ -1261,7 +1270,7 @@ class SessionManager:
     # outside the idle hook (e.g. DelegationManager._inject_terminal)
     # can still archive delegation sessions — but only at the right
     # moment, not on every idle transition.
-    _AUTO_ARCHIVE_ELIGIBLE = ("schedule", "delegation")
+    _AUTO_ARCHIVE_ELIGIBLE = ("schedule", "delegation", "task")
 
     async def auto_archive_scheduled_session(self, session_id: str) -> bool:
         """Hide a finished transient session (schedule or delegation
@@ -2871,6 +2880,12 @@ class SessionManager:
             except (json.JSONDecodeError, AttributeError):
                 fork_note = None
 
+        task_worker_prompt: str | None = None
+        if session.task_id and session.task_run_id:
+            from .task_board.prompts import TASK_WORKER_SYSTEM_PROMPT
+
+            task_worker_prompt = TASK_WORKER_SYSTEM_PROMPT
+
         return RunConfig(
             session_id=session.id,
             system_prompt=system_prompt,
@@ -2881,6 +2896,9 @@ class SessionManager:
             connectors=connectors or [],
             memory_dir=memory_dir,
             fork_note=fork_note,
+            task_id=session.task_id,
+            task_run_id=session.task_run_id,
+            task_worker_prompt=task_worker_prompt,
         )
 
     # Refresh the access_token if it expires within this many seconds. A

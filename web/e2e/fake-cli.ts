@@ -27,6 +27,8 @@ export type FakeOp =
   | { t: "ask"; questions: unknown[] }
   /** Call `mcp__bg__run` over real MCP, then end the turn. */
   | { t: "bg"; command: string; description?: string }
+  /** Complete the current durable Task Board run over the real tasks MCP. */
+  | { t: "task_complete"; summary: string }
   /** Persist a word into this session's fake-CLI state. */
   | { t: "remember"; v: string }
   /** Read that word back — only works if the server passed `--resume`. */

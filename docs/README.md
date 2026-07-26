@@ -29,6 +29,9 @@ design rationale. **Code comments cite these by filename + section** (e.g.
 - **[plans/durable-session-injections.md](plans/durable-session-injections.md)** —
   per-round delegation execution records plus the crash-safe, deduplicated
   session-injection outbox shared by delegation, bg tasks, and research.
+- **[plans/task-board.md](plans/task-board.md)** — implementation task book for
+  the multi-agent Task Board: boards, task tree + dependency DAG, durable runs
+  and handoffs, dispatcher/worker lifecycle, workspace isolation, and Kanban UI.
 - **[plans/session-rewind.md](plans/session-rewind.md)** — `/rewind`
   (also `/tree`): branch a conversation to any prior user message, with optional
   git revert of the working tree. The conversation-rewind feature.

@@ -25,10 +25,12 @@ from .legacy_rename import migrate_legacy_state, rewrite_legacy_paths
 from .notifiers import notifier_manager
 from .agent_manager import AgentManager
 from .connector_manager import ConnectorManager
-from .routers import agents, attachments, bg_tasks as bg_tasks_router, connectors, credentials, delegations as delegations_router, files, notifiers, questions, research as research_router, schedules, sessions, usage as usage_router, ws
+from .routers import agents, attachments, bg_tasks as bg_tasks_router, connectors, credentials, delegations as delegations_router, files, notifiers, questions, research as research_router, schedules, sessions, task_boards as task_boards_router, usage as usage_router, ws
 from .parked_turns import ParkedTurnRunner
 from .scheduler import ScheduleRunner
 from .session_manager import session_manager
+from .task_board import task_repository
+from .task_board.manager import task_board_manager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,6 +49,8 @@ async def lifespan(app: FastAPI):
 
     db = Database(settings.db_path)
     await db.initialize()
+    task_repository.bind(settings.db_path)
+    await task_repository.initialize()
     await rewrite_legacy_paths(db, settings)
     await session_manager.initialize(db)
     # Boot is a two-phase recovery. Domain managers may create/repair durable
@@ -60,6 +64,9 @@ async def lifespan(app: FastAPI):
     )
     delegation_manager.bind(session_mgr=session_manager, db=db)
     research_manager.bind(session_mgr=session_manager, db=db)
+    task_board_manager.bind(session_mgr=session_manager, db=db)
+    task_boards_router.set_manager(task_board_manager)
+    app.state.task_board_manager = task_board_manager
 
     # Initialize bridge manager
     bridge_manager = BridgeManager(session_manager, db)
@@ -112,10 +119,19 @@ async def lifespan(app: FastAPI):
     # async tasks; injects the final report back into the session.
     await research_manager.recover_interrupted()
 
+    # Task workers are multi-turn transient sessions. Make their durable runs
+    # truthful before nested delegation recovery, but keep the worker sessions
+    # live until descendant events have been transcript-materialized.
+    await task_board_manager.recover_phase1()
+
     # Delegation recovery runs last among domain recoveries because it
     # transcript-materializes every pending bg/research/child event aimed at a
     # delegation parent before archiving the interrupted delegation tree.
     await delegation_manager.recover_interrupted()
+
+    # Repair cross-connection terminal/outbox gaps, materialize any remaining
+    # worker-directed events without restarting models, then archive workers.
+    await task_board_manager.recover_phase2()
 
     # Domain recovery is now complete and all broadcast listeners are live.
     # Drain only after that barrier; a replay can immediately start a model
@@ -129,6 +145,7 @@ async def lifespan(app: FastAPI):
     await schedule_runner.initialize()
     await parked_turn_runner.initialize()
     await bridge_manager.start_all()
+    await task_board_manager.start()
 
     # Start Cloudflare Tunnel if enabled
     tunnel: CloudflareTunnel | None = None
@@ -147,6 +164,7 @@ async def lifespan(app: FastAPI):
     # begins. Producers below may still persist terminal state/outbox rows;
     # those pending intents are deliberately replayed on the next boot.
     session_manager.pause_session_injection_dispatch()
+    await task_board_manager.shutdown()
     if tunnel:
         await tunnel.stop()
 
@@ -164,6 +182,7 @@ async def lifespan(app: FastAPI):
     await bg_task_manager.shutdown()
     delegation_manager.shutdown()
     await session_manager.shutdown_session_injections()
+    await task_repository.close()
     await db.close()
 
 
@@ -184,6 +203,7 @@ app.include_router(files.router)
 app.include_router(bg_tasks_router.router)
 app.include_router(delegations_router.router)
 app.include_router(research_router.router)
+app.include_router(task_boards_router.router)
 app.include_router(questions.router)
 app.include_router(schedules.router)
 app.include_router(usage_router.router)

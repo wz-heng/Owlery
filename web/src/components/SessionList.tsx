@@ -21,10 +21,12 @@ export function SessionList({
   agentId,
   formOpen,
   onCloseForm,
+  onOpenSession,
 }: {
   agentId: string;
   formOpen: boolean;
   onCloseForm: () => void;
+  onOpenSession?: () => void;
 }) {
   const [newName, setNewName] = useState("");
   const [workingDir, setWorkingDir] = useState("");
@@ -99,6 +101,7 @@ export function SessionList({
       });
       if (res.ok) {
         const session: SessionInfo = await res.json();
+        onOpenSession?.();
         setSessions([...sessions, session]);
         setActiveAgentId(agentId);
         setActiveSessionId(session.id);
@@ -129,6 +132,7 @@ export function SessionList({
   };
 
   const selectSession = async (id: string) => {
+    onOpenSession?.();
     setActiveAgentId(agentId);
     setActiveSessionId(id);
     try {

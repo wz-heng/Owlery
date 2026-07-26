@@ -88,7 +88,7 @@ async def test_backfill_from_old_schema(tmp_path):
         # The built-in backfill (agent-collaboration.md §5.1 ask_agent;
         # native-deep-research.md §7 research) runs alongside the other
         # migrations and appends to every existing agent's mcp_servers list.
-        assert default["mcp_servers"] == ["ask", "bg", "ask_agent", "research"]
+        assert default["mcp_servers"] == ["ask", "bg", "ask_agent", "research", "tasks"]
 
         # Session backfilled onto it, origin defaults to 'user', backend to
         # claude-code (codex-backend.md §4.1 migration).
@@ -152,6 +152,7 @@ async def test_builtin_mcp_backfill_runs_once_and_respects_removals(tmp_path):
             "bg",
             "ask_agent",
             "research",
+            "tasks",
         }
 
         # The user deselects delegation in the settings UI and saves.

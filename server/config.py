@@ -29,6 +29,8 @@ _STATE_DIRS = (
     ("agents_dir", "agents"),
     ("fork_dir", "fork"),
     ("research_dir", "research"),
+    ("task_workspaces_dir", "task-workspaces"),
+    ("task_artifacts_dir", "task-artifacts"),
 )
 
 
@@ -87,7 +89,7 @@ class Settings(BaseSettings):
     # Set to "" to disable the migration entirely.
     legacy_home_dir: str = "~/.octopus"
 
-    # The six state dirs. Empty means "derive from home_dir" — the validator
+    # The durable state dirs. Empty means "derive from home_dir" — the validator
     # below fills them in, so `settings.attachments_dir` is always a real path.
     # Each is independently overridable, which is how tests keep their state
     # out of the developer's real home.
@@ -113,6 +115,10 @@ class Settings(BaseSettings):
     fork_dir: str = ""
     # research_dir: completed deep-research reports (native-deep-research.md).
     research_dir: str = ""
+    # task_workspaces_dir: durable per-attempt copies / Git worktrees.
+    task_workspaces_dir: str = ""
+    # task_artifacts_dir: validated immutable captures declared by workers.
+    task_artifacts_dir: str = ""
 
     # Dev mode (enables uvicorn reload)
     debug: bool = False
@@ -144,6 +150,11 @@ class Settings(BaseSettings):
     # the pipeline); and a hard per-job wall-clock cap.
     research_max_concurrent_jobs: int = 2
     research_job_timeout_seconds: int = 1200
+
+    # Durable Task Board worker orchestration. The dispatcher also wakes on
+    # mutations; this bounded tick only repairs missed in-process wakeups.
+    task_dispatch_interval_seconds: float = 2.0
+    task_run_lease_seconds: int = 1800
 
     # Connectors (connectors.md §7). The public base URL is what connector
     # OAuth redirect URIs are built against; behind a tunnel it must be set
@@ -240,6 +251,16 @@ class Settings(BaseSettings):
     def resolved_research_dir(self) -> str:
         """`research_dir` with `~` expanded — see `resolved_fork_dir`."""
         return os.path.expanduser(self.research_dir)
+
+    @property
+    def resolved_task_workspaces_dir(self) -> str:
+        """Root containing private Task Board attempt workspaces."""
+        return os.path.expanduser(self.task_workspaces_dir)
+
+    @property
+    def resolved_task_artifacts_dir(self) -> str:
+        """Root containing durable Task Board artifacts."""
+        return os.path.expanduser(self.task_artifacts_dir)
 
 
 settings = Settings()

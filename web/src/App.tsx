@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { IconMenu2 } from "@tabler/icons-react";
+import { IconClipboardList, IconMenu2 } from "@tabler/icons-react";
 import { AccountDropdown } from "./components/AccountDropdown";
 import { AgentList } from "./components/AgentList";
 import { AgentSettings } from "./components/AgentSettings";
@@ -22,6 +22,7 @@ import { Label } from "./components/ui/label";
 import { useViewportHeight } from "./hooks/useViewportHeight";
 import { useWebSocket } from "./hooks/useWebSocket";
 import { useSessionStore } from "./stores/sessionStore";
+import { TaskBoardPage } from "./components/tasks";
 
 function App() {
   useViewportHeight();
@@ -104,6 +105,7 @@ function AuthenticatedApp({
   const { sendMessage, interrupt, approveTool, denyTool, answerQuestion } =
     useWebSocket();
   const connected = useSessionStore((s) => s.connected);
+  const token = useSessionStore((s) => s.token);
   const setToken = useSessionStore((s) => s.setToken);
   const agents = useSessionStore((s) => s.agents);
   const activeAgentId = useSessionStore((s) => s.activeAgentId);
@@ -119,6 +121,8 @@ function AuthenticatedApp({
   const [schedulesOpen, setSchedulesOpen] = useState(false);
   const [archivedOpen, setArchivedOpen] = useState(false);
   const [usageOpen, setUsageOpen] = useState(false);
+  const [mainSurface, setMainSurface] = useState<"chat" | "tasks">("chat");
+  const setActiveSessionId = useSessionStore((s) => s.setActiveSessionId);
 
   const signOut = () => {
     setToken("");
@@ -180,7 +184,28 @@ function AuthenticatedApp({
          * zero breathing room, which is what made it read as a generated
          * template rather than a designed navigation. */}
         <nav className="flex-1 flex flex-col min-h-0 overflow-y-auto px-3 gap-0.5 pb-3">
-          <AgentList onCreateAgent={openCreateAgent} />
+          <AgentList
+            onCreateAgent={openCreateAgent}
+            onOpenSession={() => {
+              setMainSurface("chat");
+              setSidebarOpen(false);
+            }}
+          />
+          <button
+            type="button"
+            className={`mt-1 flex h-9 w-full items-center gap-2 rounded-lg px-3 text-left text-sm transition-colors ${
+              mainSurface === "tasks"
+                ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                : "text-sidebar-foreground/75 hover:bg-sidebar-accent/70 hover:text-sidebar-foreground"
+            }`}
+            onClick={() => {
+              setMainSurface("tasks");
+              setSidebarOpen(false);
+            }}
+          >
+            <IconClipboardList size={17} />
+            <span>Task Board</span>
+          </button>
           {/* Everything below Agents is infrastructure, not the daily path —
            * a hairline sets it apart so the eye lands on Agents first. */}
           <div className="mt-2 pt-2 border-t border-sidebar-border/60 flex flex-col gap-0.5">
@@ -204,16 +229,29 @@ function AuthenticatedApp({
       </aside>
 
       <div className="main-area">
-        <ChatView
-          sendMessage={sendMessage}
-          interrupt={interrupt}
-          approveTool={approveTool}
-          denyTool={denyTool}
-          answerQuestion={answerQuestion}
-          connected={connected}
-          onToggleSidebar={() => setSidebarOpen(!sidebarOpen)}
-          onOpenSchedules={() => setSchedulesOpen(true)}
-        />
+        {mainSurface === "tasks" ? (
+          <TaskBoardPage
+            token={token}
+            agents={agents}
+            activeAgentId={activeAgentId}
+            onOpenSession={(sessionId) => {
+              setActiveSessionId(sessionId);
+              setMainSurface("chat");
+            }}
+            onToggleSidebar={() => setSidebarOpen(!sidebarOpen)}
+          />
+        ) : (
+          <ChatView
+            sendMessage={sendMessage}
+            interrupt={interrupt}
+            approveTool={approveTool}
+            denyTool={denyTool}
+            answerQuestion={answerQuestion}
+            connected={connected}
+            onToggleSidebar={() => setSidebarOpen(!sidebarOpen)}
+            onOpenSchedules={() => setSchedulesOpen(true)}
+          />
+        )}
       </div>
 
       {sidebarOpen && (

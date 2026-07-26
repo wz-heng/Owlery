@@ -25,6 +25,7 @@ Ops:
   bash        emit a Bash tool_use, sleep, emit the tool_result
   ask         call `mcp__ask__user` over MCP and echo the answer
   bg          call `mcp__bg__run` over MCP and end the turn
+  task_complete call `mcp__tasks__complete` over MCP for the owning run
   remember    persist a word into this session's transcript
   recall      read that word back out of the transcript
   on_bg       rule: how to answer the injected `[bg-task-result]` turn
@@ -342,6 +343,14 @@ def run_ops(ops: list[dict], parsed: dict, state: dict) -> None:
             started = call_mcp_tool(mcp_servers, "bg", "run", arguments)
             _emit_tool_result(tool_use_id, started)
             _emit_text("started")
+
+        elif kind == "task_complete":
+            tool_use_id = f"toolu_fake_task_complete_{index}"
+            arguments = {"summary": op["summary"], "metadata": {"e2e": True}}
+            _emit_tool_use(tool_use_id, "mcp__tasks__complete", arguments)
+            completed = call_mcp_tool(mcp_servers, "tasks", "complete", arguments)
+            _emit_tool_result(tool_use_id, completed)
+            _emit_text("completed")
 
         elif kind == "remember":
             state["remember"] = op["v"]

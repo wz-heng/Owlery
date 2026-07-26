@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 # Built-in MCP servers attached to the Default Agent (and the default for
 # any newly-created agent). Kept here so the migration backfill and the
 # CREATE TABLE default stay in lock-step.
-_DEFAULT_MCP_SERVERS = ["ask", "bg", "ask_agent", "research"]
+_DEFAULT_MCP_SERVERS = ["ask", "bg", "ask_agent", "research", "tasks"]
 _DEFAULT_MCP_SERVERS_JSON = json.dumps(_DEFAULT_MCP_SERVERS)
 
 _SCHEMA = """
@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS agents (
     model TEXT,                             -- e.g. "claude-opus-4-7"; null = backend default
     credential_id TEXT REFERENCES backend_credentials(id) ON DELETE SET NULL,
     backend TEXT NOT NULL DEFAULT 'claude-code',  -- default harness for new sessions
-    mcp_servers TEXT NOT NULL DEFAULT '["ask","bg","ask_agent","research"]',
+    mcp_servers TEXT NOT NULL DEFAULT '["ask","bg","ask_agent","research","tasks"]',
                                             -- JSON array of built-in Owlery MCP server ids.
     tool_allow TEXT NOT NULL DEFAULT '',    -- newline-separated tool/MCP names; empty = allow all
     tool_deny  TEXT NOT NULL DEFAULT '',    -- newline-separated; deny takes precedence over allow
@@ -417,6 +417,151 @@ CREATE INDEX IF NOT EXISTS idx_turn_usage_agent_time
 CREATE INDEX IF NOT EXISTS idx_turn_usage_session
   ON turn_usage(session_id);
 
+-- Durable intent/coordination layer (task-board.md). TaskRepository owns all
+-- writes through a dedicated SQLite connection; this connection installs the
+-- additive schema and may read it for integration/recovery.
+CREATE TABLE IF NOT EXISTS task_boards (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    working_dir TEXT NOT NULL,
+    default_workspace_mode TEXT NOT NULL
+        CHECK (default_workspace_mode IN ('shared', 'copy', 'git_worktree')),
+    max_running INTEGER CHECK (max_running IS NULL OR max_running > 0),
+    max_running_per_agent INTEGER
+        CHECK (max_running_per_agent IS NULL OR max_running_per_agent > 0),
+    max_tree_depth INTEGER NOT NULL DEFAULT 8 CHECK (max_tree_depth > 0),
+    max_children_per_run INTEGER NOT NULL DEFAULT 32
+        CHECK (max_children_per_run > 0),
+    max_open_tasks INTEGER NOT NULL DEFAULT 500 CHECK (max_open_tasks > 0),
+    dispatch_enabled INTEGER NOT NULL DEFAULT 1
+        CHECK (dispatch_enabled IN (0, 1)),
+    archived INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS task_boards_live_name
+  ON task_boards(name) WHERE archived = 0;
+
+CREATE TABLE IF NOT EXISTS tasks (
+    id TEXT PRIMARY KEY,
+    board_id TEXT NOT NULL REFERENCES task_boards(id) ON DELETE CASCADE,
+    parent_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL
+        CHECK (status IN ('triage', 'todo', 'ready', 'running', 'blocked', 'done')),
+    assignee_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    origin_session_id TEXT,
+    idempotency_key TEXT,
+    scheduled_at TEXT,
+    workspace_mode TEXT
+        CHECK (workspace_mode IS NULL OR workspace_mode IN ('shared', 'copy', 'git_worktree')),
+    working_dir_override TEXT,
+    current_run_id TEXT,
+    blocked_kind TEXT CHECK (
+        blocked_kind IS NULL OR blocked_kind IN
+        ('input', 'capability', 'failure', 'protocol', 'cancelled', 'interrupted')
+    ),
+    blocked_reason TEXT,
+    result_summary TEXT,
+    archived INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0, 1)),
+    created_by_kind TEXT NOT NULL
+        CHECK (created_by_kind IN ('user', 'agent', 'schedule', 'api')),
+    created_by_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    archived_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS tasks_board_idempotency
+  ON tasks(board_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS tasks_dispatch
+  ON tasks(board_id, archived, status, priority DESC, created_at);
+CREATE INDEX IF NOT EXISTS tasks_assignee
+  ON tasks(assignee_agent_id, archived, status);
+CREATE INDEX IF NOT EXISTS tasks_parent ON tasks(parent_task_id);
+
+CREATE TABLE IF NOT EXISTS task_dependencies (
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    depends_on_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    created_by_kind TEXT NOT NULL,
+    created_by_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (task_id, depends_on_task_id),
+    CHECK (task_id != depends_on_task_id)
+);
+
+CREATE TABLE IF NOT EXISTS task_runs (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
+    agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+    session_id TEXT,
+    state TEXT NOT NULL CHECK (
+        state IN ('running', 'completed', 'blocked', 'failed', 'cancelled', 'interrupted')
+    ),
+    summary TEXT,
+    metadata TEXT,
+    error TEXT,
+    workspace_mode TEXT NOT NULL
+        CHECK (workspace_mode IN ('shared', 'copy', 'git_worktree')),
+    workspace_path TEXT NOT NULL,
+    claimed_at TEXT NOT NULL,
+    started_at TEXT,
+    last_heartbeat_at TEXT,
+    lease_expires_at TEXT,
+    finished_at TEXT,
+    UNIQUE (task_id, attempt_no)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS task_runs_one_running
+  ON task_runs(task_id) WHERE state = 'running';
+CREATE INDEX IF NOT EXISTS task_runs_task ON task_runs(task_id, attempt_no);
+CREATE INDEX IF NOT EXISTS task_runs_active_workspace
+  ON task_runs(workspace_path) WHERE state = 'running';
+
+CREATE TABLE IF NOT EXISTS task_comments (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    run_id TEXT REFERENCES task_runs(id) ON DELETE SET NULL,
+    author_kind TEXT NOT NULL CHECK (author_kind IN ('user', 'agent', 'system')),
+    author_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS task_comments_task
+  ON task_comments(task_id, created_at);
+
+CREATE TABLE IF NOT EXISTS task_events (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    board_id TEXT NOT NULL REFERENCES task_boards(id) ON DELETE CASCADE,
+    task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+    run_id TEXT REFERENCES task_runs(id) ON DELETE SET NULL,
+    kind TEXT NOT NULL,
+    actor_kind TEXT NOT NULL,
+    actor_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+    payload TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS task_events_task ON task_events(task_id, seq);
+CREATE INDEX IF NOT EXISTS task_events_board ON task_events(board_id, seq);
+
+CREATE TABLE IF NOT EXISTS task_artifacts (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    stored_path TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    mime_type TEXT,
+    size INTEGER NOT NULL CHECK (size >= 0),
+    sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    deleted_at TEXT,
+    UNIQUE (run_id, name)
+);
+
 -- Parked turns awaiting a usage-limit reset (limit-auto-resume.md §4). A turn
 -- that failed on the USER'S OWN limit is persisted here, not slept on: the
 -- wait is multi-hour, so it must survive a restart — on boot these rows
@@ -459,6 +604,7 @@ class Database:
         self._conn = await aiosqlite.connect(self._db_path)
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA foreign_keys=ON")
+        await self._conn.execute("PRAGMA busy_timeout=5000")
         await self._conn.executescript(_SCHEMA)
         await self._apply_migrations()
         await self._conn.commit()
@@ -678,6 +824,9 @@ class Database:
         if user_version < 1:
             await self._backfill_builtin_mcp_servers(("ask_agent", "research"))
             await self._conn.execute("PRAGMA user_version = 1")
+        if user_version < 2:
+            await self._backfill_builtin_mcp_servers(("tasks",))
+            await self._conn.execute("PRAGMA user_version = 2")
 
     async def _backfill_builtin_mcp_servers(self, names: tuple[str, ...]) -> None:
         cursor = await self._conn.execute("SELECT id, mcp_servers FROM agents")
@@ -1198,10 +1347,14 @@ class Database:
                     "injected_at = ? WHERE id = ?",
                     (delivered_at, research_id),
                 )
-            await self._conn.commit()
-            self._dirty = False
-            return
-        self._dirty = True
+        # A persisted/broadcast transcript event must not leave a write
+        # transaction open for the rest of the model turn. TaskRepository is
+        # an intentional second SQLite writer; batching ordinary messages
+        # until turn-idle would hold WAL's single-writer lock across arbitrary
+        # model/tool/MCP latency and make worker heartbeat/complete deadlock on
+        # SQLITE_BUSY. Commit each event before its caller broadcasts it.
+        await self._conn.commit()
+        self._dirty = False
 
     # ------------------------------------------------------- session injections
 
@@ -1284,6 +1437,68 @@ class Database:
             self._row_to_session_injection(row)
             for row in await cursor.fetchall()
         ]
+
+    async def worker_has_persisted_pending_work(self, session_id: str) -> bool:
+        """Whether durable async work still points at a task-worker session.
+
+        TaskBoardManager combines this DB predicate with SessionManager's live
+        turn/queue/approval state.  Keeping the SQL in Database prevents the
+        terminal-protocol and lease checks from drifting into separate,
+        incomplete definitions of "waiting".
+        """
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            "SELECT EXISTS("
+            " SELECT 1 FROM bg_tasks WHERE session_id = ? "
+            "   AND status IN ('pending', 'running')"
+            " UNION ALL"
+            " SELECT 1 FROM bg_tasks b WHERE b.session_id = ? "
+            "   AND b.delivery_required = 1 "
+            "   AND b.status IN ('completed', 'failed', 'cancelled', 'interrupted') "
+            "   AND NOT EXISTS ("
+            "     SELECT 1 FROM session_injections i "
+            "     WHERE i.source_key = 'bg:' || b.id"
+            "   )"
+            " UNION ALL"
+            " SELECT 1 FROM research_jobs WHERE session_id = ? AND status = 'running'"
+            " UNION ALL"
+            " SELECT 1 FROM research_jobs r WHERE r.session_id = ? "
+            "   AND r.status = 'completed' AND r.injection_status = 'pending' "
+            "   AND NOT EXISTS ("
+            "     SELECT 1 FROM session_injections i "
+            "     WHERE i.source_key = 'research:' || r.id"
+            "   )"
+            " UNION ALL"
+            " SELECT 1 FROM delegation_runs dr JOIN sessions child "
+            "   ON child.id = dr.delegation_id"
+            "   WHERE child.parent_session_id = ? AND dr.state = 'running'"
+            " UNION ALL"
+            " SELECT 1 FROM delegation_runs dr JOIN sessions child "
+            "   ON child.id = dr.delegation_id"
+            "   WHERE child.parent_session_id = ? "
+            "   AND dr.state IN ('completed', 'failed', 'cancelled', 'interrupted') "
+            "   AND NOT EXISTS ("
+            "     SELECT 1 FROM session_injections i "
+            "     WHERE i.source_key = 'delegation:' || dr.run_id || ':terminal'"
+            "   )"
+            " UNION ALL"
+            " SELECT 1 FROM session_injections WHERE session_id = ? AND status = 'pending'"
+            " UNION ALL"
+            " SELECT 1 FROM parked_turns WHERE session_id = ?"
+            ")",
+            (
+                session_id,
+                session_id,
+                session_id,
+                session_id,
+                session_id,
+                session_id,
+                session_id,
+                session_id,
+            ),
+        )
+        row = await cursor.fetchone()
+        return bool(row and row[0])
 
     async def reconcile_session_injection(self, injection_id: str) -> bool:
         """Acknowledge a legacy half-state if its transcript row exists.

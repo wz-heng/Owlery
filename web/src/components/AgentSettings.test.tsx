@@ -34,7 +34,7 @@ describe("AgentSettings built-in tools", () => {
       <AgentSettings open initialAgentId={null} onOpenChange={() => {}} />
     );
 
-    for (const id of ["ask", "bg", "ask_agent", "research"]) {
+    for (const id of ["ask", "bg", "ask_agent", "research", "tasks"]) {
       const box = screen.getByRole("checkbox", { name: id }) as HTMLInputElement;
       expect(box).toBeInTheDocument();
       expect(box.checked).toBe(true);
