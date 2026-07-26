@@ -32,6 +32,11 @@ design rationale. **Code comments cite these by filename + section** (e.g.
 - **[plans/task-board.md](plans/task-board.md)** — implementation task book for
   the multi-agent Task Board: boards, task tree + dependency DAG, durable runs
   and handoffs, dispatcher/worker lifecycle, workspace isolation, and Kanban UI.
+- **[plans/task-git-delivery.md](plans/task-git-delivery.md)** — the Git
+  delivery closure for Task Board `git_worktree` runs: change acceptance, commit
+  ownership, at-most-once branch push / PR creation / optional safe merge,
+  worktree teardown + retention, destructive-action guards, and crash recovery.
+  Builds on `task-board.md` and `durable-session-injections.md`.
 - **[plans/session-rewind.md](plans/session-rewind.md)** — `/rewind`
   (also `/tree`): branch a conversation to any prior user message, with optional
   git revert of the working tree. The conversation-rewind feature.
