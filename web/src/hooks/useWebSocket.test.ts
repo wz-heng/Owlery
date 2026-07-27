@@ -1,6 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 
-import { parkedTurnFromSnapshot, shouldApplyWsEvent } from "./useWebSocket";
+import { useSessionStore } from "../stores/sessionStore";
+import {
+  applyWsEvent,
+  parkedTurnFromSnapshot,
+  shouldApplyWsEvent,
+} from "./useWebSocket";
 
 /** Snapshot-baseline dedup primitive.
  *
@@ -73,5 +78,72 @@ describe("parkedTurnFromSnapshot", () => {
       resumeAt: null,
       limitKind: null,
     });
+  });
+});
+
+describe("applyWsEvent", () => {
+  beforeEach(() => {
+    useSessionStore.setState({
+      messages: {},
+      lastAppliedSeq: {},
+      pendingQuestions: {},
+      pendingQueue: {},
+      parkedTurns: {},
+      bgTasks: {},
+      research: {},
+    });
+  });
+
+  it("normalizes a persisted assistant event into the real message store", () => {
+    const outcome = applyWsEvent({
+      type: "assistant_text",
+      session_id: "specimen",
+      seq: 4,
+      content: "streamed answer",
+    });
+
+    expect(outcome).toMatchObject({
+      status: "applied",
+      eventType: "assistant_text",
+      seq: 4,
+      baseline: null,
+    });
+    expect(useSessionStore.getState().messages.specimen).toEqual([
+      { role: "assistant", type: "text", content: "streamed answer" },
+    ]);
+    expect(useSessionStore.getState().lastAppliedSeq.specimen).toBe(4);
+  });
+
+  it("reports and drops a duplicate without mutating the transcript", () => {
+    applyWsEvent({
+      type: "assistant_text",
+      session_id: "specimen",
+      seq: 8,
+      content: "first delivery",
+    });
+    const duplicate = applyWsEvent({
+      type: "assistant_text",
+      session_id: "specimen",
+      seq: 8,
+      content: "duplicate delivery",
+    });
+
+    expect(duplicate).toMatchObject({
+      status: "dropped",
+      reason: "duplicate_seq",
+      baseline: 8,
+    });
+    expect(useSessionStore.getState().messages.specimen).toHaveLength(1);
+  });
+
+  it("makes unknown event types observable without changing state", () => {
+    const outcome = applyWsEvent({
+      type: "future_event",
+      session_id: "specimen",
+    });
+
+    expect(outcome.status).toBe("ignored");
+    expect(outcome.reason).toBe("unknown_event");
+    expect(useSessionStore.getState().messages.specimen).toBeUndefined();
   });
 });

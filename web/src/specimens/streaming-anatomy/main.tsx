@@ -1,0 +1,14 @@
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+
+import "../../styles/tokens.css";
+import "../../styles/shape.css";
+import "../../index.css";
+import "./anatomy.css";
+import { StreamingAnatomy } from "./StreamingAnatomy";
+
+createRoot(document.getElementById("root")!).render(
+  <StrictMode>
+    <StreamingAnatomy />
+  </StrictMode>
+);

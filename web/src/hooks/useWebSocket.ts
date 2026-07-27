@@ -29,8 +29,8 @@ const getState = () => useSessionStore.getState();
  * Events without `seq` (status / queued / dequeued /
  * tool_approval_request) are ephemeral and always applied.
  *
- * Exported only so the unit tests can exercise the guard directly;
- * call sites (handleWsMessage) consume it internally.
+ * Exported so unit tests and diagnostic surfaces can exercise the guard
+ * directly; applyWsEvent consumes it for the live connection.
  */
 export function shouldApplyWsEvent(
   seq: number | null | undefined,
@@ -62,7 +62,26 @@ export function parkedTurnFromSnapshot(
   };
 }
 
-function handleWsMessage(data: Record<string, unknown>) {
+export interface WsEventApplication {
+  status: "applied" | "dropped" | "ignored";
+  eventType: string;
+  sessionId: string;
+  seq: number | null;
+  baseline: number | null;
+  reason: "event_applied" | "duplicate_seq" | "unknown_event";
+}
+
+/** Apply one server event to the client store.
+ *
+ * The live WebSocket and the streaming-anatomy specimen both enter through
+ * this function. Keeping one event vocabulary matters: the specimen is useful
+ * only if it demonstrates the production reducer rather than a look-alike.
+ * The return value is observational metadata; live callers may ignore it,
+ * while diagnostic surfaces can explain why an event was accepted or dropped.
+ */
+export function applyWsEvent(
+  data: Record<string, unknown>
+): WsEventApplication {
   const {
     addMessage,
     updateSessionStatus,
@@ -73,13 +92,21 @@ function handleWsMessage(data: Record<string, unknown>) {
     setLastAppliedSeq,
     lastAppliedSeq,
   } = getState();
-  const sessionId = data.session_id as string;
-  const type = data.type as string;
+  const sessionId = typeof data.session_id === "string" ? data.session_id : "";
+  const type = typeof data.type === "string" ? data.type : "";
 
   const seq = typeof data.seq === "number" ? (data.seq as number) : null;
+  const baseline = sessionId ? (lastAppliedSeq[sessionId] ?? null) : null;
   if (seq !== null && sessionId) {
     if (!shouldApplyWsEvent(seq, lastAppliedSeq[sessionId])) {
-      return; // already in snapshot; ignore to avoid duplicate
+      return {
+        status: "dropped",
+        eventType: type,
+        sessionId,
+        seq,
+        baseline,
+        reason: "duplicate_seq",
+      }; // already in snapshot; ignore to avoid duplicate
     }
     setLastAppliedSeq(sessionId, seq);
   }
@@ -421,7 +448,25 @@ function handleWsMessage(data: Record<string, unknown>) {
         .catch(() => {});
       break;
     }
+    default:
+      return {
+        status: "ignored",
+        eventType: type,
+        sessionId,
+        seq,
+        baseline,
+        reason: "unknown_event",
+      };
   }
+
+  return {
+    status: "applied",
+    eventType: type,
+    sessionId,
+    seq,
+    baseline,
+    reason: "event_applied",
+  };
 }
 
 export function useWebSocket() {
@@ -526,7 +571,7 @@ export function useWebSocket() {
 
       ws.onmessage = (e) => {
         try {
-          handleWsMessage(JSON.parse(e.data));
+          applyWsEvent(JSON.parse(e.data));
         } catch {
           // ignore
         }
