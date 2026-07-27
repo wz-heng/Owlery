@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from lark_channel import FeishuChannel, SecurityConfig, TransportConfig
+import lark_channel.ws.client as _lark_ws_client
 
 from .base import Bridge
 from .manager import BridgeManager
@@ -43,6 +44,49 @@ def _is_loopback(domain: str) -> bool:
     """True when `domain` points at loopback — the e2e fake-server case."""
     host = (urlsplit(domain).hostname or "").lower()
     return host in _LOOPBACK_HOSTS
+
+
+def _isolate_lark_ws_loop(
+    server_loop: asyncio.AbstractEventLoop,
+) -> asyncio.AbstractEventLoop:
+    """Guarantee the lark-channel ws client runs on a loop that is NEVER the
+    running server (uvicorn) loop.
+
+    ``lark_channel/ws/client.py`` binds a MODULE-LEVEL ``loop =
+    asyncio.get_event_loop()`` at import time, and ``WSClient.start()`` drives
+    the websocket with ``loop.run_until_complete(...)`` on THAT module global —
+    it ignores the per-instance ``self._loop``. ``server/main.py`` imports this
+    bridge module *inside* the FastAPI lifespan, i.e. while uvicorn's loop is
+    already running, so that import-time ``get_event_loop()`` captures the
+    running server loop. ``start_background()`` then runs the blocking
+    ``WSClient.start()`` in a worker thread (``run_in_executor``), which calls
+    ``run_until_complete()`` on the server's own loop from that thread — this
+    STOPS the server loop, raising ``RuntimeError: Event loop stopped before
+    Future completed`` and taking the whole process down at boot. Webhook mode
+    never constructs a ``WSClient``, so it never hit this and the (all-webhook)
+    e2e never caught it, even though ws is the production default.
+
+    Rebind the SDK's module global to a fresh loop we own and that uvicorn never
+    runs. The SDK then drives ONLY this isolated loop, on its worker thread,
+    fully decoupled from the server loop — which is exactly the standalone
+    condition the SDK was designed for (a module ``loop`` captured with no other
+    loop running). Both ``WSClient.start()`` and the SDK's shutdown path
+    (``FeishuChannel._stop_private_ws_client``) reference this same module global,
+    so start and stop stay coherent. Reuse it across reconnect/restart cycles —
+    the SDK stops but never closes it — and only replace it if it is somehow
+    unusable (closed, still running, or is the server loop), so we never leak a
+    loop per restart or run two ws clients on different loops.
+    """
+    loop = getattr(_lark_ws_client, "loop", None)
+    if (
+        loop is None
+        or loop is server_loop
+        or loop.is_closed()
+        or loop.is_running()
+    ):
+        loop = asyncio.new_event_loop()
+        _lark_ws_client.loop = loop
+    return loop
 
 
 class FeishuConfigError(ValueError):
@@ -215,6 +259,12 @@ class FeishuBridge(Bridge):
         # Capture the main loop while we're on it — SDK event handlers run on a
         # different (background) loop and must hop back here for turn work.
         self._main_loop = asyncio.get_running_loop()
+        # WS transport only: keep the SDK's module-level ws loop off THIS loop.
+        # It captured our (running) loop at import time; letting the SDK drive
+        # run_until_complete on it from a worker thread stops the server loop and
+        # crashes boot. Rebind it to an isolated loop first (see the helper).
+        if self.transport == "ws":
+            _isolate_lark_ws_loop(self._main_loop)
         # Bring the outbound worker up FIRST, then the SDK channel + keepalive
         # tick. The only thing that can fail here is a stuck lingering worker
         # (_ensure_worker raises); doing it before channel/tick means such a
