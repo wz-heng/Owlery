@@ -47,6 +47,7 @@ import lark_channel.ws.client as _lark_ws_client
 import uvicorn
 from fastapi import FastAPI
 
+import server.bridges.feishu as feishu_mod
 from server.bridges.feishu import FeishuBridge
 from server.bridges.manager import BridgeManager
 
@@ -78,6 +79,9 @@ def test_ws_transport_boots_under_real_uvicorn():
     # hazard, and the fix rebinds it to a fresh loop; neither should leak into
     # the rest of the suite.
     original_ws_loop = getattr(_lark_ws_client, "loop", None)
+    # The fix now tracks the isolated loop it owns in a module global; snapshot
+    # it so this test's minted loop doesn't leak into the rest of the suite.
+    original_owned = feishu_mod._isolated_ws_loop
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -87,6 +91,10 @@ def test_ws_transport_boots_under_real_uvicorn():
         # module ws loop BE this running server loop. Pre-fix, WSClient.start
         # would then stop this very loop from its worker thread and crash boot.
         _lark_ws_client.loop = serving_loop
+        # Owlery owns no isolated loop yet — reproduce a first-ever ws start so
+        # the helper mints a fresh loop and installs it (regardless of any loop a
+        # prior test in this process may have left owned).
+        feishu_mod._isolated_ws_loop = None
 
         class _MgrStub(BridgeManager):
             def __init__(self):
@@ -167,6 +175,7 @@ def test_ws_transport_boots_under_real_uvicorn():
         # into other tests; close it if it isn't the one we started with.
         created = _lark_ws_client.loop
         _lark_ws_client.loop = original_ws_loop
+        feishu_mod._isolated_ws_loop = original_owned
         if created is not original_ws_loop and created is not None and not created.is_closed():
             try:
                 created.close()
@@ -174,3 +183,92 @@ def test_ws_transport_boots_under_real_uvicorn():
                 pass
 
     assert not thread.is_alive(), "uvicorn thread failed to shut down"
+
+
+def test_isolated_ws_loop_reused_and_never_stolen():
+    """Focused guard for the loop-ownership invariant behind the ws fix.
+
+    The uvicorn smoke test above only ever hits a *failed* connect, so the
+    isolated loop never actually runs ``_select()`` — it can't catch what happens
+    when a second ``start()`` lands while a client is genuinely live. This test
+    drives the isolated loop into a real ``is_running()`` state (exactly what
+    ``WSClient.start()`` leaves it in, blocked in ``run_until_complete(_select())``)
+    and pins the invariant down four ways:
+
+    1. a first start with nothing owned mints a fresh loop and installs it as the
+       SDK global;
+    2. **the hard constraint** — a second start while that loop is RUNNING reuses
+       it verbatim; the running loop is never rebound (rebinding it would strand
+       the live client on a loop nobody drives → a zombie ``_select()`` thread);
+    3. a stop→start cycle (loop stopped but NOT closed, the SDK's own teardown
+       state) reuses the same loop;
+    4. only a CLOSED owned loop is replaced.
+
+    Pre-fix — when the helper replaced a loop merely because it ``is_running()`` —
+    property 2 fails: the live loop is swapped for a fresh idle one.
+    """
+    orig_global = getattr(_lark_ws_client, "loop", None)
+    orig_owned = feishu_mod._isolated_ws_loop
+
+    running_loop = None
+    runner = None
+    try:
+        # (1) First start: Owlery owns nothing yet, and the SDK global is still
+        # whatever was captured at import (stand in a sentinel to prove the
+        # helper does NOT read the old global — it installs its own).
+        feishu_mod._isolated_ws_loop = None
+        _lark_ws_client.loop = "sentinel-not-a-loop"
+        first = feishu_mod._isolate_lark_ws_loop()
+        assert first is feishu_mod._isolated_ws_loop
+        assert _lark_ws_client.loop is first
+        assert not first.is_closed()
+
+        # Drive it exactly as a live ws client does: WSClient.start() blocks in
+        # run_until_complete(_select()) on this very loop, leaving it running.
+        running_loop = first
+        ready = threading.Event()
+
+        def _run():
+            asyncio.set_event_loop(running_loop)
+            running_loop.call_soon(ready.set)
+            running_loop.run_forever()
+
+        runner = threading.Thread(target=_run, name="isolated-ws-loop", daemon=True)
+        runner.start()
+        assert ready.wait(2), "isolated loop never started running"
+        assert running_loop.is_running()
+
+        # (2) Second start WHILE running — the loop must NOT be stolen.
+        second = feishu_mod._isolate_lark_ws_loop()
+        assert second is running_loop, "second start replaced the RUNNING loop (zombie)"
+        assert _lark_ws_client.loop is running_loop, "SDK global rebound off the running loop"
+        assert running_loop.is_running(), "the live loop must keep running"
+
+        # (3) stop→start: stopped but not closed → same loop reused.
+        running_loop.call_soon_threadsafe(running_loop.stop)
+        runner.join(timeout=2)
+        assert not running_loop.is_running()
+        assert not running_loop.is_closed()
+        third = feishu_mod._isolate_lark_ws_loop()
+        assert third is running_loop, "restart after stop must reuse the same loop"
+        assert _lark_ws_client.loop is running_loop
+
+        # (4) only a CLOSED owned loop is replaced.
+        running_loop.close()
+        fourth = feishu_mod._isolate_lark_ws_loop()
+        assert fourth is not running_loop, "a closed owned loop must be replaced"
+        assert not fourth.is_closed()
+        assert _lark_ws_client.loop is fourth
+        fourth.close()
+    finally:
+        if runner is not None and runner.is_alive():
+            if running_loop is not None and running_loop.is_running():
+                running_loop.call_soon_threadsafe(running_loop.stop)
+            runner.join(timeout=2)
+        if running_loop is not None and not running_loop.is_closed():
+            running_loop.close()
+        owned = feishu_mod._isolated_ws_loop
+        if owned is not None and owned is not orig_owned and not owned.is_closed():
+            owned.close()
+        feishu_mod._isolated_ws_loop = orig_owned
+        _lark_ws_client.loop = orig_global

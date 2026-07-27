@@ -46,46 +46,66 @@ def _is_loopback(domain: str) -> bool:
     return host in _LOOPBACK_HOSTS
 
 
-def _isolate_lark_ws_loop(
-    server_loop: asyncio.AbstractEventLoop,
-) -> asyncio.AbstractEventLoop:
-    """Guarantee the lark-channel ws client runs on a loop that is NEVER the
-    running server (uvicorn) loop.
+# The single event loop Owlery owns on behalf of the lark-channel ws client.
+# Minted lazily on the first ws start and then REUSED for the whole process
+# lifetime — never rebound once a client is live on it (see
+# _isolate_lark_ws_loop for why "once live, never replace" is a hard rule).
+_isolated_ws_loop: asyncio.AbstractEventLoop | None = None
 
+
+def _isolate_lark_ws_loop() -> asyncio.AbstractEventLoop:
+    """Point the lark-channel ws client at a loop Owlery owns and that uvicorn
+    never runs — and, once a client is live on that loop, NEVER take it away.
+
+    Why this exists
+    ---------------
     ``lark_channel/ws/client.py`` binds a MODULE-LEVEL ``loop =
-    asyncio.get_event_loop()`` at import time, and ``WSClient.start()`` drives
-    the websocket with ``loop.run_until_complete(...)`` on THAT module global —
-    it ignores the per-instance ``self._loop``. ``server/main.py`` imports this
-    bridge module *inside* the FastAPI lifespan, i.e. while uvicorn's loop is
-    already running, so that import-time ``get_event_loop()`` captures the
-    running server loop. ``start_background()`` then runs the blocking
-    ``WSClient.start()`` in a worker thread (``run_in_executor``), which calls
-    ``run_until_complete()`` on the server's own loop from that thread — this
-    STOPS the server loop, raising ``RuntimeError: Event loop stopped before
-    Future completed`` and taking the whole process down at boot. Webhook mode
-    never constructs a ``WSClient``, so it never hit this and the (all-webhook)
-    e2e never caught it, even though ws is the production default.
+    asyncio.get_event_loop()`` at import time and uses THAT global everywhere,
+    ignoring the per-instance ``self._loop``: ``WSClient.start()`` drives the
+    socket with ``loop.run_until_complete(...)`` (lines 227/236/240) and — the
+    part that matters below — the running client keeps reading it to schedule
+    inbound work (``loop.create_task`` at lines 279/298/301);
+    ``FeishuChannel._stop_private_ws_client`` reads the same global to
+    disconnect. ``server/main.py`` imports this bridge *inside* the FastAPI
+    lifespan, i.e. while uvicorn's loop is already running, so that import-time
+    ``get_event_loop()`` captures the running server loop. In ws mode the SDK
+    then runs the blocking ``WSClient.start()`` on a worker thread, which calls
+    ``run_until_complete()`` on the server's own loop from that thread and STOPS
+    it — ``RuntimeError: Event loop stopped before Future completed``, taking the
+    whole process down at boot. Webhook mode never constructs a ``WSClient``, so
+    the (all-webhook) test suite never caught it, even though ws is the
+    production default.
 
-    Rebind the SDK's module global to a fresh loop we own and that uvicorn never
-    runs. The SDK then drives ONLY this isolated loop, on its worker thread,
-    fully decoupled from the server loop — which is exactly the standalone
-    condition the SDK was designed for (a module ``loop`` captured with no other
-    loop running). Both ``WSClient.start()`` and the SDK's shutdown path
-    (``FeishuChannel._stop_private_ws_client``) reference this same module global,
-    so start and stop stay coherent. Reuse it across reconnect/restart cycles —
-    the SDK stops but never closes it — and only replace it if it is somehow
-    unusable (closed, still running, or is the server loop), so we never leak a
-    loop per restart or run two ws clients on different loops.
+    The invariant: once live, never replace
+    ---------------------------------------
+    Because that global is read for the ENTIRE life of a ws client — not just at
+    start — a live client and its loop are inseparable. Rebinding the global out
+    from under a running client sends its freshly-received inbound to a loop
+    nobody drives and its stop/disconnect to the wrong loop, stranding the old
+    ``WSClient.start()`` thread forever in ``_select()``: a zombie. So a RUNNING
+    loop must NEVER be swapped out.
+
+    We therefore mint ONE loop the first time ws starts, remember it in
+    ``_isolated_ws_loop``, install it as the SDK global, and from then on always
+    hand back that same loop. It is replaced only when we own none yet or ours is
+    CLOSED — never merely because it ``is_running()`` (the old bug: "running" was
+    read as "replaceable", but running = a live client is using it = the one
+    thing you must not steal). A normal stop→start reuses it (the SDK stops but
+    never closes it); a second ``start()`` while the client is still live also
+    reuses it, so the lone live client keeps its loop. This mirrors the SDK's
+    one-global-loop model exactly: it supports a single ws client per process,
+    and Owlery registers exactly one Feishu bridge (``server/main.py``), so one
+    owned loop is all there is to own.
     """
-    loop = getattr(_lark_ws_client, "loop", None)
-    if (
-        loop is None
-        or loop is server_loop
-        or loop.is_closed()
-        or loop.is_running()
-    ):
+    global _isolated_ws_loop
+    loop = _isolated_ws_loop
+    if loop is None or loop.is_closed():
         loop = asyncio.new_event_loop()
-        _lark_ws_client.loop = loop
+        _isolated_ws_loop = loop
+    # Re-assert ourselves as the SDK global. Idempotent when it already points
+    # here (the running-client case: same object, no-op); corrective on a first
+    # start, where the global is still the server loop captured at import.
+    _lark_ws_client.loop = loop
     return loop
 
 
@@ -262,9 +282,10 @@ class FeishuBridge(Bridge):
         # WS transport only: keep the SDK's module-level ws loop off THIS loop.
         # It captured our (running) loop at import time; letting the SDK drive
         # run_until_complete on it from a worker thread stops the server loop and
-        # crashes boot. Rebind it to an isolated loop first (see the helper).
+        # crashes boot. Install our owned, isolated loop first — reused across
+        # restarts and never stolen from a live client (see the helper).
         if self.transport == "ws":
-            _isolate_lark_ws_loop(self._main_loop)
+            _isolate_lark_ws_loop()
         # Bring the outbound worker up FIRST, then the SDK channel + keepalive
         # tick. The only thing that can fail here is a stuck lingering worker
         # (_ensure_worker raises); doing it before channel/tick means such a
