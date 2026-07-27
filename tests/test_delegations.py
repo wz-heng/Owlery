@@ -186,7 +186,7 @@ async def test_files_resolved_against_working_dir(
     'absolute under <working_dir>' claim a lie)."""
     started: list[tuple[str, str]] = []
 
-    async def fake_start_message(sid, prompt, attachment_ids=None):
+    async def fake_start_message(sid, prompt, attachment_ids=None, injection_id=None):
         started.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", fake_start_message)
@@ -303,12 +303,8 @@ async def test_auto_archive_skips_user_origin_sessions(mgr, db, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_orphaned_delegation_archived_on_restart(db):
-    """A restart wipes DelegationManager._records (in-memory only) and
-    kills the child's subprocess, so a delegation child that was live at
-    restart can never finish or auto-archive itself — it would linger
-    forever in the sidebar's hidden-delegation count. SessionManager's
-    boot-time sweep archives such orphans; a healthy user-origin session
-    is left untouched."""
+    """Recovery records an interrupted round and notifies before archive."""
+    from server.delegations import DelegationManager
     from server.session_manager import SessionManager
 
     # Boot 1: a normal parent + a live delegation child (mid-flight when
@@ -325,17 +321,322 @@ async def test_orphaned_delegation_archived_on_restart(db):
     )
     assert child.id in m1.sessions  # live before the restart
 
-    # Boot 2: a fresh manager over the same DB — the run registry is gone.
+    # Boot 2: SessionManager leaves execution recovery to DelegationManager.
     m2 = SessionManager()
     await m2.initialize(db)
+    assert child.id in m2.sessions
 
-    # The orphaned delegation child is swept into the archive and dropped
-    # from memory; the user-origin parent survives as a live session.
+    injected: list[tuple[str, str, str | None]] = []
+
+    async def capture(sid, prompt, attachment_ids=None, injection_id=None):
+        injected.append((sid, prompt, injection_id))
+
+    m2.start_message = capture  # type: ignore[method-assign]
+    d2 = DelegationManager()
+    d2.bind(m2, db)
+    m2.pause_session_injection_dispatch()
+    assert await d2.recover_interrupted() == 1
+    assert injected == []
+    await m2.resume_session_injection_dispatch()
+
+    # The child is archived only after the durable run + delivery intent exist.
     assert child.id not in m2.sessions
     assert parent.id in m2.sessions
     rows = {r["id"]: r for r in await db.load_sessions(include_archived=True)}
     assert rows[child.id]["archived"]
     assert not rows[parent.id]["archived"]
+    run = await db.get_latest_delegation_run(child.id)
+    assert run and run["state"] == "interrupted"
+    assert injected and injected[0][0] == parent.id
+    assert "server restarted" in injected[0][1]
+    outbox = await db.get_session_injection_by_source(
+        f"delegation:{run['run_id']}:terminal"
+    )
+    assert outbox and outbox["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_restart_notification_rebuilds_partial_output_from_messages(db):
+    """The live captured_text cache is not the crash-recovery source."""
+    from server.delegations import DelegationManager
+    from server.session_manager import SessionManager
+
+    first = SessionManager()
+    await first.initialize(db)
+    octo = await db.get_default_agent()
+    await _make_agent(db, "Vera")
+    parent = await _make_session(first, octo["id"], name="parent")
+
+    async def accept(*args, **kwargs):
+        return None
+
+    first.start_message = accept  # type: ignore[method-assign]
+    d1 = DelegationManager()
+    d1.bind(first, db)
+    rec = await d1.start_delegation(
+        parent_session_id=parent.id, agent_name="vera", request="r"
+    )
+    await db.append_message(
+        rec.delegation_id,
+        seq=0,
+        role="assistant",
+        type="text",
+        content="I pushed the first half before the restart.",
+    )
+
+    second = SessionManager()
+    await second.initialize(db)
+    delivered: list[str] = []
+
+    async def capture(sid, prompt, attachment_ids=None, injection_id=None):
+        delivered.append(prompt)
+
+    second.start_message = capture  # type: ignore[method-assign]
+    d2 = DelegationManager()
+    d2.bind(second, db)
+    second.pause_session_injection_dispatch()
+    assert await d2.recover_interrupted() == 1
+    assert delivered == []
+    await second.resume_session_injection_dispatch()
+    assert delivered
+    assert "state 'interrupted'" in delivered[0]
+    assert "I pushed the first half before the restart." in delivered[0]
+
+
+@pytest.mark.asyncio
+async def test_completed_delegation_lists_and_follows_up_after_restart(db):
+    """The DB, not the prior manager's hot cache, owns round history."""
+    from server.delegations import DelegationManager
+    from server.session_manager import SessionManager
+
+    first = SessionManager()
+    await first.initialize(db)
+    octo = await db.get_default_agent()
+    await _make_agent(db, "Vera")
+    parent = await _make_session(first, octo["id"], name="parent")
+
+    async def accept(*args, **kwargs):
+        return None
+
+    first.start_message = accept  # type: ignore[method-assign]
+    d1 = DelegationManager()
+    d1.bind(first, db)
+    original = await d1.start_delegation(
+        parent_session_id=parent.id, agent_name="vera", request="round one"
+    )
+    await d1._on_broadcast(
+        {
+            "type": "result",
+            "session_id": original.delegation_id,
+            "is_error": False,
+        }
+    )
+
+    second = SessionManager()
+    await second.initialize(db)
+    second.start_message = accept  # type: ignore[method-assign]
+    d2 = DelegationManager()
+    d2.bind(second, db)
+
+    listed = await d2.list_delegations(parent.id)
+    assert len(listed) == 1
+    assert listed[0].run_id == original.run_id
+    assert listed[0].state == "completed"
+
+    follow = await d2.follow_up_delegation(
+        parent_session_id=parent.id,
+        delegation_id=original.delegation_id,
+        request="round two",
+    )
+    assert follow.run_id != original.run_id
+    assert follow.round_no == 2
+    rounds = await db.list_delegation_runs(original.delegation_id)
+    assert [(row["round_no"], row["state"]) for row in rounds] == [
+        (1, "completed"),
+        (2, "running"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_terminal_run_missing_outbox_is_repaired_on_restart(db):
+    """Close the crash after run terminalization but before parent enqueue."""
+    from server.delegations import DelegationManager
+    from server.session_manager import SessionManager
+
+    first = SessionManager()
+    await first.initialize(db)
+    octo = await db.get_default_agent()
+    await _make_agent(db, "Vera")
+    parent = await _make_session(first, octo["id"], name="parent")
+
+    async def accept(*args, **kwargs):
+        return None
+
+    first.start_message = accept  # type: ignore[method-assign]
+    d1 = DelegationManager()
+    d1.bind(first, db)
+    rec = await d1.start_delegation(
+        parent_session_id=parent.id, agent_name="vera", request="do it"
+    )
+    # Simulate a crash after the execution transition but before
+    # DelegationManager._inject_terminal created session_injections.
+    assert await db.finish_delegation_run(
+        rec.run_id,
+        state="completed",
+        error=None,
+        finished_at="2026-07-24T00:01:00Z",
+    )
+    assert await db.get_session_injection_by_source(
+        f"delegation:{rec.run_id}:terminal"
+    ) is None
+
+    second = SessionManager()
+    await second.initialize(db)
+    captured: list[str] = []
+
+    async def capture(sid, prompt, attachment_ids=None, injection_id=None):
+        captured.append(prompt)
+
+    second.start_message = capture  # type: ignore[method-assign]
+    d2 = DelegationManager()
+    d2.bind(second, db)
+    second.pause_session_injection_dispatch()
+    assert await d2.recover_interrupted() == 0
+    assert captured == []
+    await second.resume_session_injection_dispatch()
+    assert len(captured) == 1
+    assert captured[0].startswith("[agent-reply:Vera")
+    outbox = await db.get_session_injection_by_source(
+        f"delegation:{rec.run_id}:terminal"
+    )
+    assert outbox and outbox["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_nested_restart_materializes_descendant_before_parent_archive(db):
+    """Octo→Vera→Pete recovery preserves Pete's event without reviving Vera."""
+    from server.delegations import DelegationManager
+    from server.session_manager import SessionManager
+
+    first = SessionManager()
+    await first.initialize(db)
+    octo = await db.get_default_agent()
+    vera = await _make_agent(db, "Vera")
+    pete = await _make_agent(db, "Pete")
+    root = await _make_session(first, octo["id"], name="root")
+    vera_session = await first.create_session(
+        agent_id=vera["id"],
+        name="vera-child",
+        working_dir="/tmp",
+        origin="delegation",
+        parent_session_id=root.id,
+        delegation_request="ask Vera",
+    )
+    pete_session = await first.create_session(
+        agent_id=pete["id"],
+        name="pete-child",
+        working_dir="/tmp",
+        origin="delegation",
+        parent_session_id=vera_session.id,
+        delegation_request="ask Pete",
+    )
+    await db.create_delegation_run(
+        run_id="run-vera",
+        delegation_id=vera_session.id,
+        round_no=1,
+        request="ask Vera",
+        start_seq=-1,
+        created_at="2026-07-24T00:00:00Z",
+    )
+    await db.create_delegation_run(
+        run_id="run-pete",
+        delegation_id=pete_session.id,
+        round_no=1,
+        request="ask Pete",
+        start_seq=-1,
+        created_at="2026-07-24T00:01:00Z",
+    )
+    await db.append_message(
+        pete_session.id,
+        seq=0,
+        role="assistant",
+        type="text",
+        content="Pete made a partial change.",
+    )
+
+    second = SessionManager()
+    await second.initialize(db)
+    started: list[tuple[str, str]] = []
+
+    async def capture(sid, prompt, attachment_ids=None, injection_id=None):
+        started.append((sid, prompt))
+
+    second.start_message = capture  # type: ignore[method-assign]
+    second.pause_session_injection_dispatch()
+    recovered = DelegationManager()
+    recovered.bind(second, db)
+    assert await recovered.recover_interrupted() == 2
+
+    # Recovery itself starts no model turn. Pete's terminal event is instead
+    # committed directly into Vera's transcript before both children archive.
+    assert started == []
+    pete_outbox = await db.get_session_injection_by_source(
+        "delegation:run-pete:terminal"
+    )
+    assert pete_outbox and pete_outbox["status"] == "delivered"
+    vera_messages = await db.load_messages(vera_session.id)
+    assert any(
+        "[agent-error:Pete" in (message.get("content") or "")
+        for message in vera_messages
+    )
+    assert second.get_session(vera_session.id) is None
+    assert second.get_session(pete_session.id) is None
+
+    # Only the top-level Vera→Octo notification remains pending for the
+    # centralized post-recovery drain.
+    root_outbox = await db.get_session_injection_by_source(
+        "delegation:run-vera:terminal"
+    )
+    assert root_outbox and root_outbox["status"] == "pending"
+    await second.resume_session_injection_dispatch()
+    assert len(started) == 1
+    assert started[0][0] == root.id
+    assert "[agent-error:Vera" in started[0][1]
+
+
+@pytest.mark.asyncio
+async def test_restart_recovery_refuses_unpaused_dispatch_without_mutation(db):
+    """A future main.py reorder must fail loudly instead of racing a model."""
+    from server.delegations import DelegationManager
+    from server.session_manager import SessionManager
+
+    manager = SessionManager()
+    await manager.initialize(db)
+    octo = await db.get_default_agent()
+    vera = await _make_agent(db, "Vera")
+    root = await _make_session(manager, octo["id"], name="root")
+    child = await manager.create_session(
+        agent_id=vera["id"],
+        name="vera-child",
+        working_dir="/tmp",
+        origin="delegation",
+        parent_session_id=root.id,
+        delegation_request="work",
+    )
+    await db.create_delegation_run(
+        run_id="guarded-run",
+        delegation_id=child.id,
+        round_no=1,
+        request="work",
+        start_seq=-1,
+        created_at="2026-07-24T00:00:00Z",
+    )
+    recovered = DelegationManager()
+    recovered.bind(manager, db)
+    with pytest.raises(RuntimeError, match="requires paused"):
+        await recovered.recover_interrupted()
+    row = await db.get_latest_delegation_run(child.id)
+    assert row and row["state"] == "running"
 
 
 @pytest.mark.asyncio
@@ -368,7 +669,7 @@ async def test_nested_chain_intermediate_stays_alive_while_grandchild_runs(
     delivered: list[tuple[str, str]] = []
     inject_errors: list[str] = []
 
-    async def faithful_start_message(sid, prompt, attachment_ids=None):
+    async def faithful_start_message(sid, prompt, attachment_ids=None, injection_id=None):
         # Mirror SessionManager.start_message: ValueError when the
         # target session id is no longer in the in-memory map. Any
         # archival-too-early bug surfaces here as an exception that
@@ -461,7 +762,7 @@ async def test_start_delegation_happy_path(dm, mgr, db, monkeypatch):
     # Disable real harness spawn — we only want to verify the wiring.
     started: list[tuple[str, str]] = []
 
-    async def fake_start_message(sid, prompt, attachment_ids=None):
+    async def fake_start_message(sid, prompt, attachment_ids=None, injection_id=None):
         started.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", fake_start_message)
@@ -714,7 +1015,7 @@ async def test_depth_cap_rejected(dm, mgr, db, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-async def _noop_start_message(sid, prompt, attachment_ids=None):
+async def _noop_start_message(sid, prompt, attachment_ids=None, injection_id=None):
     return None
 
 
@@ -723,7 +1024,7 @@ async def test_reply_injection_on_result(dm, mgr, db, monkeypatch):
     """assistant_text + result(is_error=False) → [agent-reply:...] turn."""
     injected: list[tuple[str, str]] = []
 
-    async def capture(sid, prompt, attachment_ids=None):
+    async def capture(sid, prompt, attachment_ids=None, injection_id=None):
         injected.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", capture)
@@ -764,7 +1065,7 @@ async def test_reply_blocks_are_not_fused_into_one_line(dm, mgr, db, monkeypatch
     """
     injected: list[tuple[str, str]] = []
 
-    async def capture(sid, prompt, attachment_ids=None):
+    async def capture(sid, prompt, attachment_ids=None, injection_id=None):
         injected.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", capture)
@@ -812,7 +1113,7 @@ async def test_reply_preserves_block_interior_whitespace(dm, mgr, db, monkeypatc
     """
     injected: list[tuple[str, str]] = []
 
-    async def capture(sid, prompt, attachment_ids=None):
+    async def capture(sid, prompt, attachment_ids=None, injection_id=None):
         injected.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", capture)
@@ -849,7 +1150,7 @@ async def test_reply_does_not_loosen_a_tight_list(dm, mgr, db, monkeypatch):
     """
     injected: list[tuple[str, str]] = []
 
-    async def capture(sid, prompt, attachment_ids=None):
+    async def capture(sid, prompt, attachment_ids=None, injection_id=None):
         injected.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", capture)
@@ -879,7 +1180,7 @@ async def test_error_injection_on_result_error(dm, mgr, db, monkeypatch):
     """result(is_error=True) → [agent-error:...] turn, state=failed."""
     injected: list[tuple[str, str]] = []
 
-    async def capture(sid, prompt, attachment_ids=None):
+    async def capture(sid, prompt, attachment_ids=None, injection_id=None):
         injected.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", capture)
@@ -905,7 +1206,7 @@ async def test_error_injection_on_error_event(dm, mgr, db, monkeypatch):
     """An explicit error event from the child also terminates."""
     injected: list[tuple[str, str]] = []
 
-    async def capture(sid, prompt, attachment_ids=None):
+    async def capture(sid, prompt, attachment_ids=None, injection_id=None):
         injected.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", capture)
@@ -951,7 +1252,7 @@ async def test_empty_reply_gets_placeholder(dm, mgr, db, monkeypatch):
     gets a reply injection, with a placeholder body."""
     injected: list[tuple[str, str]] = []
 
-    async def capture(sid, prompt, attachment_ids=None):
+    async def capture(sid, prompt, attachment_ids=None, injection_id=None):
         injected.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", capture)
@@ -977,7 +1278,7 @@ async def test_empty_reply_gets_placeholder(dm, mgr, db, monkeypatch):
 async def test_cancel_delegation(dm, mgr, db, monkeypatch):
     injected: list[tuple[str, str]] = []
 
-    async def capture(sid, prompt, attachment_ids=None):
+    async def capture(sid, prompt, attachment_ids=None, injection_id=None):
         injected.append((sid, prompt))
 
     async def fake_interrupt(sid):
@@ -1017,7 +1318,7 @@ async def test_follow_up_happy_path(dm, mgr, db, monkeypatch):
     her transcript when she resumes."""
     injected: list[tuple[str, str]] = []
 
-    async def capture(sid, prompt, attachment_ids=None):
+    async def capture(sid, prompt, attachment_ids=None, injection_id=None):
         injected.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", capture)
@@ -1043,12 +1344,20 @@ async def test_follow_up_happy_path(dm, mgr, db, monkeypatch):
     )
     # Same identity, fresh round.
     assert updated.delegation_id == rec.delegation_id
+    assert updated.run_id != rec.run_id
+    assert updated.round_no == 2
     assert updated.state == "running"
     assert updated.request == "round 2 — please re-check finding 3"
     assert updated.captured_text == []
     assert updated.error is None
     assert updated.finished_at is None
     assert updated._terminal_injected is False
+    runs = await db.list_delegation_runs(rec.delegation_id)
+    assert [r["round_no"] for r in runs] == [1, 2]
+    assert [r["state"] for r in runs] == ["completed", "running"]
+    assert [r["request"] for r in runs] == [
+        "round 1", "round 2 — please re-check finding 3",
+    ]
     # Child is back in the live map.
     assert mgr.get_session(rec.delegation_id) is not None
     # The new request was delivered to the child's session.
@@ -1068,6 +1377,9 @@ async def test_follow_up_happy_path(dm, mgr, db, monkeypatch):
         "type": "result", "session_id": rec.delegation_id, "is_error": False,
     })
     assert updated.state == "completed"
+    assert [r["state"] for r in await db.list_delegation_runs(rec.delegation_id)] == [
+        "completed", "completed",
+    ]
     octo_injects = [p for s, p in injected if s == parent.id]
     assert len(octo_injects) == 1
     assert "Re-checked. Looks fixed." in octo_injects[0]
@@ -1159,7 +1471,7 @@ async def test_route_follow_up_requires_live_parent(client, monkeypatch):
     rounds) must 404 — otherwise the manager would round-reset the
     record and start the child, then silently drop the terminal
     turn because there's no live parent to inject into."""
-    async def noop(sid, prompt, attachment_ids=None):
+    async def noop(sid, prompt, attachment_ids=None, injection_id=None):
         return None
 
     monkeypatch.setattr(session_manager, "start_message", noop)
@@ -1199,7 +1511,7 @@ async def test_route_follow_up_requires_live_parent(client, monkeypatch):
 async def test_route_follow_up(client, monkeypatch):
     """HTTP path mirrors the manager: 200/201 happy path; 404 for
     unknown delegation; 409 while running."""
-    async def noop(sid, prompt, attachment_ids=None):
+    async def noop(sid, prompt, attachment_ids=None, injection_id=None):
         return None
 
     monkeypatch.setattr(session_manager, "start_message", noop)
@@ -1231,6 +1543,14 @@ async def test_route_follow_up(client, monkeypatch):
     assert body["delegation_id"] == did
     assert body["state"] == "running"
     assert body["request"] == "round 2"
+    history = await client.get(
+        f"/api/sessions/{parent['id']}/delegations/{did}/runs",
+        headers=HEADERS,
+    )
+    assert history.status_code == 200
+    assert [(row["round_no"], row["state"]) for row in history.json()] == [
+        (1, "completed"), (2, "running"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1243,7 +1563,7 @@ async def test_cancel_cascades_to_descendants(dm, mgr, db, monkeypatch):
     cancelled with a reason naming the parent cancel."""
     injected: list[tuple[str, str]] = []
 
-    async def capture(sid, prompt, attachment_ids=None):
+    async def capture(sid, prompt, attachment_ids=None, injection_id=None):
         injected.append((sid, prompt))
 
     async def fake_interrupt(sid):
@@ -1305,7 +1625,7 @@ async def test_cancel_delegation_single_inject_under_interrupt_broadcast(
     so `_on_broadcast` short-circuits on `rec.state != "running"`."""
     injected: list[tuple[str, str]] = []
 
-    async def capture(sid, prompt, attachment_ids=None):
+    async def capture(sid, prompt, attachment_ids=None, injection_id=None):
         injected.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", capture)
@@ -1352,7 +1672,7 @@ async def test_terminal_injection_is_idempotent(dm, mgr, db, monkeypatch):
     `[agent-…]` turn lands in the parent."""
     injected: list[tuple[str, str]] = []
 
-    async def capture(sid, prompt, attachment_ids=None):
+    async def capture(sid, prompt, attachment_ids=None, injection_id=None):
         injected.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", capture)
@@ -1383,7 +1703,7 @@ async def test_list_delegations_newest_first(dm, mgr, db, monkeypatch):
     r2 = await dm.start_delegation(
         parent_session_id=parent.id, agent_name="pete", request="r2",
     )
-    listed = dm.list_delegations(parent.id)
+    listed = await dm.list_delegations(parent.id)
     assert [r.delegation_id for r in listed] == [r2.delegation_id, r1.delegation_id]
 
 
@@ -1393,7 +1713,7 @@ async def test_concurrent_delegations_to_same_target(dm, mgr, db, monkeypatch):
     independently, parent sees both terminal turns."""
     injected: list[tuple[str, str]] = []
 
-    async def capture(sid, prompt, attachment_ids=None):
+    async def capture(sid, prompt, attachment_ids=None, injection_id=None):
         injected.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", capture)
@@ -1654,7 +1974,7 @@ async def test_question_request_routed_to_parent(dm, mgr, db, monkeypatch):
     drains it later."""
     injected: list[tuple[str, str]] = []
 
-    async def capture(sid, prompt, attachment_ids=None):
+    async def capture(sid, prompt, attachment_ids=None, injection_id=None):
         injected.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", capture)
@@ -1715,7 +2035,7 @@ async def test_question_with_empty_questions_does_not_crash(
     can decide to cancel."""
     captured: list[tuple[str, str]] = []
 
-    async def capture(sid, prompt, attachment_ids=None):
+    async def capture(sid, prompt, attachment_ids=None, injection_id=None):
         captured.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", capture)
@@ -1756,7 +2076,7 @@ async def test_terminated_delegations_ignore_questions(
     # Now a stray question_request should be a no-op.
     captured = []
 
-    async def capture(sid, prompt, attachment_ids=None):
+    async def capture(sid, prompt, attachment_ids=None, injection_id=None):
         captured.append((sid, prompt))
 
     monkeypatch.setattr(mgr, "start_message", capture)

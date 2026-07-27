@@ -401,8 +401,7 @@ async def test_start_message_caps_attachment_count(client):
 
 @pytest.mark.asyncio
 async def test_attachments_column_migration(tmp_path):
-    """An old DB created before the attachments column existed gets the
-    column added on next initialize and reads back []."""
+    """An old messages table gains every later additive delivery column."""
     db_path = tmp_path / "legacy.db"
     import aiosqlite
 
@@ -445,4 +444,12 @@ async def test_attachments_column_migration(tmp_path):
     msgs = await db.load_messages("legacy")
     assert len(msgs) == 1
     assert msgs[0]["attachments"] == []  # default for legacy rows
+    columns = {row[1] for row in await db._column_info("messages")}
+    assert "injection_id" in columns
+    indexes = await db.conn.execute("PRAGMA index_list(messages)")
+    assert "idx_messages_injection" in {row[1] for row in await indexes.fetchall()}
+    # Idempotent on the next boot/migration pass.
+    await db._apply_migrations()
+    indexes = await db.conn.execute("PRAGMA index_list(messages)")
+    assert "idx_messages_injection" in {row[1] for row in await indexes.fetchall()}
     await db.close()

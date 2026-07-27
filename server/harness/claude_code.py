@@ -157,7 +157,16 @@ concurrently. Exactly one of (`name`, `delegation_id`) must be set.
 
 Related: `mcp__ask_agent__cancel(delegation_id, reason?)` to stop \
 an in-flight delegation, `mcp__ask_agent__list()` to see recent \
-delegations from this session."""
+delegations from this session.
+
+[4] `mcp__tasks__*` — durable multi-agent Task Board work. Use a delegation \
+for one bounded RPC whose reply should return directly to this conversation. \
+Use Task Board when work must survive session/service restarts, has multiple \
+attempts or dependencies, needs human handoff, or should be visible on the \
+Kanban. Start with `mcp__tasks__list()` / `show()`, create explicit outcomes \
+with `create`, and use lifecycle tools (`specify`, `assign`, `unblock`, \
+`cancel`) instead of claiming status changes in prose. Task workers receive a \
+separate trusted protocol and must finish through `complete` or `block`."""
 
 
 def _apply_env_credential(env: dict[str, str], credential: HarnessCredential | None) -> None:

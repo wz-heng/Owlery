@@ -293,7 +293,7 @@ class UpdateScheduleRequest(BaseModel):
 # `research` (native-deep-research.md §7) shipped, so every API-created agent
 # was born without a delegation channel and only the startup backfill (which
 # touches pre-existing rows) could rescue it, on the next restart.
-DEFAULT_MCP_SERVERS = ["ask", "bg", "ask_agent", "research"]
+DEFAULT_MCP_SERVERS = ["ask", "bg", "ask_agent", "research", "tasks"]
 
 
 class AgentRead(BaseModel):

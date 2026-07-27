@@ -17,6 +17,15 @@ export const E2E_AGENTS_DIR = path.join(os.tmpdir(), "owlery-e2e-agents");
 // contract for the agents dir is unchanged.
 export const E2E_HOME_DIR = path.join(os.tmpdir(), "owlery-e2e-home");
 
+// TaskRepository needs a second connection to the SAME file database. Keep
+// that database directly under the already-existing OS temp directory:
+// Playwright starts webServer processes before globalSetup, so a DB nested
+// under E2E_HOME_DIR would fail before setup had a chance to mkdir the parent.
+export const E2E_DB_PATH = path.join(
+  os.tmpdir(),
+  `owlery-e2e.${process.pid}.db`
+);
+
 // Scratch for the fake `claude` (docs/plans/e2e-slim.md): per-session
 // remember/rule state, so a `--resume`d turn reads back what the previous turn
 // stored. That keeps the resume assertion honest — an unresumed turn finds no
@@ -122,7 +131,6 @@ export default defineConfig({
         OWLERY_PORT: "8765",
         // No Feishu credentials here → the bridge stays unmounted for the main
         // suite (its own config drives the bridge tests).
-        OWLERY_DB_PATH: ":memory:",
         // Per-agent memory dirs (docs/plans/memory.md) live under here; keep
         // them out of the developer's real ~/.owlery/agents. Cleaned in
         // e2e/global-teardown.ts.
@@ -140,6 +148,11 @@ export default defineConfig({
         // real-CLI tests click within a second of the form appearing,
         // well under this budget.
         OWLERY_ASK_USER_QUESTION_TIMEOUT_SECONDS: "12",
+        // TaskRepository intentionally uses a second SQLite connection for
+        // BEGIN IMMEDIATE claim/CAS transactions. `:memory:` would give that
+        // connection a different database, so the integrated E2E backend must
+        // use an isolated file. Global teardown removes it and its WAL files.
+        OWLERY_DB_PATH: E2E_DB_PATH,
       },
     },
     {

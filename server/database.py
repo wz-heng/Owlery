@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 # Built-in MCP servers attached to the Default Agent (and the default for
 # any newly-created agent). Kept here so the migration backfill and the
 # CREATE TABLE default stay in lock-step.
-_DEFAULT_MCP_SERVERS = ["ask", "bg", "ask_agent", "research"]
+_DEFAULT_MCP_SERVERS = ["ask", "bg", "ask_agent", "research", "tasks"]
 _DEFAULT_MCP_SERVERS_JSON = json.dumps(_DEFAULT_MCP_SERVERS)
 
 _SCHEMA = """
@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS agents (
     model TEXT,                             -- e.g. "claude-opus-4-7"; null = backend default
     credential_id TEXT REFERENCES backend_credentials(id) ON DELETE SET NULL,
     backend TEXT NOT NULL DEFAULT 'claude-code',  -- default harness for new sessions
-    mcp_servers TEXT NOT NULL DEFAULT '["ask","bg","ask_agent","research"]',
+    mcp_servers TEXT NOT NULL DEFAULT '["ask","bg","ask_agent","research","tasks"]',
                                             -- JSON array of built-in Owlery MCP server ids.
     tool_allow TEXT NOT NULL DEFAULT '',    -- newline-separated tool/MCP names; empty = allow all
     tool_deny  TEXT NOT NULL DEFAULT '',    -- newline-separated; deny takes precedence over allow
@@ -105,10 +105,56 @@ CREATE TABLE IF NOT EXISTS messages (
     -- (session-rewind.md §4 + §5.6.3). Powers the safe-revert preflight.
     git_head TEXT,                          -- `git rev-parse HEAD`; NULL when not a git repo
     git_status_clean INTEGER,               -- 1 iff `git status --porcelain` was empty
+    -- Durable async delivery identity.  A non-null value points at the
+    -- session_injections row whose prompt became this user message.  The
+    -- partial unique index is installed after additive migrations so legacy
+    -- databases gain the column before SQLite parses the index.
+    injection_id TEXT,
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq);
+
+-- Durable inbox/outbox boundary for system-produced turns (background task
+-- results, research reports, delegation questions/replies).  `pending` means
+-- the intent is durable but the corresponding user-message row is not;
+-- `delivered` is stamped atomically with that message insert.  This deliberately
+-- models delivery into the transcript, not whether a model turn subsequently
+-- finished consuming it.
+CREATE TABLE IF NOT EXISTS session_injections (
+    id TEXT PRIMARY KEY,
+    source_key TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending', -- pending|delivered|failed
+    created_at TEXT NOT NULL,
+    delivered_at TEXT,
+    error TEXT,
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_injections_pending
+  ON session_injections(status, created_at);
+
+-- One durable row per delegation ROUND.  `delegation_id` remains the public
+-- child-session continuation handle; `run_id` distinguishes repeated
+-- follow-ups in that same session so audit history is append-only.
+CREATE TABLE IF NOT EXISTS delegation_runs (
+    run_id TEXT PRIMARY KEY,
+    delegation_id TEXT NOT NULL,
+    round_no INTEGER NOT NULL,
+    request TEXT NOT NULL,
+    start_seq INTEGER NOT NULL,
+    state TEXT NOT NULL,                    -- running|completed|failed|cancelled|interrupted
+    error TEXT,
+    created_at TEXT NOT NULL,
+    finished_at TEXT,
+    FOREIGN KEY (delegation_id) REFERENCES sessions(id) ON DELETE CASCADE,
+    UNIQUE (delegation_id, round_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_delegation_runs_session
+  ON delegation_runs(delegation_id, round_no);
 
 -- A schedule belongs to the Agent ("every morning, summarize my inbox"),
 -- not to a throwaway thread. Each fire materializes a fresh session under
@@ -308,6 +354,9 @@ CREATE TABLE IF NOT EXISTS bg_tasks (
     truncated INTEGER NOT NULL DEFAULT 0,  -- bool: at least one stream hit the cap
     started_at TEXT NOT NULL,
     completed_at TEXT,
+    -- New tasks require one durable session_injections source. Legacy rows
+    -- gain this column with 0 during migration so old output is not replayed.
+    delivery_required INTEGER NOT NULL DEFAULT 1,
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
 
@@ -368,6 +417,231 @@ CREATE INDEX IF NOT EXISTS idx_turn_usage_agent_time
 CREATE INDEX IF NOT EXISTS idx_turn_usage_session
   ON turn_usage(session_id);
 
+-- Durable intent/coordination layer (task-board.md). TaskRepository owns all
+-- writes through a dedicated SQLite connection; this connection installs the
+-- additive schema and may read it for integration/recovery.
+CREATE TABLE IF NOT EXISTS task_boards (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    working_dir TEXT NOT NULL,
+    default_workspace_mode TEXT NOT NULL
+        CHECK (default_workspace_mode IN ('shared', 'copy', 'git_worktree')),
+    max_running INTEGER CHECK (max_running IS NULL OR max_running > 0),
+    max_running_per_agent INTEGER
+        CHECK (max_running_per_agent IS NULL OR max_running_per_agent > 0),
+    max_tree_depth INTEGER NOT NULL DEFAULT 8 CHECK (max_tree_depth > 0),
+    max_children_per_run INTEGER NOT NULL DEFAULT 32
+        CHECK (max_children_per_run > 0),
+    max_open_tasks INTEGER NOT NULL DEFAULT 500 CHECK (max_open_tasks > 0),
+    dispatch_enabled INTEGER NOT NULL DEFAULT 1
+        CHECK (dispatch_enabled IN (0, 1)),
+    archived INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0, 1)),
+    -- Git delivery closure (task-git-delivery.md §17). Safe defaults mean an
+    -- existing board keeps the pre-delivery "no auto-anything" behavior: keep
+    -- the branch, push to `origin`, never auto-merge. _apply_migrations adds the
+    -- same columns to pre-existing rows.
+    git_delivery_remote TEXT NOT NULL DEFAULT 'origin',
+    git_delivery_retention TEXT NOT NULL DEFAULT 'keep' CHECK (
+        git_delivery_retention IN
+        ('keep', 'remove_worktree_keep_branch', 'remove_all')
+    ),
+    git_delivery_author_name TEXT NOT NULL DEFAULT 'Owlery Task',
+    git_delivery_author_email TEXT NOT NULL DEFAULT 'owlery-tasks@localhost',
+    git_delivery_default_draft_pr INTEGER NOT NULL DEFAULT 1
+        CHECK (git_delivery_default_draft_pr IN (0, 1)),
+    git_delivery_default_merge TEXT NOT NULL DEFAULT 'none' CHECK (
+        git_delivery_default_merge IN ('none', 'fast_forward_only')
+    ),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS task_boards_live_name
+  ON task_boards(name) WHERE archived = 0;
+
+CREATE TABLE IF NOT EXISTS tasks (
+    id TEXT PRIMARY KEY,
+    board_id TEXT NOT NULL REFERENCES task_boards(id) ON DELETE CASCADE,
+    parent_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL
+        CHECK (status IN ('triage', 'todo', 'ready', 'running', 'blocked', 'done')),
+    assignee_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    origin_session_id TEXT,
+    idempotency_key TEXT,
+    scheduled_at TEXT,
+    workspace_mode TEXT
+        CHECK (workspace_mode IS NULL OR workspace_mode IN ('shared', 'copy', 'git_worktree')),
+    working_dir_override TEXT,
+    current_run_id TEXT,
+    blocked_kind TEXT CHECK (
+        blocked_kind IS NULL OR blocked_kind IN
+        ('input', 'capability', 'failure', 'protocol', 'cancelled', 'interrupted')
+    ),
+    blocked_reason TEXT,
+    result_summary TEXT,
+    archived INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0, 1)),
+    created_by_kind TEXT NOT NULL
+        CHECK (created_by_kind IN ('user', 'agent', 'schedule', 'api')),
+    created_by_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    archived_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS tasks_board_idempotency
+  ON tasks(board_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS tasks_dispatch
+  ON tasks(board_id, archived, status, priority DESC, created_at);
+CREATE INDEX IF NOT EXISTS tasks_assignee
+  ON tasks(assignee_agent_id, archived, status);
+CREATE INDEX IF NOT EXISTS tasks_parent ON tasks(parent_task_id);
+
+CREATE TABLE IF NOT EXISTS task_dependencies (
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    depends_on_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    created_by_kind TEXT NOT NULL,
+    created_by_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (task_id, depends_on_task_id),
+    CHECK (task_id != depends_on_task_id)
+);
+
+CREATE TABLE IF NOT EXISTS task_runs (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
+    agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+    session_id TEXT,
+    state TEXT NOT NULL CHECK (
+        state IN ('running', 'completed', 'blocked', 'failed', 'cancelled', 'interrupted')
+    ),
+    summary TEXT,
+    metadata TEXT,
+    error TEXT,
+    workspace_mode TEXT NOT NULL
+        CHECK (workspace_mode IN ('shared', 'copy', 'git_worktree')),
+    workspace_path TEXT NOT NULL,
+    claimed_at TEXT NOT NULL,
+    started_at TEXT,
+    last_heartbeat_at TEXT,
+    lease_expires_at TEXT,
+    finished_at TEXT,
+    UNIQUE (task_id, attempt_no)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS task_runs_one_running
+  ON task_runs(task_id) WHERE state = 'running';
+CREATE INDEX IF NOT EXISTS task_runs_task ON task_runs(task_id, attempt_no);
+CREATE INDEX IF NOT EXISTS task_runs_active_workspace
+  ON task_runs(workspace_path) WHERE state = 'running';
+
+CREATE TABLE IF NOT EXISTS task_comments (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    run_id TEXT REFERENCES task_runs(id) ON DELETE SET NULL,
+    author_kind TEXT NOT NULL CHECK (author_kind IN ('user', 'agent', 'system')),
+    author_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS task_comments_task
+  ON task_comments(task_id, created_at);
+
+CREATE TABLE IF NOT EXISTS task_events (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    board_id TEXT NOT NULL REFERENCES task_boards(id) ON DELETE CASCADE,
+    task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+    run_id TEXT REFERENCES task_runs(id) ON DELETE SET NULL,
+    kind TEXT NOT NULL,
+    actor_kind TEXT NOT NULL,
+    actor_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+    payload TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS task_events_task ON task_events(task_id, seq);
+CREATE INDEX IF NOT EXISTS task_events_board ON task_events(board_id, seq);
+
+CREATE TABLE IF NOT EXISTS task_artifacts (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    stored_path TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    mime_type TEXT,
+    size INTEGER NOT NULL CHECK (size >= 0),
+    sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    deleted_at TEXT,
+    UNIQUE (run_id, name)
+);
+
+-- Git delivery closure for git_worktree runs (task-git-delivery.md §11). One
+-- durable delivery per completed worktree run records the fate of its branch;
+-- an append-only op log records each at-most-once local/external operation.
+-- New-table-only — CREATE IF NOT EXISTS is a no-op migration.
+CREATE TABLE IF NOT EXISTS task_deliveries (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN (
+        'pending', 'preparing', 'ready', 'delivering',
+        'delivered', 'conflicted', 'blocked', 'failed'
+    )),
+    repository TEXT NOT NULL,              -- absolute source repo path (snapshot)
+    base_ref TEXT,                         -- base branch captured at prepare time; '' = detached; NULL = legacy run
+    base_head TEXT,
+    attempt_branch TEXT NOT NULL,
+    attempt_head TEXT,
+    dirty INTEGER NOT NULL DEFAULT 0 CHECK (dirty IN (0, 1)),
+    commits_ahead INTEGER,
+    diffstat TEXT,                         -- JSON {files,insertions,deletions}
+    remote_name TEXT,
+    remote_url TEXT,                       -- secret-stripped
+    pushed_ref TEXT,
+    pr_number INTEGER,
+    pr_url TEXT,
+    pr_state TEXT,
+    merge_strategy TEXT,
+    retention TEXT,
+    reason_kind TEXT,                      -- blocked|conflicted|failed reason (task-git-delivery.md §11.1)
+    reason_detail TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (run_id)
+);
+CREATE INDEX IF NOT EXISTS task_deliveries_task ON task_deliveries(task_id);
+CREATE INDEX IF NOT EXISTS task_deliveries_active
+  ON task_deliveries(status) WHERE status IN ('preparing', 'delivering');
+
+CREATE TABLE IF NOT EXISTS task_delivery_ops (
+    id TEXT PRIMARY KEY,
+    delivery_id TEXT NOT NULL REFERENCES task_deliveries(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN (
+        'commit', 'push', 'pull_request', 'merge', 'branch_delete', 'worktree_remove'
+    )),
+    source_key TEXT NOT NULL,             -- stable at-most-once key
+    external INTEGER NOT NULL CHECK (external IN (0, 1)),
+    state TEXT NOT NULL CHECK (state IN (
+        'planned', 'running', 'succeeded', 'failed', 'interrupted'
+    )),
+    request TEXT NOT NULL DEFAULT '{}',   -- JSON of requested parameters
+    result TEXT,                          -- JSON of git/platform response, secret-stripped
+    error TEXT,
+    actor_kind TEXT NOT NULL CHECK (actor_kind IN ('user', 'agent')),
+    actor_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (source_key)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS task_delivery_ops_one_running
+  ON task_delivery_ops(delivery_id) WHERE state = 'running';
+CREATE INDEX IF NOT EXISTS task_delivery_ops_delivery
+  ON task_delivery_ops(delivery_id, created_at);
+
 -- Parked turns awaiting a usage-limit reset (limit-auto-resume.md §4). A turn
 -- that failed on the USER'S OWN limit is persisted here, not slept on: the
 -- wait is multi-hour, so it must survive a restart — on boot these rows
@@ -410,6 +684,7 @@ class Database:
         self._conn = await aiosqlite.connect(self._db_path)
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA foreign_keys=ON")
+        await self._conn.execute("PRAGMA busy_timeout=5000")
         await self._conn.executescript(_SCHEMA)
         await self._apply_migrations()
         await self._conn.commit()
@@ -480,6 +755,30 @@ class Database:
         except Exception:
             pass
 
+        # Git delivery closure (task-git-delivery.md §18). Additive board
+        # settings; DEFAULTs backfill existing boards to the pre-delivery
+        # behavior (keep branch, push to origin, never auto-merge), so no board
+        # silently starts pushing or deleting. New DBs get them from _SCHEMA;
+        # this catch-up covers boards created before the feature landed.
+        for ddl in (
+            "ALTER TABLE task_boards ADD COLUMN "
+            "git_delivery_remote TEXT NOT NULL DEFAULT 'origin'",
+            "ALTER TABLE task_boards ADD COLUMN "
+            "git_delivery_retention TEXT NOT NULL DEFAULT 'keep'",
+            "ALTER TABLE task_boards ADD COLUMN "
+            "git_delivery_author_name TEXT NOT NULL DEFAULT 'Owlery Task'",
+            "ALTER TABLE task_boards ADD COLUMN "
+            "git_delivery_author_email TEXT NOT NULL DEFAULT 'owlery-tasks@localhost'",
+            "ALTER TABLE task_boards ADD COLUMN "
+            "git_delivery_default_draft_pr INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE task_boards ADD COLUMN "
+            "git_delivery_default_merge TEXT NOT NULL DEFAULT 'none'",
+        ):
+            try:
+                await self._conn.execute(ddl)
+            except Exception:
+                pass
+
         await self._migrate_agents()
         await self._migrate_schedule_recurrence()
         await self._migrate_schedule_run_at()
@@ -549,6 +848,7 @@ class Database:
             "ALTER TABLE sessions ADD COLUMN fork_status TEXT",
             "ALTER TABLE messages ADD COLUMN git_head TEXT",
             "ALTER TABLE messages ADD COLUMN git_status_clean INTEGER",
+            "ALTER TABLE messages ADD COLUMN injection_id TEXT",
         ):
             try:
                 await self._conn.execute(ddl)
@@ -561,6 +861,68 @@ class Database:
             )
         except Exception:
             pass
+        try:
+            await self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_injection "
+                "ON messages(injection_id) WHERE injection_id IS NOT NULL"
+            )
+        except Exception:
+            logger.exception("messages.injection_id index migration failed")
+        # Keep the delivery receipt inside the SAME SQLite statement as the
+        # transcript insert. Database uses one shared aiosqlite connection, so
+        # two Python execute() calls are not an isolation boundary: another
+        # coroutine could commit between them. A trigger is part of the INSERT
+        # statement itself and closes that window.
+        await self._conn.executescript(
+            """
+            DROP TRIGGER IF EXISTS messages_validate_injection;
+            DROP TRIGGER IF EXISTS messages_ack_injection;
+
+            CREATE TRIGGER messages_validate_injection
+            BEFORE INSERT ON messages
+            WHEN NEW.injection_id IS NOT NULL
+            BEGIN
+              SELECT CASE WHEN NEW.role != 'user'
+                OR NEW.type != 'text'
+                OR NOT EXISTS (
+                SELECT 1 FROM session_injections
+                WHERE id = NEW.injection_id
+                  AND session_id = NEW.session_id
+                  AND status = 'pending'
+                  AND prompt = json_extract(NEW.content, '$')
+              ) THEN RAISE(ABORT, 'invalid or already delivered session injection') END;
+            END;
+
+            CREATE TRIGGER messages_ack_injection
+            AFTER INSERT ON messages
+            WHEN NEW.injection_id IS NOT NULL
+            BEGIN
+              UPDATE session_injections
+              SET status = 'delivered',
+                  delivered_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                  error = NULL
+              WHERE id = NEW.injection_id
+                AND session_id = NEW.session_id
+                AND status = 'pending';
+            END;
+            """
+        )
+        # Delivery-outbox cutover for bg tasks. Existing terminal rows are
+        # historical and must not be replayed; fresh-schema rows default to 1
+        # and create_bg_task writes 1 explicitly.
+        if not await self._has_column("bg_tasks", "delivery_required"):
+            await self._conn.execute(
+                "ALTER TABLE bg_tasks ADD COLUMN delivery_required "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+            # Historical terminal output is assumed already delivered and must
+            # not be replayed. Work that was still in flight at cutover is
+            # different: this boot will mark it interrupted, and the caller
+            # must receive that terminal fact.
+            await self._conn.execute(
+                "UPDATE bg_tasks SET delivery_required = 1 "
+                "WHERE status IN ('running', 'pending')"
+            )
 
         # One-time catch-up: enrol every pre-existing agent in the built-in MCP
         # servers that shipped after it was created (`ask_agent` —
@@ -579,6 +941,9 @@ class Database:
         if user_version < 1:
             await self._backfill_builtin_mcp_servers(("ask_agent", "research"))
             await self._conn.execute("PRAGMA user_version = 1")
+        if user_version < 2:
+            await self._backfill_builtin_mcp_servers(("tasks",))
+            await self._conn.execute("PRAGMA user_version = 2")
 
     async def _backfill_builtin_mcp_servers(self, names: tuple[str, ...]) -> None:
         cursor = await self._conn.execute("SELECT id, mcp_servers FROM agents")
@@ -1001,6 +1366,14 @@ class Database:
         row = await cursor.fetchone()
         return row[0]
 
+    async def session_exists(self, session_id: str) -> bool:
+        """Whether a session row exists, including archived sessions."""
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
+        )
+        return await cursor.fetchone() is not None
+
     async def append_message(
         self,
         session_id: str,
@@ -1017,6 +1390,7 @@ class Database:
         attachments: list[dict[str, Any]] | None = None,
         git_head: str | None = None,
         git_status_clean: bool | None = None,
+        injection_id: str | None = None,
     ) -> None:
         await self._ensure_connected()
         content_str = json.dumps(content) if content is not None else None
@@ -1029,12 +1403,34 @@ class Database:
             int(git_status_clean) if git_status_clean is not None else None
         )
 
+        source_key = ""
+        if injection_id is not None:
+            # Friendly preflight; the trigger below is the authoritative
+            # check and remains race-safe at INSERT time.
+            src = await self._conn.execute(
+                "SELECT source_key, prompt FROM session_injections "
+                "WHERE id = ? AND session_id = ? AND status = 'pending'",
+                (injection_id, session_id),
+            )
+            src_row = await src.fetchone()
+            if (
+                src_row is None
+                or role != "user"
+                or type != "text"
+                or content != src_row[1]
+            ):
+                raise ValueError(
+                    f"Injection {injection_id!r} is missing, targets another "
+                    "session, has a different payload, or is no longer pending"
+                )
+            source_key = src_row[0]
+
         await self._conn.execute(
             "INSERT INTO messages "
             "(session_id, seq, role, type, content, tool_name, tool_input, "
             "tool_use_id, is_error, session_id_ref, cost, attachments, "
-            "git_head, git_status_clean) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "git_head, git_status_clean, injection_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 session_id,
                 seq,
@@ -1050,9 +1446,241 @@ class Database:
                 attachments_str,
                 git_head,
                 git_status_clean_int,
+                injection_id,
             ),
         )
-        self._dirty = True
+        if injection_id is not None:
+            # messages_ack_injection fired inside the INSERT statement. Keep
+            # the old research column as a non-authoritative compatibility
+            # mirror; correctness no longer depends on a second statement.
+            delivered_at = datetime.now(timezone.utc).isoformat()
+            # Keep research_jobs.injection_status as a compatibility mirror
+            # for one release. session_injections is authoritative; this
+            # mirror can be repaired by research recovery after a crash.
+            if source_key.startswith("research:"):
+                research_id = source_key.split(":", 2)[1]
+                await self._conn.execute(
+                    "UPDATE research_jobs SET injection_status = 'delivered', "
+                    "injected_at = ? WHERE id = ?",
+                    (delivered_at, research_id),
+                )
+        # A persisted/broadcast transcript event must not leave a write
+        # transaction open for the rest of the model turn. TaskRepository is
+        # an intentional second SQLite writer; batching ordinary messages
+        # until turn-idle would hold WAL's single-writer lock across arbitrary
+        # model/tool/MCP latency and make worker heartbeat/complete deadlock on
+        # SQLITE_BUSY. Commit each event before its caller broadcasts it.
+        await self._conn.commit()
+        self._dirty = False
+
+    # ------------------------------------------------------- session injections
+
+    _INJECTION_COLS = (
+        "id, source_key, session_id, prompt, status, created_at, "
+        "delivered_at, error"
+    )
+
+    @staticmethod
+    def _row_to_session_injection(row: Any) -> dict[str, Any]:
+        return {
+            "id": row[0],
+            "source_key": row[1],
+            "session_id": row[2],
+            "prompt": row[3],
+            "status": row[4],
+            "created_at": row[5],
+            "delivered_at": row[6],
+            "error": row[7],
+        }
+
+    async def create_session_injection(
+        self,
+        *,
+        injection_id: str,
+        source_key: str,
+        session_id: str,
+        prompt: str,
+        created_at: str,
+    ) -> dict[str, Any]:
+        """Persist one idempotent system-produced turn.
+
+        `source_key` is the stable producer identity.  Repeating an enqueue
+        with the same key returns the original row; changing its target or
+        payload is rejected by SessionManager before dispatch.
+        """
+        await self._ensure_connected()
+        await self._conn.execute(
+            "INSERT OR IGNORE INTO session_injections "
+            "(id, source_key, session_id, prompt, status, created_at) "
+            "VALUES (?, ?, ?, ?, 'pending', ?)",
+            (injection_id, source_key, session_id, prompt, created_at),
+        )
+        await self._conn.commit()
+        row = await self.get_session_injection_by_source(source_key)
+        if row is None:
+            raise RuntimeError(f"Failed to create injection {source_key!r}")
+        return row
+
+    async def get_session_injection(
+        self, injection_id: str
+    ) -> dict[str, Any] | None:
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            f"SELECT {self._INJECTION_COLS} FROM session_injections WHERE id = ?",
+            (injection_id,),
+        )
+        row = await cursor.fetchone()
+        return self._row_to_session_injection(row) if row else None
+
+    async def get_session_injection_by_source(
+        self, source_key: str
+    ) -> dict[str, Any] | None:
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            f"SELECT {self._INJECTION_COLS} FROM session_injections "
+            "WHERE source_key = ?",
+            (source_key,),
+        )
+        row = await cursor.fetchone()
+        return self._row_to_session_injection(row) if row else None
+
+    async def list_pending_session_injections(self) -> list[dict[str, Any]]:
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            f"SELECT {self._INJECTION_COLS} FROM session_injections "
+            "WHERE status = 'pending' ORDER BY created_at, id"
+        )
+        return [
+            self._row_to_session_injection(row)
+            for row in await cursor.fetchall()
+        ]
+
+    async def worker_has_persisted_pending_work(self, session_id: str) -> bool:
+        """Whether durable async work still points at a task-worker session.
+
+        TaskBoardManager combines this DB predicate with SessionManager's live
+        turn/queue/approval state.  Keeping the SQL in Database prevents the
+        terminal-protocol and lease checks from drifting into separate,
+        incomplete definitions of "waiting".
+        """
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            "SELECT EXISTS("
+            " SELECT 1 FROM bg_tasks WHERE session_id = ? "
+            "   AND status IN ('pending', 'running')"
+            " UNION ALL"
+            " SELECT 1 FROM bg_tasks b WHERE b.session_id = ? "
+            "   AND b.delivery_required = 1 "
+            "   AND b.status IN ('completed', 'failed', 'cancelled', 'interrupted') "
+            "   AND NOT EXISTS ("
+            "     SELECT 1 FROM session_injections i "
+            "     WHERE i.source_key = 'bg:' || b.id"
+            "   )"
+            " UNION ALL"
+            " SELECT 1 FROM research_jobs WHERE session_id = ? AND status = 'running'"
+            " UNION ALL"
+            " SELECT 1 FROM research_jobs r WHERE r.session_id = ? "
+            "   AND r.status = 'completed' AND r.injection_status = 'pending' "
+            "   AND NOT EXISTS ("
+            "     SELECT 1 FROM session_injections i "
+            "     WHERE i.source_key = 'research:' || r.id"
+            "   )"
+            " UNION ALL"
+            " SELECT 1 FROM delegation_runs dr JOIN sessions child "
+            "   ON child.id = dr.delegation_id"
+            "   WHERE child.parent_session_id = ? AND dr.state = 'running'"
+            " UNION ALL"
+            " SELECT 1 FROM delegation_runs dr JOIN sessions child "
+            "   ON child.id = dr.delegation_id"
+            "   WHERE child.parent_session_id = ? "
+            "   AND dr.state IN ('completed', 'failed', 'cancelled', 'interrupted') "
+            "   AND NOT EXISTS ("
+            "     SELECT 1 FROM session_injections i "
+            "     WHERE i.source_key = 'delegation:' || dr.run_id || ':terminal'"
+            "   )"
+            " UNION ALL"
+            " SELECT 1 FROM session_injections WHERE session_id = ? AND status = 'pending'"
+            " UNION ALL"
+            " SELECT 1 FROM parked_turns WHERE session_id = ?"
+            ")",
+            (
+                session_id,
+                session_id,
+                session_id,
+                session_id,
+                session_id,
+                session_id,
+                session_id,
+                session_id,
+            ),
+        )
+        row = await cursor.fetchone()
+        return bool(row and row[0])
+
+    async def reconcile_session_injection(self, injection_id: str) -> bool:
+        """Acknowledge a legacy half-state if its transcript row exists.
+
+        New writes cannot produce this state because ``messages_ack_injection``
+        runs inside the INSERT statement. The check remains necessary when
+        upgrading a database written by the pre-trigger implementation or
+        recovering from an old crash window. It must happen before replay or
+        the unique message index would reject the duplicate while leaving the
+        outbox row pending forever.
+        """
+        await self._ensure_connected()
+        delivered_at = datetime.now(timezone.utc).isoformat()
+        cursor = await self._conn.execute(
+            "UPDATE session_injections SET status = 'delivered', "
+            "delivered_at = ?, error = NULL "
+            "WHERE id = ? AND status = 'pending' AND EXISTS ("
+            "  SELECT 1 FROM messages m "
+            "  WHERE m.injection_id = session_injections.id "
+            "    AND m.session_id = session_injections.session_id"
+            ")",
+            (delivered_at, injection_id),
+        )
+        if cursor.rowcount:
+            src = await self._conn.execute(
+                "SELECT source_key FROM session_injections WHERE id = ?",
+                (injection_id,),
+            )
+            src_row = await src.fetchone()
+            source_key = src_row[0] if src_row else ""
+            if source_key.startswith("research:"):
+                research_id = source_key.split(":", 2)[1]
+                await self._conn.execute(
+                    "UPDATE research_jobs SET injection_status = 'delivered', "
+                    "injected_at = ? WHERE id = ?",
+                    (delivered_at, research_id),
+                )
+        await self._conn.commit()
+        return bool(cursor.rowcount)
+
+    async def fail_session_injection(
+        self, injection_id: str, error: str
+    ) -> bool:
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            "UPDATE session_injections SET status = 'failed', error = ? "
+            "WHERE id = ? AND status = 'pending'",
+            (error, injection_id),
+        )
+        if cursor.rowcount:
+            src = await self._conn.execute(
+                "SELECT source_key FROM session_injections WHERE id = ?",
+                (injection_id,),
+            )
+            src_row = await src.fetchone()
+            source_key = src_row[0] if src_row else ""
+            if source_key.startswith("research:"):
+                research_id = source_key.split(":", 2)[1]
+                await self._conn.execute(
+                    "UPDATE research_jobs SET injection_status = 'failed', "
+                    "error = ? WHERE id = ?",
+                    (f"delivery failed: {error}", research_id),
+                )
+        await self._conn.commit()
+        return bool(cursor.rowcount)
 
     async def load_messages(
         self, session_id: str, limit: int = 0, offset: int = 0
@@ -2182,11 +2810,13 @@ class Database:
             "truncated": bool(row[9]),
             "started_at": row[10],
             "completed_at": row[11],
+            "delivery_required": bool(row[12]),
         }
 
     _BG_TASK_COLS = (
         "id, session_id, command, description, working_dir, status, "
-        "exit_code, stdout, stderr, truncated, started_at, completed_at"
+        "exit_code, stdout, stderr, truncated, started_at, completed_at, "
+        "delivery_required"
     )
 
     async def create_bg_task(
@@ -2202,8 +2832,8 @@ class Database:
         await self._conn.execute(
             "INSERT INTO bg_tasks "
             "(id, session_id, command, description, working_dir, status, "
-            " stdout, stderr, truncated, started_at) "
-            "VALUES (?, ?, ?, ?, ?, 'running', '', '', 0, ?)",
+            " stdout, stderr, truncated, started_at, delivery_required) "
+            "VALUES (?, ?, ?, ?, ?, 'running', '', '', 0, ?, 1)",
             (task_id, session_id, command, description, working_dir, started_at),
         )
         await self._conn.commit()
@@ -2255,6 +2885,28 @@ class Database:
         )
         rows = await cursor.fetchall()
         return [self._row_to_bg_task(r) for r in rows]
+
+    async def list_in_flight_bg_tasks(self) -> list[dict[str, Any]]:
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            f"SELECT {self._BG_TASK_COLS} FROM bg_tasks "
+            "WHERE status IN ('running', 'pending') ORDER BY started_at"
+        )
+        return [self._row_to_bg_task(r) for r in await cursor.fetchall()]
+
+    async def list_bg_tasks_missing_delivery(self) -> list[dict[str, Any]]:
+        """Terminal post-cutover tasks with no durable outbox source."""
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            f"SELECT {self._BG_TASK_COLS} FROM bg_tasks b "
+            "WHERE b.delivery_required = 1 "
+            "AND b.status IN ('completed', 'failed', 'cancelled', 'interrupted') "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM session_injections i "
+            "  WHERE i.source_key = 'bg:' || b.id"
+            ") ORDER BY b.completed_at, b.id"
+        )
+        return [self._row_to_bg_task(r) for r in await cursor.fetchall()]
 
     async def mark_in_flight_bg_tasks_interrupted(
         self, completed_at: str
@@ -2348,6 +3000,15 @@ class Database:
         rows = await cursor.fetchall()
         return [self._row_to_research_job(r) for r in rows]
 
+    async def list_pending_research_deliveries(self) -> list[dict[str, Any]]:
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            f"SELECT {self._RESEARCH_COLS} FROM research_jobs "
+            "WHERE status = 'completed' AND injection_status = 'pending' "
+            "ORDER BY completed_at, id"
+        )
+        return [self._row_to_research_job(r) for r in await cursor.fetchall()]
+
     async def mark_in_flight_research_jobs_interrupted(self, completed_at: str) -> int:
         """Boot sweep: a `running` row belongs to a prior process — its task is
         gone, so flip it to `interrupted` (native-deep-research.md §6). v1 does
@@ -2360,6 +3021,198 @@ class Database:
         )
         await self._conn.commit()
         return cursor.rowcount
+
+    # --- Per-round agent delegation execution ledger ---
+
+    _DELEGATION_RUN_COLS = (
+        "r.run_id, r.delegation_id, r.round_no, r.request, r.start_seq, "
+        "r.state, r.error, r.created_at, r.finished_at, "
+        "s.parent_session_id, s.agent_id, a.name"
+    )
+
+    @staticmethod
+    def _row_to_delegation_run(row: Any) -> dict[str, Any]:
+        return {
+            "run_id": row[0],
+            "delegation_id": row[1],
+            "round_no": row[2],
+            "request": row[3],
+            "start_seq": row[4],
+            "state": row[5],
+            "error": row[6],
+            "created_at": row[7],
+            "finished_at": row[8],
+            "parent_session_id": row[9],
+            "target_agent_id": row[10],
+            "target_agent_name": row[11] or "unknown agent",
+        }
+
+    async def create_delegation_run(
+        self,
+        *,
+        run_id: str,
+        delegation_id: str,
+        round_no: int,
+        request: str,
+        start_seq: int,
+        created_at: str,
+        state: str = "running",
+        error: str | None = None,
+        finished_at: str | None = None,
+    ) -> None:
+        await self._ensure_connected()
+        await self._conn.execute(
+            "INSERT INTO delegation_runs "
+            "(run_id, delegation_id, round_no, request, start_seq, state, "
+            "error, created_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_id, delegation_id, round_no, request, start_seq, state,
+                error, created_at, finished_at,
+            ),
+        )
+        await self._conn.commit()
+
+    async def finish_delegation_run(
+        self,
+        run_id: str,
+        *,
+        state: str,
+        error: str | None,
+        finished_at: str,
+    ) -> bool:
+        """Transition a running round exactly once to a terminal state."""
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            "UPDATE delegation_runs SET state = ?, error = ?, finished_at = ? "
+            "WHERE run_id = ? AND state = 'running'",
+            (state, error, finished_at, run_id),
+        )
+        await self._conn.commit()
+        return bool(cursor.rowcount)
+
+    async def get_latest_delegation_run(
+        self, delegation_id: str
+    ) -> dict[str, Any] | None:
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            f"SELECT {self._DELEGATION_RUN_COLS} FROM delegation_runs r "
+            "JOIN sessions s ON s.id = r.delegation_id "
+            "LEFT JOIN agents a ON a.id = s.agent_id "
+            "WHERE r.delegation_id = ? ORDER BY r.round_no DESC LIMIT 1",
+            (delegation_id,),
+        )
+        row = await cursor.fetchone()
+        return self._row_to_delegation_run(row) if row else None
+
+    async def list_delegation_runs(
+        self, delegation_id: str
+    ) -> list[dict[str, Any]]:
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            f"SELECT {self._DELEGATION_RUN_COLS} FROM delegation_runs r "
+            "JOIN sessions s ON s.id = r.delegation_id "
+            "LEFT JOIN agents a ON a.id = s.agent_id "
+            "WHERE r.delegation_id = ? ORDER BY r.round_no",
+            (delegation_id,),
+        )
+        return [
+            self._row_to_delegation_run(row)
+            for row in await cursor.fetchall()
+        ]
+
+    async def list_latest_delegation_runs_for_parent(
+        self, parent_session_id: str, *, limit: int = 25
+    ) -> list[dict[str, Any]]:
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            f"SELECT {self._DELEGATION_RUN_COLS} FROM delegation_runs r "
+            "JOIN sessions s ON s.id = r.delegation_id "
+            "LEFT JOIN agents a ON a.id = s.agent_id "
+            "WHERE s.parent_session_id = ? AND r.round_no = ("
+            "  SELECT MAX(r2.round_no) FROM delegation_runs r2 "
+            "  WHERE r2.delegation_id = r.delegation_id"
+            ") ORDER BY r.created_at DESC LIMIT ?",
+            (parent_session_id, limit),
+        )
+        return [
+            self._row_to_delegation_run(row)
+            for row in await cursor.fetchall()
+        ]
+
+    async def list_running_delegation_runs(self) -> list[dict[str, Any]]:
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            f"SELECT {self._DELEGATION_RUN_COLS} FROM delegation_runs r "
+            "JOIN sessions s ON s.id = r.delegation_id "
+            "LEFT JOIN agents a ON a.id = s.agent_id "
+            "WHERE r.state = 'running' ORDER BY r.created_at"
+        )
+        return [
+            self._row_to_delegation_run(row)
+            for row in await cursor.fetchall()
+        ]
+
+    async def list_terminal_delegation_runs_missing_delivery(
+        self,
+    ) -> list[dict[str, Any]]:
+        """Terminal rounds whose terminal outbox intent was never created."""
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            f"SELECT {self._DELEGATION_RUN_COLS} FROM delegation_runs r "
+            "JOIN sessions s ON s.id = r.delegation_id "
+            "LEFT JOIN agents a ON a.id = s.agent_id "
+            "WHERE r.state IN ('completed', 'failed', 'cancelled', 'interrupted') "
+            "AND s.parent_session_id IS NOT NULL "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM session_injections i "
+            "  WHERE i.source_key = 'delegation:' || r.run_id || ':terminal'"
+            ") ORDER BY r.finished_at, r.run_id"
+        )
+        return [
+            self._row_to_delegation_run(row)
+            for row in await cursor.fetchall()
+        ]
+
+    async def delegation_session_has_runs(self, delegation_id: str) -> bool:
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            "SELECT 1 FROM delegation_runs WHERE delegation_id = ? LIMIT 1",
+            (delegation_id,),
+        )
+        return await cursor.fetchone() is not None
+
+    async def max_message_seq(self, session_id: str) -> int:
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            "SELECT COALESCE(MAX(seq), -1) FROM messages WHERE session_id = ?",
+            (session_id,),
+        )
+        row = await cursor.fetchone()
+        return int(row[0])
+
+    async def load_delegation_output(
+        self, delegation_id: str, *, after_seq: int
+    ) -> list[str]:
+        """Durably rebuild the assistant text produced by one round."""
+        await self._ensure_connected()
+        await self.flush()
+        cursor = await self._conn.execute(
+            "SELECT content FROM messages WHERE session_id = ? AND seq > ? "
+            "AND role = 'assistant' AND type = 'text' ORDER BY seq",
+            (delegation_id, after_seq),
+        )
+        rows = await cursor.fetchall()
+        output: list[str] = []
+        for row in rows:
+            if row[0] is None:
+                continue
+            try:
+                value = json.loads(row[0])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(value, str):
+                output.append(value)
+        return output
 
     # ------------------------------------------------------------------ parked turns
 

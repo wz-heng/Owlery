@@ -11,7 +11,13 @@ const API = window.location.origin;
  * dialog owned by App and reached from the account menu — there are no gear
  * icons here; `onCreateAgent` opens that dialog in create mode, and the
  * account menu's "Agent settings" edits whichever agent is active. */
-export function AgentList({ onCreateAgent }: { onCreateAgent: () => void }) {
+export function AgentList({
+  onCreateAgent,
+  onOpenSession,
+}: {
+  onCreateAgent: () => void;
+  onOpenSession?: () => void;
+}) {
   const token = useSessionStore((s) => s.token);
   const agents = useSessionStore((s) => s.agents);
   const setAgents = useSessionStore((s) => s.setAgents);
@@ -181,6 +187,7 @@ export function AgentList({ onCreateAgent }: { onCreateAgent: () => void }) {
                   onCloseForm={() =>
                     setFormAgentId((cur) => (cur === a.id ? null : cur))
                   }
+                  onOpenSession={onOpenSession}
                 />
               )}
             </div>

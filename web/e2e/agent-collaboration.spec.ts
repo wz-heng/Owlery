@@ -25,9 +25,9 @@
  *   3. The "Open Vera's session" link navigates to the child session,
  *      and the "Delegated from Owl" banner appears on the child
  *      header.
- *   4. The sidebar surfaces the hidden delegation pill on Vera (the
- *      child session is `origin='delegation'` so it's hidden behind
- *      `showDelegations=false` by default).
+ *   4. Once terminal delivery succeeds, Vera's child is auto-archived
+ *      and appears in the Archived sessions manager rather than the
+ *      live sidebar.
  */
 
 import { mkdtempSync, rmSync } from "node:fs";
@@ -230,28 +230,24 @@ test.describe("Agent-to-agent delegation @llm", () => {
     await banner.getByRole("button", { name: /open parent/i }).click();
     await expect(page.locator(".chat-header h3")).toHaveText("Delegation E2E");
 
-    // 6. Sidebar: the new delegation session is hidden by default.
-    //    Under the target agent's row the "+1 delegations hidden"
-    //    pill surfaces. Click it to flip the global toggle, the
-    //    delegation session appears with its subtask marker.
-    const targetAgentRow = page.locator(".agent-item", {
-      hasText: "E2E DelegTarget",
-    });
-    // Expand the agent so its session list is mounted.
-    await targetAgentRow.click();
-    const hiddenPill = targetAgentRow
-      .locator("..")
-      .locator(".delegation-toggle", { hasText: /delegation/ });
-    await expect(hiddenPill).toBeVisible({ timeout: 10_000 });
-    await hiddenPill.click();
-    // After toggle, a session under E2E DelegTarget marked as a
-    // delegation appears. The delegation marker icon hangs off the
-    // session row.
-    const delegSessionRow = targetAgentRow
-      .locator("..")
-      .locator(".session-item")
-      .filter({ has: page.locator(".delegation-marker") })
+    // 6. Terminal delivery auto-archives the child, so it must not linger
+    //    in the live sidebar. It remains inspectable in Archived sessions,
+    //    grouped beneath the target agent.
+    await page.getByRole("button", { name: "Account menu" }).click();
+    await page.getByText("Archived sessions", { exact: true }).click();
+    const archivedDialog = page.locator(".archived-sessions-dialog");
+    await expect(archivedDialog).toBeVisible({ timeout: 10_000 });
+    const targetGroup = archivedDialog
+      .locator(".archived-agent-group")
+      .filter({ has: page.locator(".archived-agent-header", {
+        hasText: "E2E DelegTarget",
+      }) });
+    const childRow = targetGroup
+      .locator(".archived-session-row", { hasText: "E2E DelegTarget ← Owl" })
       .first();
-    await expect(delegSessionRow).toBeVisible({ timeout: 5_000 });
+    await expect(childRow).toBeVisible();
+    await expect(
+      childRow.getByRole("button", { name: "View", exact: true })
+    ).toBeVisible();
   });
 });

@@ -15,6 +15,13 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const BRIDGE_AGENTS_DIR = path.join(os.tmpdir(), "owlery-e2e-bridge-agents");
 export const BRIDGE_HOME_DIR = path.join(os.tmpdir(), "owlery-e2e-bridge-home");
 export const BRIDGE_FAKE_STATE_DIR = path.join(os.tmpdir(), "owlery-e2e-bridge-fake-cli");
+// TaskRepository opens a second SQLite connection, so the bridge backend must
+// share a file database just like the main E2E backend. Keep it pid-private so
+// the two Playwright configurations can run concurrently without lock overlap.
+export const BRIDGE_DB_PATH = path.join(
+  os.tmpdir(),
+  `owlery-e2e-bridge.${process.pid}.db`
+);
 // Pid-unique, kept OUTSIDE the wiped state trees (same rationale as the main
 // config): a breach must survive teardown long enough to be read.
 export const BRIDGE_TRIPWIRE_LOG = path.join(
@@ -77,7 +84,7 @@ export default defineConfig({
         OWLERY_PORT: String(BACKEND_PORT),
         OWLERY_FAKE_STATE_DIR: BRIDGE_FAKE_STATE_DIR,
         OWLERY_FAKE_TRIPWIRE_LOG: BRIDGE_TRIPWIRE_LOG,
-        OWLERY_DB_PATH: ":memory:",
+        OWLERY_DB_PATH: BRIDGE_DB_PATH,
         OWLERY_AGENTS_DIR: BRIDGE_AGENTS_DIR,
         OWLERY_HOME_DIR: BRIDGE_HOME_DIR,
         // This backend boots the real lifespan against the real $HOME; a

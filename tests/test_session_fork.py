@@ -260,7 +260,8 @@ async def test_fork_refused_queued_message(manager):
 async def test_fork_refused_active_delegation(manager):
     parent = await _seed_parent(manager, backend="codex")
     rec = DelegationRunState(
-        delegation_id="child1", parent_session_id=parent.id,
+        run_id="run1", delegation_id="child1", round_no=1, start_seq=-1,
+        parent_session_id=parent.id,
         target_agent_id="a", target_agent_name="A", request="do",
     )
     delegation_manager._records["child1"] = rec

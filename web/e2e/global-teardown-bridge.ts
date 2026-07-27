@@ -2,6 +2,7 @@ import { existsSync, readFileSync, rmSync } from "node:fs";
 
 import {
   BRIDGE_AGENTS_DIR,
+  BRIDGE_DB_PATH,
   BRIDGE_FAKE_STATE_DIR,
   BRIDGE_HOME_DIR,
   BRIDGE_TRIPWIRE_LOG,
@@ -14,6 +15,9 @@ export default function globalTeardown(): void {
   rmSync(BRIDGE_AGENTS_DIR, { recursive: true, force: true });
   rmSync(BRIDGE_HOME_DIR, { recursive: true, force: true });
   rmSync(BRIDGE_FAKE_STATE_DIR, { recursive: true, force: true });
+  for (const suffix of ["", "-wal", "-shm"]) {
+    rmSync(`${BRIDGE_DB_PATH}${suffix}`, { force: true });
+  }
 
   if (!existsSync(BRIDGE_TRIPWIRE_LOG)) return;
   const dirs = readFileSync(BRIDGE_TRIPWIRE_LOG, "utf-8").trim().split("\n");
