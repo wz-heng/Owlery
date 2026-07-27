@@ -8,6 +8,12 @@
 > resolved as part of the turn-safety and harness work. This doc now serves as
 > design reference; the §9 test suite is in `tests/test_research*.py` and
 > `web/e2e/research.spec.ts`.
+>
+> **2026-07-24 delivery refresh.** Final reports now enter sessions through the
+> durable `session_injections` outbox. Report persistence precedes completed
+> status, and pending deliveries replay after restart without duplicating a
+> transcript row. See `durable-session-injections.md`; it supersedes the direct
+> `start_message`/`injection_status` mechanics below.
 
 ## 1. Why native (not the harness skill)
 

@@ -8,6 +8,7 @@ import {
   type ResearchJob,
   type SessionStatus,
 } from "../stores/sessionStore";
+import { useTaskStore } from "../stores/taskStore";
 
 type BgTaskStatus = BgTask["status"];
 
@@ -84,6 +85,30 @@ function handleWsMessage(data: Record<string, unknown>) {
   }
 
   switch (type) {
+    case "task_event": {
+      const boardId = typeof data.board_id === "string" ? data.board_id : "";
+      const taskId = typeof data.task_id === "string" ? data.task_id : null;
+      const event = data.event;
+      if (boardId && event && typeof event === "object") {
+        const tasks = useTaskStore.getState();
+        tasks.applyTaskEvent(
+          boardId,
+          taskId,
+          event as import("../api/tasks").TaskEvent
+        );
+        if (!taskId && tasks.token) {
+          void tasks.loadBoards(true);
+        }
+        if (
+          tasks.token &&
+          boardId === tasks.selectedBoardId &&
+          !(event as import("../api/tasks").TaskEvent).payload?.task
+        ) {
+          void tasks.catchUp(boardId);
+        }
+      }
+      break;
+    }
     case "queued":
       enqueuePending(sessionId, data.content as string);
       break;

@@ -25,6 +25,8 @@ Ops:
   bash        emit a Bash tool_use, sleep, emit the tool_result
   ask         call `mcp__ask__user` over MCP and echo the answer
   bg          call `mcp__bg__run` over MCP and end the turn
+  task_complete call `mcp__tasks__complete` over MCP for the owning run
+  write_file    write a relative file inside the current worker workspace
   remember    persist a word into this session's transcript
   recall      read that word back out of the transcript
   on_bg       rule: how to answer the injected `[bg-task-result]` turn
@@ -343,6 +345,37 @@ def run_ops(ops: list[dict], parsed: dict, state: dict) -> None:
             _emit_tool_result(tool_use_id, started)
             _emit_text("started")
 
+        elif kind == "task_complete":
+            tool_use_id = f"toolu_fake_task_complete_{index}"
+            arguments = {"summary": op["summary"], "metadata": {"e2e": True}}
+            _emit_tool_use(tool_use_id, "mcp__tasks__complete", arguments)
+            completed = call_mcp_tool(mcp_servers, "tasks", "complete", arguments)
+            _emit_tool_result(tool_use_id, completed)
+            _emit_text("completed")
+
+        elif kind == "write_file":
+            tool_use_id = f"toolu_fake_write_{index}"
+            relative = pathlib.Path(str(op["path"]))
+            _emit_tool_use(
+                tool_use_id,
+                "Write",
+                {"file_path": str(relative), "content": str(op["v"])},
+            )
+            root = pathlib.Path.cwd().resolve()
+            target = (root / relative).resolve()
+            try:
+                target.relative_to(root)
+            except ValueError:
+                _emit_tool_result(
+                    tool_use_id,
+                    "Error: fake write path escaped the worker workspace",
+                    is_error=True,
+                )
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(str(op["v"]))
+            _emit_tool_result(tool_use_id, f"Wrote {target.relative_to(root)}")
+
         elif kind == "remember":
             state["remember"] = op["v"]
             _emit_text("OK")
@@ -416,7 +449,7 @@ def run_turn(parsed: dict) -> int:
 
     _emit({
         "type": "system", "subtype": "init", "session_id": session_id,
-        "cwd": os.getcwd(), "tools": ["Bash", "Read"], "model": "fake-claude",
+        "cwd": os.getcwd(), "tools": ["Bash", "Read", "Write"], "model": "fake-claude",
         "permissionMode": "bypassPermissions",
     })
 

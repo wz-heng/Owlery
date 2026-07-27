@@ -4,9 +4,9 @@
   - `start(session_id, question)` persists a `research_jobs` row, returns the
     id immediately, and runs the pipeline as a tracked `asyncio.Task`.
   - Progress is broadcast over the session bus + written to the row's `phase`.
-  - On success the report is written to a file AND injected into the session as
-    a turn via `start_message` (the bg-delivery path); completion and delivery
-    are tracked separately, injection is idempotent.
+  - On success the report is atomically written to a file, then delivered via
+    the crash-safe `session_injections` outbox; completion and transcript
+    delivery are separate durable facts.
   - `cancel(job_id)` cancels the task — leaves re-raise CancelledError and reap
     their process groups, so nothing orphans.
   - A global semaphore bounds concurrent JOBS (per-job leaf concurrency is
@@ -61,19 +61,77 @@ class ResearchManager:
         self.db: "Database | None" = None
         self._tasks: dict[str, asyncio.Task] = {}
         self._job_sem: asyncio.Semaphore | None = None
+        self._shutting_down = False
 
     def bind(self, session_mgr: "SessionManager", db: "Database") -> None:
         self.session_mgr = session_mgr
         self.db = db
         self._job_sem = asyncio.Semaphore(max(1, settings.research_max_concurrent_jobs))
+        self._shutting_down = False
+
+    async def shutdown(self) -> None:
+        """Interrupt live jobs while the DB is still available."""
+        self._shutting_down = True
+        tasks = [task for task in self._tasks.values() if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.clear()
 
     async def recover_interrupted(self) -> int:
-        """Boot sweep — mark prior-process `running` jobs interrupted."""
-        if self.db is None:
+        """Boot sweep running jobs and re-enqueue completed reports."""
+        if self.db is None or self.session_mgr is None:
             return 0
         n = await self.db.mark_in_flight_research_jobs_interrupted(_now())
         if n:
             logger.info("research: marked %d interrupted job(s) on boot", n)
+        # Compatibility rescue for the old two-step delivery path: a process
+        # could die after marking completion but before the report became a
+        # transcript message. New jobs also use this path after any such crash; a
+        # completed job now guarantees a durable report file.
+        for row in await self.db.list_pending_research_deliveries():
+            existing = await self.db.get_session_injection_by_source(
+                f"research:{row['id']}"
+            )
+            if existing and existing["status"] == "delivered":
+                await self.db.update_research_job(
+                    row["id"],
+                    injection_status="delivered",
+                    injected_at=existing["delivered_at"] or _now(),
+                )
+                continue
+            if existing and existing["status"] == "failed":
+                await self.db.update_research_job(
+                    row["id"],
+                    injection_status="failed",
+                    error=f"delivery failed: {existing['error'] or 'unknown error'}",
+                )
+                continue
+            if existing and existing["status"] == "pending":
+                # The centralized post-recovery drain replays this row later
+                # in the boot sequence. Its stored prompt is already the
+                # durable payload; do not require or re-render the report.
+                continue
+            path = row.get("report_path")
+            try:
+                if not path:
+                    raise OSError("completed research has no report_path")
+                with open(path, encoding="utf-8") as fh:
+                    report_text = fh.read()
+                await self._enqueue_report(
+                    row["id"], row["session_id"], row["question"], report_text
+                )
+            except Exception as exc:  # legacy damaged row; surface truthfully
+                logger.warning(
+                    "research %s: cannot recover pending report: %s",
+                    row["id"], exc,
+                )
+                await self.db.update_research_job(
+                    row["id"],
+                    injection_status="failed",
+                    error=f"delivery recovery failed: {exc}",
+                )
         return n
 
     # ----------------------------------------------------------------- start
@@ -161,7 +219,7 @@ class ResearchManager:
                     timeout=settings.research_job_timeout_seconds,
                 )
 
-            # Persist the report file (best-effort) + mark completed.
+            # Persist the report file durably before claiming completion.
             report_path = self._write_report(job_id, report.report)
             await self.db.update_research_job(
                 job_id, status="completed", phase="done", cost=report.cost,
@@ -195,9 +253,21 @@ class ResearchManager:
                 "sources": report.sources,
                 "verified": len(report.findings),
             })
-            await self._inject_report(job_id, session_id, question, report)
+            await self._enqueue_report(
+                job_id, session_id, question, report.report
+            )
         except asyncio.CancelledError:
-            await self._finalize_failed(job_id, session_id, "cancelled", "cancelled by user")
+            if self._shutting_down:
+                await self._finalize_failed(
+                    job_id,
+                    session_id,
+                    "interrupted",
+                    "server shut down while research was running",
+                )
+            else:
+                await self._finalize_failed(
+                    job_id, session_id, "cancelled", "cancelled by user"
+                )
             raise
         except asyncio.TimeoutError:
             await self._finalize_failed(
@@ -210,26 +280,38 @@ class ResearchManager:
             logger.exception("research job %s crashed", job_id)
             await self._finalize_failed(job_id, session_id, "failed", str(e))
 
-    async def _inject_report(
-        self, job_id: str, session_id: str, question: str, report: Any
+    async def _enqueue_report(
+        self, job_id: str, session_id: str, question: str, report_text: str
     ) -> None:
-        """Deliver the report into the session as a turn (the bg-delivery path).
-        Idempotent + tracked separately from completion (Vera review)."""
+        """Persist the report-delivery intent before scheduling its turn."""
         assert self.db is not None and self.session_mgr is not None
-        row = await self.db.get_research_job(job_id)
-        if row and row.get("injection_status") == "delivered":
-            return
         prompt = (
             f"[deep-research:{job_id}] Research complete for: {question}\n\n"
-            f"{report.report}"
+            f"{report_text}"
         )
         try:
-            await self.session_mgr.start_message(session_id, prompt)
-            await self.db.update_research_job(
-                job_id, injection_status="delivered", injected_at=_now()
+            injection = await self.session_mgr.enqueue_session_injection(
+                source_key=f"research:{job_id}",
+                session_id=session_id,
+                prompt=prompt,
             )
+            # The outbox is authoritative. Repair the legacy compatibility
+            # mirror when enqueue returns an already-terminal source row (for
+            # example after a crash between the trigger ack and mirror write).
+            if injection["status"] == "delivered":
+                await self.db.update_research_job(
+                    job_id,
+                    injection_status="delivered",
+                    injected_at=injection["delivered_at"] or _now(),
+                )
+            elif injection["status"] == "failed":
+                await self.db.update_research_job(
+                    job_id,
+                    injection_status="failed",
+                    error=f"delivery failed: {injection['error'] or 'unknown error'}",
+                )
         except Exception as e:  # noqa: BLE001 — parent may be gone; tolerate
-            logger.warning("research %s: report injection failed: %s", job_id, e)
+            logger.warning("research %s: report enqueue failed: %s", job_id, e)
             await self.db.update_research_job(
                 job_id, injection_status="failed", error=f"delivery failed: {e}"
             )
@@ -290,15 +372,24 @@ class ResearchManager:
 
     # --------------------------------------------------------------- helpers
 
-    def _write_report(self, job_id: str, report: str) -> str | None:
+    def _write_report(self, job_id: str, report: str) -> str:
+        path = os.path.join(_research_dir(), f"{job_id}.md")
+        tmp = f"{path}.tmp"
         try:
-            path = os.path.join(_research_dir(), f"{job_id}.md")
-            with open(path, "w", encoding="utf-8") as fh:
+            with open(tmp, "w", encoding="utf-8") as fh:
                 fh.write(report)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
             return path
-        except Exception:
-            logger.exception("research %s: could not write report file", job_id)
-            return None
+        except Exception as exc:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise ResearchError(
+                f"could not persist research report: {exc}", status_code=500
+            ) from exc
 
     async def _broadcast(self, msg: dict[str, Any]) -> None:
         if self.session_mgr is not None:

@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 
+import aiosqlite
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -335,8 +336,8 @@ async def test_broadcasts_started_and_completed(manager, db, tmp_path):
 
 async def test_in_flight_marked_interrupted_on_startup(db):
     """Simulate a row left in 'running' by a prior process; new
-    manager.start() should flip it to 'interrupted' so the chip stops
-    spinning forever."""
+    manager.start() should flip it to 'interrupted' and report that terminal
+    fact instead of only stopping the spinner."""
     await _make_session_row(db, "s1", "/tmp")
     await db.create_bg_task(
         task_id="orphan-1",
@@ -347,11 +348,143 @@ async def test_in_flight_marked_interrupted_on_startup(db):
         started_at="2026-05-18T00:00:00Z",
     )
     mgr = BgTaskManager()
-    mgr.bind(db=db, deliver_cb=_noop_deliver, broadcast_cb=_noop_broadcast)
+    delivered: list[BgTaskRecord] = []
+
+    async def capture(rec):
+        delivered.append(rec)
+
+    mgr.bind(db=db, deliver_cb=capture, broadcast_cb=_noop_broadcast)
     await mgr.start()
     row = await db.get_bg_task("orphan-1")
     assert row["status"] == "interrupted"
     assert row["completed_at"] is not None
+    assert len(delivered) == 1
+    assert delivered[0].id == "orphan-1"
+    assert delivered[0].status == "interrupted"
+
+
+async def test_shutdown_with_dispatch_paused_only_persists_outbox(
+    db, tmp_path, monkeypatch
+):
+    """A bg terminal callback during teardown must not start a model turn."""
+    from server.session_manager import SessionManager
+
+    sessions = SessionManager()
+    await sessions.initialize(db)
+    agent = await db.get_default_agent()
+    target = await sessions.create_session(
+        agent["id"], "target", str(tmp_path)
+    )
+    started: list[str] = []
+
+    async def forbidden(*args, **kwargs):
+        started.append("started")
+
+    monkeypatch.setattr(sessions, "start_message", forbidden)
+    sessions.pause_session_injection_dispatch()
+    mgr = BgTaskManager()
+    mgr.bind(
+        db=db,
+        deliver_cb=sessions.deliver_bg_result,
+        broadcast_cb=_noop_broadcast,
+    )
+    await mgr.start()
+    rec = await mgr.start_task(
+        session_id=target.id,
+        command="sleep 30",
+        working_dir=str(tmp_path),
+    )
+    await mgr.shutdown()
+
+    assert started == []
+    outbox = await db.get_session_injection_by_source(f"bg:{rec.id}")
+    assert outbox and outbox["status"] == "pending"
+
+
+async def test_terminal_row_missing_outbox_is_delivered_on_startup(db):
+    """Close the crash between terminal DB update and outbox creation."""
+    await _make_session_row(db, "s1", "/tmp")
+    await db.create_bg_task(
+        task_id="done-no-outbox",
+        session_id="s1",
+        command="echo ok",
+        description="finished before crash",
+        working_dir="/tmp",
+        started_at="2026-05-18T00:00:00Z",
+    )
+    await db.update_bg_task(
+        "done-no-outbox",
+        status="completed",
+        exit_code=0,
+        stdout="ok\n",
+        completed_at="2026-05-18T00:01:00Z",
+    )
+    delivered: list[BgTaskRecord] = []
+
+    async def capture(rec):
+        delivered.append(rec)
+
+    mgr = BgTaskManager()
+    mgr.bind(db=db, deliver_cb=capture, broadcast_cb=_noop_broadcast)
+    await mgr.start()
+    assert [(rec.id, rec.status) for rec in delivered] == [
+        ("done-no-outbox", "completed")
+    ]
+
+
+async def test_legacy_terminal_bg_rows_are_not_replayed(tmp_path):
+    """Migration cutover treats pre-outbox terminal rows as historical."""
+    path = tmp_path / "legacy-bg.db"
+    conn = await aiosqlite.connect(path)
+    await conn.execute(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, name TEXT NOT NULL, "
+        "working_dir TEXT NOT NULL, created_at TEXT NOT NULL, "
+        "claude_session_id TEXT)"
+    )
+    await conn.execute(
+        "CREATE TABLE bg_tasks ("
+        "id TEXT PRIMARY KEY, session_id TEXT NOT NULL, command TEXT NOT NULL, "
+        "description TEXT, working_dir TEXT NOT NULL, status TEXT NOT NULL, "
+        "exit_code INTEGER, stdout TEXT NOT NULL DEFAULT '', "
+        "stderr TEXT NOT NULL DEFAULT '', truncated INTEGER NOT NULL DEFAULT 0, "
+        "started_at TEXT NOT NULL, completed_at TEXT)"
+    )
+    await conn.execute(
+        "INSERT INTO sessions VALUES ('s1', 'old', '/tmp', "
+        "'2026-01-01T00:00:00Z', NULL)"
+    )
+    await conn.execute(
+        "INSERT INTO bg_tasks VALUES ("
+        "'old-done', 's1', 'echo old', NULL, '/tmp', 'completed', 0, "
+        "'old output', '', 0, '2026-01-01T00:00:00Z', "
+        "'2026-01-01T00:01:00Z')"
+    )
+    await conn.execute(
+        "INSERT INTO bg_tasks VALUES ("
+        "'old-running', 's1', 'sleep 99', NULL, '/tmp', 'running', NULL, "
+        "'partial output', '', 0, '2026-01-01T00:02:00Z', NULL)"
+    )
+    await conn.commit()
+    await conn.close()
+
+    migrated = Database(str(path))
+    await migrated.initialize()
+    row = await migrated.get_bg_task("old-done")
+    assert row and row["delivery_required"] is False
+    running = await migrated.get_bg_task("old-running")
+    assert running and running["delivery_required"] is True
+    delivered: list[BgTaskRecord] = []
+
+    async def capture(rec):
+        delivered.append(rec)
+
+    mgr = BgTaskManager()
+    mgr.bind(db=migrated, deliver_cb=capture, broadcast_cb=_noop_broadcast)
+    await mgr.start()
+    assert [(rec.id, rec.status) for rec in delivered] == [
+        ("old-running", "interrupted")
+    ]
+    await migrated.close()
 
 
 async def _noop_deliver(_rec):

@@ -162,6 +162,11 @@ class RunConfig:
     # appended to the system addendum on a fork's first turn only. None
     # otherwise. NOT the replay transcript (that lives in the user channel).
     fork_note: str | None = None
+    # Trusted Task Board worker identity. Present only on origin='task'
+    # sessions and copied into the callback environment on every turn.
+    task_id: str | None = None
+    task_run_id: str | None = None
+    task_worker_prompt: str | None = None
     # Native-deep-research web leaf (native-deep-research.md §4): render a
     # scoped, web-enabled, read-only-ish turn (no destructive/fan-out tools).
     web_research: bool = False
@@ -201,7 +206,11 @@ class HarnessRun:
         # Resolve working_dir to ABSOLUTE before handing it to the CLI: MCP
         # grandchildren inherit cwd, so a relative path would be double-resolved.
         abs_wd = str(Path(working_dir).resolve())
-        callback_env = assembly.build_callback_env(self._config.session_id)
+        callback_env = assembly.build_callback_env(
+            self._config.session_id,
+            task_id=self._config.task_id,
+            task_run_id=self._config.task_run_id,
+        )
         mcp_servers = assembly.select_mcp_servers(
             self._config.mcp_servers, self._config.connectors, callback_env
         )
@@ -212,6 +221,7 @@ class HarnessRun:
             memory_dir=self._config.memory_dir,
             inject_memory=self._profile.injects_memory_prompt,
             fork_note=self._config.fork_note,
+            task_worker_prompt=self._config.task_worker_prompt,
         )
         return TurnContext(
             prompt=prompt,

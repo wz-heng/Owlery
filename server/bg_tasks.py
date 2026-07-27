@@ -185,16 +185,43 @@ class BgTaskManager:
         self._broadcast_cb = broadcast_cb
 
     async def start(self) -> None:
-        """Mark orphaned DB rows as interrupted. Called once after bind()."""
+        """Make orphaned execution truthful and close delivery gaps."""
         assert self._db is not None, "bind(db, ...) before start()"
         if self._started:
             return
-        affected = await self._db.mark_in_flight_bg_tasks_interrupted(_now_iso())
+        interrupted_at = _now_iso()
+        affected = await self._db.mark_in_flight_bg_tasks_interrupted(interrupted_at)
         if affected:
             logger.info(
                 "Marked %d bg_tasks as interrupted (left over from prior process)",
                 affected,
             )
+        if self._deliver_cb:
+            # Includes the just-interrupted rows and tasks whose terminal DB
+            # update committed before the prior process created its outbox
+            # source. Legacy terminal rows have delivery_required=0 and are not
+            # replayed; legacy in-flight rows opt in so interruption is visible.
+            for row in await self._db.list_bg_tasks_missing_delivery():
+                rec = BgTaskRecord(
+                    id=row["id"],
+                    session_id=row["session_id"],
+                    command=row["command"],
+                    description=row["description"],
+                    working_dir=row["working_dir"],
+                    status=row["status"],
+                    exit_code=row["exit_code"],
+                    stdout=row["stdout"],
+                    stderr=row["stderr"],
+                    truncated=row["truncated"],
+                    started_at=row["started_at"],
+                    completed_at=row["completed_at"],
+                )
+                try:
+                    await self._deliver_cb(rec)
+                except Exception:
+                    logger.exception(
+                        "bg recovery delivery failed for %s", rec.id
+                    )
         self._started = True
 
     async def shutdown(self) -> None:

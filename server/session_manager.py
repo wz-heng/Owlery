@@ -167,6 +167,10 @@ class QueuedPrompt:
 
     prompt: str
     attachment_ids: list[str]
+    # Non-null only for a durable system-produced turn.  It survives an
+    # in-memory queue loss through session_injections; when this prompt becomes
+    # a user message, Database atomically acknowledges the injection.
+    injection_id: str | None = None
 
 
 @dataclass
@@ -210,7 +214,7 @@ class Session:
     # created post-refactor; left optional on the dataclass so legacy
     # in-memory construction paths don't break mid-migration.
     agent_id: str | None = None
-    # Who created this session: 'user' | 'schedule' | 'bridge' | 'delegation'.
+    # Who created this session: user|schedule|bridge|delegation|fork|task.
     # Scheduler fires auto-archive on idle (§5.6); bridge/user sessions
     # persist. 'delegation' sessions auto-archive on idle too — they're a
     # transient child spawned by an agent-to-agent ask_agent call
@@ -226,6 +230,11 @@ class Session:
     # The original delegation prompt, kept verbatim for UI display on
     # delegation sessions. NULL elsewhere.
     delegation_request: str | None = None
+    # Trusted in-process identity for a Task Board worker. The durable source
+    # of truth is task_runs.session_id; these are intentionally not session
+    # columns because boot interrupts task runs before any worker can resume.
+    task_id: str | None = None
+    task_run_id: str | None = None
     # Session tree-rewind / fork (session-rewind.md §4). All NULL/False
     # on non-fork sessions. fork_metadata / fork_revert_record hold raw JSON
     # strings (parsed lazily); fork_status drives crash recovery.
@@ -264,6 +273,10 @@ class Session:
     _pending_question_answers: dict[str, str] = field(default_factory=dict, repr=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     _pending_queue: list[QueuedPrompt] = field(default_factory=list, repr=False)
+    # Terminal delivery for a delegation is observed from the inner turn task,
+    # while `_active_task` still owns the queue driver. In that case archive is
+    # deferred until the driver drains instead of being silently skipped.
+    _auto_archive_requested: bool = field(default=False, repr=False)
     # Consecutive usage-limit parks with no progress (limit-auto-resume.md §4).
     # Carried in memory ONLY across a wake-up, which consumes the DB row before
     # re-running the turn; the row itself is what survives a restart. Cleared as
@@ -289,6 +302,16 @@ class SessionManager:
         # no park machinery is wired (unit tests with a bare manager), and a
         # usage-limit failure just surfaces as-is, as it did before this feature.
         self._parked_turns: Any = None
+        # Injections remain `pending` on disk while merely accepted into an
+        # in-memory turn queue.  This set prevents the same pending outbox row
+        # from being queued twice in one process; a restart clears it and
+        # deliberately replays only rows that never reached the transcript.
+        self._dispatched_injection_ids: set[str] = set()
+        self._injection_retry_tasks: dict[str, asyncio.Task[None]] = {}
+        # Main lifespan pauses dispatch while domain managers reconcile their
+        # own durable state. Producers may still create outbox rows, but no
+        # model turn starts until every listener/recovery pass is ready.
+        self._injection_dispatch_enabled: bool = True
 
     def set_notifier_manager(self, mgr: Any) -> None:
         self._notifier_manager = mgr
@@ -301,6 +324,7 @@ class SessionManager:
 
     async def initialize(self, db: Database) -> None:
         self.db = db
+        self._injection_dispatch_enabled = True
         rows = await db.load_sessions()
         for row in rows:
             session = Session(
@@ -322,8 +346,9 @@ class SessionManager:
         logger.info("Loaded %d sessions from database", len(rows))
         # Sweep forks left mid-saga by a crash (session-rewind.md §5.6.7).
         await self._recover_incomplete_forks()
-        # Sweep delegation children orphaned by a restart (agent-collaboration.md §5.2).
-        await self._recover_orphaned_delegations()
+        # Delegation recovery runs later, after DelegationManager is bound: it
+        # must persist an interrupted round and enqueue a durable parent
+        # notification before archiving the child.
 
     def on_broadcast(self, key: str, callback: Callable) -> None:
         self._broadcast_callbacks[key] = callback
@@ -446,45 +471,6 @@ class SessionManager:
                     "fork %s: finalized interrupted revert as unknown_post_crash",
                     fork_id,
                 )
-
-    async def _recover_orphaned_delegations(self) -> None:
-        """Archive delegation children left live by a restart
-        (agent-collaboration.md §5.2).
-
-        Delegation run records live ONLY in `DelegationManager._records`
-        (in-memory; never persisted — "the delegation id IS the child
-        session id, no parallel id space"). A restart wipes that registry,
-        and the child's subprocess is dead, so the chain can never finish:
-        no `result`/`error` will ever arrive to drive `_inject_terminal`,
-        and therefore nothing will ever auto-archive the child. Loaded back
-        by `initialize` as a live `origin == "delegation"` session, it would
-        otherwise sit forever in the sidebar's "+N delegations hidden"
-        count with no path to cleanup.
-
-        Any delegation-origin session that reaches this boot un-archived is
-        by definition abandoned (a healthy one archives itself the moment
-        its terminal turn is delivered, before the process ever exits). So
-        sweep them all into the archive — they stay browsable via the
-        account-menu manage page, exactly like a normal terminal delegation.
-        Idempotent: a clean boot finds none. Pure session lifecycle — no
-        backend specifics, so no harness involvement."""
-        orphans = [
-            sid for sid, s in self.sessions.items() if s.origin == "delegation"
-        ]
-        archived = 0
-        for sid in orphans:
-            try:
-                if await self.auto_archive_scheduled_session(sid):
-                    archived += 1
-            except Exception:
-                logger.exception(
-                    "delegation recovery: failed to archive orphan %s", sid
-                )
-        if archived:
-            logger.info(
-                "delegation recovery: archived %d orphaned delegation session(s)",
-                archived,
-            )
 
     # Durable fork_metadata keys that survive first-turn cleanup. `full_copy`
     # (+ its `duplicated_from` companion) is a permanent identity of a /fork
@@ -1084,6 +1070,8 @@ class SessionManager:
         backend: str = "claude-code",
         parent_session_id: str | None = None,
         delegation_request: str | None = None,
+        task_id: str | None = None,
+        task_run_id: str | None = None,
     ) -> Session:
         """Create a conversation thread owned by `agent_id`.
 
@@ -1119,6 +1107,8 @@ class SessionManager:
             backend=backend,
             parent_session_id=parent_session_id,
             delegation_request=delegation_request,
+            task_id=task_id,
+            task_run_id=task_run_id,
         )
         self.sessions[sid] = session
         if self.db:
@@ -1210,7 +1200,12 @@ class SessionManager:
             except Exception:
                 pass
             old._backend = None
+        dropped_prompts = list(old._pending_queue)
         old._pending_queue.clear()
+        await self._fail_dropped_injections(
+            dropped_prompts,
+            reason="target session was archived before delivery",
+        )
         old._pending_questions.clear()
         self._cancel_all_question_timers(old)
 
@@ -1275,7 +1270,7 @@ class SessionManager:
     # outside the idle hook (e.g. DelegationManager._inject_terminal)
     # can still archive delegation sessions — but only at the right
     # moment, not on every idle transition.
-    _AUTO_ARCHIVE_ELIGIBLE = ("schedule", "delegation")
+    _AUTO_ARCHIVE_ELIGIBLE = ("schedule", "delegation", "task")
 
     async def auto_archive_scheduled_session(self, session_id: str) -> bool:
         """Hide a finished transient session (schedule or delegation
@@ -1298,8 +1293,13 @@ class SessionManager:
             or session.origin not in self._AUTO_ARCHIVE_ELIGIBLE
         ):
             return False
-        if session._active_task and not session._active_task.done():
-            return False  # still working — don't yank it
+        if (
+            session._active_task
+            and not session._active_task.done()
+            and session._active_task is not asyncio.current_task()
+        ):
+            session._auto_archive_requested = True
+            return False  # the queue driver archives itself when it drains
         if self.db:
             await self.db.update_session_field(session_id, archived=True)
             await self.db.clear_bridge_sticky_for_session(session_id)
@@ -1334,7 +1334,12 @@ class SessionManager:
                 except Exception:
                     pass
                 session._backend = None
+            dropped_prompts = list(session._pending_queue)
             session._pending_queue.clear()
+            await self._fail_dropped_injections(
+                dropped_prompts,
+                reason="owning agent was archived before delivery",
+            )
             self._cancel_all_question_timers(session)
             self.sessions.pop(sid, None)
             evicted.append(sid)
@@ -1570,7 +1575,15 @@ class SessionManager:
         session = self.sessions.pop(session_id, None)
         if session is None:
             return False
+        dropped_prompts = list(session._pending_queue)
         session._pending_queue.clear()
+        for queued in dropped_prompts:
+            if queued.injection_id is None:
+                continue
+            self._dispatched_injection_ids.discard(queued.injection_id)
+            retry = self._injection_retry_tasks.pop(queued.injection_id, None)
+            if retry is not None:
+                retry.cancel()
         session._pending_questions.clear()
         self._cancel_all_question_timers(session)
         if session._inner_task and not session._inner_task.done():
@@ -1604,6 +1617,7 @@ class SessionManager:
         *,
         git_head: str | None = None,
         git_status_clean: bool | None = None,
+        injection_id: str | None = None,
     ) -> int | None:
         """Persist and return the assigned seq (or None if no DB).
 
@@ -1633,14 +1647,249 @@ class SessionManager:
             attachments=[a.model_dump() for a in msg.attachments] if msg.attachments else None,
             git_head=git_head,
             git_status_clean=git_status_clean,
+            injection_id=injection_id,
         )
+        if injection_id is not None:
+            # append_message committed the transcript row and outbox ack in one
+            # transaction.  It is now safe to forget the in-process dispatch
+            # guard; any later enqueue with the same source key reads
+            # `delivered` and becomes a no-op.
+            self._dispatched_injection_ids.discard(injection_id)
+            retry = self._injection_retry_tasks.pop(injection_id, None)
+            if retry is not None and retry is not asyncio.current_task():
+                retry.cancel()
         return seq
+
+    async def enqueue_session_injection(
+        self, *, source_key: str, session_id: str, prompt: str
+    ) -> dict[str, Any]:
+        """Durably enqueue one system-produced user turn.
+
+        The source key is the idempotency contract.  Persistence happens
+        before any in-memory scheduling, and `delivered` is not recorded until
+        the user-message row itself commits.  Thus a crash can cause a pending
+        row to be replayed, but can never produce two transcript rows or claim
+        delivery without one.
+        """
+        if self.db is None:
+            raise RuntimeError("SessionManager is not initialized")
+        source_key = (source_key or "").strip()
+        if not source_key:
+            raise ValueError("source_key must be non-empty")
+        if not prompt:
+            raise ValueError("injection prompt must be non-empty")
+        row = await self.db.create_session_injection(
+            injection_id=uuid.uuid4().hex[:12],
+            source_key=source_key,
+            session_id=session_id,
+            prompt=prompt,
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        if row["session_id"] != session_id or row["prompt"] != prompt:
+            raise ValueError(
+                f"Injection source {source_key!r} was reused with a different "
+                "target or payload"
+            )
+        if row["status"] == "pending" and self._injection_dispatch_enabled:
+            await self._dispatch_session_injection(row)
+        return row
+
+    def pause_session_injection_dispatch(self) -> None:
+        """Persist new intents without starting their consuming model turns."""
+        self._injection_dispatch_enabled = False
+
+    @property
+    def session_injection_dispatch_paused(self) -> bool:
+        return not self._injection_dispatch_enabled
+
+    async def resume_session_injection_dispatch(self) -> int:
+        """Enable dispatch and drain every durable pending intent."""
+        self._injection_dispatch_enabled = True
+        return await self.recover_pending_session_injections()
+
+    async def recover_pending_session_injections(self) -> int:
+        """Replay durable delivery intents whose transcript row is absent."""
+        if self.db is None or not self._injection_dispatch_enabled:
+            return 0
+        rows = await self.db.list_pending_session_injections()
+        for row in rows:
+            if await self.db.reconcile_session_injection(row["id"]):
+                continue
+            await self._dispatch_session_injection(row)
+        if rows:
+            logger.info("session injections: recovered %d pending row(s)", len(rows))
+        return len(rows)
+
+    async def shutdown_session_injections(self) -> None:
+        """Stop in-process retry loops without discarding durable intents.
+
+        A graceful shutdown has the same delivery contract as a crash: any
+        outbox row that has not become a transcript message stays ``pending``
+        and is replayed on the next boot.  Cancelling these derived retry
+        tasks before closing SQLite also prevents them from racing the DB
+        teardown and producing misleading shutdown errors.
+        """
+        self.pause_session_injection_dispatch()
+        tasks = list(self._injection_retry_tasks.values())
+        self._injection_retry_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._dispatched_injection_ids.clear()
+
+    async def _dispatch_session_injection(self, row: dict[str, Any]) -> None:
+        assert self.db is not None
+        if not self._injection_dispatch_enabled:
+            return
+        injection_id = row["id"]
+        if injection_id in self._dispatched_injection_ids:
+            return
+        session = self.get_session(row["session_id"])
+        if session is None:
+            await self.db.fail_session_injection(
+                injection_id, "target session is deleted or archived"
+            )
+            return
+
+        # Claim before the first await inside start_message.  A duplicate
+        # producer call in this process then observes the claim and cannot
+        # append a second QueuedPrompt while the first is negotiating the
+        # session lock.
+        self._dispatched_injection_ids.add(injection_id)
+        try:
+            await self.start_message(
+                row["session_id"], row["prompt"], injection_id=injection_id
+            )
+        except ValueError as exc:
+            self._dispatched_injection_ids.discard(injection_id)
+            if "forking" in str(exc):
+                self._schedule_injection_retry(injection_id)
+                return
+            await self.db.fail_session_injection(injection_id, str(exc))
+        except Exception:
+            self._dispatched_injection_ids.discard(injection_id)
+            logger.exception("session injection %s dispatch failed", injection_id)
+            self._schedule_injection_retry(injection_id)
+
+    def _schedule_injection_retry(self, injection_id: str) -> None:
+        existing = self._injection_retry_tasks.get(injection_id)
+        if existing is not None and not existing.done():
+            return
+
+        async def retry() -> None:
+            delay = 0.1
+            try:
+                while self.db is not None:
+                    await asyncio.sleep(delay)
+                    if not self._injection_dispatch_enabled:
+                        return
+                    row = await self.db.get_session_injection(injection_id)
+                    if row is None or row["status"] != "pending":
+                        return
+                    if self.get_session(row["session_id"]) is None:
+                        await self.db.fail_session_injection(
+                            injection_id, "target session is deleted or archived"
+                        )
+                        return
+                    await self._dispatch_session_injection(row)
+                    if injection_id in self._dispatched_injection_ids:
+                        return
+                    delay = min(delay * 2, 2.0)
+            finally:
+                self._injection_retry_tasks.pop(injection_id, None)
+
+        self._injection_retry_tasks[injection_id] = asyncio.create_task(
+            retry(), name=f"injection-retry-{injection_id}"
+        )
+
+    async def materialize_pending_injections_for_sessions(
+        self, session_ids: set[str]
+    ) -> int:
+        """Commit pending prompts to transcripts without running a model turn.
+
+        This is intentionally recovery-only. A restarted delegation parent is
+        about to become ``interrupted`` and be archived, so asking its model to
+        consume a descendant's terminal event would revive non-idempotent work
+        after we already declared the round dead. The honest outcome is to
+        preserve the event in that parent's transcript, acknowledge delivery,
+        and leave it unconsumed.
+        """
+        if self.db is None or not session_ids:
+            return 0
+        if self._injection_dispatch_enabled:
+            raise RuntimeError(
+                "transcript-only injection materialization requires paused dispatch"
+            )
+        materialized = 0
+        for row in await self.db.list_pending_session_injections():
+            if row["session_id"] not in session_ids:
+                continue
+            if await self.db.reconcile_session_injection(row["id"]):
+                materialized += 1
+                continue
+            session = self.get_session(row["session_id"])
+            if session is None:
+                await self.db.fail_session_injection(
+                    row["id"], "target delegation session is unavailable"
+                )
+                continue
+            git_head, git_status_clean = await fork_helpers.capture_git_anchor(
+                session.working_dir
+            )
+            message = MessageContent(
+                role=MessageRole.user,
+                type="text",
+                content=row["prompt"],
+            )
+            seq = await self._persist_message(
+                session,
+                message,
+                git_head=git_head,
+                git_status_clean=git_status_clean,
+                injection_id=row["id"],
+            )
+            event: dict[str, Any] = {
+                "type": "user_message",
+                "session_id": session.id,
+                "content": row["prompt"],
+            }
+            if seq is not None:
+                event["seq"] = seq
+            await self._broadcast(event)
+            materialized += 1
+        return materialized
+
+    def _retry_dropped_injections(self, prompts: list[QueuedPrompt]) -> None:
+        """Release and retry durable intents removed from an in-memory queue."""
+        for queued in prompts:
+            if queued.injection_id is None:
+                continue
+            self._dispatched_injection_ids.discard(queued.injection_id)
+            self._schedule_injection_retry(queued.injection_id)
+
+    async def _fail_dropped_injections(
+        self, prompts: list[QueuedPrompt], *, reason: str
+    ) -> None:
+        """Make queued delivery intents terminal when their target is closed."""
+        if self.db is None:
+            return
+        for queued in prompts:
+            injection_id = queued.injection_id
+            if injection_id is None:
+                continue
+            self._dispatched_injection_ids.discard(injection_id)
+            retry = self._injection_retry_tasks.pop(injection_id, None)
+            if retry is not None:
+                retry.cancel()
+            await self.db.fail_session_injection(injection_id, reason)
 
     async def start_message(
         self,
         session_id: str,
         prompt: str,
         attachment_ids: list[str] | None = None,
+        injection_id: str | None = None,
     ) -> None:
         """Kick off a message, or queue it if the session is already running.
 
@@ -1658,7 +1907,11 @@ class SessionManager:
                 f"too many attachments: max {MAX_ATTACHMENTS_PER_MESSAGE}"
             )
 
-        queued = QueuedPrompt(prompt=prompt, attachment_ids=list(attachment_ids or []))
+        queued = QueuedPrompt(
+            prompt=prompt,
+            attachment_ids=list(attachment_ids or []),
+            injection_id=injection_id,
+        )
 
         # Busy path: a turn is in flight → just queue. A fork can never be in
         # flight here, because fork_session only sets `_forking` against a
@@ -1749,7 +2002,11 @@ class SessionManager:
             try:
                 await inner
             except asyncio.CancelledError:
-                pass  # interrupt() cancelled the inner task; continue draining
+                # The delivery intent survives even if this in-process attempt
+                # was interrupted before its user-message row committed.
+                if current.injection_id is not None:
+                    self._dispatched_injection_ids.discard(current.injection_id)
+                    self._schedule_injection_retry(current.injection_id)
             except UsageLimitParked:
                 # The turn hit the user's usage limit and is parked until the
                 # window resets (limit-auto-resume.md §4). Stop draining: the
@@ -1761,6 +2018,9 @@ class SessionManager:
                 logger.exception(
                     "Background task error for session %s", session_id
                 )
+                if current.injection_id is not None:
+                    self._dispatched_injection_ids.discard(current.injection_id)
+                    self._schedule_injection_retry(current.injection_id)
             finally:
                 session._inner_task = None
 
@@ -1785,7 +2045,10 @@ class SessionManager:
         # (agent-refactor.md §5.6 + agent-collaboration.md §5.2). The
         # archived rows are still browsable via the account-menu manage
         # page or the sidebar's "show delegations" toggle.
-        if session.origin in self._AUTO_ARCHIVE_ORIGINS:
+        if (
+            session.origin in self._AUTO_ARCHIVE_ORIGINS
+            or session._auto_archive_requested
+        ):
             await self.auto_archive_scheduled_session(session_id)
 
     async def _fire_session_idle_notification(self, session: Session) -> None:
@@ -1816,36 +2079,42 @@ class SessionManager:
             )
 
     async def deliver_bg_result(self, rec) -> bool:  # type: ignore[no-untyped-def]
-        """Inject a synthesized user message into a session when a bg
-        task completes. Threaded through the same start_message path
-        as a real user prompt, so it queues behind an in-flight turn
-        instead of racing it.
+        """Durably inject a synthesized user message when a bg task ends.
 
         `rec` is a server.bg_tasks.BgTaskRecord — passed by name
         rather than imported at module top to avoid a circular import
         (bg_tasks depends on Database; the manager wires the delivery
         callback into us in main.py's lifespan).
 
-        Returns True if the session exists and the prompt was accepted,
-        False if the session was already gone (e.g. deleted while the
-        bg task was running). Marker `[bg-task-result]` in the prompt
-        body is what the frontend keys off of for the "auto" badge —
-        keeping it textual means the model also sees the marker in
-        chat history on resume, which is the right cue.
+        The outbox row is committed before the turn enters SessionManager's
+        in-memory queue.  A restart therefore replays an uncommitted delivery
+        without re-running the shell command.  Returns False only when the
+        target session is already unavailable.
         """
         from .bg_tasks import render_delivery_prompt
 
-        session = self.sessions.get(rec.session_id)
-        if session is None:
-            logger.info(
-                "bg task %s completed for missing session %s; dropping result",
-                rec.id,
-                rec.session_id,
-            )
-            return False
+        if self.sessions.get(rec.session_id) is None:
+            if self.db is None:
+                return False
+            try:
+                exists = await self.db.session_exists(rec.session_id)
+            except asyncio.CancelledError:
+                return False
+            if not exists:
+                logger.info(
+                    "bg task %s completed for deleted session %s; "
+                    "no delivery target remains",
+                    rec.id,
+                    rec.session_id,
+                )
+                return False
         prompt = render_delivery_prompt(rec)
         try:
-            await self.start_message(rec.session_id, prompt, attachment_ids=None)
+            row = await self.enqueue_session_injection(
+                source_key=f"bg:{rec.id}",
+                session_id=rec.session_id,
+                prompt=prompt,
+            )
         except Exception:
             logger.exception(
                 "Failed to inject bg result for task %s into session %s",
@@ -1853,13 +2122,28 @@ class SessionManager:
                 rec.session_id,
             )
             return False
-        return True
+        if self.db is None:
+            return False
+        latest = await self.db.get_session_injection(row["id"])
+        return bool(latest and latest["status"] != "failed")
 
     async def _consume_message(
         self, session_id: str, queued: QueuedPrompt
     ) -> None:
+        if (
+            queued.injection_id is not None
+            and not self._injection_dispatch_enabled
+        ):
+            # Teardown may pause dispatch after this prompt entered an
+            # in-memory queue but before it became a transcript row. Leave the
+            # durable outbox intent pending for the next boot.
+            self._dispatched_injection_ids.discard(queued.injection_id)
+            return
         async for _event in self.send_message(
-            session_id, queued.prompt, queued.attachment_ids
+            session_id,
+            queued.prompt,
+            queued.attachment_ids,
+            injection_id=queued.injection_id,
         ):
             pass  # send_message persists + broadcasts each event
 
@@ -1868,6 +2152,8 @@ class SessionManager:
         session_id: str,
         prompt: str,
         attachment_ids: list[str] | None = None,
+        *,
+        injection_id: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         session = self.sessions.get(session_id)
         if session is None:
@@ -1928,6 +2214,7 @@ class SessionManager:
                 user_msg,
                 git_head=git_head,
                 git_status_clean=git_status_clean,
+                injection_id=injection_id,
             )
             event: dict[str, Any] = {
                 "type": "user_message",
@@ -2101,7 +2388,9 @@ class SessionManager:
         session = self.sessions.get(session_id)
         if session is None:
             raise ValueError(f"Session {session_id} not found")
+        dropped_prompts = list(session._pending_queue)
         session._pending_queue.clear()
+        self._retry_dropped_injections(dropped_prompts)
         if session._inner_task and not session._inner_task.done():
             session._inner_task.cancel()
         if session._active_task and not session._active_task.done():
@@ -2591,6 +2880,12 @@ class SessionManager:
             except (json.JSONDecodeError, AttributeError):
                 fork_note = None
 
+        task_worker_prompt: str | None = None
+        if session.task_id and session.task_run_id:
+            from .task_board.prompts import TASK_WORKER_SYSTEM_PROMPT
+
+            task_worker_prompt = TASK_WORKER_SYSTEM_PROMPT
+
         return RunConfig(
             session_id=session.id,
             system_prompt=system_prompt,
@@ -2601,6 +2896,9 @@ class SessionManager:
             connectors=connectors or [],
             memory_dir=memory_dir,
             fork_note=fork_note,
+            task_id=session.task_id,
+            task_run_id=session.task_run_id,
+            task_worker_prompt=task_worker_prompt,
         )
 
     # Refresh the access_token if it expires within this many seconds. A

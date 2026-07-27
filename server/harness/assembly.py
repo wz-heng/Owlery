@@ -34,6 +34,8 @@ _BUILTIN_MODULES = {
     # Native deep research (native-deep-research.md §7). Thin shim to the
     # /api/sessions/{sid}/research routes in front of ResearchManager.
     "research": "server.mcp_servers.research",
+    # Durable Task Board orchestration / worker terminal protocol.
+    "tasks": "server.mcp_servers.tasks",
 }
 
 
@@ -41,7 +43,12 @@ def repo_root() -> str:
     return _REPO_ROOT
 
 
-def build_callback_env(session_id: str | None) -> dict[str, str]:
+def build_callback_env(
+    session_id: str | None,
+    *,
+    task_id: str | None = None,
+    task_run_id: str | None = None,
+) -> dict[str, str]:
     """The env our bg/ask MCP servers use to call back into FastAPI."""
     from ..config import settings as _settings  # local import: avoid cycle at load
 
@@ -52,6 +59,10 @@ def build_callback_env(session_id: str | None) -> dict[str, str]:
     }
     if session_id:
         env["OWLERY_SESSION_ID"] = session_id
+    if task_id:
+        env["OWLERY_TASK_ID"] = task_id
+    if task_run_id:
+        env["OWLERY_TASK_RUN_ID"] = task_run_id
     return env
 
 
@@ -84,6 +95,11 @@ def select_mcp_servers(
         "research": {
             "command": sys.executable,
             "args": ["-m", _BUILTIN_MODULES["research"]],
+            "env": dict(callback_env),
+        },
+        "tasks": {
+            "command": sys.executable,
+            "args": ["-m", _BUILTIN_MODULES["tasks"]],
             "env": dict(callback_env),
         },
     }
@@ -148,6 +164,7 @@ def compose_system_prompt(
     memory_dir: str | None = None,
     inject_memory: bool = False,
     fork_note: str | None = None,
+    task_worker_prompt: str | None = None,
 ) -> str:
     """persona (if any) ahead of the harness's in-app-tools blurb, then the
     connectors blurb (if any), then the memory blurb (when the harness has no
@@ -166,4 +183,6 @@ def compose_system_prompt(
         out = f"{out}\n\n{render_memory_blurb(memory_dir)}"
     if fork_note:
         out = f"{out}\n\n{fork_note}"
+    if task_worker_prompt:
+        out = f"{out}\n\n{task_worker_prompt}"
     return out

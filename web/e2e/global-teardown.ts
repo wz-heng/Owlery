@@ -2,6 +2,7 @@ import { existsSync, readFileSync, rmSync } from "node:fs";
 
 import {
   E2E_AGENTS_DIR,
+  E2E_DB_PATH,
   E2E_FAKE_STATE_DIR,
   E2E_HOME_DIR,
   E2E_TRIPWIRE_LOG,
@@ -22,6 +23,9 @@ export default function globalTeardown(): void {
   rmSync(E2E_AGENTS_DIR, { recursive: true, force: true });
   rmSync(E2E_HOME_DIR, { recursive: true, force: true });
   rmSync(E2E_FAKE_STATE_DIR, { recursive: true, force: true });
+  for (const suffix of ["", "-wal", "-shm"]) {
+    rmSync(`${E2E_DB_PATH}${suffix}`, { force: true });
+  }
 
   if (!existsSync(E2E_TRIPWIRE_LOG)) return;
   const dirs = readFileSync(E2E_TRIPWIRE_LOG, "utf-8").trim().split("\n");

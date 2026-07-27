@@ -23,7 +23,7 @@ const API = `${window.location.origin}/api/agents`;
 // (agent-collaboration.md §5.1); `research` = native deep research
 // (native-deep-research.md §7). Both were long missing here, so new agents
 // defaulted without a delegation channel and the UI offered no way to add one.
-const BUILTIN_MCP = ["ask", "bg", "ask_agent", "research"] as const;
+const BUILTIN_MCP = ["ask", "bg", "ask_agent", "research", "tasks"] as const;
 
 interface Props {
   open: boolean;

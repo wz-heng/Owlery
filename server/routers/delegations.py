@@ -116,8 +116,25 @@ async def list_delegations(
     # No `_require_session` here: a parent session may have been
     # archived while a delegation is still in our in-memory registry;
     # we still want list to work for inspection in that case.
-    rows = delegation_manager.list_delegations(session_id)
+    rows = await delegation_manager.list_delegations(session_id)
     return [r.to_public_dict() for r in rows]
+
+
+@router.get("/{session_id}/delegations/{delegation_id}/runs")
+async def list_delegation_runs(
+    session_id: str,
+    delegation_id: str,
+    _: str = Depends(verify_token),
+) -> list[dict[str, Any]]:
+    """Append-only round history for one delegated child session."""
+    try:
+        rows = await delegation_manager.list_delegation_rounds(
+            parent_session_id=session_id,
+            delegation_id=delegation_id,
+        )
+    except DelegationError as e:
+        raise HTTPException(e.status_code, str(e))
+    return [row.to_public_dict() for row in rows]
 
 
 @router.post("/{session_id}/delegations/{delegation_id}/cancel")
@@ -131,7 +148,7 @@ async def cancel_delegation(
     delegation returns the existing terminal record without touching
     anything. The parent gets an `[agent-error:…]` injection on the
     transition from running → cancelled."""
-    rec = delegation_manager.get_delegation(delegation_id)
+    rec = await delegation_manager.get_delegation_record(delegation_id)
     if rec is None or rec.parent_session_id != session_id:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND, "Delegation not found"
@@ -203,7 +220,7 @@ async def answer_delegation_question(
     - 404 if the delegation isn't ours
     - 409 if there's no pending question, or the human UI raced us
     """
-    rec = delegation_manager.get_delegation(delegation_id)
+    rec = await delegation_manager.get_delegation_record(delegation_id)
     if rec is None or rec.parent_session_id != session_id:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND, "Delegation not found"

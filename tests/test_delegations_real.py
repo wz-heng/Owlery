@@ -85,11 +85,11 @@ def _intercept_parent_injections(
     captured: list[tuple[str, str]] = []
     real = mgr.start_message
 
-    async def wrapped(sid, prompt, attachment_ids=None):
+    async def wrapped(sid, prompt, attachment_ids=None, injection_id=None):
         if sid == parent_session_id:
             captured.append((sid, prompt))
             return None
-        return await real(sid, prompt, attachment_ids)
+        return await real(sid, prompt, attachment_ids, injection_id=injection_id)
 
     mgr.start_message = wrapped  # type: ignore[assignment]
     return captured
