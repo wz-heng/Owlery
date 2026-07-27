@@ -21,6 +21,29 @@ BLOCKED_KINDS = frozenset(
 WORKSPACE_MODES = frozenset({"shared", "copy", "git_worktree"})
 ACTOR_KINDS = frozenset({"user", "agent", "schedule", "api", "system"})
 
+# Git delivery closure (task-git-delivery.md §4, §11).
+DELIVERY_STATUSES = frozenset(
+    {"pending", "preparing", "ready", "delivering",
+     "delivered", "conflicted", "blocked", "failed"}
+)
+DELIVERY_OP_KINDS = frozenset(
+    {"commit", "push", "pull_request", "merge", "branch_delete", "worktree_remove"}
+)
+# Which op kinds mutate state outside Owlery's own database (§3, §4.2).
+DELIVERY_EXTERNAL_OP_KINDS = frozenset({"push", "pull_request", "merge"})
+DELIVERY_OP_STATES = frozenset(
+    {"planned", "running", "succeeded", "failed", "interrupted"}
+)
+DELIVERY_REASON_KINDS = frozenset(
+    {"no_remote", "no_connector", "ambiguous_connector", "base_ambiguous",
+     "conflict", "destructive", "interrupted", "op_failed", "push_auth_failed",
+     "workspace_gone_no_effect"}
+)
+DELIVERY_RETENTIONS = frozenset(
+    {"keep", "remove_worktree_keep_branch", "remove_all"}
+)
+DELIVERY_MERGE_STRATEGIES = frozenset({"fast_forward_only", "no_conflict_merge"})
+
 
 class TaskBoardError(RuntimeError):
     """Base class for stable repository errors consumed by REST and MCP."""
@@ -68,6 +91,12 @@ class BoardRecord(Record):
     max_open_tasks: int
     dispatch_enabled: bool
     archived: bool
+    git_delivery_remote: str
+    git_delivery_retention: str
+    git_delivery_author_name: str
+    git_delivery_author_email: str
+    git_delivery_default_draft_pr: bool
+    git_delivery_default_merge: str
     created_at: str
     updated_at: str
 
@@ -76,6 +105,9 @@ class BoardRecord(Record):
         values = dict(row)
         values["dispatch_enabled"] = bool(values["dispatch_enabled"])
         values["archived"] = bool(values["archived"])
+        values["git_delivery_default_draft_pr"] = bool(
+            values["git_delivery_default_draft_pr"]
+        )
         return cls(**values)
 
 
@@ -179,3 +211,74 @@ class DependencyRecord(Record):
     created_by_kind: str
     created_by_agent_id: str | None
     created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryRecord(Record):
+    id: str
+    task_id: str
+    run_id: str
+    status: str
+    repository: str
+    base_ref: str | None
+    base_head: str | None
+    attempt_branch: str
+    attempt_head: str | None
+    dirty: bool
+    commits_ahead: int | None
+    diffstat: dict[str, Any] | None
+    remote_name: str | None
+    remote_url: str | None
+    pushed_ref: str | None
+    pr_number: int | None
+    pr_url: str | None
+    pr_state: str | None
+    merge_strategy: str | None
+    retention: str | None
+    reason_kind: str | None
+    reason_detail: str | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryOpRecord(Record):
+    id: str
+    delivery_id: str
+    kind: str
+    source_key: str
+    external: bool
+    state: str
+    request: dict[str, Any]
+    result: dict[str, Any] | None
+    error: str | None
+    actor_kind: str
+    actor_agent_id: str | None
+    started_at: str | None
+    finished_at: str | None
+    created_at: str
+
+
+class DeliveryConfirmationRequired(TaskConflictError):
+    """A destructive delivery action needs an explicit typed confirmation flag.
+
+    Surfaces as HTTP 409 with the flag name so the UI can render a typed
+    confirmation (task-git-delivery.md §13). ``current`` carries the delivery
+    row so the browser can reconcile without a refetch.
+    """
+
+    code = "requires_confirmation"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        confirmation: str,
+        action: str,
+        current: DeliveryRecord | None = None,
+    ) -> None:
+        # TaskBoardError.current is typed for TaskRecord; a delivery row is also
+        # a Record with to_dict(), so the router serializes it the same way.
+        super().__init__(message, current=current)  # type: ignore[arg-type]
+        self.confirmation = confirmation
+        self.action = action

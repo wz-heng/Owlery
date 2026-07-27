@@ -13,7 +13,13 @@ import {
   IconX,
 } from "@tabler/icons-react";
 
-import type { CreateBoardInput, DispatcherStatus, TaskBoard, WorkspaceMode } from "../../api/tasks";
+import type {
+  CreateBoardInput,
+  DeliveryRetention,
+  DispatcherStatus,
+  TaskBoard,
+  WorkspaceMode,
+} from "../../api/tasks";
 import type { Agent } from "../../stores/sessionStore";
 import type { TaskBoardView, TaskFilters } from "../../stores/taskStore";
 import { cn } from "../../lib/utils";
@@ -254,13 +260,38 @@ function BoardFormDialog({ mode, board, mutating, onClose, onSave, onArchive }: 
   const [description, setDescription] = useState(board?.description ?? "");
   const [workingDir, setWorkingDir] = useState(board?.working_dir ?? "");
   const [workspace, setWorkspace] = useState<WorkspaceMode>(board?.default_workspace_mode ?? "shared");
+  const [deliveryRemote, setDeliveryRemote] = useState(board?.git_delivery_remote ?? "origin");
+  const [deliveryRetention, setDeliveryRetention] = useState<DeliveryRetention>(
+    board?.git_delivery_retention ?? "keep"
+  );
+  const [deliveryAuthorName, setDeliveryAuthorName] = useState(
+    board?.git_delivery_author_name ?? "Owlery Task"
+  );
+  const [deliveryAuthorEmail, setDeliveryAuthorEmail] = useState(
+    board?.git_delivery_author_email ?? "owlery-tasks@localhost"
+  );
+  const [draftPr, setDraftPr] = useState(board?.git_delivery_default_draft_pr ?? true);
+  const [defaultMerge, setDefaultMerge] = useState<"none" | "fast_forward_only">(
+    board?.git_delivery_default_merge ?? "none"
+  );
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center bg-ink-950/35 p-0 backdrop-blur-[1px] sm:items-center sm:p-4" role="dialog" aria-modal="true" aria-label={mode === "create" ? "Create board" : "Board settings"}>
       <form
         className="w-full rounded-t-2xl border border-ink-300 bg-background p-5 shadow-[var(--elevation-overlay)] sm:max-w-lg sm:rounded-2xl"
         onSubmit={(event) => {
           event.preventDefault();
-          void onSave({ name: name.trim(), description: description.trim(), working_dir: workingDir.trim(), default_workspace_mode: workspace });
+          void onSave({
+            name: name.trim(),
+            description: description.trim(),
+            working_dir: workingDir.trim(),
+            default_workspace_mode: workspace,
+            git_delivery_remote: deliveryRemote.trim(),
+            git_delivery_retention: deliveryRetention,
+            git_delivery_author_name: deliveryAuthorName.trim(),
+            git_delivery_author_email: deliveryAuthorEmail.trim(),
+            git_delivery_default_draft_pr: draftPr,
+            git_delivery_default_merge: defaultMerge,
+          });
         }}
       >
         <div className="mb-4 flex items-center justify-between">
@@ -272,11 +303,22 @@ function BoardFormDialog({ mode, board, mutating, onClose, onSave, onArchive }: 
           <Field label="Description"><textarea className="task-input min-h-20 resize-y py-2" value={description} onChange={(event) => setDescription(event.target.value)} /></Field>
           <Field label="Working directory"><input required className="task-input font-mono text-xs" value={workingDir} onChange={(event) => setWorkingDir(event.target.value)} placeholder="/absolute/project/path" /></Field>
           <Field label="Default workspace"><select className="task-input" value={workspace} onChange={(event) => setWorkspace(event.target.value as WorkspaceMode)}><option value="shared">Shared directory</option><option value="copy">Durable copy</option><option value="git_worktree">Git worktree</option></select></Field>
+          <fieldset className="rounded-xl border border-ink-300 p-3">
+            <legend className="px-1 text-xs font-semibold text-ink-700">Git delivery defaults</legend>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Field label="Remote"><input required className="task-input font-mono text-xs" value={deliveryRemote} onChange={(event) => setDeliveryRemote(event.target.value)} /></Field>
+              <Field label="Retention"><select className="task-input" value={deliveryRetention} onChange={(event) => setDeliveryRetention(event.target.value as DeliveryRetention)}><option value="keep">Keep worktree and branch</option><option value="remove_worktree_keep_branch">Remove worktree, keep branch</option><option value="remove_all">Remove worktree and branch</option></select></Field>
+              <Field label="Commit author"><input required className="task-input" value={deliveryAuthorName} onChange={(event) => setDeliveryAuthorName(event.target.value)} /></Field>
+              <Field label="Author email"><input required type="email" className="task-input" value={deliveryAuthorEmail} onChange={(event) => setDeliveryAuthorEmail(event.target.value)} /></Field>
+              <Field label="Default merge"><select className="task-input" value={defaultMerge} onChange={(event) => setDefaultMerge(event.target.value as "none" | "fast_forward_only")}><option value="none">No automatic merge</option><option value="fast_forward_only">Fast-forward only</option></select></Field>
+              <label className="flex items-center gap-2 self-end pb-2 text-xs text-ink-700"><input type="checkbox" checked={draftPr} onChange={(event) => setDraftPr(event.target.checked)} /> Open pull requests as drafts</label>
+            </div>
+          </fieldset>
         </div>
         <div className="mt-5 flex items-center gap-2">
           {onArchive && <button type="button" className="inline-flex h-9 items-center gap-1.5 rounded-lg px-3 text-xs text-destructive hover:bg-destructive-surface" onClick={() => void onArchive()}><IconArchive size={15} /> {board?.archived ? "Unarchive" : "Archive"}</button>}
           <button type="button" className="ml-auto h-9 rounded-lg px-3 text-xs text-muted-foreground hover:bg-ink-200" onClick={onClose}>Cancel</button>
-          <button type="submit" className="h-9 rounded-lg bg-primary-700 px-4 text-xs font-semibold text-white disabled:opacity-50" disabled={mutating || !name.trim() || !workingDir.trim()}>{mode === "create" ? "Create" : "Save"}</button>
+          <button type="submit" className="h-9 rounded-lg bg-primary-700 px-4 text-xs font-semibold text-white disabled:opacity-50" disabled={mutating || !name.trim() || !workingDir.trim() || !deliveryRemote.trim() || !deliveryAuthorName.trim() || !deliveryAuthorEmail.trim()}>{mode === "create" ? "Create" : "Save"}</button>
         </div>
       </form>
     </div>

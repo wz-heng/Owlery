@@ -24,10 +24,17 @@ import aiosqlite
 from .models import (
     ACTOR_KINDS,
     BLOCKED_KINDS,
+    DELIVERY_EXTERNAL_OP_KINDS,
+    DELIVERY_OP_KINDS,
+    DELIVERY_REASON_KINDS,
+    DELIVERY_RETENTIONS,
+    DELIVERY_STATUSES,
     WORKSPACE_MODES,
     ArtifactRecord,
     BoardRecord,
     CommentRecord,
+    DeliveryOpRecord,
+    DeliveryRecord,
     DependencyRecord,
     EventRecord,
     RunRecord,
@@ -36,6 +43,10 @@ from .models import (
     TaskNotFoundError,
     TaskRecord,
     TaskValidationError,
+)
+
+_DELIVERY_TERMINAL_STATUSES = frozenset(
+    {"delivered", "conflicted", "blocked", "failed"}
 )
 
 
@@ -322,6 +333,12 @@ class TaskRepository:
         max_children_per_run: int = 32,
         max_open_tasks: int = 500,
         dispatch_enabled: bool = True,
+        git_delivery_remote: str = "origin",
+        git_delivery_retention: str = "keep",
+        git_delivery_author_name: str = "Owlery Task",
+        git_delivery_author_email: str = "owlery-tasks@localhost",
+        git_delivery_default_draft_pr: bool = True,
+        git_delivery_default_merge: str = "none",
         board_id: str | None = None,
     ) -> BoardRecord:
         clean_name = name.strip()
@@ -329,6 +346,17 @@ class TaskRepository:
             raise TaskValidationError("board name is required")
         if default_workspace_mode not in WORKSPACE_MODES:
             raise TaskValidationError("invalid default workspace mode")
+        if git_delivery_retention not in DELIVERY_RETENTIONS:
+            raise TaskValidationError("invalid Git delivery retention")
+        if git_delivery_default_merge not in {"none", "fast_forward_only"}:
+            raise TaskValidationError("invalid default Git delivery merge strategy")
+        git_delivery_remote = git_delivery_remote.strip()
+        git_delivery_author_name = git_delivery_author_name.strip()
+        git_delivery_author_email = git_delivery_author_email.strip()
+        if not git_delivery_remote:
+            raise TaskValidationError("Git delivery remote is required")
+        if not git_delivery_author_name or not git_delivery_author_email:
+            raise TaskValidationError("Git delivery author name and email are required")
         for value, label in (
             (max_running, "max_running"),
             (max_running_per_agent, "max_running_per_agent"),
@@ -346,7 +374,10 @@ class TaskRepository:
                     "INSERT INTO task_boards "
                     "(id,name,description,working_dir,default_workspace_mode,max_running,"
                     "max_running_per_agent,max_tree_depth,max_children_per_run,max_open_tasks,"
-                    "dispatch_enabled,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "dispatch_enabled,git_delivery_remote,git_delivery_retention,"
+                    "git_delivery_author_name,git_delivery_author_email,"
+                    "git_delivery_default_draft_pr,git_delivery_default_merge,"
+                    "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         ident,
                         clean_name,
@@ -359,6 +390,12 @@ class TaskRepository:
                         max_children_per_run,
                         max_open_tasks,
                         int(dispatch_enabled),
+                        git_delivery_remote,
+                        git_delivery_retention,
+                        git_delivery_author_name,
+                        git_delivery_author_email,
+                        int(bool(git_delivery_default_draft_pr)),
+                        git_delivery_default_merge,
                         stamp,
                         stamp,
                     ),
@@ -397,6 +434,12 @@ class TaskRepository:
             "max_tree_depth",
             "max_children_per_run",
             "max_open_tasks",
+            "git_delivery_remote",
+            "git_delivery_retention",
+            "git_delivery_author_name",
+            "git_delivery_author_email",
+            "git_delivery_default_draft_pr",
+            "git_delivery_default_merge",
         }
         unknown = set(updates) - allowed
         if unknown:
@@ -411,6 +454,30 @@ class TaskRepository:
             updates["working_dir"] = self._validated_dir(str(updates["working_dir"]))
         if "default_workspace_mode" in updates and updates["default_workspace_mode"] not in WORKSPACE_MODES:
             raise TaskValidationError("invalid default workspace mode")
+        if (
+            "git_delivery_retention" in updates
+            and updates["git_delivery_retention"] not in DELIVERY_RETENTIONS
+        ):
+            raise TaskValidationError("invalid Git delivery retention")
+        if (
+            "git_delivery_default_merge" in updates
+            and updates["git_delivery_default_merge"]
+            not in {"none", "fast_forward_only"}
+        ):
+            raise TaskValidationError("invalid default Git delivery merge strategy")
+        for field in (
+            "git_delivery_remote",
+            "git_delivery_author_name",
+            "git_delivery_author_email",
+        ):
+            if field in updates:
+                updates[field] = str(updates[field]).strip()
+                if not updates[field]:
+                    raise TaskValidationError(f"{field} is required")
+        if "git_delivery_default_draft_pr" in updates:
+            updates["git_delivery_default_draft_pr"] = int(
+                bool(updates["git_delivery_default_draft_pr"])
+            )
         for field in (
             "max_running",
             "max_running_per_agent",
@@ -1499,10 +1566,23 @@ class TaskRepository:
             run = await self._run_row(conn, run_id)
             if task["status"] != "running" or task["current_run_id"] != run_id or run["task_id"] != task_id or run["state"] != "running":
                 raise TaskConflictError("run no longer owns the task", current=TaskRecord.from_row(task))
+            # Dispatch-time evidence (notably the git_worktree base_ref and
+            # base_head) is authoritative input to the later delivery flow.
+            # Terminal callers may add metadata, but must never erase the
+            # evidence already attached to the run.
+            merged_metadata = _load_object(run["metadata"]) or {}
+            merged_metadata.update(dict(metadata or {}))
             await conn.execute(
                 "UPDATE task_runs SET state = ?, summary = ?, metadata = ?, error = ?, "
                 "finished_at = ? WHERE id = ? AND state = 'running'",
-                (run_state, summary, _json_object(metadata), error, stamp, run_id),
+                (
+                    run_state,
+                    summary,
+                    _json_object(merged_metadata),
+                    error,
+                    stamp,
+                    run_id,
+                ),
             )
             cursor = await conn.execute(
                 "UPDATE tasks SET status = ?, current_run_id = NULL, blocked_kind = ?, "
@@ -2042,6 +2122,732 @@ class TaskRepository:
                     conn, "SELECT * FROM task_artifacts WHERE id = ?", (artifact_id,)
                 )
         return ArtifactRecord(**dict(row))
+
+    # --- Git delivery (task-git-delivery.md §11, §12) --------------------
+
+    @staticmethod
+    def _delivery_record(row: Mapping[str, Any]) -> DeliveryRecord:
+        values = dict(row)
+        values["dirty"] = bool(values["dirty"])
+        values["diffstat"] = _load_object(values["diffstat"])
+        return DeliveryRecord(**values)
+
+    @staticmethod
+    def _delivery_op_record(row: Mapping[str, Any]) -> DeliveryOpRecord:
+        values = dict(row)
+        values["external"] = bool(values["external"])
+        values["request"] = _load_object(values["request"]) or {}
+        values["result"] = _load_object(values["result"])
+        return DeliveryOpRecord(**values)
+
+    async def _delivery_row(
+        self, conn: aiosqlite.Connection, delivery_id: str
+    ) -> aiosqlite.Row:
+        row = await self._fetchone(
+            conn, "SELECT * FROM task_deliveries WHERE id = ?", (delivery_id,)
+        )
+        if row is None:
+            raise TaskNotFoundError(f"delivery {delivery_id!r} not found")
+        return row
+
+    async def _delivery_op_row(
+        self, conn: aiosqlite.Connection, op_id: str, delivery_id: str
+    ) -> aiosqlite.Row:
+        row = await self._fetchone(
+            conn,
+            "SELECT * FROM task_delivery_ops WHERE id = ? AND delivery_id = ?",
+            (op_id, delivery_id),
+        )
+        if row is None:
+            raise TaskNotFoundError(f"delivery op {op_id!r} not found")
+        return row
+
+    async def _delivery_event(
+        self,
+        conn: aiosqlite.Connection,
+        *,
+        delivery_row: Mapping[str, Any],
+        kind: str,
+        actor_kind: str,
+        actor_agent_id: str | None = None,
+        op_row: Mapping[str, Any] | None = None,
+        now: str | None = None,
+    ) -> None:
+        """Write a task-scoped audit event carrying the delivery (and op).
+
+        The payload shape ``{delivery, op}`` is what the browser store folds in
+        (task-git-delivery.md §14); ``publish_task_update`` merges the task
+        snapshot alongside it.
+        """
+        task = await self._task_row(conn, delivery_row["task_id"])
+        payload: dict[str, Any] = {
+            "delivery": self._delivery_record(delivery_row).to_dict()
+        }
+        if op_row is not None:
+            payload["op"] = self._delivery_op_record(op_row).to_dict()
+        await self._event(
+            conn,
+            task=task,
+            kind=kind,
+            actor_kind=actor_kind,
+            actor_agent_id=actor_agent_id,
+            run_id=delivery_row["run_id"],
+            payload=payload,
+            now=now,
+        )
+
+    async def set_run_metadata(
+        self, task_id: str, run_id: str, metadata: Mapping[str, Any]
+    ) -> None:
+        """Merge dispatch/prep metadata onto a run so it survives completion.
+
+        The git_worktree base branch/commit are captured at prepare time and
+        must outlive the terminal-metadata overwrite so delivery can read them
+        (task-git-delivery.md §5, B1)."""
+        async with self._transaction() as conn:
+            run = await self._run_row(conn, run_id)
+            if run["task_id"] != task_id:
+                raise TaskConflictError("run does not belong to task")
+            merged = _load_object(run["metadata"]) or {}
+            merged.update(dict(metadata or {}))
+            await conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (_json_object(merged), run_id),
+            )
+
+    async def get_delivery(self, delivery_id: str) -> DeliveryRecord:
+        async with self._lock:
+            return self._delivery_record(
+                await self._delivery_row(self.conn, delivery_id)
+            )
+
+    async def get_delivery_by_run(self, run_id: str) -> DeliveryRecord | None:
+        async with self._lock:
+            row = await self._fetchone(
+                self.conn, "SELECT * FROM task_deliveries WHERE run_id = ?", (run_id,)
+            )
+        return self._delivery_record(row) if row else None
+
+    async def list_delivery_ops(self, delivery_id: str) -> list[DeliveryOpRecord]:
+        async with self._lock:
+            rows = await self._fetchall(
+                self.conn,
+                "SELECT * FROM task_delivery_ops WHERE delivery_id = ? "
+                "ORDER BY created_at, id",
+                (delivery_id,),
+            )
+        return [self._delivery_op_record(r) for r in rows]
+
+    async def record_delivery_retention(
+        self,
+        delivery_id: str,
+        retention: str,
+        *,
+        actor_kind: str = "user",
+        actor_agent_id: str | None = None,
+    ) -> DeliveryRecord:
+        """Persist the operator-selected teardown policy before cleanup starts."""
+        if retention not in DELIVERY_RETENTIONS:
+            raise TaskValidationError("invalid Git delivery retention")
+        stamp = _now_iso()
+        async with self._transaction() as conn:
+            row = await self._delivery_row(conn, delivery_id)
+            if row["retention"] == retention:
+                return self._delivery_record(row)
+            await conn.execute(
+                "UPDATE task_deliveries SET retention=?, updated_at=? WHERE id=?",
+                (retention, stamp, delivery_id),
+            )
+            row = await self._delivery_row(conn, delivery_id)
+            await self._delivery_event(
+                conn,
+                delivery_row=row,
+                kind="delivery_retention_updated",
+                actor_kind=actor_kind,
+                actor_agent_id=actor_agent_id,
+                now=stamp,
+            )
+        return self._delivery_record(row)
+
+    async def create_delivery(
+        self,
+        run_id: str,
+        *,
+        repository: str,
+        attempt_branch: str,
+        base_ref: str | None,
+        base_head: str | None,
+        dirty: bool = False,
+        retention: str = "keep",
+        actor_kind: str = "user",
+        actor_agent_id: str | None = None,
+    ) -> DeliveryRecord:
+        """Idempotently create the one delivery for a completed worktree run.
+
+        If a delivery already exists it is returned UNCHANGED — an idempotent
+        re-accept must never rewind a terminal or in-flight delivery (nit 2).
+        """
+        if retention not in DELIVERY_RETENTIONS:
+            raise TaskValidationError("invalid Git delivery retention")
+        async with self._transaction() as conn:
+            run = await self._run_row(conn, run_id)
+            existing = await self._fetchone(
+                conn, "SELECT * FROM task_deliveries WHERE run_id = ?", (run_id,)
+            )
+            if existing is not None:
+                return self._delivery_record(existing)
+            if run["state"] != "completed" or run["workspace_mode"] != "git_worktree":
+                raise TaskConflictError(
+                    "delivery requires a completed git_worktree run"
+                )
+            stamp = _now_iso()
+            ident = _short_id()
+            await conn.execute(
+                "INSERT INTO task_deliveries (id, task_id, run_id, status, repository, "
+                "base_ref, base_head, attempt_branch, dirty, retention, created_at, updated_at) "
+                "VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    ident,
+                    run["task_id"],
+                    run_id,
+                    repository,
+                    base_ref,
+                    base_head,
+                    attempt_branch,
+                    int(bool(dirty)),
+                    retention,
+                    stamp,
+                    stamp,
+                ),
+            )
+            row = await self._delivery_row(conn, ident)
+            await self._delivery_event(
+                conn,
+                delivery_row=row,
+                kind="delivery_created",
+                actor_kind=actor_kind,
+                actor_agent_id=actor_agent_id,
+                now=stamp,
+            )
+        return self._delivery_record(row)
+
+    async def start_accept(
+        self,
+        delivery_id: str,
+        *,
+        actor_kind: str = "user",
+        actor_agent_id: str | None = None,
+    ) -> DeliveryRecord:
+        """Move a delivery into ``preparing`` for a (re)capture of its baseline.
+
+        Legal only from ``pending``/``ready``/``failed`` (nit 1: pending→preparing
+        is a valid re-accept; failed→preparing retries a baseline that could not
+        be captured). ``delivering`` and non-``failed`` terminal states are
+        rejected so an idempotent re-run cannot rewind them (nit 2)."""
+        stamp = _now_iso()
+        async with self._transaction() as conn:
+            row = await self._delivery_row(conn, delivery_id)
+            if row["status"] not in {"pending", "ready", "failed"}:
+                raise TaskConflictError(
+                    "delivery cannot be re-accepted from its current state",
+                    current=self._delivery_record(row),
+                )
+            cursor = await conn.execute(
+                "UPDATE task_deliveries SET status='preparing', reason_kind=NULL, "
+                "reason_detail=NULL, updated_at=? WHERE id=? AND "
+                "status IN ('pending','ready','failed')",
+                (stamp, delivery_id),
+            )
+            if cursor.rowcount != 1:
+                raise TaskConflictError(
+                    "delivery accept lost the CAS",
+                    current=self._delivery_record(
+                        await self._delivery_row(conn, delivery_id)
+                    ),
+                )
+            row = await self._delivery_row(conn, delivery_id)
+            await self._delivery_event(
+                conn,
+                delivery_row=row,
+                kind="delivery_accept_started",
+                actor_kind=actor_kind,
+                actor_agent_id=actor_agent_id,
+                now=stamp,
+            )
+        return self._delivery_record(row)
+
+    async def record_baseline(
+        self,
+        delivery_id: str,
+        *,
+        status: str,
+        base_ref: str | None = None,
+        attempt_head: str | None = None,
+        dirty: bool | None = None,
+        commits_ahead: int | None = None,
+        diffstat: Mapping[str, Any] | None = None,
+        remote_name: str | None = None,
+        remote_url: str | None = None,
+        reason_kind: str | None = None,
+        reason_detail: str | None = None,
+        actor_kind: str = "user",
+        actor_agent_id: str | None = None,
+    ) -> DeliveryRecord:
+        """Fold the captured baseline in and settle ``preparing`` → terminal-of-prepare.
+
+        Only the base pair is immutable; ``attempt_head``/``commits_ahead``/
+        ``diffstat`` are refreshed here and after each commit op (N1)."""
+        if status not in {"ready", "failed", "blocked"}:
+            raise TaskValidationError("invalid baseline status")
+        if reason_kind is not None and reason_kind not in DELIVERY_REASON_KINDS:
+            raise TaskValidationError("invalid delivery reason kind")
+        stamp = _now_iso()
+        fields: dict[str, Any] = {
+            "status": status,
+            "reason_kind": reason_kind,
+            "reason_detail": reason_detail,
+            "updated_at": stamp,
+        }
+        for key, val in (
+            ("base_ref", base_ref),
+            ("attempt_head", attempt_head),
+            ("commits_ahead", commits_ahead),
+            ("remote_name", remote_name),
+            ("remote_url", remote_url),
+        ):
+            if val is not None:
+                fields[key] = val
+        if dirty is not None:
+            fields["dirty"] = int(bool(dirty))
+        if diffstat is not None:
+            fields["diffstat"] = _json_object(diffstat)
+        async with self._transaction() as conn:
+            row = await self._delivery_row(conn, delivery_id)
+            if row["status"] != "preparing":
+                raise TaskConflictError(
+                    "baseline can only be recorded while preparing",
+                    current=self._delivery_record(row),
+                )
+            sets = ", ".join(f"{k} = ?" for k in fields)
+            cursor = await conn.execute(
+                f"UPDATE task_deliveries SET {sets} WHERE id = ? AND status='preparing'",
+                (*fields.values(), delivery_id),
+            )
+            if cursor.rowcount != 1:
+                raise TaskConflictError(
+                    "baseline lost the CAS",
+                    current=self._delivery_record(
+                        await self._delivery_row(conn, delivery_id)
+                    ),
+                )
+            row = await self._delivery_row(conn, delivery_id)
+            await self._delivery_event(
+                conn,
+                delivery_row=row,
+                kind=f"delivery_{status}",
+                actor_kind=actor_kind,
+                actor_agent_id=actor_agent_id,
+                now=stamp,
+            )
+        return self._delivery_record(row)
+
+    async def resolve_base(
+        self,
+        delivery_id: str,
+        *,
+        base_ref: str,
+        base_head: str | None = None,
+        actor_kind: str = "user",
+        actor_agent_id: str | None = None,
+    ) -> DeliveryRecord:
+        """Record an operator-verified base branch (and, for a legacy run with no
+        captured base commit, a derived ``base_head``), then return to
+        ``pending`` so accept re-captures the baseline (§5.1)."""
+        stamp = _now_iso()
+        async with self._transaction() as conn:
+            row = await self._delivery_row(conn, delivery_id)
+            if not (row["status"] == "blocked" and row["reason_kind"] == "base_ambiguous"):
+                raise TaskConflictError(
+                    "delivery is not awaiting base resolution",
+                    current=self._delivery_record(row),
+                )
+            new_base_head = base_head if base_head is not None else row["base_head"]
+            cursor = await conn.execute(
+                "UPDATE task_deliveries SET base_ref=?, base_head=?, status='pending', "
+                "reason_kind=NULL, reason_detail=NULL, updated_at=? "
+                "WHERE id=? AND status='blocked'",
+                (base_ref, new_base_head, stamp, delivery_id),
+            )
+            if cursor.rowcount != 1:
+                raise TaskConflictError(
+                    "base resolution lost the CAS",
+                    current=self._delivery_record(
+                        await self._delivery_row(conn, delivery_id)
+                    ),
+                )
+            row = await self._delivery_row(conn, delivery_id)
+            await self._delivery_event(
+                conn,
+                delivery_row=row,
+                kind="delivery_base_resolved",
+                actor_kind=actor_kind,
+                actor_agent_id=actor_agent_id,
+                now=stamp,
+            )
+        return self._delivery_record(row)
+
+    async def plan_op(
+        self,
+        delivery_id: str,
+        *,
+        kind: str,
+        source_key: str,
+        request: Mapping[str, Any] | None = None,
+        actor_kind: str,
+        actor_agent_id: str | None = None,
+    ) -> DeliveryOpRecord:
+        """Insert a planned op; a repeated ``source_key`` returns the existing
+        row, never a second attempt (at-most-once, §3)."""
+        if kind not in DELIVERY_OP_KINDS:
+            raise TaskValidationError("invalid delivery op kind")
+        if actor_kind not in {"user", "agent"}:
+            raise TaskValidationError("invalid delivery actor kind")
+        external = 1 if kind in DELIVERY_EXTERNAL_OP_KINDS else 0
+        stamp = _now_iso()
+        async with self._transaction() as conn:
+            await self._delivery_row(conn, delivery_id)
+            existing = await self._fetchone(
+                conn,
+                "SELECT * FROM task_delivery_ops WHERE source_key = ?",
+                (source_key,),
+            )
+            if existing is not None:
+                return self._delivery_op_record(existing)
+            ident = _short_id()
+            await conn.execute(
+                "INSERT INTO task_delivery_ops (id, delivery_id, kind, source_key, "
+                "external, state, request, actor_kind, actor_agent_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, 'planned', ?, ?, ?, ?)",
+                (
+                    ident,
+                    delivery_id,
+                    kind,
+                    source_key,
+                    external,
+                    _json_object(request) or "{}",
+                    actor_kind,
+                    actor_agent_id,
+                    stamp,
+                ),
+            )
+            row = await self._delivery_op_row(conn, ident, delivery_id)
+        return self._delivery_op_record(row)
+
+    async def start_op(
+        self,
+        delivery_id: str,
+        op_id: str,
+        *,
+        advance_delivering: bool = True,
+        allowed_statuses: frozenset[str] = frozenset({"ready"}),
+    ) -> tuple[DeliveryRecord, DeliveryOpRecord]:
+        """CAS a planned op to running (and, for goal ops, the delivery to
+        ``delivering``). The one-running partial index guarantees a single
+        in-flight op per delivery (§12). ``allowed_statuses`` are the delivery
+        states from which this op may legally begin — goal ops may re-act from a
+        settled ``delivered``/``blocked``/``conflicted`` as an explicit new op
+        (§4.1.1), teardown ops (``advance_delivering=False``) never change the
+        delivery status."""
+        stamp = _now_iso()
+        async with self._transaction() as conn:
+            delivery = await self._delivery_row(conn, delivery_id)
+            op = await self._delivery_op_row(conn, op_id, delivery_id)
+            if op["state"] != "planned":
+                raise TaskConflictError(
+                    "delivery op is not runnable",
+                    current=self._delivery_record(delivery),
+                )
+            running = await self._fetchone(
+                conn,
+                "SELECT id FROM task_delivery_ops WHERE delivery_id = ? AND state='running'",
+                (delivery_id,),
+            )
+            if running is not None:
+                raise TaskConflictError(
+                    "another delivery op is already running",
+                    current=self._delivery_record(delivery),
+                )
+            if delivery["status"] not in allowed_statuses:
+                raise TaskConflictError(
+                    "delivery is not in a state that accepts this op",
+                    current=self._delivery_record(delivery),
+                )
+            try:
+                cursor = await conn.execute(
+                    "UPDATE task_delivery_ops SET state='running', started_at=? "
+                    "WHERE id=? AND state='planned'",
+                    (stamp, op_id),
+                )
+            except aiosqlite.IntegrityError as exc:
+                raise TaskConflictError(
+                    "another delivery op is already running",
+                    current=self._delivery_record(delivery),
+                ) from exc
+            if cursor.rowcount != 1:
+                raise TaskConflictError(
+                    "delivery op lost the start CAS",
+                    current=self._delivery_record(delivery),
+                )
+            if advance_delivering:
+                placeholders = ", ".join("?" for _ in allowed_statuses)
+                await conn.execute(
+                    "UPDATE task_deliveries SET status='delivering', updated_at=? "
+                    f"WHERE id=? AND status IN ({placeholders})",
+                    (stamp, delivery_id, *sorted(allowed_statuses)),
+                )
+            delivery = await self._delivery_row(conn, delivery_id)
+            op = await self._delivery_op_row(conn, op_id, delivery_id)
+            await self._delivery_event(
+                conn,
+                delivery_row=delivery,
+                kind="delivery_op_started",
+                actor_kind=op["actor_kind"],
+                actor_agent_id=op["actor_agent_id"],
+                op_row=op,
+                now=stamp,
+            )
+        return self._delivery_record(delivery), self._delivery_op_record(op)
+
+    async def finish_op(
+        self,
+        delivery_id: str,
+        op_id: str,
+        *,
+        state: str,
+        result: Mapping[str, Any] | None = None,
+        error: str | None = None,
+        delivery_status: str | None = None,
+        delivery_fields: Mapping[str, Any] | None = None,
+        reason_kind: str | None = None,
+        reason_detail: str | None = None,
+        actor_kind: str = "user",
+        actor_agent_id: str | None = None,
+    ) -> tuple[DeliveryRecord, DeliveryOpRecord]:
+        """CAS a running op terminal and fold its effect into the delivery."""
+        if state not in {"succeeded", "failed", "interrupted"}:
+            raise TaskValidationError("invalid delivery op finish state")
+        if delivery_status is not None and delivery_status not in DELIVERY_STATUSES:
+            raise TaskValidationError("invalid delivery status")
+        if reason_kind is not None and reason_kind not in DELIVERY_REASON_KINDS:
+            raise TaskValidationError("invalid delivery reason kind")
+        stamp = _now_iso()
+        async with self._transaction() as conn:
+            op = await self._delivery_op_row(conn, op_id, delivery_id)
+            if op["state"] != "running":
+                raise TaskConflictError("delivery op is not running")
+            cursor = await conn.execute(
+                "UPDATE task_delivery_ops SET state=?, result=?, error=?, finished_at=? "
+                "WHERE id=? AND state='running'",
+                (state, _json_object(result), error, stamp, op_id),
+            )
+            if cursor.rowcount != 1:
+                raise TaskConflictError("delivery op lost the finish CAS")
+            fields: dict[str, Any] = {
+                "updated_at": stamp,
+                "reason_kind": reason_kind,
+                "reason_detail": reason_detail,
+            }
+            if delivery_status is not None:
+                fields["status"] = delivery_status
+            for key in (
+                "pushed_ref", "pr_number", "pr_url", "pr_state", "merge_strategy",
+                "retention", "attempt_head", "commits_ahead", "remote_name",
+                "remote_url",
+            ):
+                if delivery_fields and delivery_fields.get(key) is not None:
+                    fields[key] = delivery_fields[key]
+            if delivery_fields and delivery_fields.get("diffstat") is not None:
+                fields["diffstat"] = _json_object(delivery_fields["diffstat"])
+            if delivery_fields and delivery_fields.get("dirty") is not None:
+                fields["dirty"] = int(bool(delivery_fields["dirty"]))
+            sets = ", ".join(f"{k} = ?" for k in fields)
+            await conn.execute(
+                f"UPDATE task_deliveries SET {sets} WHERE id = ?",
+                (*fields.values(), delivery_id),
+            )
+            delivery = await self._delivery_row(conn, delivery_id)
+            op = await self._delivery_op_row(conn, op_id, delivery_id)
+            await self._delivery_event(
+                conn,
+                delivery_row=delivery,
+                kind="delivery_op_finished",
+                actor_kind=actor_kind,
+                actor_agent_id=actor_agent_id,
+                op_row=op,
+                now=stamp,
+            )
+        return self._delivery_record(delivery), self._delivery_op_record(op)
+
+    async def record_pr_reconcile(
+        self, delivery_id: str, *, pr_number: int | None, pr_url: str | None, pr_state: str | None
+    ) -> DeliveryRecord:
+        """Fold an already-existing PR (found by a read-only reconcile) into a
+        blocked(interrupted) delivery, settling it delivered — never a re-POST
+        (§16, S3)."""
+        stamp = _now_iso()
+        async with self._transaction() as conn:
+            row = await self._delivery_row(conn, delivery_id)
+            if not (
+                row["status"] == "blocked"
+                and row["reason_kind"] == "interrupted"
+                and row["pr_number"] is None
+            ):
+                return self._delivery_record(row)
+            await conn.execute(
+                "UPDATE task_deliveries SET pr_number=?, pr_url=?, pr_state=?, "
+                "status='delivered', reason_kind=NULL, reason_detail=NULL, updated_at=? "
+                "WHERE id=?",
+                (pr_number, pr_url, pr_state, stamp, delivery_id),
+            )
+            row = await self._delivery_row(conn, delivery_id)
+            await self._delivery_event(
+                conn, delivery_row=row, kind="delivery_pr_reconciled",
+                actor_kind="system", now=stamp,
+            )
+        return self._delivery_record(row)
+
+    async def record_delivery_notification_unavailable(
+        self, delivery_id: str, *, reason: str
+    ) -> None:
+        """One durable audit event when a terminal delivery's origin is gone."""
+        stamp = _now_iso()
+        async with self._transaction() as conn:
+            row = await self._delivery_row(conn, delivery_id)
+            task = await self._task_row(conn, row["task_id"])
+            existing = await self._fetchall(
+                conn,
+                "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+                "AND kind='delivery_notification_unavailable'",
+                (row["task_id"], row["run_id"]),
+            )
+            if any(
+                (_load_object(event["payload"]) or {}).get("delivery_id")
+                == delivery_id
+                for event in existing
+            ):
+                return
+            await self._event(
+                conn,
+                task=task,
+                kind="delivery_notification_unavailable",
+                actor_kind="system",
+                run_id=row["run_id"],
+                payload={"delivery_id": delivery_id, "reason": reason},
+                now=stamp,
+            )
+
+    async def list_running_delivery_ops(self) -> list[DeliveryOpRecord]:
+        async with self._lock:
+            rows = await self._fetchall(
+                self.conn,
+                "SELECT * FROM task_delivery_ops WHERE state='running' ORDER BY created_at",
+            )
+        return [self._delivery_op_record(r) for r in rows]
+
+    async def interrupt_running_delivery_ops(
+        self, *, reason: str
+    ) -> list[tuple[DeliveryRecord, DeliveryOpRecord]]:
+        """Boot recovery: every op left running becomes ``interrupted`` and its
+        delivery ``blocked(interrupted)``; never re-executed (§3, §16)."""
+        stamp = _now_iso()
+        out: list[tuple[DeliveryRecord, DeliveryOpRecord]] = []
+        async with self._transaction() as conn:
+            rows = await self._fetchall(
+                conn, "SELECT * FROM task_delivery_ops WHERE state='running'"
+            )
+            for op in rows:
+                detail = f"{reason} (op: {op['kind']})"
+                await conn.execute(
+                    "UPDATE task_delivery_ops SET state='interrupted', error=?, "
+                    "finished_at=? WHERE id=? AND state='running'",
+                    (detail, stamp, op["id"]),
+                )
+                await conn.execute(
+                    "UPDATE task_deliveries SET status='blocked', "
+                    "reason_kind='interrupted', reason_detail=?, updated_at=? WHERE id=?",
+                    (detail, stamp, op["delivery_id"]),
+                )
+                delivery = await self._delivery_row(conn, op["delivery_id"])
+                op_row = await self._delivery_op_row(conn, op["id"], op["delivery_id"])
+                await self._delivery_event(
+                    conn,
+                    delivery_row=delivery,
+                    kind="delivery_op_interrupted",
+                    actor_kind="system",
+                    op_row=op_row,
+                    now=stamp,
+                )
+                out.append(
+                    (self._delivery_record(delivery), self._delivery_op_record(op_row))
+                )
+        return out
+
+    async def reset_preparing_deliveries(self) -> int:
+        """Boot recovery: a delivery stuck ``preparing`` with no running op is
+        reset to ``pending`` (S5). Baseline capture is idempotent, so re-accept
+        recovers it."""
+        stamp = _now_iso()
+        count = 0
+        async with self._transaction() as conn:
+            rows = await self._fetchall(
+                conn, "SELECT * FROM task_deliveries WHERE status='preparing'"
+            )
+            for d in rows:
+                running = await self._fetchone(
+                    conn,
+                    "SELECT id FROM task_delivery_ops WHERE delivery_id=? AND state='running'",
+                    (d["id"],),
+                )
+                if running is not None:
+                    continue
+                await conn.execute(
+                    "UPDATE task_deliveries SET status='pending', updated_at=? "
+                    "WHERE id=? AND status='preparing'",
+                    (stamp, d["id"]),
+                )
+                row = await self._delivery_row(conn, d["id"])
+                await self._delivery_event(
+                    conn,
+                    delivery_row=row,
+                    kind="delivery_prepare_reset",
+                    actor_kind="system",
+                    now=stamp,
+                )
+                count += 1
+        return count
+
+    async def list_terminal_deliveries(
+        self,
+    ) -> list[tuple[TaskRecord, DeliveryRecord]]:
+        """Every delivery in a terminal status, joined to its task, for boot
+        outbox reconstruction (B2)."""
+        async with self._lock:
+            rows = await self._fetchall(
+                self.conn,
+                "SELECT * FROM task_deliveries WHERE status IN "
+                "('delivered','conflicted','blocked','failed') ORDER BY updated_at",
+            )
+            out: list[tuple[TaskRecord, DeliveryRecord]] = []
+            for d in rows:
+                task_row = await self._fetchone(
+                    self.conn, "SELECT * FROM tasks WHERE id = ?", (d["task_id"],)
+                )
+                if task_row is None:
+                    continue
+                out.append(
+                    (TaskRecord.from_row(task_row), self._delivery_record(d))
+                )
+        return out
 
 
 task_repository = TaskRepository()

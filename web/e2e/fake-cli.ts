@@ -29,6 +29,8 @@ export type FakeOp =
   | { t: "bg"; command: string; description?: string }
   /** Complete the current durable Task Board run over the real tasks MCP. */
   | { t: "task_complete"; summary: string }
+  /** Write a relative file inside the current fake worker workspace. */
+  | { t: "write_file"; path: string; v: string }
   /** Persist a word into this session's fake-CLI state. */
   | { t: "remember"; v: string }
   /** Read that word back — only works if the server passed `--resume`. */

@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import mimetypes
 import os
+import re
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -129,6 +130,15 @@ async def prepare_workspace(
     if porcelain:
         raise WorkspaceError("git_worktree requires a clean source repository")
 
+    # Capture the base BRANCH here, at worktree-creation time, alongside the
+    # base commit — the delivery closure reads this snapshot at accept time and
+    # never re-derives it from the source repo's live HEAD, which may have moved
+    # (task-git-delivery.md §5, B1). A detached source HEAD records an empty
+    # base_ref; legacy runs predating this capture record none at all.
+    rc, base_ref, _ = await _run("git", "symbolic-ref", "--short", "HEAD", cwd=repo)
+    if rc:
+        base_ref = ""
+
     branch = f"owlery/task-{task_id}-run-{attempt_no}"
     rc, _, err = await _run(
         "git", "worktree", "add", "-b", branch, str(destination), "HEAD", cwd=repo
@@ -143,7 +153,12 @@ async def prepare_workspace(
     return PreparedWorkspace(
         mode=mode,
         path=str(destination),
-        metadata={"branch": branch, "base_head": head, "repository": str(repo)},
+        metadata={
+            "branch": branch,
+            "base_ref": base_ref,
+            "base_head": head,
+            "repository": str(repo),
+        },
     )
 
 
@@ -293,3 +308,228 @@ async def delete_artifact_bytes(path: str) -> None:
     if target.is_dir():
         raise WorkspaceError("Artifact path points to a directory")
     target.unlink(missing_ok=True)
+
+
+# --- Git delivery operations (task-git-delivery.md §5-§10) -------------------
+#
+# The delivery coordinator drives these; they never touch the DB. Each is a
+# thin, bounded git subprocess wrapper. External-effect helpers (push/merge)
+# authenticate ONLY through the repo's ambient credential store — no connector
+# token is ever spliced into a URL, argv, or the environment (S4). Git itself
+# owns transport auth via ssh-agent / credential helpers it already resolves.
+
+
+def _delivery_timeout() -> float:
+    return float(settings.task_delivery_op_timeout_seconds)
+
+
+async def _git(
+    *args: str, cwd: str | Path, timeout: float | None = None
+) -> tuple[int, str, str]:
+    return await _run(
+        "git", *args, cwd=cwd, timeout=timeout or _delivery_timeout()
+    )
+
+
+def strip_remote_userinfo(url: str | None) -> str | None:
+    """Drop any ``user[:pass]@`` from an https remote URL (secret hygiene, §13)."""
+    if not url:
+        return url
+    # Only scheme://userinfo@host forms carry inline secrets; scp-style
+    # ``git@host:owner/repo`` has no password and is left as-is.
+    match = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@]*@(.*)$", url)
+    if match:
+        return f"{match.group(1)}{match.group(2)}"
+    return url
+
+
+def parse_github_remote(url: str | None) -> tuple[str, str] | None:
+    """Return ``(owner, repo)`` for a github.com remote, else None."""
+    if not url:
+        return None
+    cleaned = strip_remote_userinfo(url) or ""
+    match = re.search(
+        r"github\.com[/:]([^/]+)/(.+?)(?:\.git)?/?$", cleaned
+    )
+    if not match:
+        return None
+    return match.group(1), match.group(2)
+
+
+async def repo_is_clean(path: str) -> bool:
+    rc, porcelain, err = await _git("status", "--porcelain", cwd=path)
+    if rc:
+        raise WorkspaceError(err or "Unable to inspect Git status")
+    return porcelain == ""
+
+
+async def current_branch(path: str) -> str | None:
+    """The checked-out branch of a repo/worktree, or None if detached."""
+    rc, branch, _ = await _git("symbolic-ref", "--short", "HEAD", cwd=path)
+    return branch if rc == 0 and branch else None
+
+
+async def resolve_head(path: str) -> str:
+    rc, head, err = await _git("rev-parse", "HEAD", cwd=path)
+    if rc:
+        raise WorkspaceError(err or "Unable to resolve HEAD")
+    return head
+
+
+async def rev_exists(repo: str, rev: str) -> bool:
+    rc, _, _ = await _git("cat-file", "-e", f"{rev}^{{commit}}", cwd=repo)
+    return rc == 0
+
+
+async def is_ancestor(repo: str, ancestor: str, descendant: str) -> bool:
+    """True iff ``ancestor`` is reachable from ``descendant`` (merge-base check)."""
+    rc, _, _ = await _git(
+        "merge-base", "--is-ancestor", ancestor, descendant, cwd=repo
+    )
+    return rc == 0
+
+
+async def count_commits_ahead(repo: str, base: str, head: str) -> int:
+    rc, out, err = await _git("rev-list", "--count", f"{base}..{head}", cwd=repo)
+    if rc:
+        raise WorkspaceError(err or "Unable to count commits")
+    try:
+        return int(out.strip() or "0")
+    except ValueError:
+        return 0
+
+
+async def compute_diffstat(repo: str, base: str, head: str) -> dict[str, int]:
+    """Files changed / insertions / deletions between two revs."""
+    rc, out, err = await _git("diff", "--numstat", f"{base}..{head}", cwd=repo)
+    if rc:
+        raise WorkspaceError(err or "Unable to compute diffstat")
+    files = insertions = deletions = 0
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        files += 1
+        # Binary files report "-" for counts; treat as zero lines.
+        if parts[0].isdigit():
+            insertions += int(parts[0])
+        if parts[1].isdigit():
+            deletions += int(parts[1])
+    return {"files": files, "insertions": insertions, "deletions": deletions}
+
+
+async def commit_all(
+    worktree: str, *, author_name: str, author_email: str, message: str
+) -> dict[str, Any]:
+    """Stage every change and create ONE owned commit; no-op if already clean.
+
+    Never amends or rebases prior commits (§6). Returns the resulting HEAD and
+    whether a commit was actually created (re-reading porcelain makes a
+    crash-then-inspect re-run idempotent-by-effect).
+    """
+    if await repo_is_clean(worktree):
+        return {"head": await resolve_head(worktree), "committed": False}
+    rc, _, err = await _git("add", "-A", cwd=worktree)
+    if rc:
+        raise WorkspaceError(err or "Unable to stage worktree changes")
+    rc, _, err = await _git(
+        "-c", f"user.name={author_name}",
+        "-c", f"user.email={author_email}",
+        "commit", "-m", message,
+        cwd=worktree,
+    )
+    if rc:
+        raise WorkspaceError(err or "Unable to create delivery commit")
+    return {"head": await resolve_head(worktree), "committed": True}
+
+
+async def remote_url(repo: str, remote: str) -> str | None:
+    rc, url, _ = await _git("remote", "get-url", remote, cwd=repo)
+    if rc or not url:
+        return None
+    return strip_remote_userinfo(url.strip())
+
+
+async def remote_branch_tip(repo: str, remote: str, branch: str) -> str | None:
+    """The remote branch's sha via ls-remote, or None if it does not exist."""
+    rc, out, _ = await _git(
+        "ls-remote", "--heads", remote, branch, cwd=repo
+    )
+    if rc or not out:
+        return None
+    return out.split()[0] if out.split() else None
+
+
+async def push_branch(
+    repo: str, remote: str, branch: str, *, force_with_lease: bool = False
+) -> dict[str, Any]:
+    """Push ``branch`` to ``remote`` using ambient git credentials only (S4).
+
+    The caller has already enforced the non-fast-forward destructive guard;
+    ``force_with_lease`` is honored only when that guard confirmed it. A bare
+    ``--force`` is never used.
+    """
+    args = ["push", "--set-upstream"]
+    if force_with_lease:
+        args.append("--force-with-lease")
+    args += [remote, branch]
+    rc, out, err = await _git(*args, cwd=repo)
+    if rc:
+        raise WorkspaceError(err or out or "git push failed")
+    remote_sha = await remote_branch_tip(repo, remote, branch)
+    return {
+        "pushed_ref": f"refs/heads/{branch}",
+        "remote_sha": remote_sha,
+        "remote": remote,
+    }
+
+
+async def merge_branch(
+    repo: str, base_ref: str, branch: str, *, strategy: str
+) -> dict[str, Any]:
+    """Conservatively merge ``branch`` into ``base_ref`` in the source repo.
+
+    The caller has verified the repo is clean and checked out on ``base_ref``.
+    Never forces or auto-resolves; a conflict/non-fast-forward aborts cleanly
+    and reports ``conflicted`` (§9).
+    """
+    if strategy == "fast_forward_only":
+        rc, out, err = await _git("merge", "--ff-only", branch, cwd=repo)
+        if rc:
+            return {"merged": False, "conflicted": True, "detail": err or out}
+    elif strategy == "no_conflict_merge":
+        rc, out, err = await _git(
+            "merge", "--no-ff", "--no-edit", branch, cwd=repo
+        )
+        if rc:
+            await _git("merge", "--abort", cwd=repo)
+            return {"merged": False, "conflicted": True, "detail": err or out}
+    else:
+        raise WorkspaceError(f"unknown merge strategy: {strategy}")
+    return {"merged": True, "conflicted": False, "head": await resolve_head(repo)}
+
+
+async def remove_git_worktree(repo: str, path: str, *, force: bool = False) -> None:
+    """Deregister and remove a worktree, then prune stale registrations (§10).
+
+    This is the fix for the historical leak where ``cleanup_private_workspace``
+    removed the directory without deregistering it. Idempotent: a
+    already-removed worktree prunes clean.
+    """
+    args = ["worktree", "remove"]
+    if force:
+        args.append("--force")
+    args.append(path)
+    rc, out, err = await _git(*args, cwd=repo)
+    # A missing worktree is not an error for teardown — prune reconciles it.
+    if rc and "is not a working tree" not in (err + out) and Path(path).exists():
+        raise WorkspaceError(err or out or "Unable to remove Git worktree")
+    await _git("worktree", "prune", cwd=repo)
+
+
+async def delete_branch(repo: str, branch: str, *, force: bool = False) -> None:
+    """Delete a local branch (idempotent — an absent branch is a no-op)."""
+    flag = "-D" if force else "-d"
+    rc, out, err = await _git("branch", flag, branch, cwd=repo)
+    if rc and "not found" not in (err + out):
+        raise WorkspaceError(err or out or f"Unable to delete branch {branch}")

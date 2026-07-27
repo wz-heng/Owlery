@@ -63,6 +63,8 @@ async def test_schema_busy_timeout_and_tasks_mcp_backfill(task_store):
         "task_comments",
         "task_events",
         "task_artifacts",
+        "task_deliveries",
+        "task_delivery_ops",
     } <= tables
     agents = await db.load_agents()
     assert "tasks" in agents[0]["mcp_servers"]
@@ -91,6 +93,38 @@ async def test_transcript_write_releases_lock_for_repository(task_store):
     # the second writer immediately usable during an active model turn.
     board = await repo.create_board(name="Concurrent", working_dir=str(root))
     assert board.name == "Concurrent"
+
+
+@pytest.mark.asyncio
+async def test_board_git_delivery_defaults_are_configurable(task_store):
+    _, repo, root, _ = task_store
+    board = await _board(
+        repo,
+        root,
+        git_delivery_remote="upstream",
+        git_delivery_retention="remove_worktree_keep_branch",
+        git_delivery_author_name="Owlery Delivery",
+        git_delivery_author_email="delivery@example.test",
+        git_delivery_default_draft_pr=False,
+        git_delivery_default_merge="fast_forward_only",
+    )
+    assert board.git_delivery_remote == "upstream"
+    assert board.git_delivery_retention == "remove_worktree_keep_branch"
+    assert board.git_delivery_author_name == "Owlery Delivery"
+    assert board.git_delivery_author_email == "delivery@example.test"
+    assert board.git_delivery_default_draft_pr is False
+    assert board.git_delivery_default_merge == "fast_forward_only"
+
+    updated = await repo.update_board(
+        board.id,
+        git_delivery_retention="remove_all",
+        git_delivery_default_draft_pr=True,
+    )
+    assert updated.git_delivery_retention == "remove_all"
+    assert updated.git_delivery_default_draft_pr is True
+
+    with pytest.raises(TaskValidationError):
+        await repo.update_board(board.id, git_delivery_retention="erase_everything")
 
 
 @pytest.mark.asyncio

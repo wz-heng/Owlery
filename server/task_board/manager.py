@@ -11,7 +11,9 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from ..config import settings
-from .models import RunRecord, TaskBoardError, TaskConflictError, TaskRecord
+from ..connector_manager import ConnectorManager
+from .delivery import DeliveryCoordinator, delivery_coordinator
+from .models import DeliveryRecord, RunRecord, TaskBoardError, TaskConflictError, TaskRecord
 from .prompts import render_assignment_prompt
 from .repository import TaskRepository, task_repository
 from .workspaces import (
@@ -55,6 +57,7 @@ class TaskBoardManager:
         self._last_tick_at: str | None = None
         self._last_error: str | None = None
         self._idle_checks: dict[str, asyncio.Task[None]] = {}
+        self.delivery: DeliveryCoordinator = delivery_coordinator
 
     def bind(
         self,
@@ -67,6 +70,12 @@ class TaskBoardManager:
         self.db = db
         if repo is not None:
             self.repo = repo
+        self.delivery.bind(
+            db=db,
+            connectors=ConnectorManager(db),
+            notify_terminal=self._notify_delivery_terminal,
+            repo=self.repo,
+        )
         session_mgr.on_broadcast(self.BROADCAST_KEY, self._on_broadcast)
 
     async def start(self) -> None:
@@ -231,6 +240,13 @@ class TaskBoardManager:
                 run_id=run.id,
                 attempt_no=run.attempt_no,
             )
+            if prepared.metadata:
+                # Persist the git base branch/commit so it survives the
+                # completion-metadata overwrite and delivery can read it later
+                # (task-git-delivery.md §5, B1).
+                await self.repo.set_run_metadata(
+                    task.id, run.id, {"prepared": prepared.metadata}
+                )
             agent = await self.db.get_agent(task.assignee_agent_id) if task.assignee_agent_id else None
             if agent is None:
                 raise WorkspaceError("Assigned Agent is unavailable")
@@ -445,7 +461,10 @@ class TaskBoardManager:
         artifacts: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         task, run = await self._validate_worker(task_id, run_id, session_id)
-        terminal_metadata = dict(metadata or {})
+        # Preserve prep metadata (the git base branch/commit) under the worker's
+        # declared metadata and the terminal git inspection (B1).
+        terminal_metadata = dict(run.metadata or {})
+        terminal_metadata.update(dict(metadata or {}))
         if run.workspace_mode == "git_worktree":
             terminal_metadata["git"] = await inspect_git_workspace(run.workspace_path)
         captured = await capture_artifacts(
@@ -685,6 +704,127 @@ class TaskBoardManager:
             session_id=task.origin_session_id,
             prompt=prompt,
         )
+
+    # --- Git delivery (task-git-delivery.md §16) -------------------------
+
+    async def request_delivery(
+        self, task_id: str, run_id: str, session_id: str, *, note: str | None = None
+    ) -> dict[str, Any]:
+        """Worker-scoped hint: record that the worker wants its run delivered.
+
+        Performs NO external effect — push/PR/merge stay in the trusted server
+        path, triggered by a human or orchestrator (task-git-delivery.md §15)."""
+        _, run = await self._validate_worker(task_id, run_id, session_id)
+        body = "Worker requested Git delivery of this run's branch."
+        if note:
+            body += f"\n\n{note}"
+        await self.repo.add_comment(
+            task_id, body, run_id=run_id, author_kind="agent",
+            author_agent_id=run.agent_id,
+        )
+        await self.publish_task_update(task_id)
+        return {"requested": True, "task_id": task_id, "run_id": run_id}
+
+    async def deliver_accept(
+        self, task_id: str, run_id: str, **kwargs: Any
+    ) -> DeliveryRecord:
+        delivery = await self.delivery.accept(task_id, run_id, **kwargs)
+        await self.publish_task_update(task_id)
+        return delivery
+
+    async def deliver_run_op(
+        self, task_id: str, run_id: str, **kwargs: Any
+    ) -> DeliveryRecord:
+        delivery = await self.delivery.deliver_op(task_id, run_id, **kwargs)
+        await self.publish_task_update(task_id)
+        return delivery
+
+    async def deliver_teardown(
+        self, task_id: str, run_id: str, **kwargs: Any
+    ) -> DeliveryRecord:
+        delivery = await self.delivery.teardown(task_id, run_id, **kwargs)
+        await self.publish_task_update(task_id)
+        return delivery
+
+    @staticmethod
+    def _delivery_terminal_source(task_id: str, run_id: str) -> str:
+        return f"task:{task_id}:run:{run_id}:delivery:terminal"
+
+    async def _notify_delivery_terminal(
+        self, task: TaskRecord, delivery: DeliveryRecord
+    ) -> None:
+        if not task.origin_session_id or self.session_mgr is None or self.db is None:
+            return
+        if not await self.db.session_exists(task.origin_session_id):
+            await self.repo.record_delivery_notification_unavailable(
+                delivery.id, reason="origin session was deleted"
+            )
+            return
+        label = {
+            "delivered": "delivered",
+            "conflicted": "hit a merge conflict",
+            "blocked": "is blocked",
+            "failed": "failed",
+        }.get(delivery.status, delivery.status)
+        detail = delivery.reason_detail or (
+            f"PR #{delivery.pr_number}" if delivery.pr_number
+            else delivery.pushed_ref or "See the Task Board delivery panel."
+        )
+        prompt = (
+            f"[task-delivery task={task.id} run={delivery.run_id} "
+            f"status={delivery.status}]\n"
+            f"Git delivery for **{task.title}** {label}.\n\n{detail}\n\n"
+            "Inspect the Task Board delivery panel before any follow-up. Never "
+            "automatically retry interrupted external Git/PR work."
+        )
+        await self.session_mgr.enqueue_session_injection(
+            source_key=self._delivery_terminal_source(task.id, delivery.run_id),
+            session_id=task.origin_session_id,
+            prompt=prompt,
+        )
+
+    async def recover_deliveries(self) -> None:
+        """Boot recovery for deliveries (task-git-delivery.md §16). DB-only — no
+        hosting-platform network I/O in the injection-paused barrier (S3)."""
+        if self.session_mgr is not None and not self.session_mgr.session_injection_dispatch_paused:
+            raise RuntimeError("delivery recovery requires paused injection dispatch")
+        await self.repo.interrupt_running_delivery_ops(
+            reason="server restarted; delivery op outcome unknown"
+        )
+        await self.repo.reset_preparing_deliveries()
+        if self.session_mgr is None or self.db is None:
+            return
+        # B2: reconstruct the terminal-delivery outbox source for live origins.
+        for task, delivery in await self.repo.list_terminal_deliveries():
+            if not task.origin_session_id:
+                continue
+            source_key = self._delivery_terminal_source(task.id, delivery.run_id)
+            if await self.db.get_session_injection_by_source(source_key):
+                continue
+            if not await self.db.session_exists(task.origin_session_id):
+                await self.repo.record_delivery_notification_unavailable(
+                    delivery.id, reason="origin session was deleted"
+                )
+                continue
+            await self._notify_delivery_terminal(task, delivery)
+
+    async def reconcile_interrupted_prs(self) -> None:
+        """Off the boot critical path (S3): bounded read-only reconcile of any
+        interrupted PR op, never a re-POST. Never blocks the dispatcher/drain."""
+        try:
+            for task, delivery in await self.repo.list_terminal_deliveries():
+                if not (
+                    delivery.status == "blocked"
+                    and delivery.reason_kind == "interrupted"
+                    and delivery.pr_number is None
+                ):
+                    continue
+                updated = await self.delivery.reconcile_interrupted_pr(delivery)
+                if updated.status != delivery.status:
+                    await self._notify_delivery_terminal(task, updated)
+                    await self.publish_task_update(task.id)
+        except Exception:
+            logger.exception("interrupted-PR reconcile pass failed")
 
 
 task_board_manager = TaskBoardManager()

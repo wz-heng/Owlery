@@ -155,6 +155,10 @@ class Settings(BaseSettings):
     # mutations; this bounded tick only repairs missed in-process wakeups.
     task_dispatch_interval_seconds: float = 2.0
     task_run_lease_seconds: int = 1800
+    # Git delivery closure (task-git-delivery.md §17). Hard per-op wall-clock cap
+    # for each git/hosting-platform subprocess or REST call so a wedged push/PR
+    # can never hang the delivery coordinator. Reuses the workspaces._run pattern.
+    task_delivery_op_timeout_seconds: int = 60
 
     # Connectors (connectors.md §7). The public base URL is what connector
     # OAuth redirect URIs are built against; behind a tunnel it must be set

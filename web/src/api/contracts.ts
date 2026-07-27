@@ -1288,6 +1288,159 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/tasks/{task_id}/runs/{run_id}/delivery": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Delivery */
+        get: operations["get_delivery_api_tasks__task_id__runs__run_id__delivery_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{task_id}/runs/{run_id}/delivery/ops": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Delivery Ops */
+        get: operations["list_delivery_ops_api_tasks__task_id__runs__run_id__delivery_ops_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{task_id}/runs/{run_id}/delivery/accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Delivery Accept */
+        post: operations["delivery_accept_api_tasks__task_id__runs__run_id__delivery_accept_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{task_id}/runs/{run_id}/delivery/commit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Delivery Commit */
+        post: operations["delivery_commit_api_tasks__task_id__runs__run_id__delivery_commit_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{task_id}/runs/{run_id}/delivery/push": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Delivery Push */
+        post: operations["delivery_push_api_tasks__task_id__runs__run_id__delivery_push_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{task_id}/runs/{run_id}/delivery/pull-request": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Delivery Pull Request */
+        post: operations["delivery_pull_request_api_tasks__task_id__runs__run_id__delivery_pull_request_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{task_id}/runs/{run_id}/delivery/merge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Delivery Merge */
+        post: operations["delivery_merge_api_tasks__task_id__runs__run_id__delivery_merge_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{task_id}/runs/{run_id}/delivery/teardown": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Delivery Teardown */
+        post: operations["delivery_teardown_api_tasks__task_id__runs__run_id__delivery_teardown_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/task-worker/current/delivery/request": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Worker Request Delivery */
+        post: operations["worker_request_delivery_api_task_worker_current_delivery_request_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/sessions/{session_id}/questions": {
         parameters: {
             query?: never;
@@ -2117,6 +2270,38 @@ export interface components {
              * @default true
              */
             dispatch_enabled: boolean;
+            /**
+             * Git Delivery Remote
+             * @default origin
+             */
+            git_delivery_remote: string;
+            /**
+             * Git Delivery Retention
+             * @default keep
+             * @enum {string}
+             */
+            git_delivery_retention: "keep" | "remove_worktree_keep_branch" | "remove_all";
+            /**
+             * Git Delivery Author Name
+             * @default Owlery Task
+             */
+            git_delivery_author_name: string;
+            /**
+             * Git Delivery Author Email
+             * @default owlery-tasks@localhost
+             */
+            git_delivery_author_email: string;
+            /**
+             * Git Delivery Default Draft Pr
+             * @default true
+             */
+            git_delivery_default_draft_pr: boolean;
+            /**
+             * Git Delivery Default Merge
+             * @default none
+             * @enum {string}
+             */
+            git_delivery_default_merge: "none" | "fast_forward_only";
         };
         /** BoardPatch */
         BoardPatch: {
@@ -2138,6 +2323,18 @@ export interface components {
             max_children_per_run?: number | null;
             /** Max Open Tasks */
             max_open_tasks?: number | null;
+            /** Git Delivery Remote */
+            git_delivery_remote?: string | null;
+            /** Git Delivery Retention */
+            git_delivery_retention?: ("keep" | "remove_worktree_keep_branch" | "remove_all") | null;
+            /** Git Delivery Author Name */
+            git_delivery_author_name?: string | null;
+            /** Git Delivery Author Email */
+            git_delivery_author_email?: string | null;
+            /** Git Delivery Default Draft Pr */
+            git_delivery_default_draft_pr?: boolean | null;
+            /** Git Delivery Default Merge */
+            git_delivery_default_merge?: ("none" | "fast_forward_only") | null;
             /** Updated At */
             updated_at?: string | null;
         };
@@ -2444,6 +2641,39 @@ export interface components {
             client_id: string;
             /** Client Secret */
             client_secret: string;
+        };
+        /** DeliveryAcceptRequest */
+        DeliveryAcceptRequest: {
+            /** Base Ref */
+            base_ref?: string | null;
+        };
+        /** DeliveryMergeRequest */
+        DeliveryMergeRequest: {
+            /** Merge Strategy */
+            merge_strategy?: ("fast_forward_only" | "no_conflict_merge") | null;
+        };
+        /** DeliveryPrRequest */
+        DeliveryPrRequest: {
+            /** Connector Installation Id */
+            connector_installation_id?: string | null;
+            /** Draft */
+            draft?: boolean | null;
+        };
+        /** DeliveryPushRequest */
+        DeliveryPushRequest: {
+            /** Confirmations */
+            confirmations?: {
+                [key: string]: boolean;
+            };
+        };
+        /** DeliveryTeardownRequest */
+        DeliveryTeardownRequest: {
+            /** Retention */
+            retention?: ("keep" | "remove_worktree_keep_branch" | "remove_all") | null;
+            /** Confirmations */
+            confirmations?: {
+                [key: string]: boolean;
+            };
         };
         /** DependencyRequest */
         DependencyRequest: {
@@ -3055,6 +3285,11 @@ export interface components {
             workspace_mode?: null;
             /** Working Dir Override */
             working_dir_override?: null;
+        };
+        /** WorkerDeliveryRequest */
+        WorkerDeliveryRequest: {
+            /** Note */
+            note?: string | null;
         };
     };
     responses: never;
@@ -5826,6 +6061,331 @@ export interface operations {
         responses: {
             /** @description Successful Response */
             201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_delivery_api_tasks__task_id__runs__run_id__delivery_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                task_id: string;
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_delivery_ops_api_tasks__task_id__runs__run_id__delivery_ops_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                task_id: string;
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delivery_accept_api_tasks__task_id__runs__run_id__delivery_accept_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Owlery-Session-ID"?: string | null;
+            };
+            path: {
+                task_id: string;
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DeliveryAcceptRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delivery_commit_api_tasks__task_id__runs__run_id__delivery_commit_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Owlery-Session-ID"?: string | null;
+            };
+            path: {
+                task_id: string;
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delivery_push_api_tasks__task_id__runs__run_id__delivery_push_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Owlery-Session-ID"?: string | null;
+            };
+            path: {
+                task_id: string;
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DeliveryPushRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delivery_pull_request_api_tasks__task_id__runs__run_id__delivery_pull_request_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Owlery-Session-ID"?: string | null;
+            };
+            path: {
+                task_id: string;
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DeliveryPrRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delivery_merge_api_tasks__task_id__runs__run_id__delivery_merge_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Owlery-Session-ID"?: string | null;
+            };
+            path: {
+                task_id: string;
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DeliveryMergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delivery_teardown_api_tasks__task_id__runs__run_id__delivery_teardown_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Owlery-Session-ID"?: string | null;
+            };
+            path: {
+                task_id: string;
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DeliveryTeardownRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    worker_request_delivery_api_task_worker_current_delivery_request_post: {
+        parameters: {
+            query?: never;
+            header: {
+                "X-Owlery-Session-ID": string;
+                "X-Owlery-Task-ID": string;
+                "X-Owlery-Task-Run-ID": string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkerDeliveryRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -20,6 +20,7 @@ from pydantic import AliasChoices, BaseModel, Field, model_validator
 from ..auth import verify_token
 from ..task_board.models import (
     BLOCKED_KINDS,
+    DeliveryConfirmationRequired,
     TaskBoardError,
     TaskCapacityError,
     TaskConflictError,
@@ -61,6 +62,11 @@ def _error(exc: TaskBoardError) -> HTTPException:
     else:
         code = status.HTTP_500_INTERNAL_SERVER_ERROR
     detail: dict[str, Any] = {"code": exc.code, "message": str(exc)}
+    if isinstance(exc, DeliveryConfirmationRequired):
+        # A destructive delivery action refused pending a typed confirmation flag
+        # (task-git-delivery.md §13); surface the exact flag and action.
+        detail["confirmation"] = exc.confirmation
+        detail["action"] = exc.action
     if exc.current is not None:
         current = exc.current.to_dict()
         detail["current"] = current
@@ -167,6 +173,18 @@ class BoardCreate(BaseModel):
     max_children_per_run: int = Field(default=32, ge=1, le=1000)
     max_open_tasks: int = Field(default=500, ge=1, le=100000)
     dispatch_enabled: bool = True
+    git_delivery_remote: str = Field(default="origin", min_length=1, max_length=200)
+    git_delivery_retention: Literal[
+        "keep", "remove_worktree_keep_branch", "remove_all"
+    ] = "keep"
+    git_delivery_author_name: str = Field(
+        default="Owlery Task", min_length=1, max_length=200
+    )
+    git_delivery_author_email: str = Field(
+        default="owlery-tasks@localhost", min_length=1, max_length=320
+    )
+    git_delivery_default_draft_pr: bool = True
+    git_delivery_default_merge: Literal["none", "fast_forward_only"] = "none"
 
 
 class BoardPatch(BaseModel):
@@ -179,6 +197,20 @@ class BoardPatch(BaseModel):
     max_tree_depth: int | None = Field(default=None, ge=1, le=64)
     max_children_per_run: int | None = Field(default=None, ge=1, le=1000)
     max_open_tasks: int | None = Field(default=None, ge=1, le=100000)
+    git_delivery_remote: str | None = Field(
+        default=None, min_length=1, max_length=200
+    )
+    git_delivery_retention: Literal[
+        "keep", "remove_worktree_keep_branch", "remove_all"
+    ] | None = None
+    git_delivery_author_name: str | None = Field(
+        default=None, min_length=1, max_length=200
+    )
+    git_delivery_author_email: str | None = Field(
+        default=None, min_length=1, max_length=320
+    )
+    git_delivery_default_draft_pr: bool | None = None
+    git_delivery_default_merge: Literal["none", "fast_forward_only"] | None = None
     updated_at: str | None = None
 
 
@@ -987,3 +1019,164 @@ async def worker_link_dependency(
         )
     )
     return _dict(row)
+
+
+# --------------------------------------------------------------- git delivery
+
+
+class DeliveryAcceptRequest(BaseModel):
+    base_ref: str | None = None
+
+
+class DeliveryPushRequest(BaseModel):
+    confirmations: dict[str, bool] = Field(default_factory=dict)
+
+
+class DeliveryPrRequest(BaseModel):
+    connector_installation_id: str | None = None
+    draft: bool | None = None
+
+
+class DeliveryMergeRequest(BaseModel):
+    merge_strategy: Literal["fast_forward_only", "no_conflict_merge"] | None = None
+
+
+class DeliveryTeardownRequest(BaseModel):
+    retention: Literal["keep", "remove_worktree_keep_branch", "remove_all"] | None = None
+    confirmations: dict[str, bool] = Field(default_factory=dict)
+
+
+class WorkerDeliveryRequest(BaseModel):
+    note: str | None = None
+
+
+async def _delivery_actor(session_id: str | None) -> tuple[str, str | None]:
+    kind, agent_id, _ = await _actor(session_id)
+    return kind, agent_id
+
+
+async def _delivery_for(task_id: str, run_id: str):
+    delivery = await task_repository.get_delivery_by_run(run_id)
+    if delivery is None or delivery.task_id != task_id:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            {"code": "not_found", "message": "no delivery for this run"},
+        )
+    return delivery
+
+
+@router.get("/api/tasks/{task_id}/runs/{run_id}/delivery")
+async def get_delivery(task_id: str, run_id: str, _: str = Depends(verify_token)):
+    delivery = await _delivery_for(task_id, run_id)
+    ops = await task_repository.list_delivery_ops(delivery.id)
+    return {"delivery": delivery.to_dict(), "ops": [o.to_dict() for o in ops]}
+
+
+@router.get("/api/tasks/{task_id}/runs/{run_id}/delivery/ops")
+async def list_delivery_ops(task_id: str, run_id: str, _: str = Depends(verify_token)):
+    delivery = await _delivery_for(task_id, run_id)
+    return [o.to_dict() for o in await task_repository.list_delivery_ops(delivery.id)]
+
+
+@router.post("/api/tasks/{task_id}/runs/{run_id}/delivery/accept")
+async def delivery_accept(
+    task_id: str,
+    run_id: str,
+    req: DeliveryAcceptRequest,
+    caller_session_id: str | None = Header(default=None, alias="X-Owlery-Session-ID"),
+    _: str = Depends(verify_token),
+):
+    actor_kind, actor_agent_id = await _delivery_actor(caller_session_id)
+    return _dict(
+        await _run(
+            _get_manager().deliver_accept(
+                task_id, run_id, base_ref=req.base_ref,
+                actor_kind=actor_kind, actor_agent_id=actor_agent_id,
+            )
+        )
+    )
+
+
+async def _delivery_op(task_id, run_id, session_id, **kwargs):
+    actor_kind, actor_agent_id = await _delivery_actor(session_id)
+    return _dict(
+        await _run(
+            _get_manager().deliver_run_op(
+                task_id, run_id, actor_kind=actor_kind,
+                actor_agent_id=actor_agent_id, **kwargs,
+            )
+        )
+    )
+
+
+@router.post("/api/tasks/{task_id}/runs/{run_id}/delivery/commit")
+async def delivery_commit(
+    task_id: str, run_id: str,
+    caller_session_id: str | None = Header(default=None, alias="X-Owlery-Session-ID"),
+    _: str = Depends(verify_token),
+):
+    return await _delivery_op(task_id, run_id, caller_session_id, kind="commit")
+
+
+@router.post("/api/tasks/{task_id}/runs/{run_id}/delivery/push")
+async def delivery_push(
+    task_id: str, run_id: str, req: DeliveryPushRequest,
+    caller_session_id: str | None = Header(default=None, alias="X-Owlery-Session-ID"),
+    _: str = Depends(verify_token),
+):
+    return await _delivery_op(
+        task_id, run_id, caller_session_id, kind="push", confirmations=req.confirmations
+    )
+
+
+@router.post("/api/tasks/{task_id}/runs/{run_id}/delivery/pull-request")
+async def delivery_pull_request(
+    task_id: str, run_id: str, req: DeliveryPrRequest,
+    caller_session_id: str | None = Header(default=None, alias="X-Owlery-Session-ID"),
+    _: str = Depends(verify_token),
+):
+    return await _delivery_op(
+        task_id, run_id, caller_session_id, kind="pull_request",
+        connector_installation_id=req.connector_installation_id, draft=req.draft,
+    )
+
+
+@router.post("/api/tasks/{task_id}/runs/{run_id}/delivery/merge")
+async def delivery_merge(
+    task_id: str, run_id: str, req: DeliveryMergeRequest,
+    caller_session_id: str | None = Header(default=None, alias="X-Owlery-Session-ID"),
+    _: str = Depends(verify_token),
+):
+    return await _delivery_op(
+        task_id, run_id, caller_session_id, kind="merge", merge_strategy=req.merge_strategy
+    )
+
+
+@router.post("/api/tasks/{task_id}/runs/{run_id}/delivery/teardown")
+async def delivery_teardown(
+    task_id: str, run_id: str, req: DeliveryTeardownRequest,
+    caller_session_id: str | None = Header(default=None, alias="X-Owlery-Session-ID"),
+    _: str = Depends(verify_token),
+):
+    actor_kind, actor_agent_id = await _delivery_actor(caller_session_id)
+    return _dict(
+        await _run(
+            _get_manager().deliver_teardown(
+                task_id, run_id, retention=req.retention,
+                confirmations=req.confirmations,
+                actor_kind=actor_kind, actor_agent_id=actor_agent_id,
+            )
+        )
+    )
+
+
+@router.post("/api/task-worker/current/delivery/request")
+async def worker_request_delivery(
+    req: WorkerDeliveryRequest,
+    identity: tuple[str, str, str] = Depends(_worker_headers),
+    _: str = Depends(verify_token),
+):
+    task_id, run_id, session_id = identity
+    return await _run(
+        _get_manager().request_delivery(task_id, run_id, session_id, note=req.note)
+    )

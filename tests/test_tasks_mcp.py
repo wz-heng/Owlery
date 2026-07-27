@@ -193,3 +193,89 @@ def test_conflict_reason_is_visible(monkeypatch):
         "link_tasks", task_id="a", depends_on_task_id="b"
     )
     assert "409" in out and "cycle" in out.lower()
+
+
+def test_worker_delivery_request_is_scoped_to_trusted_run(monkeypatch):
+    _base_env(monkeypatch, worker=True)
+    captured = {}
+
+    def fake_request(method, url, **kwargs):
+        captured.update(method=method, url=url, **kwargs)
+        return _Response(payload={"requested": True})
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    out = _call("request_delivery", note="Please open a PR")
+    assert "requested" in out
+    assert captured["url"].endswith(
+        "/api/task-worker/current/delivery/request"
+    )
+    assert captured["json"] == {"note": "Please open a PR"}
+    assert captured["headers"]["X-Owlery-Task-ID"] == "task-1"
+    assert captured["headers"]["X-Owlery-Task-Run-ID"] == "run-1"
+
+
+def test_orchestrator_delivery_forwards_typed_confirmations(monkeypatch):
+    _base_env(monkeypatch)
+    calls = []
+
+    def fake_request(method, url, **kwargs):
+        calls.append({"method": method, "url": url, **kwargs})
+        return _Response(payload={"status": "ready"})
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    confirmations = {"allow_foreign_remote": True}
+    assert "ready" in _call(
+        "deliver",
+        task_id="task-1",
+        run_id="run-1",
+        action="accept",
+        base_ref="main",
+        confirmations=confirmations,
+    )
+    assert "ready" in _call(
+        "deliver",
+        task_id="task-1",
+        run_id="run-1",
+        action="pull_request",
+        connector_installation_id="github-1",
+        draft=True,
+        confirmations=confirmations,
+    )
+    assert "ready" in _call(
+        "deliver",
+        task_id="task-1",
+        run_id="run-1",
+        action="merge",
+        merge_strategy="fast_forward_only",
+        confirmations=confirmations,
+    )
+
+    assert calls[0]["json"] == {
+        "base_ref": "main",
+        "confirmations": confirmations,
+    }
+    assert calls[1]["json"] == {
+        "connector_installation_id": "github-1",
+        "draft": True,
+        "confirmations": confirmations,
+    }
+    assert calls[2]["json"] == {
+        "merge_strategy": "fast_forward_only",
+        "confirmations": confirmations,
+    }
+
+
+def test_delivery_tools_keep_worker_and_orchestrator_boundaries(monkeypatch):
+    _base_env(monkeypatch)
+    assert "only inside" in _call("request_delivery").lower()
+    _base_env(monkeypatch, worker=True)
+    assert "not available" in _call(
+        "delivery_status", task_id="task-1", run_id="run-1"
+    ).lower()
+    assert "not available" in _call(
+        "deliver", task_id="task-1", run_id="run-1", action="push"
+    ).lower()

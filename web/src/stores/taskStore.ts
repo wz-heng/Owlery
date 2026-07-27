@@ -6,10 +6,13 @@ import {
   type CreateBoardInput,
   type CreateTaskInput,
   type DispatcherStatus,
+  type MergeStrategy,
   type Task,
   type TaskArtifact,
   type TaskBoard,
   type TaskComment,
+  type TaskDelivery,
+  type TaskDeliveryOp,
   type TaskDetail,
   type TaskEvent,
   type TaskListFilters,
@@ -18,6 +21,30 @@ import {
   type UpdateBoardInput,
   type UpdateTaskInput,
 } from "../api/tasks";
+
+export type DeliveryActionKind =
+  | "accept"
+  | "commit"
+  | "push"
+  | "pull_request"
+  | "merge"
+  | "teardown";
+
+export interface DeliveryConfirmation {
+  taskId: string;
+  runId: string;
+  action: DeliveryActionKind;
+  confirmation: string;
+  verb: string;
+  message: string;
+}
+
+export interface DeliveryActionOptions {
+  confirmations?: Record<string, boolean>;
+  mergeStrategy?: MergeStrategy;
+  connectorInstallationId?: string;
+  draft?: boolean;
+}
 
 export type TaskBoardView = "kanban" | "tree";
 
@@ -89,6 +116,9 @@ interface TaskState {
   comments: Record<string, TaskComment[]>;
   events: Record<string, TaskEvent[]>;
   artifacts: Record<string, TaskArtifact[]>;
+  deliveries: Record<string, TaskDelivery>;
+  deliveryOps: Record<string, TaskDeliveryOp[]>;
+  deliveryConfirmation: DeliveryConfirmation | null;
   dispatcher: Record<string, DispatcherStatus>;
   lastEventSeq: Record<string, number>;
   filters: TaskFilters;
@@ -132,6 +162,26 @@ interface TaskState {
   addDependency(taskId: string, dependencyId: string): Promise<boolean>;
   removeDependency(taskId: string, dependencyId: string): Promise<boolean>;
   setDispatcherEnabled(boardId: string, enabled: boolean): Promise<void>;
+
+  loadDelivery(taskId: string, runId: string): Promise<void>;
+  acceptDelivery(
+    taskId: string,
+    runId: string,
+    baseRef?: string,
+    confirmations?: Record<string, boolean>
+  ): Promise<boolean>;
+  deliveryAction(
+    taskId: string,
+    runId: string,
+    action: "commit" | "push" | "pull_request" | "merge",
+    options?: DeliveryActionOptions
+  ): Promise<boolean>;
+  teardownDelivery(
+    taskId: string,
+    runId: string,
+    options?: { retention?: string; confirmations?: Record<string, boolean> }
+  ): Promise<boolean>;
+  clearDeliveryConfirmation(): void;
 }
 
 function message(error: unknown): string {
@@ -139,15 +189,86 @@ function message(error: unknown): string {
 }
 
 function mergeTask(state: TaskState, task: Task): Partial<TaskState> {
+  const current = state.tasksById[task.id];
+  // REST mutations and WebSocket events race in normal operation.  A delayed
+  // event must not roll an already-observed authoritative task snapshot back
+  // to an older lifecycle state.
+  const merged =
+    current && Date.parse(current.updated_at) > Date.parse(task.updated_at)
+      ? current
+      : task;
   return {
-    tasksById: { ...state.tasksById, [task.id]: task },
-    taskOrder: state.taskOrder.includes(task.id)
+    tasksById: { ...state.tasksById, [task.id]: merged },
+    taskOrder: state.taskOrder.includes(merged.id)
       ? state.taskOrder
-      : [...state.taskOrder, task.id],
-    details: state.details[task.id]
-      ? { ...state.details, [task.id]: { ...state.details[task.id], ...task } }
+      : [...state.taskOrder, merged.id],
+    details: state.details[merged.id]
+      ? { ...state.details, [merged.id]: { ...state.details[merged.id], ...merged } }
       : state.details,
   };
+}
+
+function mergeDeliveryState(
+  state: TaskState,
+  delivery: TaskDelivery,
+  ops?: TaskDeliveryOp[]
+): Partial<TaskState> {
+  return {
+    deliveries: { ...state.deliveries, [delivery.run_id]: delivery },
+    ...(ops ? { deliveryOps: { ...state.deliveryOps, [delivery.id]: ops } } : {}),
+  };
+}
+
+/** Append-or-upsert a single op into an append-only log, deduped by op id. */
+function upsertOp(existing: TaskDeliveryOp[] | undefined, op: TaskDeliveryOp): TaskDeliveryOp[] {
+  const list = existing ?? [];
+  const index = list.findIndex((item) => item.id === op.id);
+  if (index === -1) return [...list, op];
+  const next = [...list];
+  next[index] = op;
+  return next;
+}
+
+type DeliverySet = (
+  partial: Partial<TaskState> | ((state: TaskState) => Partial<TaskState>)
+) => void;
+
+/** Shared reconcile for the delivery mutations: mutating/finally + confirmation decode. */
+async function runDeliveryCall(
+  set: DeliverySet,
+  taskId: string,
+  runId: string,
+  action: DeliveryActionKind,
+  call: () => Promise<TaskDelivery>
+): Promise<boolean> {
+  set({ mutating: true, error: null });
+  try {
+    const delivery = await call();
+    set((state) => mergeDeliveryState(state, delivery));
+    return true;
+  } catch (error) {
+    if (
+      error instanceof TaskApiError &&
+      error.code === "requires_confirmation" &&
+      error.confirmation
+    ) {
+      set({
+        deliveryConfirmation: {
+          taskId,
+          runId,
+          action,
+          confirmation: error.confirmation,
+          verb: error.action ?? action,
+          message: error.message,
+        },
+      });
+      return false;
+    }
+    set({ error: message(error) });
+    return false;
+  } finally {
+    set({ mutating: false });
+  }
 }
 
 export const useTaskStore = create<TaskState>((set, get) => ({
@@ -162,6 +283,9 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   comments: {},
   events: {},
   artifacts: {},
+  deliveries: {},
+  deliveryOps: {},
+  deliveryConfirmation: null,
   dispatcher: {},
   lastEventSeq: {},
   filters: EMPTY_FILTERS,
@@ -194,18 +318,34 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   applyTaskEvent: (boardId, taskId, event) => {
     if (event.seq <= (get().lastEventSeq[boardId] ?? 0)) return;
     const payloadTask = event.payload.task;
-    set((state) => ({
-      lastEventSeq: { ...state.lastEventSeq, [boardId]: event.seq },
-      events: {
-        ...state.events,
-        ...(taskId
-          ? { [taskId]: [...(state.events[taskId] ?? []), event] }
+    const payloadDelivery = event.payload.delivery;
+    const payloadOp = event.payload.op;
+    set((state) => {
+      const patch: Partial<TaskState> = {
+        lastEventSeq: { ...state.lastEventSeq, [boardId]: event.seq },
+        events: {
+          ...state.events,
+          ...(taskId
+            ? { [taskId]: [...(state.events[taskId] ?? []), event] }
+            : {}),
+        },
+        ...(payloadTask && typeof payloadTask === "object"
+          ? mergeTask(state, payloadTask as Task)
           : {}),
-      },
-      ...(payloadTask && typeof payloadTask === "object"
-        ? mergeTask(state, payloadTask as Task)
-        : {}),
-    }));
+      };
+      if (payloadDelivery && typeof payloadDelivery === "object") {
+        const delivery = payloadDelivery as TaskDelivery;
+        patch.deliveries = { ...state.deliveries, [delivery.run_id]: delivery };
+      }
+      if (payloadOp && typeof payloadOp === "object") {
+        const op = payloadOp as TaskDeliveryOp;
+        patch.deliveryOps = {
+          ...state.deliveryOps,
+          [op.delivery_id]: upsertOp(state.deliveryOps[op.delivery_id], op),
+        };
+      }
+      return patch;
+    });
   },
   clearError: () => set({ error: null }),
 
@@ -478,6 +618,57 @@ export const useTaskStore = create<TaskState>((set, get) => ({
       set({ mutating: false });
     }
   },
+
+  loadDelivery: async (taskId, runId) => {
+    const { token } = get();
+    if (!token) return;
+    try {
+      const { delivery, ops } = await taskApi.getDelivery(token, taskId, runId);
+      set((state) => mergeDeliveryState(state, delivery, ops));
+    } catch (error) {
+      if (error instanceof TaskApiError && error.status === 404) return;
+      set({ error: message(error) });
+    }
+  },
+  acceptDelivery: (taskId, runId, baseRef, confirmations) =>
+    runDeliveryCall(set, taskId, runId, "accept", () =>
+      taskApi.acceptDelivery(get().token, taskId, runId, { base_ref: baseRef, confirmations })
+    ),
+  deliveryAction: (taskId, runId, action, options = {}) => {
+    const { token } = get();
+    return runDeliveryCall(set, taskId, runId, action, () => {
+      switch (action) {
+        case "commit":
+          return taskApi.commitDelivery(token, taskId, runId, {
+            confirmations: options.confirmations,
+          });
+        case "push":
+          return taskApi.pushDelivery(token, taskId, runId, {
+            confirmations: options.confirmations,
+          });
+        case "pull_request":
+          return taskApi.pullRequestDelivery(token, taskId, runId, {
+            connector_installation_id: options.connectorInstallationId,
+            draft: options.draft,
+            confirmations: options.confirmations,
+          });
+        case "merge":
+          return taskApi.mergeDelivery(token, taskId, runId, {
+            merge_strategy: options.mergeStrategy,
+            confirmations: options.confirmations,
+          });
+      }
+      throw new Error(`Unknown delivery action: ${action}`);
+    });
+  },
+  teardownDelivery: (taskId, runId, options = {}) =>
+    runDeliveryCall(set, taskId, runId, "teardown", () =>
+      taskApi.teardownDelivery(get().token, taskId, runId, {
+        retention: options.retention,
+        confirmations: options.confirmations,
+      })
+    ),
+  clearDeliveryConfirmation: () => set({ deliveryConfirmation: null }),
 }));
 
 export function resetTaskStore(): void {
@@ -493,6 +684,9 @@ export function resetTaskStore(): void {
     comments: {},
     events: {},
     artifacts: {},
+    deliveries: {},
+    deliveryOps: {},
+    deliveryConfirmation: null,
     dispatcher: {},
     lastEventSeq: {},
     filters: EMPTY_FILTERS,

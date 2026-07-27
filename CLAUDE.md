@@ -36,10 +36,10 @@ Run all four. They total well under two minutes — there is no cheap
 tier to fall back to, so don't skip one on the grounds that a change
 "only touched the frontend".
 
-1. **Backend unit**: `.venv/bin/pytest tests/ -v` (967)
-2. **Frontend unit**: `cd web && bun run test` (95)
+1. **Backend unit**: `.venv/bin/pytest tests/ -v` (1136)
+2. **Frontend unit**: `cd web && bun run test` (135)
 3. **TypeScript**: `cd web && npx tsc --noEmit`
-4. **E2E**: `cd web && bun run test:e2e` (69, ~2 min, Playwright auto-starts
+4. **E2E**: `cd web && bun run test:e2e` (76, ~2 min, Playwright auto-starts
    servers)
 
 **Zero test failures are acceptable.** All tests must pass before
@@ -57,9 +57,9 @@ Almost none, by design (`docs/plans/e2e-slim.md`). A fake CLI on PATH emits
 canned output through the real spawn → stream-json → MCP path; only the
 model is canned.
 
-- **E2E**: 3 of the 69 burn real quota — claude chat, codex chat, 2-hop
+- **E2E**: 3 of the 76 burn real quota — claude chat, codex chat, 2-hop
   delegation. They opt in by marking their working dir via `realCliDir()`;
-  everything else gets the fake. `bun run test:e2e:fast` (66, ~1.4 min) skips
+  everything else gets the fake. `bun run test:e2e:fast` (73, ~1.4 min) skips
   them via `--grep-invert @llm` — fine while iterating, but run the full
   suite before committing.
 - **Backend**: `test_*_real.py` auto-skip unless their CLI is on PATH.
@@ -103,7 +103,7 @@ environment.
 
 What each suite covers; detail lives in the linked plan docs.
 
-**Backend unit** (pytest, 967) — config, models, session manager, REST API,
+**Backend unit** (pytest, 1136) — config, models, session manager, REST API,
 DB persistence (credential split, refresh-error codes), JSONL parser/writer,
 CLI handoff/pull, import API, schedules CRUD + scheduler (interval + cron),
 NL `/schedule` parsing, telegram bridge (per-chat verbosity, `/sessions`
@@ -111,20 +111,25 @@ picker), tunnel, OAuth registry, agents • harness layer
 (`harness-layer.md`) • Codex in-app login (`codex-backend.md`) • connectors
 (`connectors.md`) • agent memory (`memory.md`) • delegation
 (`agent-collaboration.md`) • usage tracking (`usage-tracking.md`) •
-Octopus→Owlery migration (`rename-owlery.md` §3).
+Octopus→Owlery migration (`rename-owlery.md` §3) • durable Task Board and
+Git-worktree delivery state/CAS/recovery (`task-board.md`,
+`task-git-delivery.md`).
 
-**Frontend unit** (vitest, 95) — zustand store, `useWebSocket`, BgTaskChip,
+**Frontend unit** (vitest, 135) — zustand store, `useWebSocket`, BgTaskChip,
 FileViewerDialog, SlashCommandMenu, delegation cards, fork dialog +
 deferred-fork helper, CredentialList, ResearchCard, UsageDialog, `readStored`
-localStorage rename migration.
+localStorage rename migration, Task Board state/event reconciliation and Git
+delivery controls.
 
-**E2E** (Playwright, 69) — login, session CRUD, chat (send / Enter /
+**E2E** (Playwright, 76) — login, session CRUD, chat (send / Enter /
 disabled-while-running / AskUserQuestion / resume), WS reconnect, mobile
 layout, CLI handoff/pull + roundtrip, schedules, archived sessions, message
 queue + Esc interrupt, virtualized chat, OAuth + Codex device-code sign-in,
 credential override, agents rail/settings, connectors, `/research`,
 `/rewind` + deferred fork, usage page, cross-turn `mcp__bg__run` + spill
-pointer, `/showme`. Plus 6 telegram-bridge tests under their own config.
+pointer, `/showme`, Task Board worker completion, and Git-worktree
+accept/commit/push/teardown. Plus 6 telegram-bridge tests under their own
+config.
 
 ## Project Structure
 

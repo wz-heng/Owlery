@@ -385,5 +385,108 @@ def cancel_task(task_id: str, reason: str | None = None) -> str:
     return _render(code, data, action="cancel task")
 
 
+@mcp.tool(name="request_delivery")
+def request_delivery(note: str | None = None) -> str:
+    """Ask Owlery to deliver THIS worker run's Git branch. Records intent only —
+    no push/PR/merge happens here; a human or orchestrator triggers those."""
+    error = _worker_only("request_delivery")
+    if error:
+        return error
+    code, data = _call(
+        "POST", "/api/task-worker/current/delivery/request", body={"note": note}
+    )
+    return _render(code, data, action="request delivery")
+
+
+@mcp.tool(name="delivery_status")
+def delivery_status(task_id: str, run_id: str) -> str:
+    """Show the Git delivery (and its op log) for a completed git_worktree run."""
+    error = _orchestrator_only("delivery_status")
+    if error:
+        return error
+    code, data = _call("GET", f"/api/tasks/{task_id}/runs/{run_id}/delivery")
+    return _render(code, data, action="get delivery")
+
+
+@mcp.tool(name="deliver")
+def deliver(
+    task_id: str,
+    run_id: str,
+    action: str,
+    confirmations: dict | None = None,
+    connector_installation_id: str | None = None,
+    merge_strategy: str | None = None,
+    draft: bool | None = None,
+    base_ref: str | None = None,
+) -> str:
+    """Run one Git delivery action: accept | commit | push | pull_request | merge.
+
+    Destructive actions require an explicit `confirmations` flag (e.g.
+    {"allow_force_push": true}); external effects run only in the trusted server."""
+    error = _orchestrator_only("deliver")
+    if error:
+        return error
+    base = f"/api/tasks/{task_id}/runs/{run_id}/delivery"
+    if action == "accept":
+        code, data = _call(
+            "POST",
+            f"{base}/accept",
+            body={
+                "base_ref": base_ref,
+                "confirmations": confirmations or {},
+            },
+        )
+    elif action == "commit":
+        code, data = _call(
+            "POST",
+            f"{base}/commit",
+            body={"confirmations": confirmations or {}},
+        )
+    elif action == "push":
+        code, data = _call("POST", f"{base}/push", body={"confirmations": confirmations or {}})
+    elif action == "pull_request":
+        code, data = _call(
+            "POST", f"{base}/pull-request",
+            body={
+                "connector_installation_id": connector_installation_id,
+                "draft": draft,
+                "confirmations": confirmations or {},
+            },
+        )
+    elif action == "merge":
+        code, data = _call(
+            "POST",
+            f"{base}/merge",
+            body={
+                "merge_strategy": merge_strategy,
+                "confirmations": confirmations or {},
+            },
+        )
+    else:
+        return (
+            f"Error: unknown delivery action {action!r} "
+            "(accept | commit | push | pull_request | merge)."
+        )
+    return _render(code, data, action=f"deliver {action}")
+
+
+@mcp.tool(name="delivery_teardown")
+def delivery_teardown(
+    task_id: str,
+    run_id: str,
+    retention: str | None = None,
+    confirmations: dict | None = None,
+) -> str:
+    """Tear down a delivery's worktree/branch per the retention policy."""
+    error = _orchestrator_only("delivery_teardown")
+    if error:
+        return error
+    code, data = _call(
+        "POST", f"/api/tasks/{task_id}/runs/{run_id}/delivery/teardown",
+        body={"retention": retention, "confirmations": confirmations or {}},
+    )
+    return _render(code, data, action="tear down delivery")
+
+
 if __name__ == "__main__":
     mcp.run()

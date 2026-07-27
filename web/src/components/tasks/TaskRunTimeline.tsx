@@ -12,6 +12,7 @@ import type { Agent } from "../../stores/sessionStore";
 import { AgentSeal } from "../ui/seal";
 import { cn } from "../../lib/utils";
 import { formatDate, RUN_LABEL } from "./taskPresentation";
+import { TaskDeliveryPanel } from "./TaskDeliveryPanel";
 
 interface TaskRunTimelineProps {
   runs: TaskRun[];
@@ -62,6 +63,9 @@ export function TaskRunTimeline({ runs, agents, onOpenSession }: TaskRunTimeline
                   </button>
                 )}
               </div>
+              {run.workspace_mode === "git_worktree" && run.state === "completed" && (
+                <TaskDeliveryPanel run={run} />
+              )}
             </article>
           );
         })}

@@ -437,6 +437,22 @@ CREATE TABLE IF NOT EXISTS task_boards (
     dispatch_enabled INTEGER NOT NULL DEFAULT 1
         CHECK (dispatch_enabled IN (0, 1)),
     archived INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0, 1)),
+    -- Git delivery closure (task-git-delivery.md §17). Safe defaults mean an
+    -- existing board keeps the pre-delivery "no auto-anything" behavior: keep
+    -- the branch, push to `origin`, never auto-merge. _apply_migrations adds the
+    -- same columns to pre-existing rows.
+    git_delivery_remote TEXT NOT NULL DEFAULT 'origin',
+    git_delivery_retention TEXT NOT NULL DEFAULT 'keep' CHECK (
+        git_delivery_retention IN
+        ('keep', 'remove_worktree_keep_branch', 'remove_all')
+    ),
+    git_delivery_author_name TEXT NOT NULL DEFAULT 'Owlery Task',
+    git_delivery_author_email TEXT NOT NULL DEFAULT 'owlery-tasks@localhost',
+    git_delivery_default_draft_pr INTEGER NOT NULL DEFAULT 1
+        CHECK (git_delivery_default_draft_pr IN (0, 1)),
+    git_delivery_default_merge TEXT NOT NULL DEFAULT 'none' CHECK (
+        git_delivery_default_merge IN ('none', 'fast_forward_only')
+    ),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -562,6 +578,70 @@ CREATE TABLE IF NOT EXISTS task_artifacts (
     UNIQUE (run_id, name)
 );
 
+-- Git delivery closure for git_worktree runs (task-git-delivery.md §11). One
+-- durable delivery per completed worktree run records the fate of its branch;
+-- an append-only op log records each at-most-once local/external operation.
+-- New-table-only — CREATE IF NOT EXISTS is a no-op migration.
+CREATE TABLE IF NOT EXISTS task_deliveries (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN (
+        'pending', 'preparing', 'ready', 'delivering',
+        'delivered', 'conflicted', 'blocked', 'failed'
+    )),
+    repository TEXT NOT NULL,              -- absolute source repo path (snapshot)
+    base_ref TEXT,                         -- base branch captured at prepare time; '' = detached; NULL = legacy run
+    base_head TEXT,
+    attempt_branch TEXT NOT NULL,
+    attempt_head TEXT,
+    dirty INTEGER NOT NULL DEFAULT 0 CHECK (dirty IN (0, 1)),
+    commits_ahead INTEGER,
+    diffstat TEXT,                         -- JSON {files,insertions,deletions}
+    remote_name TEXT,
+    remote_url TEXT,                       -- secret-stripped
+    pushed_ref TEXT,
+    pr_number INTEGER,
+    pr_url TEXT,
+    pr_state TEXT,
+    merge_strategy TEXT,
+    retention TEXT,
+    reason_kind TEXT,                      -- blocked|conflicted|failed reason (task-git-delivery.md §11.1)
+    reason_detail TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (run_id)
+);
+CREATE INDEX IF NOT EXISTS task_deliveries_task ON task_deliveries(task_id);
+CREATE INDEX IF NOT EXISTS task_deliveries_active
+  ON task_deliveries(status) WHERE status IN ('preparing', 'delivering');
+
+CREATE TABLE IF NOT EXISTS task_delivery_ops (
+    id TEXT PRIMARY KEY,
+    delivery_id TEXT NOT NULL REFERENCES task_deliveries(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN (
+        'commit', 'push', 'pull_request', 'merge', 'branch_delete', 'worktree_remove'
+    )),
+    source_key TEXT NOT NULL,             -- stable at-most-once key
+    external INTEGER NOT NULL CHECK (external IN (0, 1)),
+    state TEXT NOT NULL CHECK (state IN (
+        'planned', 'running', 'succeeded', 'failed', 'interrupted'
+    )),
+    request TEXT NOT NULL DEFAULT '{}',   -- JSON of requested parameters
+    result TEXT,                          -- JSON of git/platform response, secret-stripped
+    error TEXT,
+    actor_kind TEXT NOT NULL CHECK (actor_kind IN ('user', 'agent')),
+    actor_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (source_key)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS task_delivery_ops_one_running
+  ON task_delivery_ops(delivery_id) WHERE state = 'running';
+CREATE INDEX IF NOT EXISTS task_delivery_ops_delivery
+  ON task_delivery_ops(delivery_id, created_at);
+
 -- Parked turns awaiting a usage-limit reset (limit-auto-resume.md §4). A turn
 -- that failed on the USER'S OWN limit is persisted here, not slept on: the
 -- wait is multi-hour, so it must survive a restart — on boot these rows
@@ -674,6 +754,30 @@ class Database:
             )
         except Exception:
             pass
+
+        # Git delivery closure (task-git-delivery.md §18). Additive board
+        # settings; DEFAULTs backfill existing boards to the pre-delivery
+        # behavior (keep branch, push to origin, never auto-merge), so no board
+        # silently starts pushing or deleting. New DBs get them from _SCHEMA;
+        # this catch-up covers boards created before the feature landed.
+        for ddl in (
+            "ALTER TABLE task_boards ADD COLUMN "
+            "git_delivery_remote TEXT NOT NULL DEFAULT 'origin'",
+            "ALTER TABLE task_boards ADD COLUMN "
+            "git_delivery_retention TEXT NOT NULL DEFAULT 'keep'",
+            "ALTER TABLE task_boards ADD COLUMN "
+            "git_delivery_author_name TEXT NOT NULL DEFAULT 'Owlery Task'",
+            "ALTER TABLE task_boards ADD COLUMN "
+            "git_delivery_author_email TEXT NOT NULL DEFAULT 'owlery-tasks@localhost'",
+            "ALTER TABLE task_boards ADD COLUMN "
+            "git_delivery_default_draft_pr INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE task_boards ADD COLUMN "
+            "git_delivery_default_merge TEXT NOT NULL DEFAULT 'none'",
+        ):
+            try:
+                await self._conn.execute(ddl)
+            except Exception:
+                pass
 
         await self._migrate_agents()
         await self._migrate_schedule_recurrence()

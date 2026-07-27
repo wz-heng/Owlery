@@ -23,6 +23,10 @@ export type TaskRunState =
   | "interrupted";
 
 export type WorkspaceMode = "shared" | "copy" | "git_worktree";
+export type DeliveryRetention =
+  | "keep"
+  | "remove_worktree_keep_branch"
+  | "remove_all";
 export type BlockedKind =
   | "input"
   | "capability"
@@ -43,6 +47,12 @@ export interface TaskBoard {
   max_children_per_run: number;
   max_open_tasks: number;
   dispatch_enabled: boolean;
+  git_delivery_remote: string;
+  git_delivery_retention: DeliveryRetention;
+  git_delivery_author_name: string;
+  git_delivery_author_email: string;
+  git_delivery_default_draft_pr: boolean;
+  git_delivery_default_merge: "none" | "fast_forward_only";
   archived: boolean;
   created_at: string;
   updated_at: string;
@@ -144,6 +154,77 @@ export interface TaskArtifact {
   download_url?: string | null;
 }
 
+export type DeliveryStatus =
+  | "pending"
+  | "preparing"
+  | "ready"
+  | "delivering"
+  | "delivered"
+  | "conflicted"
+  | "blocked"
+  | "failed";
+
+export type DeliveryOpKind =
+  | "commit"
+  | "push"
+  | "pull_request"
+  | "merge"
+  | "branch_delete"
+  | "worktree_remove";
+
+export type DeliveryOpState =
+  | "planned"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "interrupted";
+
+export type MergeStrategy = "fast_forward_only" | "no_conflict_merge";
+
+export interface TaskDelivery {
+  id: string;
+  task_id: string;
+  run_id: string;
+  status: DeliveryStatus;
+  repository: string;
+  base_ref: string | null;
+  base_head: string | null;
+  attempt_branch: string;
+  attempt_head: string | null;
+  dirty: boolean;
+  commits_ahead: number | null;
+  diffstat: { files: number; insertions: number; deletions: number } | null;
+  remote_name: string;
+  remote_url: string;
+  pushed_ref: string;
+  pr_number: number | null;
+  pr_url: string;
+  pr_state: string;
+  merge_strategy: string;
+  retention: DeliveryRetention;
+  reason_kind: string | null;
+  reason_detail: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TaskDeliveryOp {
+  id: string;
+  delivery_id: string;
+  kind: DeliveryOpKind;
+  source_key: string;
+  external: boolean;
+  state: DeliveryOpState;
+  request: Record<string, unknown>;
+  result: Record<string, unknown> | null;
+  error: string | null;
+  actor_kind: string;
+  actor_agent_id: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string;
+}
+
 export interface DispatcherStatus {
   board_id: string;
   enabled: boolean;
@@ -178,6 +259,12 @@ export interface CreateBoardInput {
   default_workspace_mode?: WorkspaceMode;
   max_running?: number | null;
   max_running_per_agent?: number | null;
+  git_delivery_remote?: string;
+  git_delivery_retention?: DeliveryRetention;
+  git_delivery_author_name?: string;
+  git_delivery_author_email?: string;
+  git_delivery_default_draft_pr?: boolean;
+  git_delivery_default_merge?: "none" | "fast_forward_only";
 }
 
 export type UpdateBoardInput = Partial<CreateBoardInput> & {
@@ -207,15 +294,32 @@ export interface UpdateTaskInput {
   updated_at?: string;
 }
 
+export interface TaskApiErrorInfo {
+  code?: string;
+  confirmation?: string;
+  action?: string;
+}
+
 export class TaskApiError extends Error {
   status: number;
   currentTask: Task | null;
+  code: string | null;
+  confirmation: string | null;
+  action: string | null;
 
-  constructor(message: string, status: number, currentTask: Task | null = null) {
+  constructor(
+    message: string,
+    status: number,
+    currentTask: Task | null = null,
+    info: TaskApiErrorInfo = {}
+  ) {
     super(message);
     this.name = "TaskApiError";
     this.status = status;
     this.currentTask = currentTask;
+    this.code = info.code ?? null;
+    this.confirmation = info.confirmation ?? null;
+    this.action = info.action ?? null;
   }
 }
 
@@ -234,18 +338,32 @@ async function decode<T>(response: Response): Promise<T> {
     return response.json() as Promise<T>;
   }
   const payload = (await response.json().catch(() => null)) as {
-    detail?: string | { message?: string; current_task?: Task };
+    detail?:
+      | string
+      | {
+          message?: string;
+          current_task?: Task;
+          code?: string;
+          confirmation?: string;
+          action?: string;
+        };
     current_task?: Task;
   } | null;
   const detail = payload?.detail;
+  const asObject = typeof detail === "object" && detail !== null ? detail : null;
   const message =
     typeof detail === "string"
       ? detail
-      : detail?.message ?? `Task Board request failed (${response.status})`;
+      : asObject?.message ?? `Task Board request failed (${response.status})`;
   throw new TaskApiError(
     message,
     response.status,
-    payload?.current_task ?? (typeof detail === "object" ? detail.current_task ?? null : null)
+    payload?.current_task ?? asObject?.current_task ?? null,
+    {
+      code: asObject?.code,
+      confirmation: asObject?.confirmation,
+      action: asObject?.action,
+    }
   );
 }
 
@@ -338,4 +456,64 @@ export const taskApi = {
     get<TaskArtifact[]>(token, `/api/tasks/${taskId}/artifacts`),
   deleteArtifact: (token: string, taskId: string, artifactId: string) =>
     mutate<void>(token, `/api/tasks/${taskId}/artifacts/${artifactId}`, "DELETE"),
+  getDelivery: (token: string, taskId: string, runId: string) =>
+    get<{ delivery: TaskDelivery; ops: TaskDeliveryOp[] }>(
+      token,
+      `/api/tasks/${taskId}/runs/${runId}/delivery`
+    ),
+  deliveryOps: (token: string, taskId: string, runId: string) =>
+    get<TaskDeliveryOp[]>(token, `/api/tasks/${taskId}/runs/${runId}/delivery/ops`),
+  acceptDelivery: (
+    token: string,
+    taskId: string,
+    runId: string,
+    body: { base_ref?: string; confirmations?: Record<string, boolean> } = {}
+  ) => mutate<TaskDelivery>(token, `/api/tasks/${taskId}/runs/${runId}/delivery/accept`, "POST", body),
+  commitDelivery: (
+    token: string,
+    taskId: string,
+    runId: string,
+    body: { confirmations?: Record<string, boolean> } = {}
+  ) => mutate<TaskDelivery>(token, `/api/tasks/${taskId}/runs/${runId}/delivery/commit`, "POST", body),
+  pushDelivery: (
+    token: string,
+    taskId: string,
+    runId: string,
+    body: { confirmations?: Record<string, boolean> } = {}
+  ) =>
+    mutate<TaskDelivery>(token, `/api/tasks/${taskId}/runs/${runId}/delivery/push`, "POST", {
+      confirmations: body.confirmations ?? {},
+    }),
+  pullRequestDelivery: (
+    token: string,
+    taskId: string,
+    runId: string,
+    body: {
+      connector_installation_id?: string;
+      draft?: boolean;
+      confirmations?: Record<string, boolean>;
+    } = {}
+  ) =>
+    mutate<TaskDelivery>(
+      token,
+      `/api/tasks/${taskId}/runs/${runId}/delivery/pull-request`,
+      "POST",
+      body
+    ),
+  mergeDelivery: (
+    token: string,
+    taskId: string,
+    runId: string,
+    body: { merge_strategy?: MergeStrategy; confirmations?: Record<string, boolean> } = {}
+  ) => mutate<TaskDelivery>(token, `/api/tasks/${taskId}/runs/${runId}/delivery/merge`, "POST", body),
+  teardownDelivery: (
+    token: string,
+    taskId: string,
+    runId: string,
+    body: { retention?: string; confirmations?: Record<string, boolean> } = {}
+  ) =>
+    mutate<TaskDelivery>(token, `/api/tasks/${taskId}/runs/${runId}/delivery/teardown`, "POST", {
+      retention: body.retention,
+      confirmations: body.confirmations ?? {},
+    }),
 };

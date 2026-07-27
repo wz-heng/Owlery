@@ -1,6 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { taskApi, TaskApiError, type Task, type TaskEvent } from "../api/tasks";
+import {
+  taskApi,
+  TaskApiError,
+  type Task,
+  type TaskDelivery,
+  type TaskDeliveryOp,
+  type TaskEvent,
+} from "../api/tasks";
 import { dragOperation, filterTasks, resetTaskStore, useTaskStore } from "./taskStore";
 
 function task(overrides: Partial<Task> = {}): Task {
@@ -32,6 +39,56 @@ function task(overrides: Partial<Task> = {}): Task {
   };
 }
 
+function delivery(overrides: Partial<TaskDelivery> = {}): TaskDelivery {
+  return {
+    id: "del-1",
+    task_id: "task-1",
+    run_id: "run-1",
+    status: "ready",
+    repository: "/repo",
+    base_ref: "main",
+    base_head: "aaaaaaaaaaaa",
+    attempt_branch: "owlery/task-1",
+    attempt_head: "bbbbbbbbbbbb",
+    dirty: false,
+    commits_ahead: 2,
+    diffstat: { files: 3, insertions: 40, deletions: 5 },
+    remote_name: "origin",
+    remote_url: "git@example.com:acme/repo.git",
+    pushed_ref: "",
+    pr_number: null,
+    pr_url: "",
+    pr_state: "",
+    merge_strategy: "fast_forward_only",
+    retention: "keep",
+    reason_kind: null,
+    reason_detail: null,
+    created_at: "2026-07-26T00:00:00Z",
+    updated_at: "2026-07-26T00:00:00Z",
+    ...overrides,
+  };
+}
+
+function op(overrides: Partial<TaskDeliveryOp> = {}): TaskDeliveryOp {
+  return {
+    id: "op-1",
+    delivery_id: "del-1",
+    kind: "commit",
+    source_key: "commit:1",
+    external: false,
+    state: "running",
+    request: {},
+    result: null,
+    error: null,
+    actor_kind: "system",
+    actor_agent_id: null,
+    started_at: "2026-07-26T00:00:01Z",
+    finished_at: null,
+    created_at: "2026-07-26T00:00:01Z",
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   resetTaskStore();
   vi.restoreAllMocks();
@@ -56,6 +113,36 @@ describe("taskStore transitions", () => {
     expect(await useTaskStore.getState().moveTask(current.id, "ready")).toBe(true);
     expect(lifecycle).toHaveBeenCalledWith("tok", current.id, "ready", {});
     expect(useTaskStore.getState().tasksById[current.id].status).toBe("ready");
+  });
+
+  it("does not let a delayed task event overwrite a newer REST snapshot", () => {
+    const triage = task({
+      status: "triage",
+      updated_at: "2026-07-26T00:00:00Z",
+    });
+    const specified = task({
+      status: "todo",
+      updated_at: "2026-07-26T00:01:00Z",
+    });
+    useTaskStore.setState({
+      tasksById: { [specified.id]: specified },
+      taskOrder: [specified.id],
+    });
+
+    useTaskStore.getState().applyTaskEvent("board-1", triage.id, {
+      seq: 1,
+      board_id: "board-1",
+      task_id: triage.id,
+      kind: "task_created",
+      actor_kind: "user",
+      actor_agent_id: null,
+      actor_session_id: null,
+      payload: { task: triage },
+      created_at: "2026-07-26T00:00:00Z",
+    });
+
+    expect(useTaskStore.getState().tasksById[specified.id].status).toBe("todo");
+    expect(useTaskStore.getState().lastEventSeq["board-1"]).toBe(1);
   });
 
   it("uses the current task returned by a lost CAS conflict", async () => {
@@ -102,5 +189,82 @@ describe("taskStore event replay and filters", () => {
     ];
     expect(filterTasks(rows, { text: "durable", assignee: "", priority: 2, includeArchived: false, mine: true }, "agent-1").map((row) => row.id)).toEqual(["task-1"]);
     expect(filterTasks(rows, { text: "", assignee: "", priority: null, includeArchived: true, mine: false }, null)).toHaveLength(3);
+  });
+});
+
+describe("taskStore git delivery", () => {
+  function deliveryEvent(seq: number, payload: Record<string, unknown>): TaskEvent {
+    return {
+      seq,
+      board_id: "board-1",
+      task_id: "task-1",
+      run_id: "run-1",
+      kind: "delivery_op_finished",
+      actor_kind: "system",
+      actor_agent_id: null,
+      payload,
+      created_at: "2026-07-26T00:01:00Z",
+    };
+  }
+
+  it("upserts deliveries[run_id] and appends deliveryOps[delivery_id] with seq dedup", () => {
+    const event = deliveryEvent(7, {
+      delivery: delivery(),
+      op: op({ state: "succeeded", finished_at: "2026-07-26T00:00:02Z" }),
+    });
+    useTaskStore.getState().applyTaskEvent("board-1", "task-1", event);
+    useTaskStore.getState().applyTaskEvent("board-1", "task-1", event); // same seq → ignored
+
+    const state = useTaskStore.getState();
+    expect(state.deliveries["run-1"].id).toBe("del-1");
+    expect(state.deliveryOps["del-1"]).toHaveLength(1);
+    expect(state.deliveryOps["del-1"][0].state).toBe("succeeded");
+    expect(state.lastEventSeq["board-1"]).toBe(7);
+  });
+
+  it("upserts an op in place on a later state change", () => {
+    useTaskStore.getState().applyTaskEvent(
+      "board-1",
+      "task-1",
+      deliveryEvent(4, { delivery: delivery(), op: op({ state: "running" }) })
+    );
+    useTaskStore.getState().applyTaskEvent(
+      "board-1",
+      "task-1",
+      deliveryEvent(5, { delivery: delivery(), op: op({ state: "succeeded" }) })
+    );
+    const ops = useTaskStore.getState().deliveryOps["del-1"];
+    expect(ops).toHaveLength(1);
+    expect(ops[0].state).toBe("succeeded");
+  });
+
+  it("surfaces a requires_confirmation error as a pending confirmation", async () => {
+    useTaskStore.setState({ token: "tok" });
+    vi.spyOn(taskApi, "pushDelivery").mockRejectedValue(
+      new TaskApiError("Force push required", 409, null, {
+        code: "requires_confirmation",
+        confirmation: "allow_force_push",
+        action: "push",
+      })
+    );
+
+    const ok = await useTaskStore.getState().deliveryAction("task-1", "run-1", "push");
+    expect(ok).toBe(false);
+    const confirmation = useTaskStore.getState().deliveryConfirmation;
+    expect(confirmation?.confirmation).toBe("allow_force_push");
+    expect(confirmation?.action).toBe("push");
+    expect(confirmation?.verb).toBe("push");
+    expect(useTaskStore.getState().mutating).toBe(false);
+    expect(useTaskStore.getState().error).toBeNull();
+  });
+
+  it("upserts the returned delivery on a successful action", async () => {
+    useTaskStore.setState({ token: "tok" });
+    vi.spyOn(taskApi, "commitDelivery").mockResolvedValue(
+      delivery({ status: "ready", dirty: false, commits_ahead: 3 })
+    );
+    const ok = await useTaskStore.getState().deliveryAction("task-1", "run-1", "commit");
+    expect(ok).toBe(true);
+    expect(useTaskStore.getState().deliveries["run-1"].commits_ahead).toBe(3);
   });
 });

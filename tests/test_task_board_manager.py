@@ -54,6 +54,38 @@ async def _ready_task(db, repo, sessions, root: Path, *, origin: bool = False):
     return board, task, origin_session
 
 
+async def _terminal_delivery(db, repo, sessions, root: Path):
+    _board, task, origin = await _ready_task(
+        db, repo, sessions, root, origin=True
+    )
+    run = await repo.claim_ready(
+        task.id,
+        workspace_mode="git_worktree",
+        workspace_path=str(root / "delivery-worktree"),
+        run_id="delivery-run",
+    )
+    await repo.complete_run(task.id, run.id, summary="Worker finished")
+    delivery = await repo.create_delivery(
+        run.id,
+        repository=str(root),
+        attempt_branch="owlery/task-delivery-run",
+        base_ref="main",
+        base_head="a" * 40,
+    )
+    await repo.start_accept(delivery.id)
+    delivery = await repo.record_baseline(
+        delivery.id,
+        status="ready",
+        attempt_head="b" * 40,
+        dirty=False,
+        commits_ahead=1,
+        diffstat={"files": 1, "insertions": 1, "deletions": 0},
+        remote_name="origin",
+        remote_url="/tmp/remote.git",
+    )
+    return task, run, origin, delivery
+
+
 @pytest.mark.asyncio
 async def test_dispatch_creates_trusted_task_worker(task_runtime):
     db, repo, sessions, manager, root = task_runtime
@@ -179,3 +211,76 @@ async def test_shutdown_cancels_idle_protocol_check_before_interrupting_run(task
     assert final_task.blocked_kind == "interrupted"
     assert final_run.state == "interrupted"
     assert check.done()
+
+
+@pytest.mark.asyncio
+async def test_delivery_recovery_interrupts_op_and_rebuilds_terminal_outbox(
+    task_runtime,
+):
+    db, repo, sessions, manager, root = task_runtime
+    task, run, origin, delivery = await _terminal_delivery(
+        db, repo, sessions, root
+    )
+    op = await repo.plan_op(
+        delivery.id,
+        kind="push",
+        source_key=f"task:{task.id}:run:{run.id}:push:1",
+        actor_kind="user",
+    )
+    await repo.start_op(delivery.id, op.id)
+    manager.delivery.reconcile_interrupted_pr = AsyncMock()
+
+    await manager.recover_deliveries()
+
+    recovered = await repo.get_delivery(delivery.id)
+    recovered_op = (await repo.list_delivery_ops(delivery.id))[0]
+    assert recovered.status == "blocked"
+    assert recovered.reason_kind == "interrupted"
+    assert recovered_op.state == "interrupted"
+    assert "outcome unknown" in (recovered_op.error or "")
+    injection = await db.get_session_injection_by_source(
+        f"task:{task.id}:run:{run.id}:delivery:terminal"
+    )
+    assert injection is not None
+    assert injection["session_id"] == origin.id
+    assert injection["status"] == "pending"
+    # Boot's paused barrier is DB-only; platform reconcile happens later.
+    manager.delivery.reconcile_interrupted_pr.assert_not_awaited()
+
+    await manager.recover_deliveries()
+    assert (
+        await db.get_session_injection_by_source(
+            f"task:{task.id}:run:{run.id}:delivery:terminal"
+        )
+    )["id"] == injection["id"]
+
+
+@pytest.mark.asyncio
+async def test_delivery_recovery_records_missing_origin_once(task_runtime):
+    db, repo, sessions, manager, root = task_runtime
+    task, _run, origin, delivery = await _terminal_delivery(
+        db, repo, sessions, root
+    )
+    await repo.start_accept(delivery.id)
+    await repo.record_baseline(
+        delivery.id,
+        status="failed",
+        reason_kind="op_failed",
+        reason_detail="baseline failed",
+    )
+    assert await sessions.delete_session(origin.id) is True
+
+    await manager.recover_deliveries()
+    await manager.recover_deliveries()
+
+    events = await repo.list_task_events(task.id)
+    unavailable = [
+        event
+        for event in events
+        if event.kind == "delivery_notification_unavailable"
+        and event.payload.get("delivery_id") == delivery.id
+    ]
+    assert len(unavailable) == 1
+    assert await db.get_session_injection_by_source(
+        f"task:{task.id}:run:{delivery.run_id}:delivery:terminal"
+    ) is None

@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -133,6 +134,11 @@ async def lifespan(app: FastAPI):
     # worker-directed events without restarting models, then archive workers.
     await task_board_manager.recover_phase2()
 
+    # Git delivery recovery (task-git-delivery.md §16): interrupt in-flight
+    # delivery ops, reset stuck baselines, and reconstruct terminal-delivery
+    # notifications. DB-only — no hosting-platform I/O in this barrier.
+    await task_board_manager.recover_deliveries()
+
     # Domain recovery is now complete and all broadcast listeners are live.
     # Drain only after that barrier; a replay can immediately start a model
     # turn, so moving this earlier reintroduces the boot race.
@@ -146,6 +152,11 @@ async def lifespan(app: FastAPI):
     await parked_turn_runner.initialize()
     await bridge_manager.start_all()
     await task_board_manager.start()
+
+    # Off the boot critical path (task-git-delivery.md §16, S3): a bounded,
+    # read-only reconcile of any interrupted PR op. Fire-and-forget so it never
+    # blocks the dispatcher, the injection drain, or any session's turn.
+    asyncio.create_task(task_board_manager.reconcile_interrupted_prs())
 
     # Start Cloudflare Tunnel if enabled
     tunnel: CloudflareTunnel | None = None
