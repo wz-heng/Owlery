@@ -133,10 +133,10 @@ describe("taskStore transitions", () => {
       seq: 1,
       board_id: "board-1",
       task_id: triage.id,
+      run_id: null,
       kind: "task_created",
       actor_kind: "user",
       actor_agent_id: null,
-      actor_session_id: null,
       payload: { task: triage },
       created_at: "2026-07-26T00:00:00Z",
     });

@@ -367,7 +367,13 @@ async function decode<T>(response: Response): Promise<T> {
   );
 }
 
-function query(values: Record<string, string | number | boolean | undefined>): string {
+type QueryValue = string | number | boolean | undefined;
+
+// Serialize a params object into a query string. Constrained on the object's
+// own value types (all must be QueryValue) rather than requiring a string
+// index signature, so domain interfaces like TaskListFilters can be passed
+// directly without a cast while still rejecting non-serializable values.
+function query<T extends Partial<Record<keyof T, QueryValue>>>(values: T): string {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(values)) {
     if (value !== undefined && value !== "") params.set(key, String(value));
