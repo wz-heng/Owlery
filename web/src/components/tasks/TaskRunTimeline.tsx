@@ -1,11 +1,14 @@
 import {
   IconAlertTriangle,
+  IconCheck,
   IconCircleCheck,
   IconClock,
+  IconCopy,
   IconExternalLink,
   IconFolder,
   IconPlayerPlay,
 } from "@tabler/icons-react";
+import { useState } from "react";
 
 import type { TaskRun } from "../../api/tasks";
 import type { Agent } from "../../stores/sessionStore";
@@ -21,6 +24,16 @@ interface TaskRunTimelineProps {
 }
 export function TaskRunTimeline({ runs, agents, onOpenSession }: TaskRunTimelineProps) {
   const agentMap = new Map(agents.map((agent) => [agent.id, agent]));
+  const [copiedRunId, setCopiedRunId] = useState<string | null>(null);
+  const copyWorkspacePath = async (runId: string, path: string) => {
+    try {
+      await navigator.clipboard.writeText(path);
+      setCopiedRunId(runId);
+      window.setTimeout(() => setCopiedRunId(null), 1400);
+    } catch {
+      // Clipboard unavailable (old browser / denied permission): ignore silently.
+    }
+  };
   return (
     <section aria-labelledby="task-runs-title">
       <h3 id="task-runs-title" className="mb-3 flex items-center gap-2 font-serif text-base font-semibold">
@@ -57,6 +70,23 @@ export function TaskRunTimeline({ runs, agents, onOpenSession }: TaskRunTimeline
               )}
               <div className="mt-3 flex flex-wrap items-center gap-2">
                 <code className="max-w-full truncate rounded bg-ink-100 px-2 py-1 text-[10px] text-muted-foreground" title={run.workspace_path}>{run.workspace_path}</code>
+                {run.workspace_path && (
+                  <button
+                    type="button"
+                    aria-label="Copy workspace path"
+                    title="Copy workspace path"
+                    className="inline-flex h-6 items-center justify-center gap-1 rounded-md px-1.5 text-[10px] font-medium text-muted-foreground hover:bg-ink-100 hover:text-ink-800"
+                    onClick={() => copyWorkspacePath(run.id, run.workspace_path)}
+                  >
+                    {copiedRunId === run.id ? (
+                      <>
+                        <IconCheck size={13} /> Copied
+                      </>
+                    ) : (
+                      <IconCopy size={13} />
+                    )}
+                  </button>
+                )}
                 {run.session_id && onOpenSession && (
                   <button type="button" className="ml-auto inline-flex items-center gap-1 text-xs font-medium text-primary-700 hover:underline" onClick={() => onOpenSession(run.session_id!)}>
                     Open session <IconExternalLink size={13} />
