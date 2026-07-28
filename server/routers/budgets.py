@@ -89,15 +89,29 @@ async def update_budget(
     _: str = Depends(verify_token),
 ) -> BudgetRead:
     db = _get_db()
-    if await db.get_budget(budget_id) is None:
+    existing = await db.get_budget(budget_id)
+    if existing is None:
         raise HTTPException(status_code=404, detail="budget not found")
-    row = await db.update_budget(
-        budget_id,
-        window=req.window,
-        limit_usd=req.limit_usd,
-        soft_pct=req.soft_pct,
-        enabled=req.enabled,
-    )
+    try:
+        row = await db.update_budget(
+            budget_id,
+            window=req.window,
+            limit_usd=req.limit_usd,
+            soft_pct=req.soft_pct,
+            enabled=req.enabled,
+        )
+    except sqlite3.IntegrityError:
+        # Moving this budget onto a (scope, window) another budget already
+        # occupies trips the same uniqueness index as create — surface it the
+        # same way (409) instead of leaking a 500.
+        target_window = req.window or existing["window"]
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"a {existing['scope']} budget for the {target_window} window "
+                f"already exists"
+            ),
+        )
     assert row is not None
     return BudgetRead(**row)
 

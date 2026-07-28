@@ -544,6 +544,23 @@ async def test_budget_rest_validation_and_conflicts(client, db):
         await client.delete("/api/budgets/missing", headers=HEADERS)
     ).status_code == 404
 
+    # Patching a budget's window onto one another budget already occupies
+    # collides on the same uniqueness index as create → 409, not a 500.
+    weekly = await client.post(
+        "/api/budgets",
+        json={"scope": "global", "window": "weekly", "limit_usd": 3.0},
+        headers=HEADERS,
+    )
+    assert weekly.status_code == 201, weekly.text
+    # The global daily from the duplicate check above still exists; moving the
+    # weekly onto `daily` would make two global dailies.
+    collide = await client.patch(
+        f"/api/budgets/{weekly.json()['id']}",
+        json={"window": "daily"},
+        headers=HEADERS,
+    )
+    assert collide.status_code == 409, collide.text
+
 
 async def test_budget_rest_agent_scope_happy_path(client, db):
     now = datetime.now(timezone.utc).isoformat()
