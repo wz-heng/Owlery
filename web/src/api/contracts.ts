@@ -518,6 +518,7 @@ export interface paths {
          *     - 404 if the parent session is gone or the target agent name
          *       doesn't resolve
          *     - 409 on cycle, depth, self-delegation, or ambiguous name
+         *     - 422 if `model` can't run on the child agent's backend
          */
         post: operations["start_delegation_api_sessions__session_id__delegations_post"];
         delete?: never;
@@ -1550,6 +1551,59 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/budgets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Budgets */
+        get: operations["list_budgets_api_budgets_get"];
+        put?: never;
+        /** Create Budget */
+        post: operations["create_budget_api_budgets_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/budgets/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Budget Status */
+        get: operations["budget_status_api_budgets_status_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/budgets/{budget_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Delete Budget */
+        delete: operations["delete_budget_api_budgets__budget_id__delete"];
+        options?: never;
+        head?: never;
+        /** Update Budget */
+        patch: operations["update_budget_api_budgets__budget_id__patch"];
+        trace?: never;
+    };
     "/api/credentials": {
         parameters: {
             query?: never;
@@ -2343,6 +2397,56 @@ export interface components {
             /** File */
             file: string;
         };
+        /** BudgetRead */
+        BudgetRead: {
+            /** Id */
+            id: string;
+            /**
+             * Scope
+             * @enum {string}
+             */
+            scope: "global" | "agent";
+            /** Agent Id */
+            agent_id?: string | null;
+            /**
+             * Window
+             * @enum {string}
+             */
+            window: "daily" | "weekly" | "monthly";
+            /** Limit Usd */
+            limit_usd: number;
+            /** Soft Pct */
+            soft_pct: number;
+            /** Enabled */
+            enabled: boolean;
+            /** Created At */
+            created_at: string;
+            /** Updated At */
+            updated_at: string;
+        };
+        /**
+         * BudgetStatusEntry
+         * @description One enabled budget with live spend for its current window; the
+         *     frontend derives the water level from limit/spent (§3.3).
+         */
+        BudgetStatusEntry: {
+            /**
+             * Scope
+             * @enum {string}
+             */
+            scope: "global" | "agent";
+            /** Agent Id */
+            agent_id?: string | null;
+            /**
+             * Window
+             * @enum {string}
+             */
+            window: "daily" | "weekly" | "monthly";
+            /** Limit Usd */
+            limit_usd: number;
+            /** Spent Usd */
+            spent_usd: number;
+        };
         /** CancelDelegationRequest */
         CancelDelegationRequest: {
             /** Reason */
@@ -2516,6 +2620,33 @@ export interface components {
             /** Expires At Epoch */
             expires_at_epoch: number;
         };
+        /** CreateBudgetRequest */
+        CreateBudgetRequest: {
+            /**
+             * Scope
+             * @enum {string}
+             */
+            scope: "global" | "agent";
+            /** Agent Id */
+            agent_id?: string | null;
+            /**
+             * Window
+             * @enum {string}
+             */
+            window: "daily" | "weekly" | "monthly";
+            /** Limit Usd */
+            limit_usd: number;
+            /**
+             * Soft Pct
+             * @default 0.8
+             */
+            soft_pct: number;
+            /**
+             * Enabled
+             * @default true
+             */
+            enabled: boolean;
+        };
         /** CreateCredentialRequest */
         CreateCredentialRequest: {
             backend: components["schemas"]["BackendKind"];
@@ -2574,6 +2705,8 @@ export interface components {
             /** Agent Id */
             agent_id?: string | null;
             backend?: components["schemas"]["BackendKind"] | null;
+            /** Model */
+            model?: string | null;
         };
         /**
          * CredentialInfo
@@ -2972,6 +3105,8 @@ export interface components {
             origin: string;
             /** @default claude-code */
             backend: components["schemas"]["BackendKind"];
+            /** Model */
+            model?: string | null;
             /** Parent Session Id */
             parent_session_id?: string | null;
             /** Delegation Request */
@@ -3049,6 +3184,8 @@ export interface components {
             origin: string;
             /** @default claude-code */
             backend: components["schemas"]["BackendKind"];
+            /** Model */
+            model?: string | null;
             /** Parent Session Id */
             parent_session_id?: string | null;
             /** Delegation Request */
@@ -3109,6 +3246,8 @@ export interface components {
         SpecifyRequest: {
             /** Body */
             body?: string | null;
+            /** Model */
+            model?: string | null;
         };
         /** StartBgTaskRequest */
         StartBgTaskRequest: {
@@ -3125,6 +3264,8 @@ export interface components {
             request: string;
             /** Files */
             files?: string[] | null;
+            /** Model */
+            model?: string | null;
         };
         /** StartResearchRequest */
         StartResearchRequest: {
@@ -3171,6 +3312,8 @@ export interface components {
             workspace_mode?: ("shared" | "copy" | "git_worktree") | null;
             /** Working Dir Override */
             working_dir_override?: string | null;
+            /** Model */
+            model?: string | null;
         };
         /** TaskPatch */
         TaskPatch: {
@@ -3200,6 +3343,17 @@ export interface components {
         UnblockRequest: {
             /** Comment */
             comment?: string | null;
+        };
+        /** UpdateBudgetRequest */
+        UpdateBudgetRequest: {
+            /** Window */
+            window?: ("daily" | "weekly" | "monthly") | null;
+            /** Limit Usd */
+            limit_usd?: number | null;
+            /** Soft Pct */
+            soft_pct?: number | null;
+            /** Enabled */
+            enabled?: boolean | null;
         };
         /** UpdateConnectorRequest */
         UpdateConnectorRequest: {
@@ -3285,6 +3439,8 @@ export interface components {
             workspace_mode?: null;
             /** Working Dir Override */
             working_dir_override?: null;
+            /** Model */
+            model?: string | null;
         };
         /** WorkerDeliveryRequest */
         WorkerDeliveryRequest: {
@@ -6656,6 +6812,143 @@ export interface operations {
                     "application/json": {
                         [key: string]: unknown;
                     };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_budgets_api_budgets_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BudgetRead"][];
+                };
+            };
+        };
+    };
+    create_budget_api_budgets_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateBudgetRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BudgetRead"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    budget_status_api_budgets_status_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BudgetStatusEntry"][];
+                };
+            };
+        };
+    };
+    delete_budget_api_budgets__budget_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                budget_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_budget_api_budgets__budget_id__patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                budget_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateBudgetRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BudgetRead"];
                 };
             };
             /** @description Validation Error */

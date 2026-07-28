@@ -214,11 +214,49 @@ function handleWsMessage(data: Record<string, unknown>) {
       });
       break;
 
+    case "budget_warning":
+      // Soft-threshold notice injected once per window before a turn runs
+      // (budget-model-routing.md §3.2). Persisted server-side, so it also
+      // arrives in the snapshot on reload; render it as a calm inline banner.
+      addMessage(sessionId, {
+        role: "system",
+        type: "budget_warning",
+        content: data.message as string,
+        budget: {
+          scope: data.scope as string,
+          agent_id: (data.agent_id as string | null) ?? null,
+          window: data.window as string,
+          limit_usd: data.limit_usd as number,
+          spent_usd: data.spent_usd as number,
+          soft_pct: data.soft_pct as number,
+        },
+      });
+      break;
+
     case "error":
       addMessage(sessionId || "__global", {
         role: "system",
         type: "error",
         content: data.message as string,
+        // Carry the structured discriminator + budget detail when the turn was
+        // refused by a hard budget block (budget-model-routing.md §3.2) so the
+        // chat can render an actionable "budget reached" card.
+        code: typeof data.code === "string" ? (data.code as string) : undefined,
+        budget:
+          data.code === "budget_exceeded" && data.budget
+            ? {
+                scope: (data.budget as Record<string, unknown>).scope as string,
+                agent_id:
+                  ((data.budget as Record<string, unknown>).agent_id as
+                    | string
+                    | null) ?? null,
+                window: (data.budget as Record<string, unknown>).window as string,
+                limit_usd: (data.budget as Record<string, unknown>)
+                  .limit_usd as number,
+                spent_usd: (data.budget as Record<string, unknown>)
+                  .spent_usd as number,
+              }
+            : undefined,
       });
       // The turn hit the user's own usage limit and is parked until the window
       // resets (limit-auto-resume.md §4). It comes back on its own — show the
