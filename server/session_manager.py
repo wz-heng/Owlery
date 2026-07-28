@@ -1492,6 +1492,10 @@ class SessionManager:
             agent_id=match.get("agent_id"),
             origin=match.get("origin") or "user",
             backend=match.get("backend") or "claude-code",
+            # Preserve the per-session model override across unarchive, else the
+            # revived in-memory session silently falls back to the agent model
+            # (budget-model-routing.md §4.1).
+            model=match.get("model"),
             # Preserve the delegation chain fields when unarchiving —
             # without these, an unarchived delegation child would lose
             # its parent_session_id pointer and the "Delegated from"

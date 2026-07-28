@@ -177,6 +177,19 @@ async def test_archive_successor_inherits_model(mgr, db):
     assert successor.model == "claude-opus-4"
 
 
+@pytest.mark.asyncio
+async def test_unarchive_preserves_model(mgr, db):
+    """Unarchiving must revive the persisted model override, not drop it back to
+    the agent default (Snape review)."""
+    agent = await db.get_default_agent()
+    s = await mgr.create_session(
+        agent_id=agent["id"], name="pinned", working_dir="/tmp", model="claude-opus-4",
+    )
+    await mgr.archive_session(s.id)  # archives s.id, returns a live successor
+    revived = await mgr.unarchive_session(s.id)
+    assert revived.model == "claude-opus-4"
+
+
 # --------------------------------------------------------------------------- #
 # Agent CRUD validation
 # --------------------------------------------------------------------------- #

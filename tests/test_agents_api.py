@@ -497,3 +497,27 @@ async def test_create_session_cross_family_model_422(client):
         headers=HEADERS,
     )
     assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+async def test_create_session_backend_override_inherited_model_422(client):
+    """A backend override that omits `model` inherits the agent's model at run
+    time; validating only the request's model would let a cross-family
+    inherited mismatch through (Snape review — effective-model bypass)."""
+    agent = await _create_agent(
+        client, name="ClaudeAgent", backend="claude-code", model="claude-opus-4"
+    )
+    # /api/sessions with codex backend, model omitted → inherited claude model.
+    resp = await client.post(
+        "/api/sessions",
+        json={"agent_id": agent["id"], "backend": "codex"},
+        headers=HEADERS,
+    )
+    assert resp.status_code == 422, resp.text
+    # Same guard on the agent-scoped session route.
+    resp2 = await client.post(
+        f"/api/agents/{agent['id']}/sessions",
+        json={"backend": "codex"},
+        headers=HEADERS,
+    )
+    assert resp2.status_code == 422, resp2.text

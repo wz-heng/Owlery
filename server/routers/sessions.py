@@ -95,8 +95,14 @@ async def create_session(
         else (agent.get("backend") if agent else None) or "claude-code"
     )
     await _check_credential_backend(req.credential_id, backend)
+    # Validate the EFFECTIVE model against the resolved backend: a request may
+    # override the backend (e.g. to codex) while omitting model, in which case
+    # the agent's model is inherited at run time (resolve_model). Validating
+    # only req.model would let that inherited mismatch through
+    # (budget-model-routing.md §4.3).
+    eff_model = req.model or (agent.get("model") if agent else None)
     try:
-        validate_model_for_backend(backend, req.model)
+        validate_model_for_backend(backend, eff_model)
     except ModelBackendError as e:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
     try:

@@ -673,3 +673,22 @@ async def test_specify_without_set_model_leaves_model_untouched(task_store):
     updated = await repo.specify_task(triage.id, body="new body")
     assert updated.model == "claude-opus-4"
     assert updated.body == "new body"
+
+
+@pytest.mark.asyncio
+async def test_assign_rejects_incompatible_backend_for_existing_model(task_store):
+    """Reassigning a task with a set model to an agent whose backend can't run
+    it is rejected at the assign entry, not deferred to dispatch (Snape review)."""
+    db, repo, root, _agent = task_store
+    from server.agent_manager import AgentManager
+    from server.task_board.models import TaskValidationError
+
+    board = await _board(repo, root)
+    # Unassigned task pinned to a Claude model (allowed — nothing to check yet).
+    task = await repo.create_task(
+        board_id=board.id, title="t", status="todo",
+        assignee_agent_id=None, model="claude-opus-4",
+    )
+    codex_agent = await AgentManager(db).create_agent(name="CoderAssign", backend="codex")
+    with pytest.raises(TaskValidationError):
+        await repo.assign_task(task.id, codex_agent["id"])

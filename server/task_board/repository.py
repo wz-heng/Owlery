@@ -1147,6 +1147,12 @@ class TaskRepository:
                 raise TaskConflictError("running/done tasks cannot be reassigned", current=TaskRecord.from_row(task))
             if agent_id is not None and not await self._agent_is_live(conn, agent_id):
                 raise TaskValidationError("assignee Agent does not exist or is archived")
+            # Reassignment is a backend-changing write entry (§4.3): reject a new
+            # assignee whose backend can't run the task's existing model up front,
+            # rather than letting it fail only after the run is claimed at dispatch.
+            await self._validate_task_model(
+                conn, assignee_agent_id=agent_id, model=task["model"]
+            )
             await conn.execute(
                 "UPDATE tasks SET assignee_agent_id = ?, updated_at = ? WHERE id = ?",
                 (agent_id, stamp, task_id),
