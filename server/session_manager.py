@@ -32,6 +32,12 @@ from .harness import (
     get_harness,
 )
 from . import fork_helpers
+from .budgets import (
+    BudgetExceededError,
+    BudgetStatus,
+    budget_statuses,
+    classify_budget_statuses,
+)
 from .config import settings
 from .crypto import decrypt, encrypt
 from .database import Database
@@ -2288,6 +2294,16 @@ class SessionManager:
             backend_dispatch_prompt = spill_if_large(session_id, augmented_prompt)
 
             try:
+                # Budget gate (budget-model-routing.md §3.2): the single
+                # pre-run checkpoint, source-agnostic — every turn (interactive,
+                # schedule, delegation, Task Board, bridge) funnels through
+                # send_message, so gating here catches them all. Soft threshold
+                # yields a one-time warning and lets the turn run; hard threshold
+                # raises BudgetExceededError, handled below like a fast turn
+                # failure (the session stays healthy and resumable).
+                async for warn_event in self._enforce_budget(session):
+                    await self._broadcast(warn_event)
+                    yield warn_event
                 async for ws_event in self._run_backend(session, backend_dispatch_prompt):
                     await self._broadcast(ws_event)
                     yield ws_event
@@ -2300,6 +2316,36 @@ class SessionManager:
                 # below still runs, so the lock is released and the session goes
                 # idle exactly as it would after any other turn.
                 raise
+            except BudgetExceededError as e:
+                # Hard budget block (§3.2): fail the turn fast with a structured
+                # error, mirroring a backend error so the existing downstream
+                # semantics fire — the delegation subscriber sees `error` and
+                # injects `[agent-error]`, Task Board handles the failed run,
+                # Feishu relays the message. The session itself stays healthy.
+                s = e.status
+                error_msg = MessageContent(
+                    role=MessageRole.system,
+                    type="error",
+                    content=str(e),
+                )
+                err_seq = await self._persist_message(session, error_msg)
+                event = {
+                    "type": "error",
+                    "session_id": session_id,
+                    "message": str(e),
+                    "code": "budget_exceeded",
+                    "budget": {
+                        "scope": s.scope,
+                        "agent_id": s.agent_id,
+                        "window": s.window,
+                        "limit_usd": s.limit_usd,
+                        "spent_usd": s.spent_usd,
+                    },
+                }
+                if err_seq is not None:
+                    event["seq"] = err_seq
+                await self._broadcast(event)
+                yield event
             except Exception as e:
                 logger.exception("Backend error in session %s", session_id)
                 error_msg = MessageContent(
@@ -3613,6 +3659,60 @@ class SessionManager:
         if "refresh endpoint returned" in lower:
             return RefreshErrorCode.refresh_token_other
         return RefreshErrorCode.unknown
+
+    # ------------------------------------------------------------------ budget gate
+
+    async def _enforce_budget(
+        self, session: Session
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Pre-run budget checkpoint (budget-model-routing.md §3.2).
+
+        Budgets cap Claude USD spend, so this is evaluated only for
+        `claude-code` sessions — a Codex turn contributes no cost and can't be
+        meaningfully gated by a Claude budget (§3.1, "只治 Claude"). Raises
+        BudgetExceededError on a hard block; otherwise yields one WS event per
+        newly-crossed soft threshold (already persisted), deduped to once per
+        window via the DB compare-and-set."""
+        if session.backend != "claude-code" or self.db is None:
+            return
+        statuses = await budget_statuses(self.db, only_agent_id=session.agent_id)
+        hard, soft = classify_budget_statuses(statuses)
+        if hard is not None:
+            raise BudgetExceededError(hard)
+        for s in soft:
+            if not await self.db.mark_budget_soft_warned(s.budget_id, s.window_start):
+                continue  # another turn already warned for this window
+            text = self._budget_warning_text(s)
+            warn_msg = MessageContent(
+                role=MessageRole.system,
+                type="budget_warning",
+                content=text,
+            )
+            seq = await self._persist_message(session, warn_msg)
+            event: dict[str, Any] = {
+                "type": "budget_warning",
+                "session_id": session.id,
+                "scope": s.scope,
+                "agent_id": s.agent_id,
+                "window": s.window,
+                "limit_usd": s.limit_usd,
+                "spent_usd": s.spent_usd,
+                "soft_pct": s.soft_pct,
+                "message": text,
+            }
+            if seq is not None:
+                event["seq"] = seq
+            yield event
+
+    @staticmethod
+    def _budget_warning_text(s: BudgetStatus) -> str:
+        scope = "Global" if s.scope == "global" else f"Agent {s.agent_id}"
+        pct = int(round(s.soft_pct * 100))
+        return (
+            f"{scope} {s.window} budget is at {pct}%+ of its ${s.limit_usd:.2f} "
+            f"limit (${s.spent_usd:.4f} spent). Turns keep running until the "
+            f"limit is reached."
+        )
 
     # ------------------------------------------------------------------ event translation
 
