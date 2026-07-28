@@ -521,3 +521,25 @@ async def test_create_session_backend_override_inherited_model_422(client):
         headers=HEADERS,
     )
     assert resp2.status_code == 422, resp2.text
+
+
+@pytest.mark.asyncio
+async def test_patch_agent_null_backend_still_validates_model(client):
+    """An explicit null backend in a PATCH keeps the existing backend (the DB
+    ignores a null on the non-null column), so a cross-family model in the same
+    PATCH must still be rejected against that kept backend (Snape review)."""
+    agent = await _create_agent(client, name="Keeper", backend="claude-code")
+    resp = await client.patch(
+        f"/api/agents/{agent['id']}",
+        json={"backend": None, "model": "gpt-5"},
+        headers=HEADERS,
+    )
+    assert resp.status_code == 422, resp.text
+    # Sanity: a valid model in the same null-backend shape still succeeds.
+    ok = await client.patch(
+        f"/api/agents/{agent['id']}",
+        json={"backend": None, "model": "claude-opus-4"},
+        headers=HEADERS,
+    )
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["model"] == "claude-opus-4"

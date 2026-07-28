@@ -100,7 +100,14 @@ class AgentManager:
         # Validate the RESULTING (backend, model) pair — a PATCH that changes
         # only the backend must still be checked against the existing model,
         # and vice-versa (budget-model-routing.md §4.3).
-        eff_backend = fields.get("backend") if "backend" in fields else agent.get("backend")
+        #
+        # backend uses `or`, not "in fields": it's a non-null column, so the DB
+        # ignores a null backend update (keeps the existing one). An explicit
+        # `{"backend": null, "model": "gpt-5"}` would otherwise validate against
+        # None (→ passes) while the model still persists onto the kept backend.
+        # model uses "in fields" because it IS nullable — an explicit null
+        # clears it, and we validate the new (possibly-cleared) value.
+        eff_backend = fields.get("backend") or agent.get("backend")
         eff_model = fields.get("model") if "model" in fields else agent.get("model")
         validate_model_for_backend(eff_backend, eff_model)
         await self.db.update_agent(agent_id, **fields)
