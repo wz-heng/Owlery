@@ -52,6 +52,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     agent_id TEXT REFERENCES agents(id) ON DELETE CASCADE,  -- owner; nullable in SQLite, required by API
     origin TEXT NOT NULL DEFAULT 'user',   -- 'user' | 'schedule' | 'bridge' | 'delegation'
     backend TEXT NOT NULL DEFAULT 'claude-code',  -- 'claude-code' | 'codex' (codex-backend.md §4.1)
+    -- Session-level model override (budget-model-routing.md §4.1). NULL means
+    -- "inherit the owning agent's model, else the backend default"; a value
+    -- wins over the agent's model in resolve_model().
+    model TEXT,
     -- Agent-to-agent: a delegation child session points at the parent
     -- session it was spawned from. SET NULL on parent delete (orphan beats
     -- mass-delete; sessions are precious). NULL on every non-delegation
@@ -475,6 +479,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     workspace_mode TEXT
         CHECK (workspace_mode IS NULL OR workspace_mode IN ('shared', 'copy', 'git_worktree')),
     working_dir_override TEXT,
+    -- Per-task model override passed to the worker session at dispatch
+    -- (budget-model-routing.md §4.2). NULL = inherit the assignee agent's
+    -- model / backend default.
+    model TEXT,
     current_run_id TEXT,
     blocked_kind TEXT CHECK (
         blocked_kind IS NULL OR blocked_kind IN
@@ -778,6 +786,27 @@ class Database:
                 await self._conn.execute(ddl)
             except Exception:
                 pass
+
+        # sessions.model — per-session model override (budget-model-routing.md
+        # §4.1). Nullable, no DEFAULT: existing rows stay NULL and keep
+        # inheriting the agent/backend default via resolve_model().
+        try:
+            await self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN model TEXT"
+            )
+        except Exception:
+            pass
+
+        # tasks.model — per-task model override for the worker session
+        # (budget-model-routing.md §4.2). Nullable; the task board schema is a
+        # CREATE-IF-NOT-EXISTS in _SCHEMA (so new DBs already have it), this
+        # ALTER backfills pre-existing rows.
+        try:
+            await self._conn.execute(
+                "ALTER TABLE tasks ADD COLUMN model TEXT"
+            )
+        except Exception:
+            pass
 
         await self._migrate_agents()
         await self._migrate_schedule_recurrence()
@@ -1232,14 +1261,15 @@ class Database:
         backend: str = "claude-code",
         parent_session_id: str | None = None,
         delegation_request: str | None = None,
+        model: str | None = None,
     ) -> None:
         await self._ensure_connected()
         await self._conn.execute(
             "INSERT INTO sessions "
             "(id, name, working_dir, created_at, claude_session_id, "
             " credential_id, agent_id, origin, backend, "
-            " parent_session_id, delegation_request) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " parent_session_id, delegation_request, model) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 session_id,
                 name,
@@ -1252,6 +1282,7 @@ class Database:
                 backend,
                 parent_session_id,
                 delegation_request,
+                model,
             ),
         )
         await self._conn.commit()
@@ -1275,6 +1306,7 @@ class Database:
         resume_id: str | None,
         fork_after_seq: int,
         fork_metadata: str | None = None,
+        model: str | None = None,
     ) -> None:
         """The DB-only half of the fork saga (session-rewind.md §5.1 step
         5): INSERT the fork `sessions` row (origin='fork',
@@ -1292,15 +1324,15 @@ class Database:
             await self._conn.execute(
                 "INSERT INTO sessions "
                 "(id, name, working_dir, created_at, claude_session_id, "
-                " credential_id, agent_id, origin, backend, "
+                " credential_id, agent_id, origin, backend, model, "
                 " forked_from_session_id, fork_after_seq, fork_needs_replay, "
                 " fork_status, fork_metadata) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'fork', ?, ?, ?, 0, "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'fork', ?, ?, ?, ?, 0, "
                 " 'initializing', ?)",
                 (
                     fork_id, name, working_dir, created_at, resume_id,
-                    credential_id, agent_id, backend, parent_id, fork_after_seq,
-                    fork_metadata,
+                    credential_id, agent_id, backend, model, parent_id,
+                    fork_after_seq, fork_metadata,
                 ),
             )
             await self._conn.execute(
@@ -1325,7 +1357,7 @@ class Database:
         await self._ensure_connected()
         query = (
             "SELECT id, name, working_dir, created_at, claude_session_id, "
-            "credential_id, archived, agent_id, origin, backend, "
+            "credential_id, archived, agent_id, origin, backend, model, "
             "parent_session_id, delegation_request, forked_from_session_id, "
             "fork_after_seq, fork_needs_replay, fork_metadata, "
             "fork_revert_record, fork_status FROM sessions"
@@ -1346,14 +1378,15 @@ class Database:
                 "agent_id": row[7],
                 "origin": row[8] or "user",
                 "backend": row[9] or "claude-code",
-                "parent_session_id": row[10],
-                "delegation_request": row[11],
-                "forked_from_session_id": row[12],
-                "fork_after_seq": row[13],
-                "fork_needs_replay": bool(row[14]),
-                "fork_metadata": row[15],
-                "fork_revert_record": row[16],
-                "fork_status": row[17],
+                "model": row[10],
+                "parent_session_id": row[11],
+                "delegation_request": row[12],
+                "forked_from_session_id": row[13],
+                "fork_after_seq": row[14],
+                "fork_needs_replay": bool(row[15]),
+                "fork_metadata": row[16],
+                "fork_revert_record": row[17],
+                "fork_status": row[18],
             }
             for row in rows
         ]

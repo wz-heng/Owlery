@@ -35,6 +35,7 @@ from . import fork_helpers
 from .config import settings
 from .crypto import decrypt, encrypt
 from .database import Database
+from .model_routing import resolve_model
 from .oauth_errors import RefreshErrorCode
 from .oauth_providers import OAuthTokenSet, get_provider
 from .models import (
@@ -222,6 +223,10 @@ class Session:
     origin: str = "user"
     # Which AI backend drives this session ('claude-code' | 'codex').
     backend: str = "claude-code"
+    # Per-session model override (budget-model-routing.md §4.1). None means
+    # "inherit the agent's model, else the backend default". resolve_model()
+    # gives this priority over agent.model.
+    model: str | None = None
     # Agent-to-agent: parent session that spawned this delegation, or None
     # for every non-delegation session. Used by the delegation listener to
     # route replies/questions/errors back to the parent and by guards to
@@ -337,6 +342,7 @@ class SessionManager:
                 agent_id=row.get("agent_id"),
                 origin=row.get("origin") or "user",
                 backend=row.get("backend") or "claude-code",
+                model=row.get("model"),
                 parent_session_id=row.get("parent_session_id"),
                 delegation_request=row.get("delegation_request"),
                 **_session_fork_kwargs(row),
@@ -619,6 +625,7 @@ class SessionManager:
                 credential_id=parent.credential_id,
                 resume_id=resume_id_hint,
                 fork_after_seq=fork_after_seq,
+                model=parent.model,
             )
             fork = Session(
                 id=fork_id,
@@ -630,6 +637,7 @@ class SessionManager:
                 agent_id=parent.agent_id,
                 origin="fork",
                 backend=parent.backend,
+                model=parent.model,
                 forked_from_session_id=parent_id,
                 fork_after_seq=fork_after_seq,
                 fork_status="initializing",
@@ -896,7 +904,7 @@ class SessionManager:
                     created_at=now, parent_id=parent_id, backend=parent.backend,
                     agent_id=parent.agent_id, credential_id=parent.credential_id,
                     resume_id=resume_id_hint, fork_after_seq=last_seq,
-                    fork_metadata=fork_meta,
+                    fork_metadata=fork_meta, model=parent.model,
                 )
             except Exception:
                 shutil.rmtree(dest, ignore_errors=True)
@@ -905,6 +913,7 @@ class SessionManager:
                 id=fork_id, name=fork_name, working_dir=dest, created_at=now,
                 claude_session_id=resume_id_hint, credential_id=parent.credential_id,
                 agent_id=parent.agent_id, origin="fork", backend=parent.backend,
+                model=parent.model,
                 forked_from_session_id=parent_id, fork_after_seq=last_seq,
                 fork_metadata=fork_meta, fork_status="initializing",
             )
@@ -1072,6 +1081,7 @@ class SessionManager:
         delegation_request: str | None = None,
         task_id: str | None = None,
         task_run_id: str | None = None,
+        model: str | None = None,
     ) -> Session:
         """Create a conversation thread owned by `agent_id`.
 
@@ -1105,6 +1115,7 @@ class SessionManager:
             agent_id=agent_id,
             origin=origin,
             backend=backend,
+            model=model,
             parent_session_id=parent_session_id,
             delegation_request=delegation_request,
             task_id=task_id,
@@ -1124,6 +1135,7 @@ class SessionManager:
                 backend=session.backend,
                 parent_session_id=session.parent_session_id,
                 delegation_request=session.delegation_request,
+                model=session.model,
             )
         return session
 
@@ -1228,6 +1240,7 @@ class SessionManager:
             credential_id=old.credential_id,
             origin=old.origin,
             backend=old.backend,
+            model=old.model,
         )
 
         # Schedules/bridges are agent-owned, so ownership needs no repoint.
@@ -1381,6 +1394,7 @@ class SessionManager:
                     "agent_id": row.get("agent_id"),
                     "origin": row.get("origin") or "user",
                     "backend": row.get("backend") or "claude-code",
+                    "model": row.get("model"),
                     "parent_session_id": row.get("parent_session_id"),
                     "delegation_request": row.get("delegation_request"),
                     "archived": True,
@@ -1423,6 +1437,7 @@ class SessionManager:
             agent_id=match.get("agent_id"),
             origin=match.get("origin") or "user",
             backend=match.get("backend") or "claude-code",
+            model=match.get("model"),
             parent_session_id=match.get("parent_session_id"),
             delegation_request=match.get("delegation_request"),
             **fork_info_fields(
@@ -2562,7 +2577,7 @@ class SessionManager:
                         # result — error ones included — appends a turn_usage
                         # row. Recording must never fail the turn.
                         await self._record_turn_usage(
-                            session, agent.get("model") if agent else None, event
+                            session, resolve_model(session, agent), event
                         )
                         # First fork turn produced a result: drop the ephemeral
                         # fork state so turn 2+ behaves like a normal resumed
@@ -2844,13 +2859,14 @@ class SessionManager:
         to (`get_harness(session.backend).create_run(config)`) renders it the
         way its profile dictates — no backend-kind branching here."""
         system_prompt: str | None = None
-        model: str | None = None
+        # Session-level override wins, then agent.model, then backend default
+        # (budget-model-routing.md §4.1) — the single model-resolution seam.
+        model = resolve_model(session, agent)
         mcp_servers: list[str] | None = None
         tool_allow: list[str] | None = None
         tool_deny: list[str] | None = None
         if agent:
             system_prompt = agent.get("system_prompt") or None
-            model = agent.get("model") or None
             servers = agent.get("mcp_servers")
             mcp_servers = list(servers) if servers is not None else None
             tool_allow = _split_tool_list(agent.get("tool_allow"))

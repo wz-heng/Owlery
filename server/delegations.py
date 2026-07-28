@@ -44,6 +44,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from .harness import join_text_blocks
+from .model_routing import ModelBackendError, validate_model_for_backend
 
 if TYPE_CHECKING:
     from .database import Database
@@ -354,6 +355,7 @@ class DelegationManager:
         agent_name: str,
         request: str,
         files: list[str] | None = None,
+        model: str | None = None,
     ) -> DelegationRunState:
         """Create a child session under the named target agent and kick
         off its first turn. Returns immediately with the record — the
@@ -397,6 +399,12 @@ class DelegationManager:
         parent_name = (parent_agent or {}).get("name") or "another agent"
 
         child_backend = (target.get("backend") or "claude-code")
+        # Cross-family guard: reject a model the child's backend can't run
+        # (budget-model-routing.md §4.3) BEFORE spawning the child session.
+        try:
+            validate_model_for_backend(child_backend, model)
+        except ModelBackendError as exc:
+            raise DelegationError(str(exc), status_code=422) from exc
         child_name = f"{target['name']} ← {parent_name}"
         child = await self.session_mgr.create_session(
             agent_id=target["id"],
@@ -406,6 +414,7 @@ class DelegationManager:
             backend=child_backend,
             parent_session_id=parent.id,
             delegation_request=request,
+            model=model,
         )
 
         run_id = uuid.uuid4().hex[:12]

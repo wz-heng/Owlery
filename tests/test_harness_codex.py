@@ -169,8 +169,17 @@ def test_oneshot_extracts_agent_message():
 # result usage normalization (usage-tracking.md §2)
 
 
+def _prime_output(p: CodexEventParser) -> None:
+    """A real turn always emits an agent_message before turn.completed; the
+    empty-turn backstop (budget-model-routing.md §4.3) keys off that. Prime it
+    so a usage-focused test exercises the healthy-result path, not the
+    synthesized-error path."""
+    p.parse({"type": "item.completed", "item": {"type": "agent_message", "text": "ok"}})
+
+
 def test_turn_completed_normalizes_usage():
     p = CodexEventParser()
+    _prime_output(p)
     # The probed real shape: input_tokens INCLUDES cached_input_tokens.
     ev = p.parse({
         "type": "turn.completed",
@@ -194,6 +203,7 @@ def test_turn_completed_normalizes_usage():
 
 def test_turn_completed_usage_clamps_and_defaults():
     p = CodexEventParser()
+    _prime_output(p)
     # cached > input (shouldn't happen, but never go negative) + empty usage.
     ev = p.parse({
         "type": "turn.completed",
@@ -204,3 +214,42 @@ def test_turn_completed_usage_clamps_and_defaults():
 
     ev = p.parse({"type": "turn.completed", "usage": {}}).events[0]
     assert ev.usage is not None and ev.usage.total_tokens == 0
+
+
+def test_turn_completed_without_output_synthesizes_error():
+    """A turn that ends with no assistant output and no error event is the
+    silent-empty-turn bug (e.g. a Codex session pinned to a Claude model) —
+    the parser surfaces an explicit error rather than a healthy empty result
+    (budget-model-routing.md §4.3)."""
+    p = CodexEventParser()
+    p.parse({"type": "thread.started", "thread_id": "th-x"})
+    p.parse({"type": "turn.started"})
+    out = p.parse({"type": "turn.completed", "usage": {}})
+    assert out.end_of_stream is True
+    ev = out.events[0]
+    assert ev.type == "result" and ev.is_error
+    assert "no output" in (ev.content or "").lower()
+    assert ev.session_id == "th-x"
+
+
+def test_turn_completed_after_error_is_not_double_flagged():
+    """If an error event already fired this turn, turn.completed must NOT also
+    synthesize a second empty-turn error."""
+    p = CodexEventParser()
+    p.parse({"type": "error", "message": "boom"})
+    ev = p.parse({"type": "turn.completed", "usage": {}}).events[0]
+    # Falls through to the normal (non-error) usage result.
+    assert ev.type == "result" and ev.is_error is False
+
+
+def test_turn_completed_with_only_tool_output_is_healthy():
+    """A turn whose only item was a tool call (no final agent_message) still
+    counts as real output — not the empty-turn bug."""
+    p = CodexEventParser()
+    p.parse({"type": "thread.started", "thread_id": "th-y"})
+    p.parse({
+        "type": "item.started",
+        "item": {"type": "command_execution", "id": "c1", "command": "ls"},
+    })
+    ev = p.parse({"type": "turn.completed", "usage": {}}).events[0]
+    assert ev.type == "result" and ev.is_error is False

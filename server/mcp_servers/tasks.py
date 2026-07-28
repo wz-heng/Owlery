@@ -183,12 +183,17 @@ def create_task(
     priority: int = 0,
     idempotency_key: str | None = None,
     scheduled_at: str | None = None,
+    model: str | None = None,
 ) -> str:
     """Create a durable task.
 
     Worker-created tasks inherit the current board and workspace policy; a
     worker-supplied ``board_id`` is ignored by the server. Normal sessions must
     name a board.
+
+    Pass ``model`` to route the task's worker session onto a specific model
+    (e.g. a cheaper model for a mechanical sub-task). It must be compatible
+    with the assignee agent's backend, or the create is rejected.
     """
     if not (title or "").strip():
         return "Error: `title` must be non-empty."
@@ -205,6 +210,8 @@ def create_task(
         "idempotency_key": idempotency_key,
         "scheduled_at": scheduled_at,
     }
+    if (model or "").strip():
+        body_data["model"] = model.strip()
     if worker is None:
         path = f"/api/task-boards/{board_id}/tasks"
     else:
@@ -304,13 +311,22 @@ def triage_task(task_id: str) -> str:
 
 
 @mcp.tool(name="specify")
-def specify_task(task_id: str, body: str | None = None) -> str:
-    """Mark a triaged task specified and recompute its eligibility."""
+def specify_task(
+    task_id: str, body: str | None = None, model: str | None = None
+) -> str:
+    """Mark a triaged task specified and recompute its eligibility.
+
+    Pass ``model`` to also set the task's worker-session model override (must
+    be compatible with the assignee agent's backend); omit it to leave the
+    task's model untouched."""
     error = _orchestrator_only("specify")
     if error:
         return error
+    payload: dict[str, Any] = {"body": body}
+    if model is not None:
+        payload["model"] = model
     code, data = _call(
-        "POST", f"/api/tasks/{task_id}/specify", body={"body": body}
+        "POST", f"/api/tasks/{task_id}/specify", body=payload
     )
     return _render(code, data, action="specify task")
 

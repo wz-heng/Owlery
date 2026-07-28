@@ -126,6 +126,10 @@ class TaskRecord(Record):
     scheduled_at: str | None
     workspace_mode: str | None
     working_dir_override: str | None
+    # Per-task model override passed to the worker session at dispatch
+    # (budget-model-routing.md §4.2). NULL = inherit the assignee agent's
+    # model / backend default.
+    model: str | None
     current_run_id: str | None
     blocked_kind: str | None
     blocked_reason: str | None

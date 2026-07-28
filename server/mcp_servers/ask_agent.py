@@ -109,6 +109,7 @@ def ask_agent(
     name: str | None = None,
     delegation_id: str | None = None,
     files: list[str] | None = None,
+    model: str | None = None,
 ) -> str:
     """Delegate work to another agent and wait — across turns — for
     their reply. Returns a delegation id immediately; the other
@@ -159,6 +160,12 @@ def ask_agent(
         files: Optional list of paths the other agent should read.
             Mode 1 only; ignored for continuations (the prior turn's
             file references are already in the transcript).
+        model: Optional model override for the child session (mode 1
+            only) — pick a cheaper model for a mechanical sub-task or a
+            flagship one for a hard one. Must be compatible with the
+            other agent's backend (a Claude model on a Codex agent, or
+            vice-versa, is rejected). Omit to inherit the agent's
+            configured model.
 
     Returns:
         A short string with the delegation id. Cite that id back to
@@ -236,6 +243,9 @@ def ask_agent(
     }
     if files:
         body["files"] = files
+    model = (model or "").strip() or None
+    if model:
+        body["model"] = model
     try:
         r = httpx.post(
             url, json=body, headers=hdrs, timeout=10.0, trust_env=False

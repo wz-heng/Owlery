@@ -29,6 +29,10 @@ class CreateSessionRequest(BaseModel):
     # Which AI backend drives this session (codex-backend.md §4.1). None =
     # inherit the owning agent's default backend (resolved in the route).
     backend: BackendKind | None = None
+    # Optional per-session model override (budget-model-routing.md §4.1). None
+    # = inherit the agent's model / backend default. Validated against the
+    # resolved backend (cross-family mismatches → 422).
+    model: str | None = None
 
 
 class ForkSessionRequest(BaseModel):
@@ -87,6 +91,9 @@ class SessionInfo(BaseModel):
     origin: str = "user"
     # Which AI backend drives this session.
     backend: BackendKind = BackendKind.claude_code
+    # Per-session model override (budget-model-routing.md §4.1); None = inherit
+    # the agent's model / backend default.
+    model: str | None = None
     # Agent-to-agent: set on delegation sessions to point at the parent
     # session that spawned them; NULL elsewhere. The verbatim original
     # delegation prompt is kept alongside for UI display.

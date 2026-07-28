@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from ..auth import verify_token
 from ..harness import BackendForkNotSupported
 from ..models import CreateSessionRequest, DuplicateSessionRequest, ForkSessionRequest, ImportSessionRequest, MessageContent, PendingParkInfo, PendingQuestionInfo, SessionDetail, SessionInfo, SessionStatus
+from ..model_routing import ModelBackendError, validate_model_for_backend
 from ..session_manager import ForkError, fork_info_fields, session_manager
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
@@ -38,6 +39,7 @@ def _to_session_info(
         agent_id=s.agent_id,
         origin=s.origin,
         backend=s.backend,
+        model=s.model,
         parent_session_id=s.parent_session_id,
         delegation_request=s.delegation_request,
         archived=archived,
@@ -94,12 +96,17 @@ async def create_session(
     )
     await _check_credential_backend(req.credential_id, backend)
     try:
+        validate_model_for_backend(backend, req.model)
+    except ModelBackendError as e:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
+    try:
         s = await session_manager.create_session(
             agent_id,
             req.name,
             req.working_dir,
             credential_id=req.credential_id,
             backend=backend,
+            model=req.model,
         )
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
@@ -137,6 +144,7 @@ async def import_session(
         agent_id=s.agent_id,
         origin=s.origin,
         backend=s.backend,
+        model=s.model,
         parent_session_id=s.parent_session_id,
         delegation_request=s.delegation_request,
         **_fork_fields(s),
@@ -184,6 +192,7 @@ async def get_session(session_id: str, _: str = Depends(verify_token)):
             agent_id=s.agent_id,
             origin=s.origin,
             backend=s.backend,
+            model=s.model,
             parent_session_id=s.parent_session_id,
             delegation_request=s.delegation_request,
             **_fork_fields(s),

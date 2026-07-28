@@ -12,6 +12,7 @@ from typing import Any, Mapping
 
 from ..config import settings
 from ..connector_manager import ConnectorManager
+from ..model_routing import ModelBackendError, validate_model_for_backend
 from .delivery import DeliveryCoordinator, delivery_coordinator
 from .models import DeliveryRecord, RunRecord, TaskBoardError, TaskConflictError, TaskRecord
 from .prompts import render_assignment_prompt
@@ -250,14 +251,25 @@ class TaskBoardManager:
             agent = await self.db.get_agent(task.assignee_agent_id) if task.assignee_agent_id else None
             if agent is None:
                 raise WorkspaceError("Assigned Agent is unavailable")
+            worker_backend = agent.get("backend") or "claude-code"
+            # Belt-and-braces re-check: the task's model was validated against
+            # its assignee at create/specify time, but a later reassignment can
+            # pair it with an incompatible backend. Fail the run with a clear
+            # message rather than spawning a doomed worker session
+            # (budget-model-routing.md §4.3).
+            try:
+                validate_model_for_backend(worker_backend, task.model)
+            except ModelBackendError as exc:
+                raise WorkspaceError(str(exc)) from exc
             session = await self.session_mgr.create_session(
                 agent_id=agent["id"],
                 name=f"Task: {task.title}",
                 working_dir=prepared.path,
                 origin="task",
-                backend=agent.get("backend") or "claude-code",
+                backend=worker_backend,
                 task_id=task.id,
                 task_run_id=run.id,
+                model=task.model,
             )
             run = await self.repo.attach_run_session(task.id, run.id, session.id)
             prompt = render_assignment_prompt(
@@ -536,6 +548,7 @@ class TaskBoardManager:
             scheduled_at=create.pop("scheduled_at", None),
             idempotency_key=create.pop("idempotency_key", None),
             status=create.pop("status", "triage"),
+            model=create.pop("model", None),
             origin_session_id=task.origin_session_id,
             created_by_kind="agent",
             created_by_agent_id=run.agent_id,

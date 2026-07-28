@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from ..agent_manager import AgentError, AgentManager
 from ..auth import verify_token
+from ..model_routing import ModelBackendError
 from ..models import (
     AgentCreate,
     AgentRead,
@@ -50,6 +51,8 @@ async def list_agents(
 async def create_agent(req: AgentCreate, _: str = Depends(verify_token)):
     try:
         agent = await _get_manager().create_agent(**req.model_dump())
+    except ModelBackendError as e:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
     except AgentError as e:
         raise _agent_http_error(e)
     return AgentRead(**agent)
@@ -72,6 +75,8 @@ async def update_agent(
     fields = req.model_dump(exclude_unset=True)
     try:
         agent = await _get_manager().update_agent(agent_id, **fields)
+    except ModelBackendError as e:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
     except AgentError as e:
         raise _agent_http_error(e)
     return AgentRead(**agent)
@@ -121,6 +126,7 @@ async def create_agent_session(
 ):
     """Preferred path to start a session — the agent comes from the URL, so
     the body's `agent_id` (if any) is ignored."""
+    from ..model_routing import validate_model_for_backend
     from .sessions import _check_credential_backend, _to_session_info
 
     # Inherit the agent's default backend when the request doesn't pin one.
@@ -132,12 +138,17 @@ async def create_agent_session(
     )
     await _check_credential_backend(req.credential_id, backend)
     try:
+        validate_model_for_backend(backend, req.model)
+    except ModelBackendError as e:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
+    try:
         s = await session_manager.create_session(
             agent_id,
             req.name,
             req.working_dir,
             credential_id=req.credential_id,
             backend=backend,
+            model=req.model,
         )
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))

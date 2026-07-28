@@ -594,3 +594,82 @@ async def test_worker_pending_work_covers_terminal_to_outbox_windows(task_store)
         "delivery intentionally settled for test",
     )
     assert not await db.worker_has_persisted_pending_work(session_id)
+
+
+# --------------------------------------------------------------------------- #
+# Model routing (budget-model-routing.md §4.2)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_tasks_schema_has_model_column(task_store):
+    db, _repo, _root, _agent = task_store
+    cols = {row[1] for row in await db._column_info("tasks")}
+    assert "model" in cols
+
+
+@pytest.mark.asyncio
+async def test_create_task_persists_model(task_store):
+    _db, repo, root, agent_id = task_store
+    board = await _board(repo, root)
+    task = await _task(repo, board.id, agent_id, model="claude-opus-4")
+    assert task.model == "claude-opus-4"
+    # Round-trips through a fresh read.
+    assert (await repo.get_task(task.id)).model == "claude-opus-4"
+
+
+@pytest.mark.asyncio
+async def test_create_task_rejects_cross_family_model(task_store):
+    db, repo, root, _agent = task_store
+    from server.agent_manager import AgentManager
+    from server.model_routing import ModelBackendError  # noqa: F401
+    from server.task_board.models import TaskValidationError
+
+    codex_agent = await AgentManager(db).create_agent(name="Coder", backend="codex")
+    board = await _board(repo, root)
+    with pytest.raises(TaskValidationError):
+        await _task(repo, board.id, codex_agent["id"], model="claude-opus-4")
+
+
+@pytest.mark.asyncio
+async def test_create_task_unassigned_model_deferred(task_store):
+    _db, repo, root, _agent = task_store
+    board = await _board(repo, root)
+    # No assignee → nothing to validate the model against; it's stored and
+    # re-checked at dispatch. Even a "wrong-looking" model is allowed here.
+    task = await repo.create_task(
+        board_id=board.id, title="later", status="todo",
+        assignee_agent_id=None, model="claude-opus-4",
+    )
+    assert task.model == "claude-opus-4"
+
+
+@pytest.mark.asyncio
+async def test_specify_sets_and_validates_model(task_store):
+    db, repo, root, agent_id = task_store
+    from server.agent_manager import AgentManager
+    from server.task_board.models import TaskValidationError
+
+    board = await _board(repo, root)
+    # A triage task assigned to the (claude-code) default agent.
+    triage = await _task(repo, board.id, agent_id, status="triage")
+    updated = await repo.specify_task(triage.id, model="claude-opus-4", set_model=True)
+    # Leaves triage; an eligible task is promoted straight through todo→ready.
+    assert updated.status in ("todo", "ready")
+    assert updated.model == "claude-opus-4"
+
+    # Specify that sets a cross-family model on a codex-assigned task is rejected.
+    codex_agent = await AgentManager(db).create_agent(name="Coder2", backend="codex")
+    triage2 = await _task(repo, board.id, codex_agent["id"], status="triage")
+    with pytest.raises(TaskValidationError):
+        await repo.specify_task(triage2.id, model="claude-opus-4", set_model=True)
+
+
+@pytest.mark.asyncio
+async def test_specify_without_set_model_leaves_model_untouched(task_store):
+    _db, repo, root, agent_id = task_store
+    board = await _board(repo, root)
+    triage = await _task(repo, board.id, agent_id, status="triage", model="claude-opus-4")
+    updated = await repo.specify_task(triage.id, body="new body")
+    assert updated.model == "claude-opus-4"
+    assert updated.body == "new body"
