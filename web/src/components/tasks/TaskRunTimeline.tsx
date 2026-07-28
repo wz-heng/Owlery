@@ -8,7 +8,7 @@ import {
   IconFolder,
   IconPlayerPlay,
 } from "@tabler/icons-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import type { TaskRun } from "../../api/tasks";
 import type { Agent } from "../../stores/sessionStore";
@@ -24,15 +24,41 @@ interface TaskRunTimelineProps {
 }
 export function TaskRunTimeline({ runs, agents, onOpenSession }: TaskRunTimelineProps) {
   const agentMap = new Map(agents.map((agent) => [agent.id, agent]));
-  const [copiedRunId, setCopiedRunId] = useState<string | null>(null);
+  // Track the acknowledgement per run id so each run's copy button flips
+  // independently; a shared slot would let one run's copy (or its expiry
+  // timer) clobber another run's "Copied" state.
+  const [copiedRunIds, setCopiedRunIds] = useState<Set<string>>(new Set());
+  const copyTimersRef = useRef<Map<string, number>>(new Map());
+  useEffect(() => {
+    const timers = copyTimersRef.current;
+    return () => {
+      timers.forEach((id) => window.clearTimeout(id));
+      timers.clear();
+    };
+  }, []);
   const copyWorkspacePath = async (runId: string, path: string) => {
     try {
       await navigator.clipboard.writeText(path);
-      setCopiedRunId(runId);
-      window.setTimeout(() => setCopiedRunId(null), 1400);
     } catch {
       // Clipboard unavailable (old browser / denied permission): ignore silently.
+      return;
     }
+    const timers = copyTimersRef.current;
+    const pending = timers.get(runId);
+    if (pending !== undefined) window.clearTimeout(pending);
+    setCopiedRunIds((prev) => new Set(prev).add(runId));
+    timers.set(
+      runId,
+      window.setTimeout(() => {
+        timers.delete(runId);
+        setCopiedRunIds((prev) => {
+          if (!prev.has(runId)) return prev;
+          const next = new Set(prev);
+          next.delete(runId);
+          return next;
+        });
+      }, 1400),
+    );
   };
   return (
     <section aria-labelledby="task-runs-title">
@@ -75,10 +101,12 @@ export function TaskRunTimeline({ runs, agents, onOpenSession }: TaskRunTimeline
                     type="button"
                     aria-label="Copy workspace path"
                     title="Copy workspace path"
-                    className="inline-flex h-6 items-center justify-center gap-1 rounded-md px-1.5 text-[10px] font-medium text-muted-foreground hover:bg-ink-100 hover:text-ink-800"
+                    // min-w reserves room for the "Copied" state so the ack
+                    // never reflows the row or nudges the Open session button.
+                    className="inline-flex h-6 min-w-[4.5rem] items-center justify-center gap-1 rounded-md px-1.5 text-[10px] font-medium text-muted-foreground hover:bg-ink-100 hover:text-ink-800"
                     onClick={() => copyWorkspacePath(run.id, run.workspace_path)}
                   >
-                    {copiedRunId === run.id ? (
+                    {copiedRunIds.has(run.id) ? (
                       <>
                         <IconCheck size={13} /> Copied
                       </>
