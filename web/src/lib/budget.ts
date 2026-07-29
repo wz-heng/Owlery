@@ -42,3 +42,19 @@ export function budgetGauge(
 export function fmtUsd(n: number): string {
   return `$${n.toFixed(4)}`;
 }
+
+/** The bare period noun for "spent this <noun>" copy. Mapped explicitly rather
+ * than by stripping "ly": that would turn "daily" into "dai". Unknown windows
+ * pass through unchanged. */
+export function windowNoun(window: string): string {
+  switch (window) {
+    case "daily":
+      return "day";
+    case "weekly":
+      return "week";
+    case "monthly":
+      return "month";
+    default:
+      return window;
+  }
+}

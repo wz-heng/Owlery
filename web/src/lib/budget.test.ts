@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { budgetGauge, fmtUsd } from "./budget";
+import { budgetGauge, fmtUsd, windowNoun } from "./budget";
 
 describe("budgetGauge", () => {
   it("classifies below the soft percentage as ok", () => {
@@ -37,5 +37,18 @@ describe("fmtUsd", () => {
   it("formats to four decimals with a dollar sign", () => {
     expect(fmtUsd(1.5)).toBe("$1.5000");
     expect(fmtUsd(0.0001)).toBe("$0.0001");
+  });
+});
+
+describe("windowNoun", () => {
+  it("maps each window to its bare period noun", () => {
+    // Regression: a naive replace(/ly$/,"") turned "daily" into "dai".
+    expect(windowNoun("daily")).toBe("day");
+    expect(windowNoun("weekly")).toBe("week");
+    expect(windowNoun("monthly")).toBe("month");
+  });
+
+  it("passes an unknown window through unchanged", () => {
+    expect(windowNoun("hourly")).toBe("hourly");
   });
 });

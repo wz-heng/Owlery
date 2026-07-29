@@ -9,7 +9,7 @@ import {
 } from "../api/budgets";
 import type { BudgetRead, BudgetScope, BudgetWindow } from "../api";
 import { useSessionStore } from "../stores/sessionStore";
-import { budgetGauge, fmtUsd } from "../lib/budget";
+import { budgetGauge, fmtUsd, windowNoun } from "../lib/budget";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 
@@ -288,7 +288,7 @@ function BudgetRow({
           </div>
           <p className="budget-spend text-[11px] text-muted-foreground">
             {fmtUsd(spent ?? 0)} of {fmtUsd(budget.limit_usd)} spent this{" "}
-            {budget.window.replace(/ly$/, "")}
+            {windowNoun(budget.window)}
             {gauge.level === "hard" && (
               <span className="text-destructive"> · limit reached</span>
             )}
