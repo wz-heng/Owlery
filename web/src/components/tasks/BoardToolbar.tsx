@@ -287,7 +287,7 @@ function BoardFormDialog({ mode, board, mutating, onClose, onSave, onArchive }: 
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center bg-ink-950/35 p-0 backdrop-blur-[1px] sm:items-center sm:p-4" role="dialog" aria-modal="true" aria-label={mode === "create" ? "Create board" : "Board settings"}>
       <form
-        className="w-full rounded-t-2xl border border-ink-300 bg-background p-5 shadow-[var(--elevation-overlay)] sm:max-w-lg sm:rounded-2xl"
+        className="flex max-h-[calc(100dvh-2rem)] w-full flex-col rounded-t-2xl border border-ink-300 bg-background p-5 shadow-[var(--elevation-overlay)] sm:max-w-lg sm:rounded-2xl"
         onSubmit={(event) => {
           event.preventDefault();
           void onSave({
@@ -306,11 +306,11 @@ function BoardFormDialog({ mode, board, mutating, onClose, onSave, onArchive }: 
           });
         }}
       >
-        <div className="mb-4 flex items-center justify-between">
+        <div className="mb-4 flex shrink-0 items-center justify-between">
           <h2 className="font-serif text-lg font-semibold">{mode === "create" ? "Create task board" : "Board settings"}</h2>
           <button type="button" className="rounded-md p-1 text-muted-foreground hover:bg-ink-200" onClick={onClose} aria-label="Close"><IconX size={18} /></button>
         </div>
-        <div className="space-y-3">
+        <div className="-mx-1 min-h-0 flex-1 space-y-3 overflow-y-auto px-1">
           <Field label="Name"><input required className="task-input" value={name} onChange={(event) => setName(event.target.value)} /></Field>
           <Field label="Description"><textarea className="task-input min-h-20 resize-y py-2" value={description} onChange={(event) => setDescription(event.target.value)} /></Field>
           <Field label="Working directory"><input required className="task-input font-mono text-xs" value={workingDir} onChange={(event) => setWorkingDir(event.target.value)} placeholder="/absolute/project/path" /></Field>
@@ -359,7 +359,7 @@ function BoardFormDialog({ mode, board, mutating, onClose, onSave, onArchive }: 
             </div>
           </fieldset>
         </div>
-        <div className="mt-5 flex items-center gap-2">
+        <div className="mt-5 flex shrink-0 items-center gap-2">
           {onArchive && <button type="button" className="inline-flex h-9 items-center gap-1.5 rounded-lg px-3 text-xs text-destructive hover:bg-destructive-surface" onClick={() => void onArchive()}><IconArchive size={15} /> {board?.archived ? "Unarchive" : "Archive"}</button>}
           <button type="button" className="ml-auto h-9 rounded-lg px-3 text-xs text-muted-foreground hover:bg-ink-200" onClick={onClose}>Cancel</button>
           <button type="submit" className="h-9 rounded-lg bg-primary-700 px-4 text-xs font-semibold text-white disabled:opacity-50" disabled={mutating || !limitsValid || !name.trim() || !workingDir.trim() || !deliveryRemote.trim() || !deliveryAuthorName.trim() || !deliveryAuthorEmail.trim()}>{mode === "create" ? "Create" : "Save"}</button>
