@@ -727,7 +727,10 @@ full main-area surface, not a modal.
 
 ### 10.1 Board view
 
-- board selector and create/archive/settings controls;
+- board selector and create/archive/settings controls; the create/settings
+  dialog edits name, description, working dir, default workspace, the
+  concurrency caps (`max_running` and `max_running_per_agent` — each a whole
+  number ≥ 1, or blank for unlimited), and the Git-delivery defaults;
 - six columns: Triage, Todo, Ready, Running, Blocked, Done;
 - cards show title, assignee seal, priority, child/dependency counts, heartbeat/
   blocked age, workspace mode, and latest run state;
