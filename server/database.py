@@ -661,7 +661,13 @@ CREATE TABLE IF NOT EXISTS deployments (
     slot TEXT NOT NULL,                  -- 'a' | 'b'
     sha TEXT NOT NULL,
     source_repo TEXT NOT NULL,
-    state TEXT NOT NULL,                 -- staged|switching|live|rolled_back|superseded|failed
+    -- Lifecycle: staging → staged → switching → live, with rolled_back /
+    -- superseded / failed as terminals. `staging` and `switching` are the
+    -- in-flight states the deployments_one_active lock (below) covers; `staged`
+    -- is the settled post-stage state and is deliberately NOT locked, so future
+    -- op code must insert `staging` (not `staged`) while a stage runs or it will
+    -- bypass the global lock.
+    state TEXT NOT NULL,                 -- staging|staged|switching|live|rolled_back|superseded|failed
     journal TEXT,                        -- JSON: final journal excerpt for this deploy
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -814,8 +820,15 @@ class Database:
         ):
             try:
                 await self._conn.execute(ddl)
-            except Exception:
-                pass
+            except aiosqlite.OperationalError as exc:
+                # The only benign outcome of these catch-up ADD COLUMNs is
+                # "duplicate column" — the column already exists on a newer DB.
+                # Anything else (a genuinely malformed/failed migration) must
+                # surface here, not be swallowed to crash later at a misleading
+                # site when a NOT NULL column reads back missing.
+                if "duplicate column" not in str(exc).lower():
+                    logger.error("board migration failed: %s (%s)", ddl, exc)
+                    raise
 
         await self._migrate_agents()
         await self._migrate_schedule_recurrence()

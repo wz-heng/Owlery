@@ -122,6 +122,42 @@ def test_slot_path_rejects_unknown_slot(tmp_path: Path):
         DeployLayout.at(tmp_path).slot_path("c")
 
 
+def test_current_slot_rejects_symlinked_slot(tmp_path: Path):
+    """A slot that is itself a symlink (possibly out of the tree) must read as
+    'no current' — trusting it would let `current -> a -> /outside` pass every
+    guard and deploy outside deploy_root (invariant §13.9), the opposite of
+    fail-closed."""
+    import os
+
+    layout = DeployLayout.at(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    os.symlink(outside, layout.slot_path("a"))  # slot a is a symlink out of tree
+    os.symlink("a", layout.current_link)
+    assert layout.current_slot() is None
+
+
+def test_switch_current_rejects_missing_or_symlinked_slot(tmp_path: Path):
+    """The one sanctioned flip point validates its target rather than trusting
+    the caller: a missing or symlinked slot is refused, and no dangling/foreign
+    `current` is left behind."""
+    import os
+
+    layout = DeployLayout.at(tmp_path)
+    with pytest.raises(DeployError):
+        layout.switch_current("a")  # slot a does not exist
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    os.symlink(outside, layout.slot_path("b"))  # slot b is a symlink out of tree
+    with pytest.raises(DeployError):
+        layout.switch_current("b")
+
+    assert not layout.current_link.is_symlink()
+    assert not (tmp_path / ".current.a.staged").exists()
+    assert not (tmp_path / ".current.b.staged").exists()
+
+
 # ------------------------------------------------------------------ deploy init
 
 
@@ -165,6 +201,37 @@ def test_deploy_init_is_idempotent_and_never_reclones(tmp_path: Path):
     venv_calls = [c for c in second_runner.calls if c[0][1:3] == ["-m", "venv"]]
     assert clone_calls == []
     assert venv_calls == []
+
+
+class FailingBuildRunner(FakeRunner):
+    """Clones fine but fails the venv build — an init that dies AFTER the slot-a
+    clone but BEFORE the `current` flip, leaving a half-built slot-a dir."""
+
+    def __call__(self, argv: list[str], cwd: Path) -> str:
+        if argv[1:3] == ["-m", "venv"]:
+            raise DeployError("simulated venv failure")
+        return super().__call__(argv, cwd)
+
+
+def test_deploy_init_recovers_from_partial_failure(tmp_path: Path):
+    src = _fake_source(tmp_path)
+    root = tmp_path / "deploy"
+    layout = DeployLayout.at(root)
+
+    # First run dies mid slot-a build: the clone left <root>/a on disk, but the
+    # flip never happened, so there is no valid `current`.
+    with pytest.raises(DeployError):
+        deploy_init(root, src, runner=FailingBuildRunner())
+    assert layout.slot_path("a").exists()  # debris from the failed run
+    assert layout.current_slot() is None  # never flipped → not initialized
+
+    # A re-run must SUCCEED, not choke on the pre-existing slot-a dir (a real
+    # `git clone` refuses a non-empty target). The debris is cleared and rebuilt.
+    result = deploy_init(root, src, runner=FakeRunner())
+    assert result.already_initialized is False
+    assert result.live_slot == "a"
+    assert layout.current_slot() == "a"
+    assert (layout.slot_path("a") / ".venv" / "bin" / "owlery").exists()
 
 
 def test_deploy_init_report_names_the_start_command(tmp_path: Path):

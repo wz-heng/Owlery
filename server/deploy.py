@@ -14,6 +14,7 @@ atomic rename, never edited in place. Everything else is plumbing around it.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -94,9 +95,22 @@ class DeployLayout:
             raise ValueError(f"unknown slot {slot!r}; expected one of {SLOTS}")
         return self.root / slot
 
+    @staticmethod
+    def _is_real_slot(slot_dir: Path) -> bool:
+        """A usable slot is a real directory entry directly under the deploy
+        root — never a symlink and never a missing/dangling path.
+
+        Rejecting symlinks is fail-closed and load-bearing: a slot symlinked to
+        an out-of-root target would let `current -> a -> /outside` pass every
+        guard, deploying and (later) mutating a path outside `deploy_root` —
+        exactly what invariant §13.9 forbids. `is_dir()`/`resolve()` both follow
+        symlinks, so the `is_symlink()` check is what actually pins the slot
+        inside the tree."""
+        return slot_dir.is_dir() and not slot_dir.is_symlink()
+
     def current_slot(self) -> str | None:
         """The slot `current` points at ('a'/'b'), or None if the link is
-        missing, not a symlink, or resolves outside the two known slots.
+        missing, not a symlink, or resolves outside the two known real slots.
 
         Resolution is by realpath so a link written as the relative target
         `a` and a slot reached through a symlinked root still compare equal."""
@@ -109,10 +123,11 @@ class DeployLayout:
             return None
         for slot in SLOTS:
             slot_dir = self.slot_path(slot)
-            # Require the slot to actually exist: a dangling `current` (target
-            # slot missing) is a broken/incomplete layout and must read as "no
-            # current" so the fail-closed guard refuses rather than trusts it.
-            if target == slot_dir.resolve() and slot_dir.is_dir():
+            # Require a real slot dir: a dangling `current` (target missing) or a
+            # slot that is itself a symlink is a broken/foreign layout and must
+            # read as "no current" so the fail-closed guard refuses rather than
+            # trusts it.
+            if self._is_real_slot(slot_dir) and target == slot_dir.resolve():
                 return slot
         return None
 
@@ -131,6 +146,16 @@ class DeployLayout:
         """
         if slot not in SLOTS:
             raise ValueError(f"unknown slot {slot!r}; expected one of {SLOTS}")
+        # Never point `current` at a missing or symlinked slot: this is the one
+        # sanctioned flip point, so it validates the target rather than trusting
+        # the caller to have built the slot — a bad flip would leave a permanent
+        # dangling/foreign `current` that every later guard would then key off.
+        slot_dir = self.slot_path(slot)
+        if not self._is_real_slot(slot_dir):
+            raise DeployError(
+                f"cannot flip current to slot {slot!r}: {slot_dir} is not a "
+                "real slot directory (missing, or a symlink out of the tree)"
+            )
         staged = self.root / f".{CURRENT_LINK}.{slot}.staged"
         if staged.is_symlink() or staged.exists():
             staged.unlink()
@@ -176,6 +201,16 @@ def _build_slot(slot_dir: Path, runner: CommandRunner) -> None:
     runner(["bun", "run", "build"], slot_dir / "web")
 
 
+def _remove_slot(slot_dir: Path) -> None:
+    """Remove leftover slot debris (dir, file, or symlink). Only ever called on
+    a slot with no valid `current` pointing at it, so it never deletes a live
+    installation — see `deploy_init`."""
+    if slot_dir.is_symlink() or slot_dir.is_file():
+        slot_dir.unlink()
+    elif slot_dir.is_dir():
+        shutil.rmtree(slot_dir)
+
+
 def deploy_init(
     root: str | os.PathLike[str],
     from_checkout: str | os.PathLike[str],
@@ -209,11 +244,18 @@ def deploy_init(
 
     commit = _git_head(src, runner)
     live, idle = "a", "b"
+    # We only reach here with no valid `current` (the already-initialized branch
+    # returned above), so nothing is live: any slot dir present is debris from a
+    # prior init that died before the flip (e.g. a venv/build failure between the
+    # clone and `switch_current`). Clear both so this re-run is truly idempotent
+    # — a real `git clone` refuses a non-empty target. A live slot is never
+    # reached here, so this can never delete a running instance's code (§3.1).
+    for slot in (live, idle):
+        _remove_slot(layout.slot_path(slot))
     _clone_slot(src, layout.slot_path(live), commit, runner)
     _build_slot(layout.slot_path(live), runner)
     # Idle slot is cloned but not built — the first deploy_stage builds it (§3.1).
-    if not layout.slot_path(idle).exists():
-        _clone_slot(src, layout.slot_path(idle), commit, runner)
+    _clone_slot(src, layout.slot_path(idle), commit, runner)
     layout.switch_current(live)
     return _result(layout, live, commit, already=False)
 
