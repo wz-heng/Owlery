@@ -97,6 +97,7 @@ class BoardRecord(Record):
     git_delivery_author_email: str
     git_delivery_default_draft_pr: bool
     git_delivery_default_merge: str
+    allow_local_deploy: bool
     created_at: str
     updated_at: str
 
@@ -108,6 +109,7 @@ class BoardRecord(Record):
         values["git_delivery_default_draft_pr"] = bool(
             values["git_delivery_default_draft_pr"]
         )
+        values["allow_local_deploy"] = bool(values["allow_local_deploy"])
         return cls(**values)
 
 

@@ -192,6 +192,26 @@ class Settings(BaseSettings):
     github_oauth_client_id: str | None = None
     github_oauth_client_secret: str | None = None
 
+    # Local deploy-and-restart (docs/plans/local-deploy.md §9). Deployment is an
+    # INSTANCE property, not a board property — these live here, and the board
+    # only carries a single opt-in flag (`allow_local_deploy`). `deploy_root`
+    # unset is the whole feature's off switch: every deploy verb fails closed
+    # with `blocked(deploy_not_initialized)` and names the fix. It is NOT
+    # derived from `home_dir`: the dual-slot tree is created explicitly by
+    # `owlery deploy init` and is a deliberate, separately-configured location.
+    deploy_root: str = ""
+    # Per-staging-subprocess wall-clock cap (`bun install`/`pip` earn minutes,
+    # unlike the 60s git ops of task_delivery_op_timeout_seconds).
+    deploy_stage_timeout_seconds: int = 600
+    # Switcher wait for the old server to exit and free its port.
+    deploy_switch_timeout_seconds: int = 30
+    # Switcher wait for the new server's /health to answer with the new sha.
+    deploy_health_timeout_seconds: int = 60
+    # `drain=true` cap: how long a switch waits for running work to quiesce.
+    deploy_quiesce_timeout_seconds: int = 120
+    # Pre-switch SQLite snapshots retained under <deploy_root>/snapshots.
+    deploy_keep_snapshots: int = 5
+
     model_config = {"env_prefix": _ENV_PREFIX, "env_file": ".env", "extra": "ignore"}
 
     @classmethod
@@ -286,6 +306,14 @@ class Settings(BaseSettings):
     def resolved_task_artifacts_dir(self) -> str:
         """Root containing durable Task Board artifacts."""
         return os.path.expanduser(self.task_artifacts_dir)
+
+    @property
+    def resolved_deploy_root(self) -> str:
+        """`deploy_root` with `~` expanded, or "" when the feature is disabled.
+
+        Empty string is load-bearing: it is the single signal every deploy
+        fail-closed guard keys off (docs/plans/local-deploy.md §3.1/§9)."""
+        return os.path.expanduser(self.deploy_root) if self.deploy_root else ""
 
 
 settings = Settings()

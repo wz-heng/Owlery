@@ -339,6 +339,7 @@ class TaskRepository:
         git_delivery_author_email: str = "owlery-tasks@localhost",
         git_delivery_default_draft_pr: bool = True,
         git_delivery_default_merge: str = "none",
+        allow_local_deploy: bool = False,
         board_id: str | None = None,
     ) -> BoardRecord:
         clean_name = name.strip()
@@ -377,7 +378,8 @@ class TaskRepository:
                     "dispatch_enabled,git_delivery_remote,git_delivery_retention,"
                     "git_delivery_author_name,git_delivery_author_email,"
                     "git_delivery_default_draft_pr,git_delivery_default_merge,"
-                    "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "allow_local_deploy,"
+                    "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         ident,
                         clean_name,
@@ -396,6 +398,7 @@ class TaskRepository:
                         git_delivery_author_email,
                         int(bool(git_delivery_default_draft_pr)),
                         git_delivery_default_merge,
+                        int(bool(allow_local_deploy)),
                         stamp,
                         stamp,
                     ),
@@ -440,6 +443,7 @@ class TaskRepository:
             "git_delivery_author_email",
             "git_delivery_default_draft_pr",
             "git_delivery_default_merge",
+            "allow_local_deploy",
         }
         unknown = set(updates) - allowed
         if unknown:
@@ -478,6 +482,8 @@ class TaskRepository:
             updates["git_delivery_default_draft_pr"] = int(
                 bool(updates["git_delivery_default_draft_pr"])
             )
+        if "allow_local_deploy" in updates:
+            updates["allow_local_deploy"] = int(bool(updates["allow_local_deploy"]))
         for field in (
             "max_running",
             "max_running_per_agent",

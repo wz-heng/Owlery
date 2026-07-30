@@ -453,6 +453,12 @@ CREATE TABLE IF NOT EXISTS task_boards (
     git_delivery_default_merge TEXT NOT NULL DEFAULT 'none' CHECK (
         git_delivery_default_merge IN ('none', 'fast_forward_only')
     ),
+    -- Local deploy (docs/plans/local-deploy.md §9). A board whose runs may
+    -- deploy to the production instance is an explicit decision; default 0
+    -- (off) backfills every existing board, so no board silently gains the
+    -- power to restart production. _apply_migrations adds it to old rows.
+    allow_local_deploy INTEGER NOT NULL DEFAULT 0
+        CHECK (allow_local_deploy IN (0, 1)),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -642,6 +648,34 @@ CREATE UNIQUE INDEX IF NOT EXISTS task_delivery_ops_one_running
 CREATE INDEX IF NOT EXISTS task_delivery_ops_delivery
   ON task_delivery_ops(delivery_id, created_at);
 
+-- Local deploy-and-restart (docs/plans/local-deploy.md §6). What version the
+-- local production instance is running, and how it got there. Exactly one row
+-- is `live` at any time (the partial unique index), and at most one deploy is
+-- `staging`/`switching` across all boards — that second index is the global
+-- deploy lock (§4). New-table-only — CREATE IF NOT EXISTS is a no-op migration.
+CREATE TABLE IF NOT EXISTS deployments (
+    id TEXT PRIMARY KEY,
+    delivery_id TEXT REFERENCES task_deliveries(id) ON DELETE SET NULL,
+    task_id TEXT,                        -- denormalized for display; survives delivery GC
+    op_id TEXT,                          -- the deploy_switch op, once one exists
+    slot TEXT NOT NULL,                  -- 'a' | 'b'
+    sha TEXT NOT NULL,
+    source_repo TEXT NOT NULL,
+    state TEXT NOT NULL,                 -- staged|switching|live|rolled_back|superseded|failed
+    journal TEXT,                        -- JSON: final journal excerpt for this deploy
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS deployments_one_live
+  ON deployments(state) WHERE state = 'live';
+-- The global deploy lock (§4): at most ONE row is staging-OR-switching across
+-- all boards. The predicate spans two state values, so it is indexed on the
+-- constant (1) — the literal `ON deployments(state)` of §6 would only bound
+-- each value on its own, letting a `staging` and a `switching` coexist (two
+-- pipelines), which §4's "one instance, one pipeline at a time" forbids.
+CREATE UNIQUE INDEX IF NOT EXISTS deployments_one_active
+  ON deployments((1)) WHERE state IN ('staging', 'switching');
+
 -- Parked turns awaiting a usage-limit reset (limit-auto-resume.md §4). A turn
 -- that failed on the USER'S OWN limit is persisted here, not slept on: the
 -- wait is multi-hour, so it must survive a restart — on boot these rows
@@ -773,6 +807,10 @@ class Database:
             "git_delivery_default_draft_pr INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE task_boards ADD COLUMN "
             "git_delivery_default_merge TEXT NOT NULL DEFAULT 'none'",
+            # Local deploy (docs/plans/local-deploy.md §9). DEFAULT 0 backfills
+            # every existing board to "may not deploy production" — fail-closed.
+            "ALTER TABLE task_boards ADD COLUMN "
+            "allow_local_deploy INTEGER NOT NULL DEFAULT 0",
         ):
             try:
                 await self._conn.execute(ddl)

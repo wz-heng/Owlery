@@ -220,6 +220,24 @@ def do_pull(args: argparse.Namespace) -> None:
     print(f"\nResume with:\n  claude --resume {claude_session_id}")
 
 
+def do_deploy_init(args: argparse.Namespace) -> None:
+    """Execute `deploy init` — one-time migration to the dual-slot layout.
+
+    Offline and idempotent (docs/plans/local-deploy.md §3.1). `--from` defaults
+    to the checkout this `owlery` runs from, which is the real case: an existing
+    single-checkout instance converting itself to slots.
+    """
+    from .deploy import DeployError, deploy_init, format_init_report
+
+    from_checkout = args.from_checkout or str(Path(__file__).resolve().parent.parent)
+    try:
+        result = deploy_init(args.root, from_checkout)
+    except DeployError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    print(format_init_report(result))
+
+
 def do_serve(args: argparse.Namespace) -> None:
     """Execute the serve subcommand (default)."""
     dist_index = Path(__file__).resolve().parent.parent / "web" / "dist" / "index.html"
@@ -256,6 +274,27 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=None,
         help="Enable Cloudflare Tunnel for public HTTPS access",
+    )
+
+    # deploy — grouped subcommands for the local deploy pipeline. Only `init`
+    # exists in step 1 (docs/plans/local-deploy.md §17); the switcher and op
+    # verbs arrive with later steps.
+    deploy_parser = subparsers.add_parser(
+        "deploy", help="Local deploy-and-restart management"
+    )
+    deploy_sub = deploy_parser.add_subparsers(dest="deploy_command")
+    init_parser = deploy_sub.add_parser(
+        "init", help="Migrate a checkout to the dual-slot deploy layout"
+    )
+    init_parser.add_argument(
+        "--root",
+        required=True,
+        help="Deploy root to create the a/b/current layout under",
+    )
+    init_parser.add_argument(
+        "--from",
+        dest="from_checkout",
+        help="Existing checkout to seed the slots from (default: this checkout)",
     )
 
     # handoff
@@ -326,6 +365,11 @@ def main() -> None:
         do_handoff(args)
     elif args.command == "pull":
         do_pull(args)
+    elif args.command == "deploy":
+        if getattr(args, "deploy_command", None) == "init":
+            do_deploy_init(args)
+        else:
+            parser.parse_args(["deploy", "--help"])
     else:
         parser.print_help()
 
