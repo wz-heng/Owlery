@@ -47,7 +47,33 @@ _TEARDOWN_START_STATES = frozenset(
     {"ready", "delivered", "blocked", "conflicted", "failed"}
 )
 
+# Delivery block reasons that a deploy_stage itself produced — a later green
+# stage clears these, unlike a real git block/conflict (local-deploy.md §4).
+_DEPLOY_BLOCK_REASONS = frozenset({"stage_failed", "deploy_locked"})
+
 NotifyTerminal = Callable[[TaskRecord, DeliveryRecord], Awaitable[None]]
+
+
+def _stage_success_status(
+    prior_status: str,
+    prior_reason_kind: str | None,
+    prior_reason_detail: str | None,
+    delivery: DeliveryRecord,
+) -> tuple[str, str | None, str | None]:
+    """The (status, reason_kind, reason_detail) a successful deploy_stage settles
+    the delivery to (docs/plans/local-deploy.md §4 — "succeed back to
+    ready/delivered"). Staging is transparent to genuine git state but never
+    perpetuates its OWN prior failure."""
+    if prior_status in {"blocked", "conflicted"} and prior_reason_kind in _DEPLOY_BLOCK_REASONS:
+        # Only a prior deploy attempt blocked this delivery; a green stage undoes
+        # it. Land delivered if it was ever pushed/PR'd, else ready.
+        delivered = bool(delivery.pushed_ref or delivery.pr_number)
+        return ("delivered" if delivered else "ready", None, None)
+    if prior_status in {"blocked", "conflicted"}:
+        # A real git block/conflict — a stage does not resolve it; keep it.
+        return (prior_status, prior_reason_kind, prior_reason_detail)
+    # A settled ready/delivered — keep it, with no lingering reason.
+    return (prior_status, None, None)
 
 
 async def _github_create_pr(
@@ -551,15 +577,24 @@ class DeliveryCoordinator:
         completely (venv + build + import probe), and records a ``deployments``
         row — all while the running instance is untouched by construction.
 
-        The instance fail-closed guard and the git prerequisites (§2) are
-        preconditions: they refuse without creating an op or mutating the
-        delivery, exactly like ``deliver_op``'s baseline/state checks. Only an
-        attempt that actually acquires the global lock and stages creates an op —
-        which fails to ``blocked(stage_failed)`` on a bad step, or
-        ``blocked(deploy_locked)`` if it loses the lock race (§4, §5, §12)."""
+        The board opt-in, the instance fail-closed guard, and the git
+        prerequisites (§2/§9) are preconditions: they refuse without creating an
+        op or mutating the delivery, exactly like ``deliver_op``'s baseline/state
+        checks. Only an attempt that actually starts creates an op — which fails
+        to ``blocked(stage_failed)`` on a bad step, or ``blocked(deploy_locked)``
+        if the global deploy lock is already held (§4, §5, §12)."""
         task, run, board = await self._load(task_id, run_id)
 
-        # 1. Instance fail-closed guard (§3.1). A config/instance problem, not a
+        # 1. Board opt-in (§9). Touching the production instance is an explicit
+        #    per-board decision; a board that never opted in is refused outright.
+        if not board.allow_local_deploy:
+            raise TaskConflictError(
+                "this board may not deploy the local instance "
+                "(enable allow_local_deploy on the board first)",
+                current=await self._delivery_for(run_id),
+            )
+
+        # 2. Instance fail-closed guard (§3.1). A config/instance problem, not a
         #    delivery one — refuse without touching this (or any) delivery.
         check = deploy.deploy_precheck(settings, server_root=server_root)
         if not check.ok:
@@ -567,7 +602,7 @@ class DeliveryCoordinator:
 
         delivery = await self._delivery_for(run_id)
 
-        # 2. Git prerequisites (§2) — same shape as deliver_op's preconditions.
+        # 3. Git prerequisites (§2) — same shape as deliver_op's preconditions.
         if delivery.status not in _GOAL_START_STATES:
             raise TaskConflictError(
                 "delivery is not in a state that accepts a deploy", current=delivery
@@ -590,17 +625,6 @@ class DeliveryCoordinator:
         layout = deploy.DeployLayout.at(settings.resolved_deploy_root)
         slot = layout.idle_slot()
 
-        # 3. Global deploy lock (§4). Common case: the holder is visible, so
-        #    refuse op-free naming it. The race (holder appears between here and
-        #    the insert) is caught by begin_deployment_staging below.
-        active = await self.repo.get_active_deployment()
-        if active is not None:
-            raise TaskConflictError(
-                f"deploy_locked: another deploy is {active.state} (slot {active.slot}, "
-                f"sha {active.sha[:12]}, task {active.task_id})",
-                current=delivery,
-            )
-
         prior_status = delivery.status
         prior_reason_kind = delivery.reason_kind
         prior_reason_detail = delivery.reason_detail
@@ -612,6 +636,10 @@ class DeliveryCoordinator:
             actor_agent_id=actor_agent_id,
         )
 
+        # 4. Global deploy lock (§4/§12): a durable outcome. Whether the holder
+        #    was already there or raced in, begin_deployment_staging's unique
+        #    index rejects the insert and the op fails to blocked(deploy_locked)
+        #    naming the holder — an explicit new op is required to try again.
         try:
             deployment = await self.repo.begin_deployment_staging(
                 delivery_id=delivery.id,
@@ -655,16 +683,24 @@ class DeliveryCoordinator:
             return await self._published(task, final)
 
         staged = await self.repo.mark_deployment_staged(deployment.id)
-        # Staging is transparent to the git-delivery status: restore whatever
-        # settled state the delivery had, preserving a blocked/conflicted reason.
-        restore_reason = prior_status in {"blocked", "conflicted"}
+        # A successful stage must "succeed back to ready/delivered" (§4). Staging
+        # is otherwise transparent to the git-delivery status:
+        #   - a delivery blocked by THIS pipeline's own prior failure
+        #     (stage_failed / deploy_locked) is cleared — a green restage undoes
+        #     it, landing delivered if it was ever pushed, else ready;
+        #   - a block/conflict from real git work (a merge conflict, an
+        #     interrupted push) is preserved — a stage does not resolve it;
+        #   - a settled ready/delivered is kept as-is.
+        new_status, new_reason_kind, new_reason_detail = _stage_success_status(
+            prior_status, prior_reason_kind, prior_reason_detail, delivery
+        )
         final, _ = await self.repo.finish_op(
             delivery.id,
             op_id,
             state="succeeded",
-            delivery_status=prior_status,
-            reason_kind=prior_reason_kind if restore_reason else None,
-            reason_detail=prior_reason_detail if restore_reason else None,
+            delivery_status=new_status,
+            reason_kind=new_reason_kind,
+            reason_detail=new_reason_detail,
             result={
                 "staged_sha": result.sha,
                 "staged_slot": result.slot,

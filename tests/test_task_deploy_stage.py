@@ -68,6 +68,7 @@ async def _ready_delivery(db, repo, tmp, agent, *, worker_commits=True):
         name=f"D-{uuid.uuid4().hex[:8]}",
         working_dir=str(src),
         default_workspace_mode="git_worktree",
+        allow_local_deploy=True,
     )
     task = await repo.create_task(
         board_id=board.id, title="Ship it", status="todo", assignee_agent_id=agent
@@ -323,6 +324,33 @@ async def test_stage_failed_captures_output_and_leaves_instance(store, tmp_path,
     assert layout.current_slot() == "a"
 
 
+# ----------------------------------------------------- idle-slot path guard
+
+
+@pytest.mark.asyncio
+async def test_symlinked_idle_slot_refused(store, tmp_path, monkeypatch):
+    db, repo, tmp, agent = store
+    board, task, run, src, delivery = await _ready_delivery(db, repo, tmp, agent)
+    layout = _init_layout(tmp_path / "deploy", monkeypatch)
+    # Replace the idle slot `b` with a symlink pointing outside the deploy tree
+    # (with a .git inside) — the guard must refuse rather than build there (§13.9).
+    outside = tmp_path / "outside"
+    (outside / ".git").mkdir(parents=True)
+    (outside / "web").mkdir()
+    layout.slot_path("b").symlink_to(outside)
+    coord = _coord(db, repo)
+    runner = FakeStageRunner()
+
+    d = await coord.deploy_stage(
+        task.id, run.id, server_root=layout.slot_path("a"), stage_runner=runner
+    )
+    assert d.status == "blocked" and d.reason_kind == "stage_failed"
+    assert "slot_guard" in d.reason_detail
+    # No subprocess ran against the foreign directory.
+    assert runner.calls == []
+    assert not (outside / ".venv").exists()
+
+
 # -------------------------------------------------------------- supersede
 
 
@@ -375,15 +403,78 @@ async def test_global_lock_blocks_second_deploy(store, tmp_path, monkeypatch):
         delivery_id=None, task_id="t-other", op_id=None,
         slot="a", sha="deadbeef" * 5, source_repo=str(src),
     )
+    d = await coord.deploy_stage(
+        task.id, run.id, server_root=layout.slot_path("a"),
+        stage_runner=FakeStageRunner(),
+    )
+    # deploy_locked is a durable outcome (§4/§12): the op fails and the delivery
+    # is blocked, naming the holder — an explicit new op is required to retry.
+    assert d.status == "blocked" and d.reason_kind == "deploy_locked"
+    assert holder.sha[:12] in d.reason_detail and "t-other" in d.reason_detail
+    op = [o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_stage"][0]
+    assert op.state == "failed"
+    # The holder still holds the lock; the loser never inserted a deployments row.
+    assert (await repo.get_active_deployment()).id == holder.id
+    assert [dep.id for dep in await repo.list_deployments()] == [holder.id]
+
+
+@pytest.mark.asyncio
+async def test_board_without_opt_in_refuses(store, tmp_path, monkeypatch):
+    db, repo, tmp, agent = store
+    board, task, run, src, delivery = await _ready_delivery(db, repo, tmp, agent)
+    # Flip the board's opt-in back off: deploy must refuse (§9).
+    await repo.update_board(board.id, allow_local_deploy=False)
+    layout = _init_layout(tmp_path / "deploy", monkeypatch)
+    coord = _coord(db, repo)
     with pytest.raises(TaskConflictError) as exc:
         await coord.deploy_stage(
             task.id, run.id, server_root=layout.slot_path("a"),
             stage_runner=FakeStageRunner(),
         )
-    assert "deploy_locked" in str(exc.value)
-    assert holder.sha[:12] in str(exc.value) and "t-other" in str(exc.value)
-    # An op-free refusal: no deploy_stage op was created for the loser.
+    assert "allow_local_deploy" in str(exc.value)
+    # Op-free refusal: no op, delivery untouched.
     assert not [o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_stage"]
+    assert (await repo.get_delivery(delivery.id)).status == "ready"
+
+
+@pytest.mark.asyncio
+async def test_boot_recovery_releases_staging_lock(store):
+    db, repo, tmp, agent = store
+    # A stage that died mid-pipeline leaves an orphan `staging` row holding the
+    # global lock. Boot recovery must fail it so deploys are not wedged.
+    orphan = await repo.begin_deployment_staging(
+        delivery_id=None, task_id="t1", op_id=None,
+        slot="a", sha="a" * 40, source_repo="/repo",
+    )
+    assert (await repo.get_active_deployment()).id == orphan.id
+    failed = await repo.fail_orphan_staging_deployments(reason="server restarted")
+    assert [d.id for d in failed] == [orphan.id]
+    assert (await repo.get_deployment(orphan.id)).state == "failed"
+    assert await repo.get_active_deployment() is None  # lock released
+    # A second run is idempotent (nothing left staging).
+    assert await repo.fail_orphan_staging_deployments(reason="again") == []
+
+
+@pytest.mark.asyncio
+async def test_restage_after_failure_clears_block(store, tmp_path, monkeypatch):
+    db, repo, tmp, agent = store
+    board, task, run, src, delivery = await _ready_delivery(db, repo, tmp, agent)
+    layout = _init_layout(tmp_path / "deploy", monkeypatch)
+    coord = _coord(db, repo)
+
+    # First stage fails → delivery blocked(stage_failed).
+    d = await coord.deploy_stage(
+        task.id, run.id, server_root=layout.slot_path("a"),
+        stage_runner=FakeStageRunner(fail_step="build"),
+    )
+    assert d.status == "blocked" and d.reason_kind == "stage_failed"
+    # A green restage from that blocked state must clear the deploy-caused block
+    # and succeed back to a ready delivery (§4), not perpetuate stage_failed.
+    d = await coord.deploy_stage(
+        task.id, run.id, server_root=layout.slot_path("a"),
+        stage_runner=FakeStageRunner(),
+    )
+    assert d.status == "ready" and d.reason_kind is None and d.reason_detail is None
 
 
 @pytest.mark.asyncio
@@ -468,7 +559,7 @@ async def _zero_ahead_delivery(db, repo, tmp, agent):
     _init_repo(src)
     board = await repo.create_board(
         name=f"Z-{uuid.uuid4().hex[:8]}", working_dir=str(src),
-        default_workspace_mode="git_worktree",
+        default_workspace_mode="git_worktree", allow_local_deploy=True,
     )
     task = await repo.create_task(
         board_id=board.id, title="No-op", status="todo", assignee_agent_id=agent

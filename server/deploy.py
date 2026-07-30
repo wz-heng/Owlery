@@ -447,6 +447,22 @@ def stage_slot(
          stage time, not at switch time (§5.5).
     """
     slot_dir = layout.slot_path(slot)
+
+    # Fail closed if the idle slot is anything but a real directory or absent
+    # (§13.9): a slot symlinked out of the tree — or a stray file — would let the
+    # pipeline fetch/build/checkout into a path outside deploy_root. Only a real
+    # dir (re-stage of an established slot) or a missing path (lazy first-deploy
+    # clone) is allowed. is_dir()/exists() follow symlinks, so is_symlink() is
+    # what actually pins the target inside the tree.
+    if slot_dir.is_symlink() or (slot_dir.exists() and not slot_dir.is_dir()):
+        return StageResult(
+            ok=False, slot=slot, sha=sha, failed_step="slot_guard",
+            output=(
+                f"idle slot {slot_dir} is not a real directory (a symlink or "
+                "file); refusing to stage outside the deploy tree"
+            ),
+        )
+
     venv_python = slot_dir / ".venv" / "bin" / "python"
     venv_pip = slot_dir / ".venv" / "bin" / "pip"
     web_dir = slot_dir / "web"

@@ -1107,8 +1107,17 @@ class Database:
         row = await cur.fetchone()
         if row is None or "deploy_stage" in (row[0] or ""):
             return
+        # Clear any scratch table left by a prior rebuild that was interrupted
+        # between CREATE and RENAME — otherwise the CREATE below would fail and
+        # (because aiosqlite's executescript deadlocks on a mid-script error)
+        # hang the boot. Every live op row satisfies the widened table by
+        # construction: the CHECK only ADDS a kind, and NOT NULL / the CASCADE
+        # and SET-NULL FKs are unchanged, so the copy cannot lose or reject a row
+        # (an FK orphan could never have been inserted under the identical old
+        # FKs), and thus cannot itself error mid-script.
         await self._conn.executescript(
             """
+            DROP TABLE IF EXISTS task_delivery_ops__new;
             CREATE TABLE task_delivery_ops__new (
                 id TEXT PRIMARY KEY,
                 delivery_id TEXT NOT NULL REFERENCES task_deliveries(id) ON DELETE CASCADE,

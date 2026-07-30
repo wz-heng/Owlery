@@ -791,6 +791,14 @@ class TaskBoardManager:
         await self.repo.interrupt_running_delivery_ops(
             reason="server restarted; delivery op outcome unknown"
         )
+        # A deploy_stage that died mid-pipeline leaves its `deployments` row
+        # `staging`, which holds the global deploy lock; interrupting the op does
+        # not release it. Fail those orphans so deploys are not wedged forever
+        # (docs/plans/local-deploy.md §5). The staging never touched the running
+        # instance, so this is DB-only and safe inside the boot barrier.
+        await self.repo.fail_orphan_staging_deployments(
+            reason="server restarted; deploy_stage interrupted"
+        )
         await self.repo.reset_preparing_deliveries()
         if self.session_mgr is None or self.db is None:
             return

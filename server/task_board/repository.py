@@ -2947,6 +2947,36 @@ class TaskRepository:
             )
         return self._deployment_record(row)
 
+    async def fail_orphan_staging_deployments(
+        self, *, reason: str
+    ) -> list[DeploymentRecord]:
+        """Boot recovery for the global deploy lock (docs/plans/local-deploy.md
+        §5). A ``staging`` row exists only between ``begin_deployment_staging``
+        and its settle, both inside one live ``deploy_stage`` call — so any
+        ``staging`` row seen at boot is an orphan from a stage whose process
+        died. Fail them to release ``deployments_one_active``; a stage never
+        touches the running instance, so nothing else needs undoing. ``switching``
+        rows are the switch op's journal-reconciled concern (§8) and are left
+        untouched here."""
+        stamp = _now_iso()
+        out: list[DeploymentRecord] = []
+        async with self._transaction() as conn:
+            rows = await self._fetchall(
+                conn, "SELECT * FROM deployments WHERE state='staging'"
+            )
+            for row in rows:
+                journal = _json_object({"boot_recovery": reason})
+                await conn.execute(
+                    "UPDATE deployments SET state='failed', journal=?, updated_at=? "
+                    "WHERE id=? AND state='staging'",
+                    (journal, stamp, row["id"]),
+                )
+                fresh = await self._fetchone(
+                    conn, "SELECT * FROM deployments WHERE id = ?", (row["id"],)
+                )
+                out.append(self._deployment_record(fresh))
+        return out
+
     async def mark_deployment_staged(
         self, deployment_id: str, *, journal: Mapping[str, Any] | None = None
     ) -> DeploymentRecord:
