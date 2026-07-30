@@ -146,23 +146,31 @@ test.describe("Task Board", () => {
       await login(page);
       await page.getByRole("button", { name: "Task Board" }).click();
       await page.getByLabel("Task board", { exact: true }).selectOption(board.id);
-      await page.getByRole("region", { name: "Done tasks" })
-        .getByRole("button", { name: `Open task ${title}` }).click();
+      // The board card carries a delivery chip derived from the same live WS
+      // enrichment; it must track the drawer panel step for step.
+      const card = page.getByRole("region", { name: "Done tasks" })
+        .getByRole("button", { name: `Open task ${title}` });
+      const cardChip = card.getByTestId("task-delivery-chip");
+      await expect(cardChip).toHaveText("Not accepted");
+      await card.click();
       const drawer = page.getByRole("dialog", { name: `Task: ${title}` });
       const panel = drawer.getByRole("region", { name: "Git delivery" });
 
       await expect(panel).toContainText("Not accepted");
       await panel.getByRole("button", { name: "Accept" }).click();
       await expect(panel).toContainText("Uncommitted");
+      await expect(cardChip).toHaveText("Uncommitted");
       await expect(panel.getByRole("button", { name: "Commit" })).toBeEnabled();
 
       await panel.getByRole("button", { name: "Commit" }).click();
       await expect(panel.getByRole("button", { name: "Push" })).toBeEnabled();
       await expect(panel).not.toContainText("Uncommitted");
+      await expect(cardChip).toHaveText("Ready to push");
 
       await panel.getByRole("button", { name: "Push" }).click();
       await expect(panel).toContainText("delivered");
       await expect(panel).toContainText("refs/heads/owlery/task-");
+      await expect(cardChip).toHaveText("Pushed");
 
       // Teardown must use a live dirty check and require an explicit typed
       // confirmation before discarding changes made after delivery.

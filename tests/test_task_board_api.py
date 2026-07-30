@@ -275,3 +275,82 @@ async def test_real_repository_board_task_roundtrip(client, monkeypatch, tmp_pat
     finally:
         await repository.close()
         await database.close()
+
+
+# --------------------------------------------------------------- enrichment
+# The list, tree, and single-task exits must all serialize the same card-facing
+# derived fields (task-card-status.md §1).  Wire a real repository behind the
+# router and assert the three exits agree, including the delivery summary.
+
+_ENRICHMENT_KEYS = {
+    "latest_run_state",
+    "latest_heartbeat_at",
+    "latest_run_workspace_mode",
+    "child_count",
+    "dependency_count",
+    "delivery",
+}
+
+
+@pytest.fixture
+async def real_client(tmp_path):
+    db_path = tmp_path / "owlery.db"
+    db = Database(str(db_path))
+    await db.initialize()
+    repo = TaskRepository(str(db_path))
+    await repo.initialize()
+    agent_id = (await db.load_agents())[0]["id"]
+    app = FastAPI()
+    app.include_router(routes.router)
+    previous = routes.task_repository
+    routes.task_repository = repo
+    transport = ASGITransport(app=app)
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as c:
+            yield c, repo, tmp_path, agent_id
+    finally:
+        routes.task_repository = previous
+        await repo.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_list_tree_and_detail_expose_identical_enrichment(real_client):
+    c, repo, root, agent_id = real_client
+    board = await repo.create_board(
+        name="Ship", working_dir=str(root), default_workspace_mode="git_worktree"
+    )
+    task = await repo.create_task(
+        board_id=board.id, title="Deliver", status="todo", assignee_agent_id=agent_id
+    )
+    run = await repo.claim_ready(
+        task.id, workspace_mode="git_worktree", workspace_path=str(root / "wt")
+    )
+    await repo.complete_run(task.id, run.id, summary="done")
+    delivery = await repo.create_delivery(
+        run.id, repository="/repo", attempt_branch="owlery/x", base_ref="main", base_head="a"
+    )
+    await repo.start_accept(delivery.id)
+    await repo.record_baseline(delivery.id, status="ready", dirty=True, commits_ahead=1)
+
+    listed = await c.get(f"/api/tasks?board_id={board.id}", headers=HEADERS)
+    assert listed.status_code == 200
+    card = next(t for t in listed.json() if t["id"] == task.id)
+
+    tree = await c.get(f"/api/task-boards/{board.id}/tree", headers=HEADERS)
+    assert tree.status_code == 200
+    tree_node = next(t for t in tree.json() if t["id"] == task.id)
+
+    detail = await c.get(f"/api/tasks/{task.id}", headers=HEADERS)
+    assert detail.status_code == 200
+    detail_body = detail.json()
+
+    for body in (card, tree_node, detail_body):
+        assert _ENRICHMENT_KEYS <= set(body)
+        assert body["latest_run_state"] == "completed"
+        assert body["latest_run_workspace_mode"] == "git_worktree"
+        assert body["delivery"]["status"] == "ready"
+        assert body["delivery"]["dirty"] is True
+        assert body["delivery"]["commits_ahead"] == 1
+    for key in _ENRICHMENT_KEYS:
+        assert card[key] == tree_node[key] == detail_body[key], key

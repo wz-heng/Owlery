@@ -5,7 +5,12 @@ import type { Task } from "../../api/tasks";
 import type { Agent } from "../../stores/sessionStore";
 import { cn } from "../../lib/utils";
 import { AgentSeal } from "../ui/seal";
-import { STATUS_ACCENT, STATUS_LABEL } from "./taskPresentation";
+import {
+  DELIVERY_TONE_PILL,
+  deliveryChip,
+  STATUS_ACCENT,
+  STATUS_LABEL,
+} from "./taskPresentation";
 
 interface TaskTreeProps {
   tasks: Task[];
@@ -41,6 +46,7 @@ export function TaskTree({ tasks, agents, onOpenTask }: TaskTreeProps) {
     const descendants = children.get(task.id) ?? [];
     const isCollapsed = collapsed.has(task.id);
     const agent = task.assignee_agent_id ? agentMap.get(task.assignee_agent_id) : undefined;
+    const delivery = deliveryChip(task);
     return (
       <div key={task.id}>
         <div
@@ -91,6 +97,17 @@ export function TaskTree({ tasks, agents, onOpenTask }: TaskTreeProps) {
             <span className="inline-flex items-center gap-1" title="Execution dependencies">
               <IconGitBranch size={13} /> {task.dependency_count ?? task.dependencies?.length ?? 0}
             </span>
+            {delivery && (
+              <span
+                data-testid="task-delivery-chip"
+                className={cn(
+                  "inline-flex items-center rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
+                  DELIVERY_TONE_PILL[delivery.tone]
+                )}
+              >
+                {delivery.label}
+              </span>
+            )}
           </div>
         </div>
         {!isCollapsed && descendants.map((child) => row(child, depth + 1))}

@@ -640,14 +640,14 @@ class TaskBoardManager:
         event = await self.repo.get_latest_task_event(task_id)
         if event is None:
             return
-        task = await self.repo.get_task(task_id)
+        task = await self.repo.enrich_task(task_id)
         payload = event.to_dict()
-        payload["payload"] = {**payload["payload"], "task": task.to_dict()}
+        payload["payload"] = {**payload["payload"], "task": task}
         await self.session_mgr._broadcast(
             {
                 "type": "task_event",
-                "board_id": task.board_id,
-                "task_id": task.id,
+                "board_id": task["board_id"],
+                "task_id": task["id"],
                 "event": payload,
             }
         )

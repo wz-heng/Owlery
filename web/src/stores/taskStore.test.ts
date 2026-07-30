@@ -181,6 +181,54 @@ describe("taskStore event replay and filters", () => {
     expect(useTaskStore.getState().lastEventSeq["board-1"]).toBe(4);
   });
 
+  it("refreshes enrichment when a delivery event carries the same updated_at", () => {
+    // Git delivery ops do not bump tasks.updated_at, yet publish_task_update
+    // re-emits the task with fresh enrichment.  mergeTask must take the incoming
+    // snapshot on a timestamp tie so the card's chip advances (no stale hold).
+    const accepted = task({
+      latest_run_state: "completed",
+      latest_run_workspace_mode: "git_worktree",
+      delivery: {
+        status: "ready",
+        dirty: true,
+        commits_ahead: 0,
+        pushed_ref: null,
+        pr_number: null,
+        pr_state: null,
+        merge_strategy: null,
+        reason_kind: null,
+      },
+    });
+    useTaskStore.setState({ tasksById: { [accepted.id]: accepted }, taskOrder: [accepted.id] });
+    const pushed = task({
+      // identical updated_at — delivery progress does not touch the task row
+      latest_run_state: "completed",
+      latest_run_workspace_mode: "git_worktree",
+      delivery: {
+        status: "delivered",
+        dirty: false,
+        commits_ahead: 0,
+        pushed_ref: "refs/heads/owlery/task-1",
+        pr_number: null,
+        pr_state: null,
+        merge_strategy: null,
+        reason_kind: null,
+      },
+    });
+    useTaskStore.getState().applyTaskEvent("board-1", accepted.id, {
+      seq: 9,
+      board_id: "board-1",
+      task_id: accepted.id,
+      run_id: "run-1",
+      kind: "delivery_op_finished",
+      actor_kind: "system",
+      actor_agent_id: null,
+      payload: { task: pushed },
+      created_at: "2026-07-26T00:01:00Z",
+    });
+    expect(useTaskStore.getState().tasksById[accepted.id].delivery?.status).toBe("delivered");
+  });
+
   it("combines text, mine, priority and archived filters", () => {
     const rows = [
       task(),

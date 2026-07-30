@@ -450,8 +450,8 @@ async def list_all_tasks(
     _: str = Depends(verify_token),
 ):
     assignee_id = await _resolve_agent(assignee, None) if assignee else None
-    rows = await _run(
-        task_repository.list_tasks(
+    return await _run(
+        task_repository.list_tasks_enriched(
             board_id=board_id,
             status=status_filter,
             assignee_agent_id=assignee_id,
@@ -460,7 +460,6 @@ async def list_all_tasks(
             limit=limit,
         )
     )
-    return [_dict(row) for row in rows]
 
 
 @router.get("/api/task-boards/{board_id}/tasks")
@@ -519,7 +518,10 @@ async def create_task(
 
 
 async def _task_detail(task_id: str) -> dict[str, Any]:
-    task = await _run(task_repository.get_task(task_id))
+    # The detail exit carries the same derived fields as the list/tree/WS exits
+    # so opening a task in the drawer never strips the card's delivery/run chip
+    # when the browser merges the detail back into its board snapshot.
+    task = await _run(task_repository.enrich_task(task_id))
     dependencies = await _run(task_repository.list_dependencies(task_id))
     comments = await _run(task_repository.list_comments(task_id))
     runs = await _run(task_repository.list_runs(task_id))
@@ -535,14 +537,14 @@ async def _task_detail(task_id: str) -> dict[str, Any]:
     ]
     children = await _run(
         task_repository.list_tasks(
-            board_id=task.board_id,
-            parent_task_id=task.id,
+            board_id=task["board_id"],
+            parent_task_id=task["id"],
             include_archived=True,
             limit=1000,
         )
     )
     return {
-        **task.to_dict(),
+        **task,
         "dependencies": [_dict(row) for row in dependency_tasks],
         "dependents": [_dict(row) for row in dependent_tasks],
         "children": [_dict(row) for row in children],
