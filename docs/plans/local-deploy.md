@@ -125,11 +125,12 @@ migration, offline and idempotent:
 The original checkout is left untouched (the user retires it manually).
 Deploy is **fail-closed** until this has happened: with no configured
 `deploy_root` (§9), or a server whose own executable path does not resolve
-through `<root>/current`, every deploy verb returns
-`blocked(deploy_not_initialized)` / `blocked(not_running_via_current)` with
-the exact command to fix — Owlery never guesses a layout and never deploys an
-instance it could not restart correctly. `settings.debug` (uvicorn reload)
-also refuses: a reloading dev server must not be production-switched.
+through `<root>/current`, every deploy verb refuses as a precondition
+(`deploy_not_initialized` / `not_running_via_current`, a 409 that names the
+exact command to fix, no op and no delivery mutation — §12) — Owlery never
+guesses a layout and never deploys an instance it could not restart correctly.
+`settings.debug` (uvicorn reload) also refuses: a reloading dev server must
+not be production-switched.
 
 ## 4. Op model
 
@@ -340,8 +341,8 @@ ops — skips all of this at the cost of one `stat()`.
 Global (`server/config.py`) — deployment is an instance property, not a
 board property:
 
-- `deploy_root` (default unset → feature disabled, verbs return
-  `blocked(deploy_not_initialized)`)
+- `deploy_root` (default unset → feature disabled, verbs refuse as a
+  precondition — `deploy_not_initialized`, a 409 with no op, §12)
 - `deploy_stage_timeout_seconds` (default 600; per staging subprocess)
 - `deploy_switch_timeout_seconds` (default 30; old-exit + port-free wait)
 - `deploy_health_timeout_seconds` (default 60)
