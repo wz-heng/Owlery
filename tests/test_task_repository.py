@@ -594,3 +594,187 @@ async def test_worker_pending_work_covers_terminal_to_outbox_windows(task_store)
         "delivery intentionally settled for test",
     )
     assert not await db.worker_has_persisted_pending_work(session_id)
+
+
+# --------------------------------------------------------------- enrichment
+# Card-facing derived fields (task-card-status.md): latest run state, child /
+# dependency counts, and a delivery summary, aggregated in three fixed queries
+# and served identically by the list, tree, single-task, and WS-publish exits.
+
+_ENRICHMENT_KEYS = {
+    "latest_run_state",
+    "latest_heartbeat_at",
+    "latest_run_workspace_mode",
+    "child_count",
+    "dependency_count",
+    "delivery",
+}
+
+
+async def _worktree_delivery(repo, root, agent_id):
+    """A completed git_worktree run with an accepted (ready) delivery."""
+    board = await repo.create_board(
+        name="Ship", working_dir=str(root), default_workspace_mode="git_worktree"
+    )
+    task = await _task(repo, board.id, agent_id, title="Deliver me")
+    run = await repo.claim_ready(
+        task.id, workspace_mode="git_worktree", workspace_path=str(root / "wt")
+    )
+    await repo.complete_run(task.id, run.id, summary="done")
+    delivery = await repo.create_delivery(
+        run.id,
+        repository="/repo",
+        attempt_branch=f"owlery/task-{task.id}-run-{run.attempt_no}",
+        base_ref="main",
+        base_head="aaaa",
+    )
+    await repo.start_accept(delivery.id)
+    delivery = await repo.record_baseline(
+        delivery.id,
+        status="ready",
+        attempt_head="bbbb",
+        dirty=False,
+        commits_ahead=2,
+    )
+    return board, task, run, delivery
+
+
+@pytest.mark.asyncio
+async def test_enrichment_no_run_is_all_empty(task_store):
+    _db, repo, root, agent = task_store
+    board = await _board(repo, root)
+    task = await _task(repo, board.id, agent)
+    [enriched] = await repo.list_tasks_enriched(board_id=board.id)
+    assert set(enriched) >= _ENRICHMENT_KEYS
+    assert enriched["latest_run_state"] is None
+    assert enriched["latest_run_workspace_mode"] is None
+    assert enriched["latest_heartbeat_at"] is None
+    assert enriched["delivery"] is None
+    assert enriched["child_count"] == 0
+    assert enriched["dependency_count"] == 0
+    # The task's own authoritative fields survive alongside the derived ones.
+    assert enriched["id"] == task.id
+    assert enriched["status"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_enrichment_latest_run_without_delivery(task_store):
+    _db, repo, root, agent = task_store
+    board = await _board(repo, root, default_workspace_mode="copy")
+    task = await _task(repo, board.id, agent)
+    run = await repo.claim_ready(
+        task.id, workspace_mode="copy", workspace_path=str(root / "copy")
+    )
+    await repo.heartbeat_run(task.id, run.id, lease_expires_at="2099-01-01T00:00:00+00:00")
+    [enriched] = await repo.list_tasks_enriched(board_id=board.id)
+    assert enriched["latest_run_state"] == "running"
+    assert enriched["latest_run_workspace_mode"] == "copy"
+    assert enriched["latest_heartbeat_at"] is not None
+    assert enriched["delivery"] is None
+
+
+@pytest.mark.asyncio
+async def test_enrichment_latest_run_tracks_highest_attempt(task_store):
+    _db, repo, root, agent = task_store
+    board = await _board(repo, root)
+    task = await _task(repo, board.id, agent)
+    run1 = await repo.claim_ready(
+        task.id, workspace_mode="shared", workspace_path=str(root)
+    )
+    await repo.block_run(
+        task.id, run1.id, reason="need input", kind="input"
+    )
+    await repo.unblock_task(task.id)
+    run2 = await repo.claim_ready(
+        task.id, workspace_mode="shared", workspace_path=str(root)
+    )
+    assert run2.attempt_no == 2
+    [enriched] = await repo.list_tasks_enriched(board_id=board.id)
+    # The latest attempt (running), not the earlier blocked one, wins.
+    assert enriched["latest_run_state"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_enrichment_delivery_summary(task_store):
+    _db, repo, root, agent = task_store
+    board, task, run, _delivery = await _worktree_delivery(repo, root, agent)
+    [enriched] = await repo.list_tasks_enriched(board_id=board.id)
+    assert enriched["latest_run_state"] == "completed"
+    assert enriched["latest_run_workspace_mode"] == "git_worktree"
+    summary = enriched["delivery"]
+    assert summary is not None
+    assert summary["status"] == "ready"
+    assert summary["dirty"] is False
+    assert summary["commits_ahead"] == 2
+    # Fields not yet set by an op stay null; the frontend derives from these.
+    assert summary["pushed_ref"] is None
+    assert summary["pr_number"] is None
+    assert summary["merge_strategy"] is None
+    assert summary["reason_kind"] is None
+    assert set(summary) == {
+        "status", "dirty", "commits_ahead", "pushed_ref",
+        "pr_number", "pr_state", "merge_strategy", "reason_kind",
+    }
+
+
+@pytest.mark.asyncio
+async def test_enrichment_delivery_surfaces_terminal_columns(task_store):
+    _db, repo, root, agent = task_store
+    board, task, run, delivery = await _worktree_delivery(repo, root, agent)
+    # Drive the row to a delivered/merged shape at the storage layer so the
+    # enrichment SQL's column mapping is asserted independently of the op engine.
+    await repo.conn.execute(
+        "UPDATE task_deliveries SET status='delivered', pushed_ref='refs/heads/x', "
+        "pr_number=7, pr_state='open', merge_strategy='fast_forward_only' WHERE id=?",
+        (delivery.id,),
+    )
+    await repo.conn.commit()
+    [enriched] = await repo.list_tasks_enriched(board_id=board.id)
+    summary = enriched["delivery"]
+    assert summary["status"] == "delivered"
+    assert summary["pushed_ref"] == "refs/heads/x"
+    assert summary["pr_number"] == 7
+    assert summary["pr_state"] == "open"
+    assert summary["merge_strategy"] == "fast_forward_only"
+
+
+@pytest.mark.asyncio
+async def test_enrichment_child_and_dependency_counts(task_store):
+    _db, repo, root, agent = task_store
+    board = await _board(repo, root)
+    dep = await _task(repo, board.id, agent, title="Dependency")
+    parent = await _task(repo, board.id, agent, title="Parent", dependencies=[dep.id])
+    await _task(repo, board.id, agent, title="Child A", parent_task_id=parent.id)
+    await _task(repo, board.id, agent, title="Child B", parent_task_id=parent.id)
+    enriched = {t["id"]: t for t in await repo.list_tasks_enriched(board_id=board.id)}
+    assert enriched[parent.id]["child_count"] == 2
+    assert enriched[parent.id]["dependency_count"] == 1
+    assert enriched[dep.id]["child_count"] == 0
+    assert enriched[dep.id]["dependency_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_enrichment_shape_identical_across_exits(task_store):
+    """list / tree / single-task exits must all carry the same derived fields."""
+    _db, repo, root, agent = task_store
+    board, task, _run, _delivery = await _worktree_delivery(repo, root, agent)
+
+    from_list = {t["id"]: t for t in await repo.list_tasks_enriched(board_id=board.id)}[task.id]
+    single = await repo.enrich_task(task.id)
+    tree = await repo.get_tree(board.id)
+    # Flatten the tree to find the same task node.
+    stack = list(tree)
+    from_tree = None
+    while stack:
+        node = stack.pop()
+        if node["id"] == task.id:
+            from_tree = node
+            break
+        stack.extend(node.get("children", []))
+    assert from_tree is not None
+
+    for exit_dict in (from_list, single, from_tree):
+        assert _ENRICHMENT_KEYS <= set(exit_dict)
+    # The enrichment values agree exactly across all three exits.
+    for key in _ENRICHMENT_KEYS:
+        assert from_list[key] == single[key] == from_tree[key], key

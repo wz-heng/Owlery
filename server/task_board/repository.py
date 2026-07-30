@@ -816,17 +816,17 @@ class TaskRepository:
             )
         return TaskRecord.from_row(row) if row else None
 
-    async def list_tasks(
-        self,
+    @staticmethod
+    def _list_tasks_sql(
         *,
-        board_id: str | None = None,
-        status: str | None = None,
-        assignee_agent_id: str | None = None,
-        parent_task_id: str | None = None,
-        root_only: bool = False,
-        include_archived: bool = False,
-        limit: int = 200,
-    ) -> list[TaskRecord]:
+        board_id: str | None,
+        status: str | None,
+        assignee_agent_id: str | None,
+        parent_task_id: str | None,
+        root_only: bool,
+        include_archived: bool,
+        limit: int,
+    ) -> tuple[str, list[Any]]:
         if limit < 1 or limit > 1000:
             raise TaskValidationError("limit must be between 1 and 1000")
         clauses: list[str] = []
@@ -852,23 +852,159 @@ class TaskRepository:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY priority DESC, created_at, id LIMIT ?"
         args.append(limit)
+        return sql, args
+
+    async def list_tasks(
+        self,
+        *,
+        board_id: str | None = None,
+        status: str | None = None,
+        assignee_agent_id: str | None = None,
+        parent_task_id: str | None = None,
+        root_only: bool = False,
+        include_archived: bool = False,
+        limit: int = 200,
+    ) -> list[TaskRecord]:
+        sql, args = self._list_tasks_sql(
+            board_id=board_id,
+            status=status,
+            assignee_agent_id=assignee_agent_id,
+            parent_task_id=parent_task_id,
+            root_only=root_only,
+            include_archived=include_archived,
+            limit=limit,
+        )
         async with self._lock:
             rows = await self._fetchall(self.conn, sql, args)
         return [TaskRecord.from_row(row) for row in rows]
+
+    @staticmethod
+    def _empty_enrichment() -> dict[str, Any]:
+        """The card-facing derived fields every task carries, all absent."""
+        return {
+            "latest_run_state": None,
+            "latest_heartbeat_at": None,
+            "latest_run_workspace_mode": None,
+            "child_count": 0,
+            "dependency_count": 0,
+            "delivery": None,
+        }
+
+    async def _enrichment_for(
+        self, conn: aiosqlite.Connection, task_ids: Sequence[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Aggregate card-facing derived fields for a batch of tasks.
+
+        Three fixed queries regardless of batch size — never N+1.  ``list_tasks``,
+        ``get_tree``, the single-task detail exit, and ``publish_task_update`` all
+        route through here so a card renders identically no matter which exit
+        delivered it.  Board lists cap at 1000 tasks, well under SQLite's bound
+        parameter limit, so a single ``IN (...)`` per query suffices.
+        """
+        result = {tid: self._empty_enrichment() for tid in task_ids}
+        if not task_ids:
+            return result
+        placeholders = ",".join("?" * len(task_ids))
+        ids = list(task_ids)
+        # Latest run per task (max attempt_no) LEFT JOINed to its delivery, if any.
+        run_rows = await self._fetchall(
+            conn,
+            f"SELECT r.task_id AS task_id, r.state AS state, "
+            f"r.last_heartbeat_at AS last_heartbeat_at, r.workspace_mode AS workspace_mode, "
+            f"d.status AS d_status, d.dirty AS d_dirty, d.commits_ahead AS d_commits_ahead, "
+            f"d.pushed_ref AS d_pushed_ref, d.pr_number AS d_pr_number, d.pr_state AS d_pr_state, "
+            f"d.merge_strategy AS d_merge_strategy, d.reason_kind AS d_reason_kind "
+            f"FROM task_runs r JOIN ("
+            f"  SELECT task_id, MAX(attempt_no) AS max_attempt FROM task_runs "
+            f"  WHERE task_id IN ({placeholders}) GROUP BY task_id"
+            f") latest ON latest.task_id = r.task_id AND latest.max_attempt = r.attempt_no "
+            f"LEFT JOIN task_deliveries d ON d.run_id = r.id",
+            ids,
+        )
+        for row in run_rows:
+            entry = result[row["task_id"]]
+            entry["latest_run_state"] = row["state"]
+            entry["latest_heartbeat_at"] = row["last_heartbeat_at"]
+            entry["latest_run_workspace_mode"] = row["workspace_mode"]
+            if row["d_status"] is not None:
+                entry["delivery"] = {
+                    "status": row["d_status"],
+                    "dirty": bool(row["d_dirty"]),
+                    "commits_ahead": row["d_commits_ahead"],
+                    "pushed_ref": row["d_pushed_ref"],
+                    "pr_number": row["d_pr_number"],
+                    "pr_state": row["d_pr_state"],
+                    "merge_strategy": row["d_merge_strategy"],
+                    "reason_kind": row["d_reason_kind"],
+                }
+        child_rows = await self._fetchall(
+            conn,
+            f"SELECT parent_task_id AS pid, COUNT(*) AS n FROM tasks "
+            f"WHERE parent_task_id IN ({placeholders}) GROUP BY parent_task_id",
+            ids,
+        )
+        for row in child_rows:
+            result[row["pid"]]["child_count"] = row["n"]
+        dep_rows = await self._fetchall(
+            conn,
+            f"SELECT task_id AS tid, COUNT(*) AS n FROM task_dependencies "
+            f"WHERE task_id IN ({placeholders}) GROUP BY task_id",
+            ids,
+        )
+        for row in dep_rows:
+            result[row["tid"]]["dependency_count"] = row["n"]
+        return result
+
+    async def list_tasks_enriched(
+        self,
+        *,
+        board_id: str | None = None,
+        status: str | None = None,
+        assignee_agent_id: str | None = None,
+        parent_task_id: str | None = None,
+        root_only: bool = False,
+        include_archived: bool = False,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """``list_tasks`` plus card-facing derived fields, in one lock hold."""
+        sql, args = self._list_tasks_sql(
+            board_id=board_id,
+            status=status,
+            assignee_agent_id=assignee_agent_id,
+            parent_task_id=parent_task_id,
+            root_only=root_only,
+            include_archived=include_archived,
+            limit=limit,
+        )
+        async with self._lock:
+            rows = await self._fetchall(self.conn, sql, args)
+            records = [TaskRecord.from_row(row) for row in rows]
+            enrichment = await self._enrichment_for(
+                self.conn, [record.id for record in records]
+            )
+        return [{**record.to_dict(), **enrichment[record.id]} for record in records]
+
+    async def enrich_task(self, task_id: str) -> dict[str, Any]:
+        """A single task's dict with the same derived fields the list exits add."""
+        async with self._lock:
+            record = TaskRecord.from_row(await self._task_row(self.conn, task_id))
+            enrichment = await self._enrichment_for(self.conn, [task_id])
+        return {**record.to_dict(), **enrichment[task_id]}
 
     async def get_tree(
         self, board_id: str, *, include_archived: bool = False
     ) -> list[dict[str, Any]]:
         """Return a stable nested tree; dependency edges remain separate."""
-        tasks = await self.list_tasks(
+        tasks = await self.list_tasks_enriched(
             board_id=board_id, include_archived=include_archived, limit=1000
         )
-        nodes = {task.id: {**task.to_dict(), "children": []} for task in tasks}
+        nodes = {task["id"]: {**task, "children": []} for task in tasks}
         roots: list[dict[str, Any]] = []
         for task in tasks:
-            node = nodes[task.id]
-            if task.parent_task_id and task.parent_task_id in nodes:
-                nodes[task.parent_task_id]["children"].append(node)
+            node = nodes[task["id"]]
+            parent_id = task["parent_task_id"]
+            if parent_id and parent_id in nodes:
+                nodes[parent_id]["children"].append(node)
             else:
                 roots.append(node)
         return roots

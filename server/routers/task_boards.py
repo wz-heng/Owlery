@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
 
@@ -25,6 +26,7 @@ from ..task_board.models import (
     TaskCapacityError,
     TaskConflictError,
     TaskNotFoundError,
+    TaskRecord,
     TaskValidationError,
 )
 from ..task_board.repository import task_repository
@@ -52,7 +54,7 @@ def _dict(value: Any) -> Any:
     return value
 
 
-def _error(exc: TaskBoardError) -> HTTPException:
+async def _error(exc: TaskBoardError) -> HTTPException:
     if isinstance(exc, TaskNotFoundError):
         code = status.HTTP_404_NOT_FOUND
     elif isinstance(exc, (TaskConflictError, TaskCapacityError)):
@@ -68,7 +70,14 @@ def _error(exc: TaskBoardError) -> HTTPException:
         detail["confirmation"] = exc.confirmation
         detail["action"] = exc.action
     if exc.current is not None:
-        current = exc.current.to_dict()
+        # The browser upserts this authoritative snapshot into its board store
+        # on a conflict, so a task must carry the same card-facing enrichment the
+        # read/WS exits do — otherwise a rejected edit wipes the card's chip.
+        current = (
+            await _enriched(exc.current)
+            if isinstance(exc.current, TaskRecord)
+            else exc.current.to_dict()
+        )
         detail["current"] = current
         # One-release compatibility with the independently-developed browser
         # client while generated OpenAPI aliases converge.
@@ -80,7 +89,33 @@ async def _run(call):
     try:
         return await call
     except TaskBoardError as exc:
-        raise _error(exc) from exc
+        raise await _error(exc) from exc
+
+
+async def _enriched(record: TaskRecord | Mapping[str, Any]) -> dict[str, Any]:
+    """A task as a dict carrying the card-facing enrichment every read exit adds
+    (task-card-status.md §3).
+
+    Every mutation that returns a ``Task`` the browser upserts routes through
+    here so its HTTP response matches the enriched WS payload published for the
+    same change; a bare task would lose the timestamp-tie merge race and strip
+    the card's delivery/run chip until reload.  Accepts either a ``TaskRecord``
+    (most exits) or an already-serialized task ``Mapping`` (the manager's block
+    / running-cancel paths hand back ``to_dict()``).
+
+    Enrichment is a capability of the real repository — a lightweight test
+    double without ``enrich_task`` (or a task that lost a concurrent delete
+    before we could re-read it) degrades to the plain task, never a 500 or a
+    masked conflict.
+    """
+    task_id = record["id"] if isinstance(record, Mapping) else record.id
+    enrich = getattr(task_repository, "enrich_task", None)
+    if enrich is None:
+        return _dict(record)
+    try:
+        return await enrich(task_id)
+    except TaskBoardError:
+        return _dict(record)
 
 
 async def _publish(task_id: str) -> None:
@@ -97,10 +132,15 @@ def _clean_etag(value: str | None) -> str | None:
     return value.strip().removeprefix("W/").strip('"')
 
 
-async def _check_precondition(item: Any, if_match: str | None) -> None:
+async def _check_precondition(
+    item: Any, if_match: str | None, *, enrich: bool = False
+) -> None:
     expected = _clean_etag(if_match)
     if expected is not None and expected != item.updated_at:
-        current = item.to_dict()
+        # Same rule as _error's conflict snapshot: the browser upserts this, so a
+        # task must be enriched or the stale-edit rejection strips the chip. Only
+        # the task patch opts in; the board precondition stays a plain board.
+        current = await _enriched(item) if enrich else item.to_dict()
         raise HTTPException(
             status.HTTP_412_PRECONDITION_FAILED,
             {
@@ -450,8 +490,8 @@ async def list_all_tasks(
     _: str = Depends(verify_token),
 ):
     assignee_id = await _resolve_agent(assignee, None) if assignee else None
-    rows = await _run(
-        task_repository.list_tasks(
+    return await _run(
+        task_repository.list_tasks_enriched(
             board_id=board_id,
             status=status_filter,
             assignee_agent_id=assignee_id,
@@ -460,7 +500,6 @@ async def list_all_tasks(
             limit=limit,
         )
     )
-    return [_dict(row) for row in rows]
 
 
 @router.get("/api/task-boards/{board_id}/tasks")
@@ -515,11 +554,16 @@ async def create_task(
     await _get_manager().wake_dispatcher()
     response.status_code = status.HTTP_201_CREATED if created else status.HTTP_200_OK
     response.headers["Location"] = f"/api/tasks/{row.id}"
-    return row.to_dict()
+    # An idempotency-key hit returns a pre-existing task that may already carry
+    # run/delivery enrichment, so enrich here too rather than wipe it (§3).
+    return await _enriched(row)
 
 
 async def _task_detail(task_id: str) -> dict[str, Any]:
-    task = await _run(task_repository.get_task(task_id))
+    # The detail exit carries the same derived fields as the list/tree/WS exits
+    # so opening a task in the drawer never strips the card's delivery/run chip
+    # when the browser merges the detail back into its board snapshot.
+    task = await _run(task_repository.enrich_task(task_id))
     dependencies = await _run(task_repository.list_dependencies(task_id))
     comments = await _run(task_repository.list_comments(task_id))
     runs = await _run(task_repository.list_runs(task_id))
@@ -535,14 +579,14 @@ async def _task_detail(task_id: str) -> dict[str, Any]:
     ]
     children = await _run(
         task_repository.list_tasks(
-            board_id=task.board_id,
-            parent_task_id=task.id,
+            board_id=task["board_id"],
+            parent_task_id=task["id"],
             include_archived=True,
             limit=1000,
         )
     )
     return {
-        **task.to_dict(),
+        **task,
         "dependencies": [_dict(row) for row in dependency_tasks],
         "dependents": [_dict(row) for row in dependent_tasks],
         "children": [_dict(row) for row in children],
@@ -568,12 +612,12 @@ async def patch_task(
     _: str = Depends(verify_token),
 ):
     current = await _run(task_repository.get_task(task_id))
-    await _check_precondition(current, if_match)
+    await _check_precondition(current, if_match, enrich=True)
     updates = req.model_dump(exclude_unset=True)
     body_version = updates.pop("updated_at", None)
     expected = _clean_etag(if_match) or body_version
     if if_match is None and body_version is not None:
-        await _check_precondition(current, body_version)
+        await _check_precondition(current, body_version, enrich=True)
     row = await _run(
         task_repository.update_task(
             task_id,
@@ -582,8 +626,9 @@ async def patch_task(
         )
     )
     await _publish(task_id)
-    _set_etag(response, row.updated_at)
-    return row.to_dict()
+    enriched = await _enriched(row)
+    _set_etag(response, enriched["updated_at"])
+    return enriched
 
 
 @router.post("/api/tasks/{task_id}/assign")
@@ -605,7 +650,7 @@ async def assign_task(
     )
     await _publish(task_id)
     await _get_manager().wake_dispatcher()
-    return row.to_dict()
+    return await _enriched(row)
 
 
 @router.post("/api/tasks/{task_id}/dependencies", status_code=201)
@@ -625,7 +670,7 @@ async def add_dependency(
         )
     )
     await _publish(task_id)
-    return row.to_dict()
+    return await _enriched(row)
 
 
 @router.delete("/api/tasks/{task_id}/dependencies/{dependency_id}")
@@ -646,7 +691,7 @@ async def remove_dependency(
     )
     await _publish(task_id)
     await _get_manager().wake_dispatcher()
-    return row.to_dict()
+    return await _enriched(row)
 
 
 @router.post("/api/tasks/{task_id}/comments", status_code=201)
@@ -684,7 +729,7 @@ async def triage_task(
         )
     )
     await _publish(task_id)
-    return _dict(row)
+    return await _enriched(row)
 
 
 @router.post("/api/tasks/{task_id}/specify")
@@ -705,7 +750,7 @@ async def specify_task(
     )
     await _publish(task_id)
     await _get_manager().wake_dispatcher()
-    return row.to_dict()
+    return await _enriched(row)
 
 
 @router.post("/api/tasks/{task_id}/ready")
@@ -724,7 +769,7 @@ async def ready_task(
     )
     await _publish(task_id)
     await _get_manager().wake_dispatcher()
-    return row.to_dict()
+    return await _enriched(row)
 
 
 @router.post("/api/tasks/{task_id}/block")
@@ -740,7 +785,7 @@ async def block_task(
             metadata=req.metadata,
         )
     )
-    return _dict(row)
+    return await _enriched(row)
 
 
 @router.post("/api/tasks/{task_id}/unblock")
@@ -761,7 +806,7 @@ async def unblock_task(
     )
     await _publish(task_id)
     await _get_manager().wake_dispatcher()
-    return row.to_dict()
+    return await _enriched(row)
 
 
 @router.post("/api/tasks/{task_id}/cancel")
@@ -774,11 +819,10 @@ async def cancel_task(
     actor_kind, actor_agent_id, _origin = await _actor(caller_session_id)
     current = await _run(task_repository.get_task(task_id))
     if current.status == "running":
-        return _dict(
-            await _run(
-                _get_manager().cancel_task(task_id, req.reason or "cancelled")
-            )
+        cancelled = await _run(
+            _get_manager().cancel_task(task_id, req.reason or "cancelled")
         )
+        return await _enriched(cancelled)
     row = await _run(
             task_repository.cancel_task(
                 task_id,
@@ -788,7 +832,7 @@ async def cancel_task(
             )
         )
     await _publish(task_id)
-    return _dict(row)
+    return await _enriched(row)
 
 
 @router.post("/api/tasks/{task_id}/archive")
@@ -807,7 +851,7 @@ async def archive_task(
         )
     )
     await _publish(task_id)
-    return _dict(row)
+    return await _enriched(row)
 
 
 @router.post("/api/tasks/{task_id}/unarchive")
@@ -826,7 +870,7 @@ async def unarchive_task(
         )
     )
     await _publish(task_id)
-    return _dict(row)
+    return await _enriched(row)
 
 
 @router.get("/api/tasks/{task_id}/runs")

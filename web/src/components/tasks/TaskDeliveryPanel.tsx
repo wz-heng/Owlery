@@ -23,23 +23,16 @@ import {
   type DeliveryConfirmation,
 } from "../../stores/taskStore";
 import { cn } from "../../lib/utils";
-import { formatDate } from "./taskPresentation";
+import {
+  DELIVERY_TONE_PILL,
+  deliveryStatusTone,
+  formatDate,
+} from "./taskPresentation";
 
-/** Tailwind pill classes keyed by the delivery lifecycle status. */
+/** Tailwind pill classes keyed by the delivery lifecycle status.  Shares the
+ * board card / tree colour language via `deliveryStatusTone`. */
 function statusPill(status: DeliveryStatus): string {
-  switch (status) {
-    case "delivered":
-      return "bg-success-surface text-success";
-    case "delivering":
-    case "preparing":
-      return "bg-attention-surface text-attention";
-    case "conflicted":
-    case "failed":
-    case "blocked":
-      return "bg-destructive-surface text-destructive";
-    default:
-      return "bg-ink-200 text-muted-foreground";
-  }
+  return DELIVERY_TONE_PILL[deliveryStatusTone(status)];
 }
 
 /** Tailwind pill classes keyed by an op's execution state. */

@@ -93,9 +93,25 @@ export interface Task {
   dependent_count?: number;
   latest_run_state?: TaskRunState | null;
   latest_heartbeat_at?: string | null;
+  latest_run_workspace_mode?: WorkspaceMode | null;
+  delivery?: TaskDeliverySummary | null;
   dependencies?: TaskDependency[];
   dependents?: TaskDependency[];
   children?: Task[];
+}
+
+/** The card-facing subset of a run's git delivery, aggregated server-side.
+ * Present only for git_worktree runs that have been accepted; `null` otherwise.
+ * Raw facts only — the display label/tone is derived in `taskPresentation`. */
+export interface TaskDeliverySummary {
+  status: DeliveryStatus;
+  dirty: boolean;
+  commits_ahead: number | null;
+  pushed_ref: string | null;
+  pr_number: number | null;
+  pr_state: string | null;
+  merge_strategy: string | null;
+  reason_kind: string | null;
 }
 
 export interface TaskRun {

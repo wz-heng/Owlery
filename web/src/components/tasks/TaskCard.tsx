@@ -12,7 +12,13 @@ import type { Task } from "../../api/tasks";
 import type { Agent } from "../../stores/sessionStore";
 import { AgentSeal } from "../ui/seal";
 import { cn } from "../../lib/utils";
-import { relativeTime, RUN_LABEL, STATUS_ACCENT } from "./taskPresentation";
+import {
+  DELIVERY_TONE_PILL,
+  deliveryChip,
+  relativeTime,
+  RUN_LABEL,
+  STATUS_ACCENT,
+} from "./taskPresentation";
 
 interface TaskCardProps {
   task: Task;
@@ -22,6 +28,7 @@ interface TaskCardProps {
 }
 
 export function TaskCard({ task, agent, onOpen, draggable = true }: TaskCardProps) {
+  const delivery = deliveryChip(task);
   const ageSource =
     task.status === "running"
       ? task.latest_heartbeat_at ?? task.updated_at
@@ -98,6 +105,17 @@ export function TaskCard({ task, agent, onOpen, draggable = true }: TaskCardProp
         {task.latest_run_state && (
           <span className="inline-flex items-center gap-0.5">
             <IconPlayerPlay size={12} /> {RUN_LABEL[task.latest_run_state]}
+          </span>
+        )}
+        {delivery && (
+          <span
+            data-testid="task-delivery-chip"
+            className={cn(
+              "inline-flex items-center rounded-full px-1.5 py-0.5 font-semibold uppercase tracking-wide",
+              DELIVERY_TONE_PILL[delivery.tone]
+            )}
+          >
+            {delivery.label}
           </span>
         )}
         {(task.workspace_mode || task.working_dir_override) && (
