@@ -57,8 +57,16 @@ export function deliveryStatusTone(status: DeliveryStatus): DeliveryTone {
     case "failed":
     case "blocked":
       return "destructive";
-    default:
+    case "pending":
+    case "ready":
       return "neutral";
+    default: {
+      // Compile-time exhaustiveness: a new DeliveryStatus without a tone is a
+      // type error here, not a silent neutral. Runtime keeps the safe default.
+      const _exhaustive: never = status;
+      void _exhaustive;
+      return "neutral";
+    }
   }
 }
 

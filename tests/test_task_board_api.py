@@ -304,19 +304,26 @@ async def real_client(tmp_path):
     app.include_router(routes.router)
     previous = routes.task_repository
     routes.task_repository = repo
+    # Mutation exits publish via _get_manager(); bind (and restore) a lightweight
+    # manager so these tests don't depend on global _manager pollution from an
+    # earlier test — they must pass in isolation too.
+    previous_manager = routes._manager
+    routes.set_manager(_Manager())
     transport = ASGITransport(app=app)
     try:
         async with AsyncClient(transport=transport, base_url="http://test") as c:
             yield c, repo, tmp_path, agent_id
     finally:
         routes.task_repository = previous
+        routes.set_manager(previous_manager)
         await repo.close()
         await db.close()
 
 
-@pytest.mark.asyncio
-async def test_list_tree_and_detail_expose_identical_enrichment(real_client):
-    c, repo, root, agent_id = real_client
+async def _accepted_task_with_delivery(repo, root, agent_id):
+    """A git_worktree task whose run completed and whose delivery is accepted
+    (status=ready, dirty, 1 commit ahead) — the enrichment-bearing shape the
+    card exits must preserve.  Returns (board, task)."""
     board = await repo.create_board(
         name="Ship", working_dir=str(root), default_workspace_mode="git_worktree"
     )
@@ -332,6 +339,13 @@ async def test_list_tree_and_detail_expose_identical_enrichment(real_client):
     )
     await repo.start_accept(delivery.id)
     await repo.record_baseline(delivery.id, status="ready", dirty=True, commits_ahead=1)
+    return board, task
+
+
+@pytest.mark.asyncio
+async def test_list_tree_and_detail_expose_identical_enrichment(real_client):
+    c, repo, root, agent_id = real_client
+    board, task = await _accepted_task_with_delivery(repo, root, agent_id)
 
     listed = await c.get(f"/api/tasks?board_id={board.id}", headers=HEADERS)
     assert listed.status_code == 200
@@ -354,3 +368,69 @@ async def test_list_tree_and_detail_expose_identical_enrichment(real_client):
         assert body["delivery"]["commits_ahead"] == 1
     for key in _ENRICHMENT_KEYS:
         assert card[key] == tree_node[key] == detail_body[key], key
+
+
+@pytest.mark.asyncio
+async def test_mutation_response_carries_enrichment(real_client):
+    """A mutation the browser upserts must return the same enriched card shape as
+    the WS payload published for that change; a bare TaskRecord would lose the
+    timestamp-tie merge race and strip the card's delivery chip (§3).
+
+    A delivered card is always a done task (its run completed), so archival — not
+    a title edit — is the realistic successful mutation a user runs against it."""
+    c, repo, root, agent_id = real_client
+    _board, task = await _accepted_task_with_delivery(repo, root, agent_id)
+
+    resp = await c.post(f"/api/tasks/{task.id}/archive", headers=HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["archived"] is True
+    assert _ENRICHMENT_KEYS <= set(body)
+    assert body["latest_run_state"] == "completed"
+    assert body["latest_run_workspace_mode"] == "git_worktree"
+    assert body["delivery"]["status"] == "ready"
+    assert body["delivery"]["commits_ahead"] == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_patch_conflict_current_is_enriched(real_client):
+    """The 412 conflict snapshot the browser upserts on a rejected stale edit
+    must be enriched too, or a losing edit wipes the card's chip (§3)."""
+    c, repo, root, agent_id = real_client
+    _board, task = await _accepted_task_with_delivery(repo, root, agent_id)
+
+    resp = await c.patch(
+        f"/api/tasks/{task.id}",
+        json={"title": "Renamed"},
+        headers={**HEADERS, "If-Match": '"1999-01-01T00:00:00+00:00"'},
+    )
+    assert resp.status_code == 412
+    current = resp.json()["detail"]["current_task"]
+    assert _ENRICHMENT_KEYS <= set(current)
+    assert current["delivery"]["status"] == "ready"
+    assert current["latest_run_state"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_enriched_accepts_task_record_or_mapping(monkeypatch):
+    """The manager's block / running-cancel exits hand _enriched an already
+    serialized task dict, not a TaskRecord; it must accept both — through the
+    enrich path and the capability-less fallback — without a 500."""
+
+    class _Enrich:
+        async def enrich_task(self, task_id):
+            return {"id": task_id, "enriched": True}
+
+    monkeypatch.setattr(routes, "task_repository", _Enrich())
+    from_mapping = await routes._enriched({"id": "task-map"})
+    from_record = await routes._enriched(_Record("task-rec"))
+    assert from_mapping == {"id": "task-map", "enriched": True}
+    assert from_record == {"id": "task-rec", "enriched": True}
+
+    class _NoEnrich:  # a repository double lacking the enrich capability
+        pass
+
+    monkeypatch.setattr(routes, "task_repository", _NoEnrich())
+    payload = {"id": "task-9", "title": "keep me"}
+    assert await routes._enriched(payload) == payload
+    assert (await routes._enriched(_Record("task-8")))["id"] == "task-8"
