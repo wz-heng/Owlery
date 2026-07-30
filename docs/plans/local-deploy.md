@@ -284,9 +284,14 @@ Small, sequential, journaling every step before performing it:
 6. **failure** (no health in time, or the new process exited): journal
    `rollback_begin`; stop the new process if alive (SIGTERM, then KILL after
    grace — the new instance holds no user work: probation, §7.5, kept it
-   from starting any); flip `current` back; restore the DB snapshot over
-   `owlery.db` (§7.4); start the old slot's server; journal `rolled_back`
-   with the captured reason; exit 1.
+   from starting any); wait for its port to free; flip `current` back; restore
+   the DB snapshot over `owlery.db` (§7.4); start the old slot's server and
+   **health-check it back to `old_sha`** — the process dimension of §5's total
+   rollback is verified, not assumed; journal `rolled_back` with the captured
+   reason; exit 1. If a dimension cannot be completed (the port never frees, or
+   the old server never becomes healthy) the switcher journals
+   `rollback_incomplete` instead, so a partial rollback is never mistaken for a
+   completed one — a human inspects `current`, the journal, and `switcher.log`.
 
 ### 7.4 The DB snapshot
 
@@ -325,6 +330,7 @@ that op id:
 |---|---|
 | `switched_ok` | op `succeeded`; `deployments` row → `live` (previous live → `superseded`); delivery folded (`deployed_sha`, slot) |
 | `rolled_back(reason)` | op `failed(reason)`; deployment → `rolled_back`; delivery `blocked(health_failed)` with the journal detail |
+| `rollback_incomplete(stage)` | rollback could not be proven total (port never freed, or the restarted old server never became healthy). op `failed(health_failed)`; deployment → `failed`; delivery `blocked`; `current` + `switcher.log` are the evidence — **never auto-repaired** |
 | `old_wont_die` | op `failed(old_wont_die)`; deployment stays `staged` (flip never happened); delivery `blocked` |
 | `flip_done`, non-terminal, journal fresh | probation (§7.5): leave the op `running`, wait for the switcher's verdict |
 | `handoff` only, or stale non-terminal | op `interrupted`, delivery `blocked(interrupted)`, deployment → `failed`; a human inspects `current`, the journal, and `switcher.log` — never an auto-repair |

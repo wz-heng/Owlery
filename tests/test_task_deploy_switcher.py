@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -420,7 +421,7 @@ def test_journal_fsync_ordering(env: DeployEnv, monkeypatch):
     env._procs.append(dummy)
     monkeypatch.setattr(switcher, "_wait_old_gone", lambda *a, **k: True)
     monkeypatch.setattr(switcher, "_spawn_detached", lambda *a, **k: dummy.pid)
-    monkeypatch.setattr(switcher, "_poll_new_health", lambda *a, **k: None)
+    monkeypatch.setattr(switcher, "_poll_health", lambda *a, **k: None)
     monkeypatch.setattr(switcher, "_flip", spy_flip)
 
     rc = switcher.run_switch(
@@ -473,3 +474,104 @@ def test_corrupt_handoff_aborts(env: DeployEnv):
     tail = Journal(env.journal_path).entries(env.op_id)[-1]
     assert tail["step"] == "switch_error"
     assert tail["detail"]["reason"].startswith("bad_handoff")
+
+
+@pytest.mark.parametrize(
+    "override, reason_sub",
+    [
+        ({"to_slot": "c"}, "slots must each be one of"),              # illegal slot
+        ({"from_slot": "b", "to_slot": "b"}, "nothing to switch"),    # from == to
+        ({"serve_argv": "serve"}, "serve_argv must be a list"),       # not a list
+        ({"serve_env": {"OWLERY_PORT": 8000}}, "serve_env must be a"),  # non-str value
+        ({"old_pid": 0}, "positive pid"),                             # bad pid
+        ({"port": 0}, "port out of range"),                          # bad port
+    ],
+)
+def test_semantic_corrupt_handoff_aborts(env: DeployEnv, override, reason_sub):
+    """A handoff whose fields are all present but *semantically* invalid must be
+    caught at validation and abort with `switch_error`/2 BEFORE any action — never
+    discovered mid-flip (which would leave a misleading `flip_done` tail)."""
+    detail = _handoff_detail(env, old_pid=999_999)
+    detail.update(override)
+    _write_handoff(env.journal_path, env.op_id, detail)
+
+    result = env.run_switcher()
+
+    assert result.returncode == switcher.EXIT_ERROR
+    assert _current_target(env.root) == "a"                       # never flipped
+    entries = Journal(env.journal_path).entries(env.op_id)
+    assert "flip_done" not in [r["step"] for r in entries]
+    assert entries[-1]["step"] == "switch_error"
+    assert reason_sub in entries[-1]["detail"]["reason"]
+
+
+def test_missing_snapshot_aborts(env: DeployEnv):
+    """No pre-switch DB snapshot → abort before flipping: without it a rollback
+    could not restore the DB, so §5's total rollback is unattainable (§7.4)."""
+    env.snapshot_path.unlink()
+    _write_handoff(env.journal_path, env.op_id, _handoff_detail(env, old_pid=999_999))
+
+    result = env.run_switcher()
+
+    assert result.returncode == switcher.EXIT_ERROR
+    assert _current_target(env.root) == "a"
+    tail = Journal(env.journal_path).entries(env.op_id)[-1]
+    assert tail["step"] == "switch_error"
+    assert "snapshot missing" in tail["detail"]["reason"]
+
+
+def test_missing_staged_slot_aborts(env: DeployEnv):
+    """The staged `to_slot` is not a real slot directory → abort before flipping
+    (§13.9 fail-closed), never crash at the flip."""
+    shutil.rmtree(env.root / "b")
+    _write_handoff(env.journal_path, env.op_id, _handoff_detail(env, old_pid=999_999))
+
+    result = env.run_switcher()
+
+    assert result.returncode == switcher.EXIT_ERROR
+    assert _current_target(env.root) == "a"
+    tail = Journal(env.journal_path).entries(env.op_id)[-1]
+    assert tail["step"] == "switch_error"
+    assert "to_slot" in tail["detail"]["reason"]
+
+
+def test_rollback_incomplete_when_old_server_unhealthy(env: DeployEnv):
+    """Rollback totality is verified, not assumed: when the restarted old server
+    never becomes healthy, the switcher journals `rollback_incomplete` (not
+    `rolled_back`) so a partial rollback is never mistaken for a completed one."""
+    # New (b) never reports the expected sha → rollback is triggered.
+    (env.root / "b" / "HEALTH_SHA").write_text("sha-wrong-cccccccc")
+    old = env.start_server("a")
+    assert _wait_health(env.port, "sha-old-aaaaaaaa", 5.0)
+    _write_handoff(env.journal_path, env.op_id, _handoff_detail(env, old_pid=old.pid))
+    old.terminate()
+    old.wait(timeout=5)
+    # Replace slot a's binary so the switcher's rollback restart of it crashes —
+    # the process dimension of the rollback cannot complete.
+    _make_slot(env.root, "a", "sha-old-aaaaaaaa", crash=True)
+
+    result = env.run_switcher(health_timeout=2.0)
+
+    assert result.returncode == switcher.EXIT_FAILED
+    assert _current_target(env.root) == "a"                       # symlink rolled back
+    assert env.db_path.read_text() == "db-preswitch-snapshot"     # DB restored
+    entries = Journal(env.journal_path).entries(env.op_id)
+    steps = [r["step"] for r in entries]
+    assert steps[-2:] == ["rollback_begin", "rollback_incomplete"]
+    assert entries[-1]["detail"]["stage"].startswith("old_server")
+
+
+def test_cli_deploy_switch_dispatch(env: DeployEnv):
+    """The real `owlery deploy-switch` entry (server.cli top-level dispatch)
+    reaches run_switch — a guard against the CLI wiring silently regressing. With
+    no handoff it aborts `switch_error`/2."""
+    result = subprocess.run(
+        [sys.executable, "-m", "server.cli", "deploy-switch",
+         "--journal", str(env.journal_path), "--op", env.op_id,
+         "--switch-timeout", "1", "--health-timeout", "1", "--poll-interval", "0.1"],
+        cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=30,
+    )
+
+    assert result.returncode == switcher.EXIT_ERROR
+    tail = Journal(env.journal_path).entries(env.op_id)[-1]
+    assert tail["step"] == "switch_error"

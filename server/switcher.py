@@ -49,7 +49,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .deploy import CURRENT_LINK, DeployLayout
+from .deploy import CURRENT_LINK, SLOTS, DeployLayout
 
 # Journal step names (docs/plans/local-deploy.md §8). `handoff` is written by the
 # server before it spawns the switcher; every other name below is written by the
@@ -61,6 +61,10 @@ STEP_FLIP_DONE = "flip_done"
 STEP_SWITCHED_OK = "switched_ok"
 STEP_ROLLBACK_BEGIN = "rollback_begin"
 STEP_ROLLED_BACK = "rolled_back"
+# A rollback that could not be proven total (port never freed, or the restarted
+# old server never became healthy). Distinct from `rolled_back` so nobody — and
+# no §8 reconciler — mistakes an unverified rollback for a completed one.
+STEP_ROLLBACK_INCOMPLETE = "rollback_incomplete"
 STEP_SWITCH_ERROR = "switch_error"
 
 # Rollback reason strings recorded in the journal detail. Boot reconciliation
@@ -162,6 +166,11 @@ class Handoff:
 
     @classmethod
     def from_detail(cls, op_id: str, detail: dict[str, Any]) -> "Handoff":
+        """Parse and *fully validate* the handoff contract. Any structural or
+        semantic defect raises ``ValueError`` — the switcher must catch it and
+        journal ``switch_error`` before performing any action, never discover it
+        mid-flip. Validating here (not at the flip) is what keeps a bad handoff
+        from ever writing a misleading ``flip_done`` tail."""
         required = (
             "from_slot", "to_slot", "old_sha", "new_sha",
             "old_pid", "host", "port", "db_path", "snapshot_path",
@@ -169,19 +178,50 @@ class Handoff:
         missing = [k for k in required if detail.get(k) in (None, "")]
         if missing:
             raise ValueError(f"handoff detail missing keys: {', '.join(missing)}")
+
+        from_slot, to_slot = str(detail["from_slot"]), str(detail["to_slot"])
+        if from_slot not in SLOTS or to_slot not in SLOTS:
+            raise ValueError(
+                f"handoff slots must each be one of {SLOTS}: "
+                f"from={from_slot!r} to={to_slot!r}"
+            )
+        if from_slot == to_slot:
+            raise ValueError(
+                f"handoff from_slot == to_slot ({from_slot!r}); nothing to switch"
+            )
+
+        try:
+            old_pid, port = int(detail["old_pid"]), int(detail["port"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"handoff old_pid/port must be integers: {exc}") from exc
+        if old_pid <= 0:
+            raise ValueError(f"handoff old_pid must be a positive pid: {old_pid}")
+        if not 0 < port < 65536:
+            raise ValueError(f"handoff port out of range 1..65535: {port}")
+
+        serve_argv = detail.get("serve_argv") or ["serve"]
+        if not (isinstance(serve_argv, list) and all(isinstance(a, str) for a in serve_argv)):
+            raise ValueError("handoff serve_argv must be a list of strings")
+        serve_env = detail.get("serve_env") or {}
+        if not (
+            isinstance(serve_env, dict)
+            and all(isinstance(k, str) and isinstance(v, str) for k, v in serve_env.items())
+        ):
+            raise ValueError("handoff serve_env must be a dict of string -> string")
+
         return cls(
             op_id=op_id,
-            from_slot=str(detail["from_slot"]),
-            to_slot=str(detail["to_slot"]),
+            from_slot=from_slot,
+            to_slot=to_slot,
             old_sha=str(detail["old_sha"]),
             new_sha=str(detail["new_sha"]),
-            old_pid=int(detail["old_pid"]),
+            old_pid=old_pid,
             host=str(detail["host"]),
-            port=int(detail["port"]),
+            port=port,
             db_path=str(detail["db_path"]),
             snapshot_path=str(detail["snapshot_path"]),
-            serve_argv=list(detail.get("serve_argv") or ["serve"]),
-            serve_env=dict(detail.get("serve_env") or {}),
+            serve_argv=list(serve_argv),
+            serve_env=dict(serve_env),
         )
 
 
@@ -360,20 +400,41 @@ def _serve_command(root: Path, handoff: Handoff) -> tuple[list[str], dict[str, s
     return argv, env, str(root / CURRENT_LINK)
 
 
-def _poll_new_health(
-    handoff: Handoff, new_pid: int, health_timeout: float, poll: float
+def _poll_health(
+    handoff: Handoff, pid: int, want_sha: str, health_timeout: float, poll: float
 ) -> str | None:
-    """§7.3 step 4: poll /health for the new sha until healthy or the window
-    closes. Returns None on success, or a rollback reason string if the new
-    process died or never reported the new sha in time."""
+    """Poll /health until the server at `pid` reports `want_sha`, or the window
+    closes. Returns None on success, or a reason string (`new_process_exited` if
+    the process died, `health_timeout` if it never reported the sha). Used both
+    for the new server (§7.3 step 4) and the restarted old server during rollback
+    (proving the process dimension of §5's total restoration, not just assuming
+    a fork implies a healthy server)."""
     deadline = _now() + health_timeout
     while _now() < deadline:
-        if not _pid_alive(new_pid):
+        if not _pid_alive(pid):
             return REASON_NEW_PROCESS_EXITED
-        if _fetch_health_sha(handoff.host, handoff.port, timeout=min(5.0, health_timeout)) == handoff.new_sha:
+        if _fetch_health_sha(handoff.host, handoff.port, timeout=min(5.0, health_timeout)) == want_sha:
             return None
         time.sleep(poll)
     return REASON_HEALTH_TIMEOUT
+
+
+def _validate_switch_preconditions(root: Path, handoff: Handoff) -> str | None:
+    """Filesystem preconditions that must hold before the flip — checked so the
+    switcher aborts with `switch_error` (no action, no `flip_done`) rather than
+    crashing mid-flip. Returns an error message, or None if the switch may run.
+
+    Both slots must be real slot directories (the staged `to_slot` to flip into,
+    the `from_slot` to roll back to), and the pre-switch DB snapshot must exist —
+    without it a rollback could not restore the DB, so §5's total rollback could
+    not be honoured and we must not start."""
+    layout = DeployLayout.at(root)
+    for role, slot in (("to_slot", handoff.to_slot), ("from_slot", handoff.from_slot)):
+        if not DeployLayout._is_real_slot(layout.slot_path(slot)):
+            return f"{role} {slot!r} is not a real slot directory under {root}"
+    if not Path(handoff.snapshot_path).is_file():
+        return f"pre-switch DB snapshot missing: {handoff.snapshot_path}"
+    return None
 
 
 def run_switch(
@@ -408,6 +469,13 @@ def run_switch(
         journal.append(op_id, STEP_SWITCH_ERROR, {"reason": f"bad_handoff: {exc}"})
         return EXIT_ERROR
 
+    # Filesystem preconditions (slots real, snapshot present) — abort before any
+    # action so a bad handoff never writes a misleading `flip_done`.
+    precond_error = _validate_switch_preconditions(root, handoff)
+    if precond_error is not None:
+        journal.append(op_id, STEP_SWITCH_ERROR, {"reason": precond_error})
+        return EXIT_ERROR
+
     # Step 1: wait for the old server to exit and free the port. Never signal it.
     if not _wait_old_gone(handoff, switch_timeout, poll_interval):
         journal.append(
@@ -430,7 +498,7 @@ def run_switch(
     new_pid = _spawn_detached(argv, cwd, env, log_path)
 
     # Step 4: health-check the new server for the new sha.
-    reason = _poll_new_health(handoff, new_pid, health_timeout, poll_interval)
+    reason = _poll_health(handoff, new_pid, handoff.new_sha, health_timeout, poll_interval)
     if reason is None:
         # Step 5: success.
         journal.append(
@@ -439,14 +507,37 @@ def run_switch(
         )
         return EXIT_OK
 
-    # Step 6: rollback — total return to the pre-switch state (§7.3 step 6, §7.4).
+    # Step 6: rollback — total return to the pre-switch state (§7.3 step 6, §7.4,
+    # invariant §5). Each dimension is *verified*, not assumed: if the port never
+    # frees, or the restarted old server never becomes healthy, we journal
+    # `rollback_incomplete` rather than claim a completed `rolled_back`.
     journal.append(op_id, STEP_ROLLBACK_BEGIN, {"reason": reason})
     _terminate(new_pid, term_grace, poll_interval)
-    _wait_port_free(handoff.host, handoff.port, switch_timeout, poll_interval)
+    if not _wait_port_free(handoff.host, handoff.port, switch_timeout, poll_interval):
+        # The new server's port is still held; restarting the old server would
+        # only fail to bind. Stop here with the flip NOT reverted — `current`
+        # still points at the staged slot and the DB is untouched, so a human
+        # inspecting sees a consistent (if failed) state rather than a half-restore.
+        journal.append(
+            op_id, STEP_ROLLBACK_INCOMPLETE,
+            {"reason": reason, "stage": "port_not_freed", "port": handoff.port},
+        )
+        return EXIT_FAILED
     _flip(root, handoff.from_slot)
     _restore_snapshot(handoff.snapshot_path, handoff.db_path)
     old_argv, old_env, old_cwd = _serve_command(root, handoff)
     old_pid = _spawn_detached(old_argv, old_cwd, old_env, log_path)
+    old_health = _poll_health(handoff, old_pid, handoff.old_sha, health_timeout, poll_interval)
+    if old_health is not None:
+        # Symlink and DB are restored, but the old server did not come back up —
+        # the process dimension of the rollback is unproven. Do not pretend it
+        # completed; a human inspects `current`, the journal, and switcher.log.
+        journal.append(
+            op_id, STEP_ROLLBACK_INCOMPLETE,
+            {"reason": reason, "stage": f"old_server_{old_health}",
+             "restored_slot": handoff.from_slot, "old_pid": old_pid},
+        )
+        return EXIT_FAILED
     journal.append(
         op_id, STEP_ROLLED_BACK,
         {"reason": reason, "restored_slot": handoff.from_slot,
