@@ -403,11 +403,20 @@ All verbs are CAS-guarded, 409 + current state on a lost race, broadcast
 
 ## 12. Failure matrix
 
-| Failure | Durable outcome |
+Two shapes of refusal appear below. **Preconditions** — board not opted in
+(§9), no `deploy_root` / not via `current` / debug (§3.1), and the §2 git
+prerequisites (settled state, `dirty=false`, `attempt_head` present,
+`nothing_to_deliver`) — are refused *before* any op is planned: a 409 that
+names the fix, creating no op and mutating no delivery, exactly like the
+existing git-delivery preconditions. **Op outcomes** — everything from the
+global-lock loss onward — are durable: an op row plus a delivery status change.
+
+| Failure | Outcome |
 |---|---|
-| Deploy verb with no `deploy_root` / not started via `current` / debug mode | `blocked(deploy_not_initialized \| not_running_via_current)`; verb names the fix |
-| Stage: fetch/build/venv/import-probe fails | op `failed(stage_failed)` + full output; running instance untouched |
-| Second deploy while one is staging/switching | `blocked(deploy_locked)` naming the holder |
+| Deploy verb on a board without `allow_local_deploy`, or with no `deploy_root` / not started via `current` / debug mode | precondition 409 naming the fix (`deploy_not_initialized \| not_running_via_current`); **no op, no delivery mutation** |
+| §2 git prerequisite unmet (unsettled state / dirty / no `attempt_head` / `nothing_to_deliver`) | precondition 409 naming the fix; **no op, no delivery mutation** |
+| Second deploy while one is staging/switching | op `failed(deploy_locked)` + delivery `blocked(deploy_locked)` naming the holder |
+| Stage: fetch/build/venv/import-probe fails (or a foreign idle slot) | op `failed(stage_failed)` + full output; delivery `blocked(stage_failed)`; running instance untouched |
 | Switch requested while work is running | `blocked(not_idle)` + busy census; `drain` waits bounded, then same |
 | Server dies after `handoff` journal, switcher never ran | boot: op `interrupted`, journal tail shown; human inspects |
 | Old process won't exit in time | switcher exits without flipping; op `failed(old_wont_die)`; nothing changed |

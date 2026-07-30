@@ -58,22 +58,30 @@ def _stage_success_status(
     prior_status: str,
     prior_reason_kind: str | None,
     prior_reason_detail: str | None,
-    delivery: DeliveryRecord,
+    *,
+    was_delivered: bool,
 ) -> tuple[str, str | None, str | None]:
     """The (status, reason_kind, reason_detail) a successful deploy_stage settles
     the delivery to (docs/plans/local-deploy.md §4 — "succeed back to
     ready/delivered"). Staging is transparent to genuine git state but never
-    perpetuates its OWN prior failure."""
+    perpetuates its OWN prior failure.
+
+    ``was_delivered`` is authoritative — whether a push/PR/merge op actually
+    succeeded — not inferred from delivery fields (``merge_strategy`` is set on a
+    conflicted merge too, so it cannot stand in for "was delivered")."""
     if prior_status in {"blocked", "conflicted"} and prior_reason_kind in _DEPLOY_BLOCK_REASONS:
         # Only a prior deploy attempt blocked this delivery; a green stage undoes
-        # it. Land delivered if it was ever pushed/PR'd, else ready.
-        delivered = bool(delivery.pushed_ref or delivery.pr_number)
-        return ("delivered" if delivered else "ready", None, None)
+        # it. Land delivered if it was ever actually delivered, else ready.
+        return ("delivered" if was_delivered else "ready", None, None)
     if prior_status in {"blocked", "conflicted"}:
         # A real git block/conflict — a stage does not resolve it; keep it.
         return (prior_status, prior_reason_kind, prior_reason_detail)
     # A settled ready/delivered — keep it, with no lingering reason.
     return (prior_status, None, None)
+
+
+# Op kinds whose success means the delivery was actually delivered (§4).
+_DELIVERED_OP_KINDS = frozenset({"push", "pull_request", "merge"})
 
 
 async def _github_create_pr(
@@ -687,12 +695,18 @@ class DeliveryCoordinator:
         # is otherwise transparent to the git-delivery status:
         #   - a delivery blocked by THIS pipeline's own prior failure
         #     (stage_failed / deploy_locked) is cleared — a green restage undoes
-        #     it, landing delivered if it was ever pushed, else ready;
+        #     it, landing delivered iff a push/PR/merge op actually succeeded,
+        #     else ready;
         #   - a block/conflict from real git work (a merge conflict, an
         #     interrupted push) is preserved — a stage does not resolve it;
         #   - a settled ready/delivered is kept as-is.
+        ops = await self.repo.list_delivery_ops(delivery.id)
+        was_delivered = any(
+            o.state == "succeeded" and o.kind in _DELIVERED_OP_KINDS for o in ops
+        )
         new_status, new_reason_kind, new_reason_detail = _stage_success_status(
-            prior_status, prior_reason_kind, prior_reason_detail, delivery
+            prior_status, prior_reason_kind, prior_reason_detail,
+            was_delivered=was_delivered,
         )
         final, _ = await self.repo.finish_op(
             delivery.id,

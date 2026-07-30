@@ -478,6 +478,31 @@ async def test_restage_after_failure_clears_block(store, tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_restage_after_failure_keeps_merge_delivered(store, tmp_path, monkeypatch):
+    db, repo, tmp, agent = store
+    board, task, run, src, delivery = await _ready_delivery(db, repo, tmp, agent)
+    coord = _coord(db, repo)
+    # Deliver via merge (no push/PR) → delivered, merge_strategy set, no pushed_ref.
+    d = await coord.deliver_op(task.id, run.id, kind="merge")
+    assert d.status == "delivered" and d.pushed_ref is None and d.merge_strategy
+
+    layout = _init_layout(tmp_path / "deploy", monkeypatch)
+    # Stage fails → blocked(stage_failed), overwriting the delivered status.
+    d = await coord.deploy_stage(
+        task.id, run.id, server_root=layout.slot_path("a"),
+        stage_runner=FakeStageRunner(fail_step="build"),
+    )
+    assert d.status == "blocked" and d.reason_kind == "stage_failed"
+    # A green restage must recognise the succeeded merge op and restore delivered
+    # (not downgrade to ready just because there is no pushed_ref/pr_number).
+    d = await coord.deploy_stage(
+        task.id, run.id, server_root=layout.slot_path("a"),
+        stage_runner=FakeStageRunner(),
+    )
+    assert d.status == "delivered" and d.reason_kind is None
+
+
+@pytest.mark.asyncio
 async def test_begin_staging_is_globally_unique(store):
     db, repo, tmp, agent = store
     await repo.begin_deployment_staging(
