@@ -297,6 +297,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Existing checkout to seed the slots from (default: this checkout)",
     )
 
+    # deploy-switch — the detached switcher (docs/plans/local-deploy.md §7.3).
+    # A top-level command (the handoff spawns `<old slot>/.venv/bin/owlery
+    # deploy-switch ...`), stdlib-only, driven entirely by the journal.
+    switch_parser = subparsers.add_parser(
+        "deploy-switch",
+        help="Detached deploy switcher (internal; spawned by the deploy_switch op)",
+    )
+    switch_parser.add_argument("--journal", required=True, help="Path to journal.jsonl")
+    switch_parser.add_argument(
+        "--op", required=True, dest="op_id", help="deploy_switch op id"
+    )
+    switch_parser.add_argument("--switch-timeout", type=float, default=30.0)
+    switch_parser.add_argument("--health-timeout", type=float, default=60.0)
+    switch_parser.add_argument("--term-grace", type=float, default=10.0)
+    switch_parser.add_argument("--poll-interval", type=float, default=0.2)
+
     # handoff
     handoff_parser = subparsers.add_parser(
         "handoff", help="Import a local Claude Code session"
@@ -370,6 +386,19 @@ def main() -> None:
             do_deploy_init(args)
         else:
             parser.parse_args(["deploy", "--help"])
+    elif args.command == "deploy-switch":
+        from .switcher import run_switch
+
+        sys.exit(
+            run_switch(
+                args.journal,
+                args.op_id,
+                switch_timeout=args.switch_timeout,
+                health_timeout=args.health_timeout,
+                term_grace=args.term_grace,
+                poll_interval=args.poll_interval,
+            )
+        )
     else:
         parser.print_help()
 
