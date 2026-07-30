@@ -29,6 +29,7 @@ from .models import (
     DELIVERY_REASON_KINDS,
     DELIVERY_RETENTIONS,
     DELIVERY_STATUSES,
+    DEPLOYMENT_STATES,
     WORKSPACE_MODES,
     ArtifactRecord,
     BoardRecord,
@@ -36,6 +37,8 @@ from .models import (
     DeliveryOpRecord,
     DeliveryRecord,
     DependencyRecord,
+    DeploymentRecord,
+    DeployLockedError,
     EventRecord,
     RunRecord,
     TaskCapacityError,
@@ -2854,6 +2857,139 @@ class TaskRepository:
                     (TaskRecord.from_row(task_row), self._delivery_record(d))
                 )
         return out
+
+    # --- Local deploy: deployments (docs/plans/local-deploy.md §6) --------
+
+    @staticmethod
+    def _deployment_record(row: Mapping[str, Any]) -> DeploymentRecord:
+        values = dict(row)
+        values["journal"] = _load_object(values["journal"])
+        return DeploymentRecord(**values)
+
+    async def get_deployment(self, deployment_id: str) -> DeploymentRecord:
+        async with self._lock:
+            row = await self._fetchone(
+                self.conn, "SELECT * FROM deployments WHERE id = ?", (deployment_id,)
+            )
+        if row is None:
+            raise TaskNotFoundError(f"deployment {deployment_id!r} not found")
+        return self._deployment_record(row)
+
+    async def list_deployments(self) -> list[DeploymentRecord]:
+        async with self._lock:
+            rows = await self._fetchall(
+                self.conn, "SELECT * FROM deployments ORDER BY created_at, id"
+            )
+        return [self._deployment_record(r) for r in rows]
+
+    async def get_active_deployment(self) -> DeploymentRecord | None:
+        """The single ``staging``/``switching`` row that holds the global deploy
+        lock, or None. At most one exists (deployments_one_active, §4)."""
+        async with self._lock:
+            row = await self._fetchone(
+                self.conn,
+                "SELECT * FROM deployments WHERE state IN ('staging','switching') "
+                "ORDER BY created_at LIMIT 1",
+            )
+        return self._deployment_record(row) if row else None
+
+    async def begin_deployment_staging(
+        self,
+        *,
+        delivery_id: str,
+        task_id: str | None,
+        op_id: str | None,
+        slot: str,
+        sha: str,
+        source_repo: str,
+    ) -> DeploymentRecord:
+        """Take the global deploy lock by inserting a ``staging`` row (§4, §5).
+
+        Re-staging overwrites the idle slot, so any prior ``staged`` row for the
+        SAME slot describes content about to be destroyed and becomes
+        ``superseded`` in the same transaction (§5). If another deploy already
+        holds the lock the ``deployments_one_active`` unique index rejects the
+        insert and this raises ``DeployLockedError`` naming the holder."""
+        stamp = _now_iso()
+        async with self._transaction() as conn:
+            await conn.execute(
+                "UPDATE deployments SET state='superseded', updated_at=? "
+                "WHERE slot=? AND state='staged'",
+                (stamp, slot),
+            )
+            ident = _short_id()
+            try:
+                await conn.execute(
+                    "INSERT INTO deployments (id, delivery_id, task_id, op_id, slot, "
+                    "sha, source_repo, state, journal, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'staging', NULL, ?, ?)",
+                    (ident, delivery_id, task_id, op_id, slot, sha, source_repo,
+                     stamp, stamp),
+                )
+            except aiosqlite.IntegrityError as exc:
+                holder = await self._fetchone(
+                    conn,
+                    "SELECT * FROM deployments WHERE state IN ('staging','switching') "
+                    "ORDER BY created_at LIMIT 1",
+                )
+                # Only the global-lock index (one active row) is a deploy_locked;
+                # any other integrity failure (a bad delivery_id FK, a missing
+                # NOT NULL) is a real bug, not a lock, and must surface as itself.
+                if holder is None:
+                    raise
+                detail = (
+                    f"another deploy is {holder['state']} (slot {holder['slot']}, "
+                    f"sha {holder['sha'][:12]}, task {holder['task_id']})"
+                )
+                raise DeployLockedError(f"deploy_locked: {detail}") from exc
+            row = await self._fetchone(
+                conn, "SELECT * FROM deployments WHERE id = ?", (ident,)
+            )
+        return self._deployment_record(row)
+
+    async def mark_deployment_staged(
+        self, deployment_id: str, *, journal: Mapping[str, Any] | None = None
+    ) -> DeploymentRecord:
+        """CAS a ``staging`` row to ``staged`` — the settled post-stage state,
+        which releases the global lock (§5, §6)."""
+        return await self._settle_deployment(
+            deployment_id, "staged", from_state="staging", journal=journal
+        )
+
+    async def mark_deployment_failed(
+        self, deployment_id: str, *, journal: Mapping[str, Any] | None = None
+    ) -> DeploymentRecord:
+        """CAS a ``staging`` row to ``failed`` — a stage step failed, releasing
+        the global lock; the running instance was never touched (§5)."""
+        return await self._settle_deployment(
+            deployment_id, "failed", from_state="staging", journal=journal
+        )
+
+    async def _settle_deployment(
+        self,
+        deployment_id: str,
+        state: str,
+        *,
+        from_state: str,
+        journal: Mapping[str, Any] | None,
+    ) -> DeploymentRecord:
+        if state not in DEPLOYMENT_STATES:
+            raise TaskValidationError("invalid deployment state")
+        stamp = _now_iso()
+        async with self._transaction() as conn:
+            cursor = await conn.execute(
+                "UPDATE deployments SET state=?, journal=COALESCE(?, journal), "
+                "updated_at=? WHERE id=? AND state=?",
+                (state, _json_object(journal), stamp, deployment_id, from_state),
+            )
+            if cursor.rowcount != 1:
+                raise TaskConflictError(
+                    f"deployment {deployment_id!r} is not {from_state!r}"
+                )
+            row = await self._fetchone(
+                conn, "SELECT * FROM deployments WHERE id = ?", (deployment_id,)
+            )
+        return self._deployment_record(row)
 
 
 task_repository = TaskRepository()

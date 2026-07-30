@@ -29,10 +29,12 @@ JOURNAL_NAME = "journal.jsonl"
 SNAPSHOTS_DIR = "snapshots"
 
 # reason_kind values this module can emit (the fail-closed subset of §9). The
-# op-layer reasons (deploy_locked, not_idle, stage_failed, …) arrive with their
-# ops in later steps.
+# switch-layer reasons (not_idle, health_failed, old_wont_die) arrive with §17
+# step 4.
 REASON_NOT_INITIALIZED = "deploy_not_initialized"
 REASON_NOT_VIA_CURRENT = "not_running_via_current"
+REASON_DEPLOY_LOCKED = "deploy_locked"
+REASON_STAGE_FAILED = "stage_failed"
 
 
 class DeployError(RuntimeError):
@@ -364,3 +366,107 @@ def deploy_precheck(settings, *, server_root: Path | None = None) -> DeployPrech
         )
 
     return DeployPrecheck(True)
+
+
+# ------------------------------------------------------------- deploy_stage (§5)
+#
+# Staging prepares the idle slot completely while the running server is untouched
+# (docs/plans/local-deploy.md §5). It is a pure filesystem/subprocess pipeline
+# with no DB or op knowledge — the coordinator owns the op lifecycle, the global
+# lock, and the `deployments` row; this only turns an idle slot into a runnable
+# checkout of an exact sha, or reports which step failed with its full output.
+
+
+@dataclass(frozen=True, slots=True)
+class StageResult:
+    """Outcome of the §5 pipeline. On failure, ``failed_step`` names the step and
+    ``output`` is that command's full combined stdout+stderr (secret-free — the
+    pipeline only runs git/venv/pip/bun/python against local paths, §10)."""
+
+    ok: bool
+    slot: str
+    sha: str
+    failed_step: str | None = None
+    output: str = ""
+
+
+# A staging runner runs ``argv`` in ``cwd`` under a per-subprocess wall-clock cap
+# (``deploy_stage_timeout_seconds``, §9) and returns ``(returncode, combined
+# output)`` — it never raises for a non-zero exit, so the pipeline can capture
+# the failing step's output. Tests inject a fake that materializes each step's
+# on-disk effect without a real clone/venv/build.
+StageRunner = Callable[[list[str], Path, int], tuple[int, str]]
+
+
+def _default_stage_runner(argv: list[str], cwd: Path, timeout: int) -> tuple[int, str]:
+    try:
+        proc = subprocess.run(
+            argv,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        return 127, f"command not found: {argv[0]}"
+    except subprocess.TimeoutExpired as exc:
+        partial = (exc.stdout or "") + (exc.stderr or "")
+        if isinstance(partial, bytes):  # text=True normally yields str
+            partial = partial.decode("utf-8", "replace")
+        return 124, f"timed out after {timeout}s: {' '.join(argv)}\n{partial}"
+    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+
+def stage_slot(
+    layout: DeployLayout,
+    slot: str,
+    *,
+    repo_path: str,
+    sha: str,
+    timeout: int,
+    runner: StageRunner = _default_stage_runner,
+) -> StageResult:
+    """Prepare ``slot`` into a runnable checkout of ``sha`` (docs/plans/
+    local-deploy.md §5, steps 1-5). The caller resolves and owns the slot; this
+    never touches ``current`` and never mutates the live slot by construction.
+
+    Steps, each bounded by ``timeout`` and short-circuiting on the first
+    non-zero exit:
+
+      0. clone the board repo into the slot if it has no checkout yet — the idle
+         slot may be staged lazily on the first deploy (§3.1);
+      1. ``git fetch <repo_path> <sha>`` — bring the exact reviewed object in by
+         local path, no network (§2);
+      2. ``git checkout --detach <sha>`` — the exact sha, never a branch name
+         that could move (§5.2);
+      3. create the slot venv at its final path if absent, then
+         ``pip install -e .`` (venvs are not relocatable — building in place is
+         what keeps the flip skew-free, §3/§5.3);
+      4. ``bun install`` + ``bun run build`` in the slot's ``web`` (§5.4);
+      5. ``python -c "import server.main"`` — an import crash is caught here, at
+         stage time, not at switch time (§5.5).
+    """
+    slot_dir = layout.slot_path(slot)
+    venv_python = slot_dir / ".venv" / "bin" / "python"
+    venv_pip = slot_dir / ".venv" / "bin" / "pip"
+    web_dir = slot_dir / "web"
+
+    # (name, argv, cwd) in order. Conditional steps are omitted when their
+    # artifact already exists so re-staging an established slot skips clone/venv.
+    steps: list[tuple[str, list[str], Path]] = []
+    if not (slot_dir / ".git").is_dir():
+        steps.append(("clone", ["git", "clone", repo_path, str(slot_dir)], layout.root))
+    steps.append(("fetch", ["git", "fetch", repo_path, sha], slot_dir))
+    steps.append(("checkout", ["git", "checkout", "--detach", sha], slot_dir))
+    if not venv_python.exists():
+        steps.append(("venv", [sys.executable, "-m", "venv", ".venv"], slot_dir))
+    steps.append(("pip", [str(venv_pip), "install", "-e", "."], slot_dir))
+    steps.append(("bun_install", ["bun", "install"], web_dir))
+    steps.append(("build", ["bun", "run", "build"], web_dir))
+    steps.append(("import_probe", [str(venv_python), "-c", "import server.main"], slot_dir))
+
+    for name, argv, cwd in steps:
+        rc, out = runner(argv, cwd, timeout)
+        if rc != 0:
+            return StageResult(ok=False, slot=slot, sha=sha, failed_step=name, output=out)
+    return StageResult(ok=True, slot=slot, sha=sha)

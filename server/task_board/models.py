@@ -27,9 +27,12 @@ DELIVERY_STATUSES = frozenset(
      "delivered", "conflicted", "blocked", "failed"}
 )
 DELIVERY_OP_KINDS = frozenset(
-    {"commit", "push", "pull_request", "merge", "branch_delete", "worktree_remove"}
+    {"commit", "push", "pull_request", "merge", "branch_delete", "worktree_remove",
+     "deploy_stage"}
 )
 # Which op kinds mutate state outside Owlery's own database (§3, §4.2).
+# `deploy_stage` is local and idempotent (it only prepares the idle slot), so it
+# is NOT external — like `commit` (docs/plans/local-deploy.md §4).
 DELIVERY_EXTERNAL_OP_KINDS = frozenset({"push", "pull_request", "merge"})
 DELIVERY_OP_STATES = frozenset(
     {"planned", "running", "succeeded", "failed", "interrupted"}
@@ -37,12 +40,25 @@ DELIVERY_OP_STATES = frozenset(
 DELIVERY_REASON_KINDS = frozenset(
     {"no_remote", "no_connector", "ambiguous_connector", "base_ambiguous",
      "conflict", "destructive", "interrupted", "op_failed", "push_auth_failed",
-     "workspace_gone_no_effect"}
+     "workspace_gone_no_effect",
+     # Local deploy (docs/plans/local-deploy.md §9). Only the two the stage op
+     # emits live here; the switch-only reasons (not_idle/health_failed/
+     # old_wont_die) arrive with §17 step 4.
+     "deploy_locked", "stage_failed"}
 )
 DELIVERY_RETENTIONS = frozenset(
     {"keep", "remove_worktree_keep_branch", "remove_all"}
 )
 DELIVERY_MERGE_STRATEGIES = frozenset({"fast_forward_only", "no_conflict_merge"})
+
+# Local deploy-and-restart (docs/plans/local-deploy.md §6). A deployment row's
+# lifecycle: `staging` → `staged` (settled after deploy_stage), then `switching`
+# → `live` at switch time, with `rolled_back`/`superseded`/`failed` as terminals.
+# `staging` and `switching` are the in-flight states the global deploy lock
+# (deployments_one_active) covers.
+DEPLOYMENT_STATES = frozenset(
+    {"staging", "staged", "switching", "live", "rolled_back", "superseded", "failed"}
+)
 
 
 class TaskBoardError(RuntimeError):
@@ -61,6 +77,14 @@ class TaskNotFoundError(TaskBoardError):
 
 class TaskConflictError(TaskBoardError):
     code = "conflict"
+
+
+class DeployLockedError(TaskConflictError):
+    """A second deploy raced onto the global deploy lock (docs/plans/
+    local-deploy.md §4). Distinct from a plain conflict so the coordinator can
+    fold it into a ``deploy_locked`` op result naming the holder."""
+
+    code = "deploy_locked"
 
 
 class TaskValidationError(TaskBoardError):
@@ -259,6 +283,24 @@ class DeliveryOpRecord(Record):
     started_at: str | None
     finished_at: str | None
     created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class DeploymentRecord(Record):
+    """A row of the `deployments` table (docs/plans/local-deploy.md §6): what
+    version the local instance staged/ran, and how it got there."""
+
+    id: str
+    delivery_id: str | None
+    task_id: str | None
+    op_id: str | None
+    slot: str
+    sha: str
+    source_repo: str
+    state: str
+    journal: dict[str, Any] | None
+    created_at: str
+    updated_at: str
 
 
 class DeliveryConfirmationRequired(TaskConflictError):

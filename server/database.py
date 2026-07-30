@@ -626,7 +626,8 @@ CREATE TABLE IF NOT EXISTS task_delivery_ops (
     id TEXT PRIMARY KEY,
     delivery_id TEXT NOT NULL REFERENCES task_deliveries(id) ON DELETE CASCADE,
     kind TEXT NOT NULL CHECK (kind IN (
-        'commit', 'push', 'pull_request', 'merge', 'branch_delete', 'worktree_remove'
+        'commit', 'push', 'pull_request', 'merge', 'branch_delete', 'worktree_remove',
+        'deploy_stage'
     )),
     source_key TEXT NOT NULL,             -- stable at-most-once key
     external INTEGER NOT NULL CHECK (external IN (0, 1)),
@@ -830,6 +831,7 @@ class Database:
                     logger.error("board migration failed: %s (%s)", ddl, exc)
                     raise
 
+        await self._migrate_delivery_op_kinds()
         await self._migrate_agents()
         await self._migrate_schedule_recurrence()
         await self._migrate_schedule_run_at()
@@ -1086,6 +1088,64 @@ class Database:
             if row[1] == column:
                 return bool(row[3])
         return False
+
+    async def _migrate_delivery_op_kinds(self) -> None:
+        """Widen ``task_delivery_ops.kind``'s CHECK to admit ``deploy_stage``
+        (docs/plans/local-deploy.md §4). SQLite cannot ALTER a CHECK constraint,
+        so a DB created before local deploy needs the table rebuilt; new DBs get
+        the widened CHECK straight from ``_SCHEMA``.
+
+        Guarded on the live table's own DDL text so it runs exactly once, and a
+        no-op when the table is absent. Nothing references ``task_delivery_ops``
+        by foreign key, so the drop-and-rename is safe with foreign_keys ON, as
+        with the other rebuilds in this module. Every existing row already
+        satisfies the widened CHECK (it only ADDS an allowed value), so the copy
+        never loses a row."""
+        cur = await self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='task_delivery_ops'"
+        )
+        row = await cur.fetchone()
+        if row is None or "deploy_stage" in (row[0] or ""):
+            return
+        await self._conn.executescript(
+            """
+            CREATE TABLE task_delivery_ops__new (
+                id TEXT PRIMARY KEY,
+                delivery_id TEXT NOT NULL REFERENCES task_deliveries(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL CHECK (kind IN (
+                    'commit', 'push', 'pull_request', 'merge', 'branch_delete',
+                    'worktree_remove', 'deploy_stage'
+                )),
+                source_key TEXT NOT NULL,
+                external INTEGER NOT NULL CHECK (external IN (0, 1)),
+                state TEXT NOT NULL CHECK (state IN (
+                    'planned', 'running', 'succeeded', 'failed', 'interrupted'
+                )),
+                request TEXT NOT NULL DEFAULT '{}',
+                result TEXT,
+                error TEXT,
+                actor_kind TEXT NOT NULL CHECK (actor_kind IN ('user', 'agent')),
+                actor_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE (source_key)
+            );
+            INSERT INTO task_delivery_ops__new
+                (id, delivery_id, kind, source_key, external, state, request,
+                 result, error, actor_kind, actor_agent_id, started_at,
+                 finished_at, created_at)
+                SELECT id, delivery_id, kind, source_key, external, state, request,
+                       result, error, actor_kind, actor_agent_id, started_at,
+                       finished_at, created_at FROM task_delivery_ops;
+            DROP TABLE task_delivery_ops;
+            ALTER TABLE task_delivery_ops__new RENAME TO task_delivery_ops;
+            CREATE UNIQUE INDEX IF NOT EXISTS task_delivery_ops_one_running
+              ON task_delivery_ops(delivery_id) WHERE state = 'running';
+            CREATE INDEX IF NOT EXISTS task_delivery_ops_delivery
+              ON task_delivery_ops(delivery_id, created_at);
+            """
+        )
 
     async def _migrate_agents(self) -> None:
         """First-class Agents refactor migration (agent-refactor.md §4.5).

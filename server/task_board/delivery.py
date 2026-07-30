@@ -9,12 +9,14 @@ credential. Nothing here is auto-retried — a crash mid-op is recovered as
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import httpx
 
+from .. import deploy
 from ..config import settings
 from ..connector_manager import ConnectorManager
 from . import workspaces as ws
@@ -22,6 +24,7 @@ from .models import (
     DELIVERY_RETENTIONS,
     DeliveryConfirmationRequired,
     DeliveryRecord,
+    DeployLockedError,
     TaskConflictError,
     TaskNotFoundError,
     TaskRecord,
@@ -526,6 +529,150 @@ class DeliveryCoordinator:
                 )
         except ws.WorkspaceError as exc:
             final = await self._fail(delivery.id, op_id, "op_failed", str(exc), actor_kind, actor_agent_id)
+        return await self._published(task, final)
+
+    # --- deploy_stage (docs/plans/local-deploy.md §4, §5) ----------------
+
+    async def deploy_stage(
+        self,
+        task_id: str,
+        run_id: str,
+        *,
+        actor_kind: str = "user",
+        actor_agent_id: str | None = None,
+        server_root: Path | None = None,
+        stage_runner: deploy.StageRunner | None = None,
+    ) -> DeliveryRecord:
+        """Stage the delivered sha into the idle deploy slot (local-deploy §5).
+
+        A local, idempotent, re-runnable delivery op under the same
+        ``task_delivery_ops`` machinery as ``commit`` (§4). It fetches the exact
+        reviewed sha from the board repo by local path, prepares the idle slot
+        completely (venv + build + import probe), and records a ``deployments``
+        row — all while the running instance is untouched by construction.
+
+        The instance fail-closed guard and the git prerequisites (§2) are
+        preconditions: they refuse without creating an op or mutating the
+        delivery, exactly like ``deliver_op``'s baseline/state checks. Only an
+        attempt that actually acquires the global lock and stages creates an op —
+        which fails to ``blocked(stage_failed)`` on a bad step, or
+        ``blocked(deploy_locked)`` if it loses the lock race (§4, §5, §12)."""
+        task, run, board = await self._load(task_id, run_id)
+
+        # 1. Instance fail-closed guard (§3.1). A config/instance problem, not a
+        #    delivery one — refuse without touching this (or any) delivery.
+        check = deploy.deploy_precheck(settings, server_root=server_root)
+        if not check.ok:
+            raise TaskConflictError(check.message, current=await self._delivery_for(run_id))
+
+        delivery = await self._delivery_for(run_id)
+
+        # 2. Git prerequisites (§2) — same shape as deliver_op's preconditions.
+        if delivery.status not in _GOAL_START_STATES:
+            raise TaskConflictError(
+                "delivery is not in a state that accepts a deploy", current=delivery
+            )
+        if delivery.base_head is None:
+            raise TaskConflictError("delivery has no baseline; accept it first", current=delivery)
+        if delivery.dirty:
+            raise TaskConflictError(
+                "worktree is dirty; run the commit op before deploying", current=delivery
+            )
+        if not delivery.attempt_head:
+            raise TaskConflictError("delivery has no committed head to deploy", current=delivery)
+        if (delivery.commits_ahead or 0) < 1:
+            raise TaskConflictError(
+                "nothing_to_deliver: no commits ahead of base", current=delivery
+            )
+
+        # deploy_precheck guaranteed a resolvable layout; read the idle slot now
+        # so the deployments row and the pipeline agree on a single target.
+        layout = deploy.DeployLayout.at(settings.resolved_deploy_root)
+        slot = layout.idle_slot()
+
+        # 3. Global deploy lock (§4). Common case: the holder is visible, so
+        #    refuse op-free naming it. The race (holder appears between here and
+        #    the insert) is caught by begin_deployment_staging below.
+        active = await self.repo.get_active_deployment()
+        if active is not None:
+            raise TaskConflictError(
+                f"deploy_locked: another deploy is {active.state} (slot {active.slot}, "
+                f"sha {active.sha[:12]}, task {active.task_id})",
+                current=delivery,
+            )
+
+        prior_status = delivery.status
+        prior_reason_kind = delivery.reason_kind
+        prior_reason_detail = delivery.reason_detail
+        op_id = await self._begin(
+            delivery,
+            "deploy_stage",
+            request={"slot": slot, "sha": delivery.attempt_head},
+            actor_kind=actor_kind,
+            actor_agent_id=actor_agent_id,
+        )
+
+        try:
+            deployment = await self.repo.begin_deployment_staging(
+                delivery_id=delivery.id,
+                task_id=task.id,
+                op_id=op_id,
+                slot=slot,
+                sha=delivery.attempt_head,
+                source_repo=delivery.repository,
+            )
+        except DeployLockedError as exc:
+            final = await self._fail(
+                delivery.id, op_id, "deploy_locked", str(exc), actor_kind, actor_agent_id
+            )
+            return await self._published(task, final)
+
+        runner = stage_runner or deploy._default_stage_runner
+        try:
+            result = await asyncio.to_thread(
+                deploy.stage_slot,
+                layout,
+                slot,
+                repo_path=delivery.repository,
+                sha=delivery.attempt_head,
+                timeout=settings.deploy_stage_timeout_seconds,
+                runner=runner,
+            )
+        except Exception as exc:  # pragma: no cover - defensive; steps return rc
+            await self.repo.mark_deployment_failed(deployment.id)
+            final = await self._fail(
+                delivery.id, op_id, "stage_failed",
+                f"stage pipeline crashed: {exc}", actor_kind, actor_agent_id,
+            )
+            return await self._published(task, final)
+
+        if not result.ok:
+            await self.repo.mark_deployment_failed(deployment.id)
+            detail = f"stage step {result.failed_step!r} failed:\n{result.output}".strip()
+            final = await self._fail(
+                delivery.id, op_id, "stage_failed", detail, actor_kind, actor_agent_id
+            )
+            return await self._published(task, final)
+
+        staged = await self.repo.mark_deployment_staged(deployment.id)
+        # Staging is transparent to the git-delivery status: restore whatever
+        # settled state the delivery had, preserving a blocked/conflicted reason.
+        restore_reason = prior_status in {"blocked", "conflicted"}
+        final, _ = await self.repo.finish_op(
+            delivery.id,
+            op_id,
+            state="succeeded",
+            delivery_status=prior_status,
+            reason_kind=prior_reason_kind if restore_reason else None,
+            reason_detail=prior_reason_detail if restore_reason else None,
+            result={
+                "staged_sha": result.sha,
+                "staged_slot": result.slot,
+                "deployment_id": staged.id,
+            },
+            actor_kind=actor_kind,
+            actor_agent_id=actor_agent_id,
+        )
         return await self._published(task, final)
 
     # --- teardown --------------------------------------------------------
