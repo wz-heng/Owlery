@@ -614,6 +614,8 @@ CREATE TABLE IF NOT EXISTS task_deliveries (
     retention TEXT,
     reason_kind TEXT,                      -- blocked|conflicted|failed reason (task-git-delivery.md §11.1)
     reason_detail TEXT,
+    deployed_sha TEXT,                     -- sha a successful deploy_switch made live (local-deploy.md §8)
+    deployed_slot TEXT,                    -- slot ('a'/'b') that sha runs in
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (run_id)
@@ -627,7 +629,7 @@ CREATE TABLE IF NOT EXISTS task_delivery_ops (
     delivery_id TEXT NOT NULL REFERENCES task_deliveries(id) ON DELETE CASCADE,
     kind TEXT NOT NULL CHECK (kind IN (
         'commit', 'push', 'pull_request', 'merge', 'branch_delete', 'worktree_remove',
-        'deploy_stage'
+        'deploy_stage', 'deploy_switch'
     )),
     source_key TEXT NOT NULL,             -- stable at-most-once key
     external INTEGER NOT NULL CHECK (external IN (0, 1)),
@@ -829,6 +831,20 @@ class Database:
                 # site when a NOT NULL column reads back missing.
                 if "duplicate column" not in str(exc).lower():
                     logger.error("board migration failed: %s (%s)", ddl, exc)
+                    raise
+
+        # Local deploy (docs/plans/local-deploy.md §8). A successful deploy_switch
+        # folds the live sha/slot into the delivery; these back-fill NULL on rows
+        # created before the switch op landed. New DBs get them from _SCHEMA.
+        for ddl in (
+            "ALTER TABLE task_deliveries ADD COLUMN deployed_sha TEXT",
+            "ALTER TABLE task_deliveries ADD COLUMN deployed_slot TEXT",
+        ):
+            try:
+                await self._conn.execute(ddl)
+            except aiosqlite.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    logger.error("delivery migration failed: %s (%s)", ddl, exc)
                     raise
 
         await self._migrate_delivery_op_kinds()
@@ -1090,8 +1106,9 @@ class Database:
         return False
 
     async def _migrate_delivery_op_kinds(self) -> None:
-        """Widen ``task_delivery_ops.kind``'s CHECK to admit ``deploy_stage``
-        (docs/plans/local-deploy.md §4). SQLite cannot ALTER a CHECK constraint,
+        """Widen ``task_delivery_ops.kind``'s CHECK to admit ``deploy_stage`` and
+        ``deploy_switch`` (docs/plans/local-deploy.md §4). SQLite cannot ALTER a
+        CHECK constraint,
         so a DB created before local deploy needs the table rebuilt; new DBs get
         the widened CHECK straight from ``_SCHEMA``.
 
@@ -1105,7 +1122,9 @@ class Database:
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='task_delivery_ops'"
         )
         row = await cur.fetchone()
-        if row is None or "deploy_stage" in (row[0] or ""):
+        # Guard on the NEWEST admitted kind so a DB widened for `deploy_stage`
+        # (but not yet `deploy_switch`) is still rebuilt exactly once more.
+        if row is None or "deploy_switch" in (row[0] or ""):
             return
         # Clear any scratch table left by a prior rebuild that was interrupted
         # between CREATE and RENAME — otherwise the CREATE below would fail and
@@ -1123,7 +1142,7 @@ class Database:
                 delivery_id TEXT NOT NULL REFERENCES task_deliveries(id) ON DELETE CASCADE,
                 kind TEXT NOT NULL CHECK (kind IN (
                     'commit', 'push', 'pull_request', 'merge', 'branch_delete',
-                    'worktree_remove', 'deploy_stage'
+                    'worktree_remove', 'deploy_stage', 'deploy_switch'
                 )),
                 source_key TEXT NOT NULL,
                 external INTEGER NOT NULL CHECK (external IN (0, 1)),
@@ -1334,10 +1353,40 @@ class Database:
             await self._conn.commit()
             self._dirty = False
 
+    async def wal_checkpoint_truncate(self) -> tuple[int, int, int]:
+        """Fully checkpoint the WAL and truncate it (`PRAGMA wal_checkpoint(TRUNCATE)`),
+        returning SQLite's `(busy, log_frames, checkpointed_frames)` row.
+
+        Used by the deploy snapshot (docs/plans/local-deploy.md §7.2/§7.4): after a
+        clean TRUNCATE (``busy == 0``) every committed frame is folded into the main
+        DB file and the WAL is emptied, so a plain file copy is a complete, self-
+        contained snapshot. ``busy != 0`` means a concurrent reader blocked the
+        truncate — the caller must NOT treat a bare file copy as complete
+        (the WAL still holds committed frames), which is exactly the silent-busy
+        data-loss trap SQLite's TRUNCATE checkpoint hides behind a non-raising
+        return."""
+        await self._ensure_connected()
+        # Commit our own pending writes first so they are in the WAL to fold in.
+        if self._dirty:
+            await self._conn.commit()
+            self._dirty = False
+        cursor = await self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:  # pragma: no cover - PRAGMA always returns a row
+            return (1, -1, -1)
+        return (int(row[0]), int(row[1]), int(row[2]))
+
     @property
     def conn(self) -> aiosqlite.Connection:
         assert self._conn is not None, "Database not initialized"
         return self._conn
+
+    @property
+    def path(self) -> str:
+        """The on-disk path of this database file (the deploy snapshot copies it
+        and the switcher restores over it, docs/plans/local-deploy.md §7.4)."""
+        return self._db_path
 
     async def save_session(
         self,

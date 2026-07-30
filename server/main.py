@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import signal
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -160,27 +161,62 @@ async def lifespan(app: FastAPI):
 
     # Git delivery recovery (task-git-delivery.md §16): interrupt in-flight
     # delivery ops, reset stuck baselines, and reconstruct terminal-delivery
-    # notifications. DB-only — no hosting-platform I/O in this barrier.
-    await task_board_manager.recover_deliveries()
+    # notifications. DB-only — no hosting-platform I/O in this barrier. Also
+    # reconciles any interrupted `deploy_switch` op from the switcher journal
+    # (local-deploy.md §8); a flipped-but-unconfirmed boot returns a probation.
+    probation = await task_board_manager.recover_deliveries()
 
-    # Domain recovery is now complete and all broadcast listeners are live.
-    # Drain only after that barrier; a replay can immediately start a model
-    # turn, so moving this earlier reintroduces the boot race.
-    await session_manager.resume_session_injection_dispatch()
+    # Wire the deploy-switch effects that only exist in a live server
+    # (local-deploy.md §7.2): the quiesce census/drain primitives, the
+    # `server_restarting` broadcast, and the in-process graceful-shutdown trigger
+    # (send ourselves the same SIGTERM uvicorn already turns into this teardown).
+    task_board_manager.bind_deploy_switch(
+        broadcast_restarting=session_manager._broadcast,
+        request_shutdown=lambda: os.kill(os.getpid(), signal.SIGTERM),
+        bg_task_manager=bg_task_manager,
+        research_manager=research_manager,
+        bridge_manager_getter=lambda: getattr(app.state, "bridge_manager", None),
+        scheduler_getter=lambda: getattr(
+            getattr(app.state, "schedule_runner", None), "_scheduler", None
+        ),
+        parked_scheduler_getter=lambda: getattr(
+            getattr(app.state, "parked_turn_runner", None), "_scheduler", None
+        ),
+    )
 
-    # Only now start autonomous producers. A due parked turn, schedule, or
-    # bridge message can call start_message directly (outside the injection
-    # outbox), so starting any of them before the recovery barrier would bypass
-    # paused injection dispatch.
-    await schedule_runner.initialize()
-    await parked_turn_runner.initialize()
-    await bridge_manager.start_all()
-    await task_board_manager.start()
+    async def _release_producers() -> None:
+        # Domain recovery is complete and all broadcast listeners are live. Drain
+        # only after that barrier; a replay can immediately start a model turn, so
+        # moving this earlier reintroduces the boot race. A due parked turn,
+        # schedule, or bridge message can call start_message directly (outside the
+        # injection outbox), so producers start only after the barrier too.
+        await session_manager.resume_session_injection_dispatch()
+        await schedule_runner.initialize()
+        await parked_turn_runner.initialize()
+        await bridge_manager.start_all()
+        await task_board_manager.start()
+        # Off the boot critical path (task-git-delivery.md §16, S3): a bounded,
+        # read-only reconcile of any interrupted PR op. Fire-and-forget so it
+        # never blocks the dispatcher, the injection drain, or any session's turn.
+        asyncio.create_task(task_board_manager.reconcile_interrupted_prs())
 
-    # Off the boot critical path (task-git-delivery.md §16, S3): a bounded,
-    # read-only reconcile of any interrupted PR op. Fire-and-forget so it never
-    # blocks the dispatcher, the injection drain, or any session's turn.
-    asyncio.create_task(task_board_manager.reconcile_interrupted_prs())
+    if probation is None:
+        await _release_producers()
+    else:
+        # Boot probation (local-deploy.md §7.5): this server flipped but the
+        # switcher has not yet confirmed health. Hold every producer paused — the
+        # health window performs no user-visible work a snapshot restore could
+        # undo — until the switcher's verdict lands (or the window elapses), then
+        # release. /health is already served, so the switcher can confirm us.
+        logger.info(
+            "deploy probation: holding producers until switch op %s settles",
+            probation.op_id,
+        )
+        asyncio.create_task(
+            task_board_manager.run_deploy_probation(
+                probation, on_release=_release_producers
+            )
+        )
 
     # Start Cloudflare Tunnel if enabled
     tunnel: CloudflareTunnel | None = None

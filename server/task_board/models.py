@@ -28,12 +28,14 @@ DELIVERY_STATUSES = frozenset(
 )
 DELIVERY_OP_KINDS = frozenset(
     {"commit", "push", "pull_request", "merge", "branch_delete", "worktree_remove",
-     "deploy_stage"}
+     "deploy_stage", "deploy_switch"}
 )
 # Which op kinds mutate state outside Owlery's own database (§3, §4.2).
 # `deploy_stage` is local and idempotent (it only prepares the idle slot), so it
-# is NOT external — like `commit` (docs/plans/local-deploy.md §4).
-DELIVERY_EXTERNAL_OP_KINDS = frozenset({"push", "pull_request", "merge"})
+# is NOT external — like `commit`. `deploy_switch` is the single sharpest
+# external op in the system: its side effect includes the recorder's own death,
+# so it is external=1 and never auto-retried (docs/plans/local-deploy.md §4).
+DELIVERY_EXTERNAL_OP_KINDS = frozenset({"push", "pull_request", "merge", "deploy_switch"})
 DELIVERY_OP_STATES = frozenset(
     {"planned", "running", "succeeded", "failed", "interrupted"}
 )
@@ -41,10 +43,10 @@ DELIVERY_REASON_KINDS = frozenset(
     {"no_remote", "no_connector", "ambiguous_connector", "base_ambiguous",
      "conflict", "destructive", "interrupted", "op_failed", "push_auth_failed",
      "workspace_gone_no_effect",
-     # Local deploy (docs/plans/local-deploy.md §9). Only the two the stage op
-     # emits live here; the switch-only reasons (not_idle/health_failed/
-     # old_wont_die) arrive with §17 step 4.
-     "deploy_locked", "stage_failed"}
+     # Local deploy (docs/plans/local-deploy.md §9). `deploy_locked`/`stage_failed`
+     # are stage-op reasons; `not_idle`/`health_failed`/`old_wont_die` are the
+     # switch-op reasons (§7.1/§7.3/§8).
+     "deploy_locked", "stage_failed", "not_idle", "health_failed", "old_wont_die"}
 )
 DELIVERY_RETENTIONS = frozenset(
     {"keep", "remove_worktree_keep_branch", "remove_all"}
@@ -263,6 +265,11 @@ class DeliveryRecord(Record):
     retention: str | None
     reason_kind: str | None
     reason_detail: str | None
+    # Local deploy (docs/plans/local-deploy.md §8): the sha/slot that a
+    # successful `deploy_switch` op made live, folded into the delivery the same
+    # way `pushed_ref`/`pr_number` fold a git op's external effect.
+    deployed_sha: str | None
+    deployed_slot: str | None
     created_at: str
     updated_at: str
 

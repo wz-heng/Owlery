@@ -49,7 +49,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .deploy import CURRENT_LINK, SLOTS, DeployLayout
+from .deploy import CURRENT_LINK, JOURNAL_NAME, SLOTS, DeployLayout
 
 # Journal step names (docs/plans/local-deploy.md §8). `handoff` is written by the
 # server before it spawns the switcher; every other name below is written by the
@@ -544,6 +544,46 @@ def run_switch(
          "restored_sha": handoff.old_sha, "old_pid": old_pid},
     )
     return EXIT_FAILED
+
+
+# ------------------------------------------------------- handoff-side spawn
+#
+# Used by the server (the delivery coordinator) at handoff to launch the
+# switcher fully detached from the old slot's trusted code (§7.2 step 4). Lives
+# here, next to `_spawn_detached`, so the double-fork + `setsid` detachment used
+# for BOTH the switcher itself and the servers it starts is one implementation.
+
+
+def spawn_switcher(
+    *,
+    root: str | os.PathLike[str],
+    from_slot: str,
+    op_id: str,
+    switch_timeout: float,
+    health_timeout: float,
+    env: dict[str, str] | None = None,
+    log_path: str | None = None,
+) -> int:
+    """Launch `<root>/<from_slot>/.venv/bin/owlery deploy-switch ...` fully
+    detached (own session + process group) and return its pid (§7.2 step 4).
+
+    The binary is the OLD (currently trusted) slot's `owlery`, never the staged
+    slot's — the switcher must run code that has already been health-proven, not
+    the version it is about to try (§13.6). Detachment is load-bearing: a
+    switcher reaped by the dying server's process-group cleanup is exactly the
+    `multi-agent-contention` zombie incident this feature must not recreate."""
+    root_path = Path(root)
+    owlery_bin = str(root_path / from_slot / ".venv" / "bin" / "owlery")
+    journal = str(root_path / JOURNAL_NAME)
+    argv = [
+        owlery_bin, "deploy-switch",
+        "--journal", journal,
+        "--op", op_id,
+        "--switch-timeout", str(switch_timeout),
+        "--health-timeout", str(health_timeout),
+    ]
+    log = log_path or str(root_path / "switcher.log")
+    return _spawn_detached(argv, str(root_path), dict(env or os.environ), log)
 
 
 # --------------------------------------------------------------------- CLI glue

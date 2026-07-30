@@ -1,0 +1,765 @@
+"""`deploy_switch` op, quiesce gate, boot reconciliation, and probation
+(docs/plans/local-deploy.md §7/§8, step 4 of §17).
+
+Everything runs against temp dirs and a fake instance (a dual-slot layout whose
+`.venv/bin/owlery` binaries are stubs), never a real production path (§14). The
+switcher itself is a seam here — its real-process behaviour is covered by
+`test_task_deploy_switcher.py`; these tests drive the SERVER side: the census,
+the drain/switch_when_idle gate, the handoff (snapshot + journal + detached
+spawn + broadcast + shutdown), the §8 boot-reconciliation table, and probation.
+
+The §14 switch/boot bullets covered:
+- quiesce census, each busy source individually;
+- drain pause/resume (and the honest `not_idle` refusal on timeout);
+- `switch_when_idle` non-durability across a restart;
+- snapshot checkpoint + copy (a self-contained, queryable snapshot);
+- handoff journal contract;
+- detachment: the spawned switcher owns its process group + session;
+- every §8 journal-tail row;
+- probation holds until the journal goes terminal (or the window elapses);
+- stale journal → interrupted.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+import server.switcher as switcher
+from server.config import settings
+from server.database import Database
+from server.deploy import DeployLayout
+from server.task_board.delivery import DeliveryCoordinator
+from server.task_board.deploy_quiesce import BusySource, DeployQuiesce
+from server.task_board.manager import DeployProbation, TaskBoardManager
+from server.task_board.models import TaskConflictError
+from server.task_board.repository import TaskRepository
+from server.task_board.workspaces import prepare_workspace
+
+
+# --------------------------------------------------------------- fixtures
+
+
+def _git(cwd, *args):
+    subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True)
+
+
+@pytest.fixture
+async def store(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(settings, "task_workspaces_dir", str(tmp_path / "wsroot"))
+    db_path = tmp_path / "owlery.db"
+    db = Database(str(db_path))
+    await db.initialize()
+    repo = TaskRepository(str(db_path))
+    await repo.initialize()
+    agent_id = (await db.load_agents())[0]["id"]
+    yield db, repo, tmp_path, agent_id
+    await repo.close()
+    await db.close()
+
+
+def _init_repo(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    _git(path, "init", "-q")
+    _git(path, "config", "user.email", "a@b.c")
+    _git(path, "config", "user.name", "T")
+    (path / "f.txt").write_text("base\n")
+    _git(path, "add", ".")
+    _git(path, "commit", "-qm", "base")
+    _git(path, "branch", "-M", "main")
+
+
+def _coord(db, repo) -> DeliveryCoordinator:
+    c = DeliveryCoordinator()
+    c.bind(db=db, connectors=None, notify_terminal=None, repo=repo)
+    return c
+
+
+def _init_layout(root: Path, monkeypatch, *, seed_idle: bool = True) -> DeployLayout:
+    """Dual-slot layout with `current -> a` live and `b` the idle target."""
+    layout = DeployLayout.at(root)
+    root.mkdir(parents=True, exist_ok=True)
+    for slot in ("a", "b") if seed_idle else ("a",):
+        s = layout.slot_path(slot)
+        (s / ".git").mkdir(parents=True)
+        (s / "web").mkdir()
+        bindir = s / ".venv" / "bin"
+        bindir.mkdir(parents=True)
+        for exe in ("python", "pip", "owlery"):
+            (bindir / exe).touch()
+    layout.snapshots_path.mkdir(exist_ok=True)
+    layout.journal_path.touch()
+    layout.switch_current("a")
+    monkeypatch.setattr(settings, "deploy_root", str(root))
+    monkeypatch.setattr(settings, "debug", False)
+    return layout
+
+
+class FakeStageRunner:
+    def __call__(self, argv, cwd, timeout):
+        if argv[:2] == ["git", "clone"]:
+            dst = Path(argv[3])
+            (dst / ".git").mkdir(parents=True, exist_ok=True)
+            (dst / "web").mkdir(exist_ok=True)
+        elif argv[1:3] == ["-m", "venv"]:
+            bindir = cwd / ".venv" / "bin"
+            bindir.mkdir(parents=True, exist_ok=True)
+            for exe in ("python", "pip", "owlery"):
+                (bindir / exe).touch()
+        return 0, "ok"
+
+
+async def _staged(db, repo, tmp, agent, monkeypatch):
+    """A ready delivery whose idle slot `b` is staged — the input a switch needs.
+    Returns (task, run, delivery, layout, coord, staged_deployment)."""
+    src = tmp / "src"
+    _init_repo(src)
+    board = await repo.create_board(
+        name=f"D-{uuid.uuid4().hex[:8]}", working_dir=str(src),
+        default_workspace_mode="git_worktree", allow_local_deploy=True,
+    )
+    task = await repo.create_task(
+        board_id=board.id, title="Ship it", status="todo", assignee_agent_id=agent
+    )
+    run_id = uuid.uuid4().hex[:12]
+    planned = str(Path(settings.resolved_task_workspaces_dir) / task.id / run_id)
+    run = await repo.claim_ready(
+        task.id, workspace_mode="git_worktree", workspace_path=planned, run_id=run_id
+    )
+    prepared = await prepare_workspace(
+        mode="git_worktree", source_dir=str(src), task_id=task.id,
+        run_id=run.id, attempt_no=run.attempt_no,
+    )
+    wt = Path(prepared.path)
+    (wt / "g.txt").write_text("worker change\n")
+    _git(wt, "add", ".")
+    _git(wt, "commit", "-qm", "worker change")
+    await repo.set_run_metadata(task.id, run.id, {"prepared": prepared.metadata})
+    await repo.complete_run(task.id, run.id, summary="did the work")
+    coord = _coord(db, repo)
+    delivery = await coord.accept(task.id, run.id)
+    layout = _init_layout(tmp / "deploy", monkeypatch)
+    delivery = await coord.deploy_stage(
+        task.id, run.id, server_root=layout.slot_path("a"), stage_runner=FakeStageRunner()
+    )
+    staged = await repo.get_staged_deployment_for_delivery(delivery.id)
+    assert staged is not None and staged.slot == "b" and staged.state == "staged"
+    return board, task, await repo.get_run(run.id), delivery, layout, coord, staged
+
+
+class FakeQuiesce:
+    """Coordinator-side quiesce seam: a scripted census plus pause/resume spies."""
+
+    def __init__(self, busy_sequence):
+        self._seq = [list(x) for x in busy_sequence]
+        self.paused = 0
+        self.resumed = 0
+
+    async def census(self, *, exclude_op_id=None):
+        if len(self._seq) > 1:
+            return self._seq.pop(0)
+        return list(self._seq[0]) if self._seq else []
+
+    async def pause_for_drain(self):
+        self.paused += 1
+
+    async def resume_from_drain(self):
+        self.resumed += 1
+
+
+def _wire_switch(coord, quiesce):
+    """Inject the deploy-switch effects with spies; no real spawn/broadcast/kill."""
+    coord.deploy_quiesce = quiesce
+    coord.broadcasts = []
+    coord.shutdowns = []
+    coord.spawns = []
+
+    async def _broadcast(msg):
+        coord.broadcasts.append(msg)
+
+    def _spawn(**kw):
+        coord.spawns.append(kw)
+        return 4321
+
+    coord.broadcast_restarting = _broadcast
+    coord.request_shutdown = lambda: coord.shutdowns.append(True)
+    coord.spawn_switcher = _spawn
+    coord._drain_poll_interval = 0.01
+    return coord
+
+
+def _manager(db, repo) -> TaskBoardManager:
+    m = TaskBoardManager()
+    m.repo = repo
+    m.db = db
+    m.session_mgr = None
+    m._probation_poll_interval = 0.01
+    return m
+
+
+# ---------------------------------------------------- A. quiesce census
+
+
+class _Task:
+    def __init__(self, done):
+        self._done = done
+
+    def done(self):
+        return self._done
+
+
+class _Sess:
+    def __init__(self, done):
+        self._active_task = _Task(done)
+
+
+class _SM:
+    def __init__(self):
+        self.sessions = {}
+
+
+class _Obj:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+class _Repo:
+    def __init__(self):
+        self.runs = []
+        self.ops = []
+
+    async def list_running_runs(self):
+        return self.runs
+
+    async def list_running_delivery_ops(self):
+        return self.ops
+
+
+class _DB:
+    def __init__(self):
+        self.parked = []
+        self.deleg = []
+        self.inj = []
+
+    async def list_parked_turns(self):
+        return self.parked
+
+    async def list_running_delegation_runs(self):
+        return self.deleg
+
+    async def list_pending_session_injections(self):
+        return self.inj
+
+
+def _quiesce(sm=None, repo=None, db=None, bg=None, research=None):
+    return DeployQuiesce(
+        session_manager=sm or _SM(), repo=repo or _Repo(), db=db or _DB(),
+        bg_task_manager=bg, research_manager=research,
+    )
+
+
+@pytest.mark.asyncio
+async def test_census_idle_is_empty():
+    assert await _quiesce().census() == []
+
+
+@pytest.mark.asyncio
+async def test_census_active_session_turn():
+    sm = _SM()
+    sm.sessions = {"live": _Sess(done=False), "finished": _Sess(done=True)}
+    busy = await _quiesce(sm=sm).census()
+    assert [b.kind for b in busy] == ["session_turn"]
+    assert busy[0].detail == "live"
+
+
+@pytest.mark.asyncio
+async def test_census_parked_turn():
+    db = _DB()
+    db.parked = [{"session_id": "s7"}]
+    busy = await _quiesce(db=db).census()
+    assert busy == [BusySource("parked_turn", "s7")]
+
+
+@pytest.mark.asyncio
+async def test_census_task_run():
+    repo = _Repo()
+    repo.runs = [_Obj(id="run1")]
+    busy = await _quiesce(repo=repo).census()
+    assert busy == [BusySource("task_run", "run1")]
+
+
+@pytest.mark.asyncio
+async def test_census_other_delivery_op_excludes_self():
+    repo = _Repo()
+    repo.ops = [_Obj(id="me", kind="deploy_switch"), _Obj(id="other", kind="push")]
+    busy = await _quiesce(repo=repo).census(exclude_op_id="me")
+    assert busy == [BusySource("delivery_op", "push:other")]
+
+
+@pytest.mark.asyncio
+async def test_census_bg_research_delegation_injection():
+    db = _DB()
+    db.deleg = [{"id": "d1"}]
+    db.inj = [{"id": "inj1"}]
+    bg = _Obj(_running={"t1": object()})
+    research = _Obj(_tasks={"r1": object(), "r2": object()})
+    busy = await _quiesce(db=db, bg=bg, research=research).census()
+    kinds = {b.kind for b in busy}
+    assert kinds == {"bg_task", "research", "delegation", "session_injection"}
+    research_src = next(b for b in busy if b.kind == "research")
+    assert research_src.detail == "2 running"
+
+
+# ------------------------------------------ B. DeployQuiesce drain primitives
+
+
+@pytest.mark.asyncio
+async def test_pause_resume_for_drain_hits_every_primitive():
+    events = []
+
+    class _SMspy:
+        sessions = {}
+
+        def pause_session_injection_dispatch(self):
+            events.append("inj_pause")
+
+        async def resume_session_injection_dispatch(self):
+            events.append("inj_resume")
+
+    class _Bridge:
+        async def stop_all(self):
+            events.append("bridge_stop")
+
+        async def start_all(self):
+            events.append("bridge_start")
+
+    class _Sched:
+        def pause(self):
+            events.append("sched_pause")
+
+        def resume(self):
+            events.append("sched_resume")
+
+    sched = _Sched()
+    q = DeployQuiesce(
+        session_manager=_SMspy(), repo=_Repo(), db=_DB(),
+        pause_dispatch=lambda: events.append("disp_pause"),
+        resume_dispatch=lambda: events.append("disp_resume"),
+        bridge_manager_getter=lambda: _Bridge(),
+        scheduler_getter=lambda: sched,
+        parked_scheduler_getter=lambda: sched,
+    )
+    await q.pause_for_drain()
+    await q.resume_from_drain()
+    assert "inj_pause" in events and "disp_pause" in events
+    assert "bridge_stop" in events and "sched_pause" in events
+    assert "bridge_start" in events and "disp_resume" in events
+    assert "inj_resume" in events and "sched_resume" in events
+
+
+# --------------------------------------------------- C. coordinator gate
+
+
+@pytest.mark.asyncio
+async def test_switch_refuses_not_idle_with_census(store, monkeypatch):
+    db, repo, tmp, agent = store
+    _, task, run, delivery, layout, coord, staged = await _staged(db, repo, tmp, agent, monkeypatch)
+    _wire_switch(coord, FakeQuiesce([[BusySource("session_turn", "s1")]]))
+
+    d = await coord.deploy_switch(task.id, run.id, server_root=layout.slot_path("a"))
+
+    assert d.status == "blocked" and d.reason_kind == "not_idle"
+    assert "session_turn:s1" in (d.reason_detail or "")
+    op = next(o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch")
+    assert op.state == "failed" and op.external is True
+    # The staged deployment is untouched — a busy refusal never flips anything.
+    assert (await repo.get_deployment(staged.id)).state == "staged"
+    assert coord.spawns == [] and coord.shutdowns == []
+
+
+@pytest.mark.asyncio
+async def test_drain_times_out_resumes_and_refuses(store, monkeypatch):
+    db, repo, tmp, agent = store
+    _, task, run, delivery, layout, coord, staged = await _staged(db, repo, tmp, agent, monkeypatch)
+    monkeypatch.setattr(settings, "deploy_quiesce_timeout_seconds", 0.05)
+    q = FakeQuiesce([[BusySource("task_run", "r1")]])  # busy forever
+    _wire_switch(coord, q)
+
+    d = await coord.deploy_switch(task.id, run.id, drain=True, server_root=layout.slot_path("a"))
+
+    assert d.status == "blocked" and d.reason_kind == "not_idle"
+    assert q.paused == 1 and q.resumed == 1  # producers handed back on timeout
+    assert coord.spawns == []
+
+
+@pytest.mark.asyncio
+async def test_drain_waits_then_proceeds(store, monkeypatch):
+    db, repo, tmp, agent = store
+    _, task, run, delivery, layout, coord, staged = await _staged(db, repo, tmp, agent, monkeypatch)
+    monkeypatch.setattr(settings, "deploy_quiesce_timeout_seconds", 5)
+    # Busy at the gate, idle once drained.
+    q = FakeQuiesce([[BusySource("task_run", "r1")], []])
+    _wire_switch(coord, q)
+
+    await coord.deploy_switch(task.id, run.id, drain=True, server_root=layout.slot_path("a"))
+
+    assert q.paused == 1 and q.resumed == 0  # proceeded; restart restores producers
+    assert len(coord.spawns) == 1 and coord.shutdowns == [True]
+
+
+# --------------------------------------- D. switch_when_idle non-durability
+
+
+@pytest.mark.asyncio
+async def test_switch_when_idle_plans_and_is_not_durable(store, monkeypatch):
+    db, repo, tmp, agent = store
+    _, task, run, delivery, layout, coord, staged = await _staged(db, repo, tmp, agent, monkeypatch)
+    coord._drain_poll_interval = 100  # the waiter parks, never proceeds
+    _wire_switch(coord, FakeQuiesce([[BusySource("task_run", "r1")]]))
+
+    await coord.deploy_switch(task.id, run.id, switch_when_idle=True, server_root=layout.slot_path("a"))
+    try:
+        op = next(o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch")
+        assert op.state == "planned"  # held in memory, never started
+
+        # Simulate a restart: boot reconciliation must leave the planned op alone
+        # (§3 nothing auto-starts; §7.1 the hold does not survive a restart).
+        m = _manager(db, repo)
+        assert await m.reconcile_deploy_switch_ops() is None
+        op = next(o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch")
+        assert op.state == "planned"
+        assert (await repo.get_deployment(staged.id)).state == "staged"
+    finally:
+        for t in list(coord._idle_switch_waiters):
+            t.cancel()
+
+
+# ---------------------------------------------- E. handoff + snapshot
+
+
+@pytest.mark.asyncio
+async def test_handoff_snapshot_journal_spawn_broadcast_shutdown(store, monkeypatch):
+    db, repo, tmp, agent = store
+    _, task, run, delivery, layout, coord, staged = await _staged(db, repo, tmp, agent, monkeypatch)
+    _wire_switch(coord, FakeQuiesce([[]]))
+
+    await coord.deploy_switch(task.id, run.id, server_root=layout.slot_path("a"))
+
+    op = next(o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch")
+    # The op stays RUNNING through handoff — the switcher/probation finalizes it.
+    assert op.state == "running"
+    assert op.result and op.result.get("journal_ref") == str(layout.journal_path)
+    # Deployment took the global lock as `switching`, bound to this op.
+    dep = await repo.get_deployment(staged.id)
+    assert dep.state == "switching" and dep.op_id == op.id
+
+    # The handoff journal line carries the full switch contract (§7.2 step 2).
+    entries = switcher.Journal(str(layout.journal_path)).entries(op.id)
+    handoff = next(e for e in entries if e["step"] == switcher.STEP_HANDOFF)
+    d = handoff["detail"]
+    assert d["from_slot"] == "a" and d["to_slot"] == "b"
+    assert d["new_sha"] == staged.sha and d["old_pid"] == os.getpid()
+    assert d["snapshot_path"].endswith(f"{op.id}.db")
+
+    # The snapshot is a self-contained, queryable copy of the live DB (§7.4).
+    snap = Path(d["snapshot_path"])
+    assert snap.is_file()
+    conn = sqlite3.connect(str(snap))
+    got = conn.execute("SELECT id FROM tasks WHERE id=?", (task.id,)).fetchone()
+    conn.close()
+    assert got is not None  # committed rows survived checkpoint+copy
+
+    # The detached switcher was spawned from the OLD slot; restart is under way.
+    assert coord.spawns[0]["from_slot"] == "a" and coord.spawns[0]["op_id"] == op.id
+    assert coord.broadcasts[0]["type"] == "server_restarting"
+    assert coord.shutdowns == [True]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_prunes_to_keep(store, monkeypatch):
+    db, repo, tmp, agent = store
+    _, task, run, delivery, layout, coord, staged = await _staged(db, repo, tmp, agent, monkeypatch)
+    monkeypatch.setattr(settings, "deploy_keep_snapshots", 2)
+    # Pre-seed 3 old snapshots; pruning keeps 2 total incl. the fresh one.
+    for i in range(3):
+        (layout.snapshots_path / f"old{i}.db").write_text("x")
+    _wire_switch(coord, FakeQuiesce([[]]))
+
+    await coord.deploy_switch(task.id, run.id, server_root=layout.slot_path("a"))
+
+    op = next(o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch")
+    snaps = {p.name for p in layout.snapshots_path.glob("*.db")}
+    assert f"{op.id}.db" in snaps and len(snaps) == 2  # own snapshot never pruned
+
+
+# ------------------------------------------------- F. detachment (pgid/sid)
+
+
+_DETACH_STUB = """\
+#!{python}
+import os
+out = os.environ["DETACH_OUT"]
+with open(out, "w") as f:
+    f.write("{},{},{}".format(os.getpid(), os.getpgid(0), os.getsid(0)))
+""".replace("{python}", sys.executable)
+
+
+@pytest.mark.asyncio
+async def test_spawn_switcher_is_fully_detached(tmp_path, monkeypatch):
+    import time
+
+    root = tmp_path / "deploy"
+    bindir = root / "a" / ".venv" / "bin"
+    bindir.mkdir(parents=True)
+    owlery = bindir / "owlery"
+    owlery.write_text(_DETACH_STUB)
+    owlery.chmod(0o755)
+    (root / switcher.JOURNAL_NAME).touch()
+    out = tmp_path / "detach.txt"
+
+    pid = switcher.spawn_switcher(
+        root=str(root), from_slot="a", op_id="op1",
+        switch_timeout=1, health_timeout=1,
+        env={**os.environ, "DETACH_OUT": str(out)},
+    )
+    for _ in range(200):
+        if out.exists():
+            break
+        time.sleep(0.02)
+    child_pid, pgid, sid = (int(x) for x in out.read_text().split(","))
+    # The grandchild lives in the NEW session `setsid` created in the intermediate
+    # child (so pgid == sid), entirely separate from this (server) process's
+    # session and group — it can never be reaped by the dying server's
+    # process-group cleanup (§7.2).
+    assert pgid == sid
+    assert child_pid != os.getpid()
+    assert sid != os.getsid(0) and pgid != os.getpgid(0)
+
+
+# ------------------------------------------- G. §8 boot reconciliation
+
+
+async def _handed_off(db, repo, tmp, agent, monkeypatch):
+    """Drive a full handoff, then return (manager, coord, op, staged, layout, ids)
+    with the op `running`, the deployment `switching`, and a `handoff` journal
+    tail — the state every §8 boot row starts from."""
+    _, task, run, delivery, layout, coord, staged = await _staged(db, repo, tmp, agent, monkeypatch)
+    _wire_switch(coord, FakeQuiesce([[]]))
+    await coord.deploy_switch(task.id, run.id, server_root=layout.slot_path("a"))
+    op = next(o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch")
+    return _manager(db, repo), coord, op, staged, layout, (task, run, delivery)
+
+
+def _append(layout, op_id, step, detail):
+    switcher.Journal(str(layout.journal_path)).append(op_id, step, detail)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_switched_ok(store, monkeypatch):
+    db, repo, tmp, agent = store
+    m, coord, op, staged, layout, (task, run, delivery) = await _handed_off(db, repo, tmp, agent, monkeypatch)
+    _append(layout, op.id, switcher.STEP_SWITCHED_OK, {"slot": "b", "sha": staged.sha, "pid": 9})
+
+    assert await m.reconcile_deploy_switch_ops() is None  # terminal, no probation
+
+    op = next(o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch")
+    assert op.state == "succeeded"
+    assert (await repo.get_deployment(staged.id)).state == "live"
+    d = await repo.get_delivery(delivery.id)
+    assert d.deployed_sha == staged.sha and d.deployed_slot == "b"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_switched_ok_supersedes_prior_live(store, monkeypatch):
+    db, repo, tmp, agent = store
+    m, coord, op, staged, layout, (task, run, delivery) = await _handed_off(db, repo, tmp, agent, monkeypatch)
+    # Seed a prior live deployment (slot a) directly — begin_deployment_staging
+    # can't be used, the handoff already holds the global lock as `switching`.
+    async with repo._transaction() as conn:
+        await conn.execute(
+            "INSERT INTO deployments (id, delivery_id, task_id, op_id, slot, sha, "
+            "source_repo, state, journal, created_at, updated_at) VALUES "
+            "('priorlive', NULL, NULL, NULL, 'a', 'oldsha', 'x', 'live', NULL, "
+            "'2020-01-01T00:00:00+00:00', '2020-01-01T00:00:00+00:00')"
+        )
+    _append(layout, op.id, switcher.STEP_SWITCHED_OK, {"slot": "b", "sha": staged.sha})
+
+    await m.reconcile_deploy_switch_ops()
+
+    assert (await repo.get_deployment("priorlive")).state == "superseded"
+    assert (await repo.get_deployment(staged.id)).state == "live"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_rolled_back(store, monkeypatch):
+    db, repo, tmp, agent = store
+    m, coord, op, staged, layout, (task, run, delivery) = await _handed_off(db, repo, tmp, agent, monkeypatch)
+    _append(layout, op.id, switcher.STEP_ROLLED_BACK, {"reason": "health_timeout"})
+
+    await m.reconcile_deploy_switch_ops()
+
+    op = next(o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch")
+    assert op.state == "failed"
+    assert (await repo.get_deployment(staged.id)).state == "rolled_back"
+    d = await repo.get_delivery(delivery.id)
+    assert d.status == "blocked" and d.reason_kind == "health_failed"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_rollback_incomplete(store, monkeypatch):
+    db, repo, tmp, agent = store
+    m, coord, op, staged, layout, (task, run, delivery) = await _handed_off(db, repo, tmp, agent, monkeypatch)
+    _append(layout, op.id, switcher.STEP_ROLLBACK_INCOMPLETE,
+            {"stage": "port_not_freed", "reason": "health_timeout"})
+
+    await m.reconcile_deploy_switch_ops()
+
+    op = next(o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch")
+    assert op.state == "failed"
+    assert (await repo.get_deployment(staged.id)).state == "failed"
+    d = await repo.get_delivery(delivery.id)
+    assert d.status == "blocked" and d.reason_kind == "health_failed"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_old_wont_die_reverts_to_staged(store, monkeypatch):
+    db, repo, tmp, agent = store
+    m, coord, op, staged, layout, (task, run, delivery) = await _handed_off(db, repo, tmp, agent, monkeypatch)
+    _append(layout, op.id, switcher.STEP_OLD_WONT_DIE, {"old_pid": 1, "port": 8000})
+
+    await m.reconcile_deploy_switch_ops()
+
+    op = next(o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch")
+    assert op.state == "failed"
+    # The flip never happened → the deployment is deployable again (§8).
+    assert (await repo.get_deployment(staged.id)).state == "staged"
+    assert await repo.get_active_deployment() is None  # lock released
+    d = await repo.get_delivery(delivery.id)
+    assert d.status == "blocked" and d.reason_kind == "old_wont_die"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_handoff_only_is_interrupted(store, monkeypatch):
+    db, repo, tmp, agent = store
+    m, coord, op, staged, layout, (task, run, delivery) = await _handed_off(db, repo, tmp, agent, monkeypatch)
+    # No switcher line beyond `handoff`.
+    assert await m.reconcile_deploy_switch_ops() is None
+
+    op = next(o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch")
+    assert op.state == "interrupted"
+    assert (await repo.get_deployment(staged.id)).state == "failed"
+    d = await repo.get_delivery(delivery.id)
+    assert d.status == "blocked" and d.reason_kind == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_stale_flip_done_is_interrupted(store, monkeypatch):
+    db, repo, tmp, agent = store
+    m, coord, op, staged, layout, (task, run, delivery) = await _handed_off(db, repo, tmp, agent, monkeypatch)
+    monkeypatch.setattr(settings, "deploy_health_timeout_seconds", 60)
+    old_ts = (datetime.now(timezone.utc) - timedelta(seconds=9999)).isoformat()
+    with open(layout.journal_path, "a") as f:
+        f.write(json.dumps({"ts": old_ts, "op_id": op.id, "step": "flip_done", "detail": {}}) + "\n")
+
+    assert await m.reconcile_deploy_switch_ops() is None  # too stale for probation
+
+    op = next(o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch")
+    assert op.state == "interrupted"
+
+
+# --------------------------------------------------- H. probation
+
+
+@pytest.mark.asyncio
+async def test_fresh_flip_done_enters_probation(store, monkeypatch):
+    db, repo, tmp, agent = store
+    m, coord, op, staged, layout, (task, run, delivery) = await _handed_off(db, repo, tmp, agent, monkeypatch)
+    _append(layout, op.id, switcher.STEP_FLIP_DONE, {"from_slot": "a", "to_slot": "b"})
+
+    probation = await m.reconcile_deploy_switch_ops()
+
+    assert isinstance(probation, DeployProbation) and probation.op_id == op.id
+    # Left RUNNING for the probation monitor (§7.5).
+    op = next(o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch")
+    assert op.state == "running"
+
+
+@pytest.mark.asyncio
+async def test_probation_releases_on_switched_ok(store, monkeypatch):
+    db, repo, tmp, agent = store
+    m, coord, op, staged, layout, (task, run, delivery) = await _handed_off(db, repo, tmp, agent, monkeypatch)
+    _append(layout, op.id, switcher.STEP_FLIP_DONE, {"from_slot": "a", "to_slot": "b"})
+    probation = await m.reconcile_deploy_switch_ops()
+    # The switcher confirms health.
+    _append(layout, op.id, switcher.STEP_SWITCHED_OK, {"slot": "b", "sha": staged.sha})
+
+    released = []
+
+    async def _release():
+        released.append(True)
+
+    outcome = await m.run_deploy_probation(probation, on_release=_release)
+
+    assert outcome == switcher.STEP_SWITCHED_OK and released == [True]
+    op = next(o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch")
+    assert op.state == "succeeded"
+    assert (await repo.get_deployment(staged.id)).state == "live"
+
+
+@pytest.mark.asyncio
+async def test_probation_times_out_to_interrupted(store, monkeypatch):
+    db, repo, tmp, agent = store
+    m, coord, op, staged, layout, (task, run, delivery) = await _handed_off(db, repo, tmp, agent, monkeypatch)
+    _append(layout, op.id, switcher.STEP_FLIP_DONE, {"from_slot": "a", "to_slot": "b"})
+    probation = await m.reconcile_deploy_switch_ops()
+    monkeypatch.setattr(settings, "deploy_health_timeout_seconds", 0.05)
+
+    released = []
+
+    async def _release():
+        released.append(True)
+
+    outcome = await m.run_deploy_probation(probation, on_release=_release)
+
+    assert outcome == "timeout" and released == [True]  # producers always released
+    op = next(o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch")
+    assert op.state == "interrupted"
+    assert (await repo.get_deployment(staged.id)).state == "failed"
+
+
+# --------------------------------------------------- I. preconditions
+
+
+@pytest.mark.asyncio
+async def test_switch_requires_board_opt_in(store, monkeypatch):
+    db, repo, tmp, agent = store
+    board, task, run, delivery, layout, coord, staged = await _staged(db, repo, tmp, agent, monkeypatch)
+    await repo.update_board(board.id, allow_local_deploy=False)
+    _wire_switch(coord, FakeQuiesce([[]]))
+
+    with pytest.raises(TaskConflictError):
+        await coord.deploy_switch(task.id, run.id, server_root=layout.slot_path("a"))
+    # No op planned; nothing flipped.
+    assert not [o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch"]
+    assert (await repo.get_deployment(staged.id)).state == "staged"
+
+
+@pytest.mark.asyncio
+async def test_switch_requires_a_staged_slot(store, monkeypatch):
+    db, repo, tmp, agent = store
+    _, task, run, delivery, layout, coord, staged = await _staged(db, repo, tmp, agent, monkeypatch)
+    # Supersede the staged row so nothing is staged to switch to.
+    async with repo._transaction() as conn:
+        await conn.execute("UPDATE deployments SET state='superseded' WHERE id=?", (staged.id,))
+    _wire_switch(coord, FakeQuiesce([[]]))
+
+    with pytest.raises(TaskConflictError, match="nothing_staged"):
+        await coord.deploy_switch(task.id, run.id, server_root=layout.slot_path("a"))
+    assert not [o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch"]

@@ -2671,7 +2671,7 @@ class TaskRepository:
             for key in (
                 "pushed_ref", "pr_number", "pr_url", "pr_state", "merge_strategy",
                 "retention", "attempt_head", "commits_ahead", "remote_name",
-                "remote_url",
+                "remote_url", "deployed_sha", "deployed_slot",
             ):
                 if delivery_fields and delivery_fields.get(key) is not None:
                     fields[key] = delivery_fields[key]
@@ -2766,13 +2766,21 @@ class TaskRepository:
     async def interrupt_running_delivery_ops(
         self, *, reason: str
     ) -> list[tuple[DeliveryRecord, DeliveryOpRecord]]:
-        """Boot recovery: every op left running becomes ``interrupted`` and its
-        delivery ``blocked(interrupted)``; never re-executed (§3, §16)."""
+        """Boot recovery: every running op becomes ``interrupted`` and its
+        delivery ``blocked(interrupted)``; never re-executed (§3, §16).
+
+        ``deploy_switch`` ops are deliberately excluded: a running one is not
+        simply "unknown" — the detached switcher may still be finishing the flip,
+        and its terminal state is reconciled from the write-ahead journal, never
+        by a blind interrupt (docs/plans/local-deploy.md §8). They are owned
+        entirely by ``reconcile_deploy_switch_ops`` (which runs first at boot)."""
         stamp = _now_iso()
         out: list[tuple[DeliveryRecord, DeliveryOpRecord]] = []
         async with self._transaction() as conn:
             rows = await self._fetchall(
-                conn, "SELECT * FROM task_delivery_ops WHERE state='running'"
+                conn,
+                "SELECT * FROM task_delivery_ops WHERE state='running' "
+                "AND kind != 'deploy_switch'",
             )
             for op in rows:
                 detail = f"{reason} (op: {op['kind']})"
@@ -2881,6 +2889,15 @@ class TaskRepository:
                 self.conn, "SELECT * FROM deployments ORDER BY created_at, id"
             )
         return [self._deployment_record(r) for r in rows]
+
+    async def get_live_deployment(self) -> DeploymentRecord | None:
+        """The single ``live`` deployment row — what the instance is running
+        (docs/plans/local-deploy.md §6), or None before the first switch."""
+        async with self._lock:
+            row = await self._fetchone(
+                self.conn, "SELECT * FROM deployments WHERE state='live' LIMIT 1"
+            )
+        return self._deployment_record(row) if row else None
 
     async def get_active_deployment(self) -> DeploymentRecord | None:
         """The single ``staging``/``switching`` row that holds the global deploy
@@ -3020,6 +3037,269 @@ class TaskRepository:
                 conn, "SELECT * FROM deployments WHERE id = ?", (deployment_id,)
             )
         return self._deployment_record(row)
+
+    # --- Local deploy: deploy_switch op + boot reconciliation (§7/§8) ------
+
+    async def get_staged_deployment_for_delivery(
+        self, delivery_id: str
+    ) -> DeploymentRecord | None:
+        """The `staged` deployment row for a delivery — the switch target
+        (docs/plans/local-deploy.md §6). None if nothing is staged for it."""
+        async with self._lock:
+            row = await self._fetchone(
+                self.conn,
+                "SELECT * FROM deployments WHERE delivery_id=? AND state='staged' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (delivery_id,),
+            )
+        return self._deployment_record(row) if row else None
+
+    async def list_running_deploy_switch_ops(self) -> list[DeliveryOpRecord]:
+        """Every `deploy_switch` op left `running` in the DB — the boot
+        reconciler's worklist (§8). Empty in the common boot (no open deploy),
+        so the reconciler reads no journal at all: the cheap fast path."""
+        async with self._lock:
+            rows = await self._fetchall(
+                self.conn,
+                "SELECT * FROM task_delivery_ops WHERE state='running' "
+                "AND kind='deploy_switch' ORDER BY created_at",
+            )
+        return [self._delivery_op_record(r) for r in rows]
+
+    async def begin_deployment_switching(
+        self, *, deployment_id: str, op_id: str
+    ) -> DeploymentRecord:
+        """CAS a `staged` deployment to `switching`, binding it to the switch op
+        and taking the global deploy lock (docs/plans/local-deploy.md §6/§7.2).
+
+        `switching` is a `deployments_one_active` state, so a concurrent
+        staging/switching deploy makes the unique index reject this and raise
+        `DeployLockedError` naming the holder — the same lock the stage op
+        contends for. A non-`staged` source is a lost race (`TaskConflictError`)."""
+        stamp = _now_iso()
+        async with self._transaction() as conn:
+            try:
+                cursor = await conn.execute(
+                    "UPDATE deployments SET state='switching', op_id=?, updated_at=? "
+                    "WHERE id=? AND state='staged'",
+                    (op_id, stamp, deployment_id),
+                )
+            except aiosqlite.IntegrityError as exc:
+                holder = await self._fetchone(
+                    conn,
+                    "SELECT * FROM deployments WHERE state IN ('staging','switching') "
+                    "AND id != ? ORDER BY created_at LIMIT 1",
+                    (deployment_id,),
+                )
+                if holder is None:
+                    raise
+                detail = (
+                    f"another deploy is {holder['state']} (slot {holder['slot']}, "
+                    f"sha {holder['sha'][:12]}, task {holder['task_id']})"
+                )
+                raise DeployLockedError(f"deploy_locked: {detail}") from exc
+            if cursor.rowcount != 1:
+                raise TaskConflictError(
+                    f"deployment {deployment_id!r} is not staged; cannot switch"
+                )
+            row = await self._fetchone(
+                conn, "SELECT * FROM deployments WHERE id=?", (deployment_id,)
+            )
+        return self._deployment_record(row)
+
+    async def record_switch_journal_ref(
+        self, op_id: str, *, journal_ref: str, detail: Mapping[str, Any] | None = None
+    ) -> DeliveryOpRecord:
+        """Persist the switcher's journal reference onto the still-running switch
+        op (§7.2 step 3), result-partial. A crash between here and the switcher's
+        first journal line is then reconcilable — the op points at exactly which
+        journal + op id the boot reconciler must read."""
+        result: dict[str, Any] = {"journal_ref": journal_ref}
+        if detail:
+            result.update(detail)
+        async with self._transaction() as conn:
+            row = await self._fetchone(
+                conn, "SELECT * FROM task_delivery_ops WHERE id=?", (op_id,)
+            )
+            if row is None:
+                raise TaskNotFoundError(f"delivery op {op_id!r} not found")
+            if row["state"] != "running":
+                raise TaskConflictError("switch op is not running")
+            await conn.execute(
+                "UPDATE task_delivery_ops SET result=? WHERE id=? AND state='running'",
+                (_json_object(result), op_id),
+            )
+            row = await self._fetchone(
+                conn, "SELECT * FROM task_delivery_ops WHERE id=?", (op_id,)
+            )
+        return self._delivery_op_record(row)
+
+    async def _finalize_switch(
+        self,
+        op_id: str,
+        *,
+        op_state: str,
+        op_error: str | None,
+        op_result: Mapping[str, Any] | None,
+        deployment_state: str | None,
+        make_live: bool = False,
+        delivery_status: str | None,
+        set_reason: bool,
+        reason_kind: str | None = None,
+        reason_detail: str | None = None,
+        deployed_sha: str | None = None,
+        deployed_slot: str | None = None,
+        journal_excerpt: Mapping[str, Any] | None = None,
+    ) -> tuple[DeliveryRecord, DeploymentRecord | None, DeliveryOpRecord]:
+        """One-transaction terminal for a running `deploy_switch` op (§8): CAS the
+        op terminal, move the bound `switching` deployment to its final state
+        (superseding the prior `live` on a successful `make_live`), fold the
+        delivery, and emit the shared audit event. All boot-reconciliation rows
+        of the §8 table go through here so op/deployment/delivery never disagree."""
+        stamp = _now_iso()
+        async with self._transaction() as conn:
+            op = await self._fetchone(
+                conn, "SELECT * FROM task_delivery_ops WHERE id=?", (op_id,)
+            )
+            if op is None:
+                raise TaskNotFoundError(f"delivery op {op_id!r} not found")
+            if op["state"] != "running":
+                raise TaskConflictError("switch op is not running")
+            cursor = await conn.execute(
+                "UPDATE task_delivery_ops SET state=?, error=?, result=?, finished_at=? "
+                "WHERE id=? AND state='running'",
+                (op_state, op_error, _json_object(op_result), stamp, op_id),
+            )
+            if cursor.rowcount != 1:
+                raise TaskConflictError("switch op lost the finish CAS")
+
+            deployment: DeploymentRecord | None = None
+            dep_row = await self._fetchone(
+                conn,
+                "SELECT * FROM deployments WHERE op_id=? ORDER BY created_at DESC LIMIT 1",
+                (op_id,),
+            )
+            if dep_row is not None and deployment_state is not None:
+                if make_live:
+                    # Retire the prior live row FIRST, so `deployments_one_live`
+                    # never sees two live rows mid-transaction (§6).
+                    await conn.execute(
+                        "UPDATE deployments SET state='superseded', updated_at=? "
+                        "WHERE state='live' AND id != ?",
+                        (stamp, dep_row["id"]),
+                    )
+                await conn.execute(
+                    "UPDATE deployments SET state=?, journal=COALESCE(?, journal), "
+                    "updated_at=? WHERE id=?",
+                    (deployment_state, _json_object(journal_excerpt), stamp, dep_row["id"]),
+                )
+                fresh = await self._fetchone(
+                    conn, "SELECT * FROM deployments WHERE id=?", (dep_row["id"],)
+                )
+                deployment = self._deployment_record(fresh)
+
+            fields: dict[str, Any] = {"updated_at": stamp}
+            if delivery_status is not None:
+                fields["status"] = delivery_status
+            if set_reason:
+                fields["reason_kind"] = reason_kind
+                fields["reason_detail"] = reason_detail
+            if deployed_sha is not None:
+                fields["deployed_sha"] = deployed_sha
+            if deployed_slot is not None:
+                fields["deployed_slot"] = deployed_slot
+            sets = ", ".join(f"{k}=?" for k in fields)
+            await conn.execute(
+                f"UPDATE task_deliveries SET {sets} WHERE id=?",
+                (*fields.values(), op["delivery_id"]),
+            )
+            delivery_row = await self._delivery_row(conn, op["delivery_id"])
+            op_row = await self._delivery_op_row(conn, op_id, op["delivery_id"])
+            await self._delivery_event(
+                conn, delivery_row=delivery_row, kind="delivery_op_finished",
+                actor_kind="system", op_row=op_row, now=stamp,
+            )
+        return (
+            self._delivery_record(delivery_row),
+            deployment,
+            self._delivery_op_record(op_row),
+        )
+
+    async def finalize_deploy_switched(
+        self, op_id: str, *, deployed_sha: str, deployed_slot: str,
+        journal_excerpt: Mapping[str, Any] | None = None,
+    ) -> tuple[DeliveryRecord, DeploymentRecord | None, DeliveryOpRecord]:
+        """§8 `switched_ok`: op `succeeded`, deployment → `live` (prior live →
+        `superseded`), delivery folds `deployed_sha`/`deployed_slot`. The delivery
+        keeps its settled git status (the switch never advanced it)."""
+        return await self._finalize_switch(
+            op_id, op_state="succeeded", op_error=None,
+            op_result={"deployed_sha": deployed_sha, "deployed_slot": deployed_slot},
+            deployment_state="live", make_live=True,
+            delivery_status=None, set_reason=False,
+            deployed_sha=deployed_sha, deployed_slot=deployed_slot,
+            journal_excerpt=journal_excerpt,
+        )
+
+    async def finalize_deploy_rolled_back(
+        self, op_id: str, *, reason: str,
+        journal_excerpt: Mapping[str, Any] | None = None,
+    ) -> tuple[DeliveryRecord, DeploymentRecord | None, DeliveryOpRecord]:
+        """§8 `rolled_back(reason)`: op `failed(health_failed)`, deployment →
+        `rolled_back`, delivery `blocked(health_failed)` with the journal detail."""
+        return await self._finalize_switch(
+            op_id, op_state="failed", op_error=reason, op_result={"reason": reason},
+            deployment_state="rolled_back",
+            delivery_status="blocked", set_reason=True,
+            reason_kind="health_failed", reason_detail=reason,
+            journal_excerpt=journal_excerpt,
+        )
+
+    async def finalize_deploy_rollback_incomplete(
+        self, op_id: str, *, reason: str,
+        journal_excerpt: Mapping[str, Any] | None = None,
+    ) -> tuple[DeliveryRecord, DeploymentRecord | None, DeliveryOpRecord]:
+        """§8 `rollback_incomplete(stage)`: a rollback that could not be proven
+        total. op `failed(health_failed)`, deployment → `failed`, delivery
+        `blocked` — never auto-repaired; `current` + `switcher.log` are evidence."""
+        return await self._finalize_switch(
+            op_id, op_state="failed", op_error=reason,
+            op_result={"reason": reason, "rollback": "incomplete"},
+            deployment_state="failed",
+            delivery_status="blocked", set_reason=True,
+            reason_kind="health_failed", reason_detail=reason,
+            journal_excerpt=journal_excerpt,
+        )
+
+    async def finalize_deploy_old_wont_die(
+        self, op_id: str, *, reason: str = "old server did not exit in time",
+        journal_excerpt: Mapping[str, Any] | None = None,
+    ) -> tuple[DeliveryRecord, DeploymentRecord | None, DeliveryOpRecord]:
+        """§8 `old_wont_die`: the flip never happened. op `failed(old_wont_die)`,
+        deployment reverts `switching` → `staged` (still deployable, lock
+        released), delivery `blocked(old_wont_die)`."""
+        return await self._finalize_switch(
+            op_id, op_state="failed", op_error=reason, op_result={"reason": reason},
+            deployment_state="staged",
+            delivery_status="blocked", set_reason=True,
+            reason_kind="old_wont_die", reason_detail=reason,
+            journal_excerpt=journal_excerpt,
+        )
+
+    async def finalize_deploy_interrupted(
+        self, op_id: str, *, reason: str,
+        journal_excerpt: Mapping[str, Any] | None = None,
+    ) -> tuple[DeliveryRecord, DeploymentRecord | None, DeliveryOpRecord]:
+        """§8 `handoff`-only / stale non-terminal: op `interrupted`, deployment →
+        `failed`, delivery `blocked(interrupted)`. A human inspects `current`, the
+        journal, and `switcher.log` — never an auto-repair."""
+        return await self._finalize_switch(
+            op_id, op_state="interrupted", op_error=reason, op_result={"reason": reason},
+            deployment_state="failed",
+            delivery_status="blocked", set_reason=True,
+            reason_kind="interrupted", reason_detail=reason,
+            journal_excerpt=journal_excerpt,
+        )
 
 
 task_repository = TaskRepository()
