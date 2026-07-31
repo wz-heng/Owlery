@@ -13,13 +13,13 @@
 ## 0. What we're building, and the mental model
 
 Today an Owlery session has one human on the outside and one agent on
-the inside. We want **agents to call each other**: from inside Octo's
-session you say "ask Vera to review the code", Octo dispatches the
-request to Vera, Vera works in her own session with her own
-configuration, and Vera's eventual reply lands back in Octo's session
-as a fresh turn. Octo and the user keep talking while Vera works;
-multiple delegations can be in flight at once; Vera can in turn
-delegate to Pete.
+the inside. We want **agents to call each other**: from inside Dobby's
+session you say "ask Snape to review the code", Dobby dispatches the
+request to Snape, Snape works in her own session with her own
+configuration, and Snape's eventual reply lands back in Dobby's session
+as a fresh turn. Dobby and the user keep talking while Snape works;
+multiple delegations can be in flight at once; Snape can in turn
+delegate to Albus.
 
 The whole feature collapses onto **one mental model**: every session
 has exactly one **caller**.
@@ -97,12 +97,12 @@ needed: a delegation is a normal `Session` row with a
 - **No new `Run` table.** Same reasoning as `agent-refactor.md`: a
   turn stays implicit inside a session. The async wakeup mechanism
   already exists for bg-tasks; we reuse it.
-- **No automatic context-sharing from parent to child.** Vera does
-  not see Octo's transcript. The model paraphrases what Vera needs
+- **No automatic context-sharing from parent to child.** Snape does
+  not see Dobby's transcript. The model paraphrases what Snape needs
   into the `request` argument and names files explicitly via
   `files=[…]`. This is a deliberate privacy/token/leak boundary.
 - **No agent permissioning in v1.** Any agent can ask any other.
-  Per-agent allow/deny lists ("Vera is askable by: [Octo, Pete]") are
+  Per-agent allow/deny lists ("Snape is askable by: [Dobby, Albus]") are
   a future feature; the schema is forward-compatible.
 - **No special multi-agent UI dashboard.** The chat view renders
   delegations inline as request/event cards over the existing message
@@ -182,7 +182,7 @@ ALTER TABLE sessions ADD COLUMN delegation_request TEXT;
 ```
 
 When `origin='delegation'`, store the original prompt verbatim so the
-UI can render "Octo asked: «…»" at the top of Vera's session view
+UI can render "Dobby asked: «…»" at the top of Snape's session view
 without rummaging through the first message. NULL for non-delegation
 sessions. Nice-to-have, not load-bearing — the same string is also the
 first user-message in the child's transcript.
@@ -232,8 +232,8 @@ Server-side flow:
    a mistake; if we ever want it, drop the check).
 2. **Cycle + depth guards.** Walk `parent_session_id` upwards from
    the parent. Reject if any ancestor session belongs to the target
-   agent (cycle). Reject if depth would exceed **3** (Octo → Vera →
-   Pete is fine; Pete → Q is not).
+   agent (cycle). Reject if depth would exceed **3** (Dobby → Snape →
+   Albus is fine; Albus → Q is not).
 3. **Create the child session** under the target agent:
    - `agent_id = target_agent.id`
    - `parent_session_id = parent_sid`
@@ -262,7 +262,7 @@ Server-side flow:
    events.
 6. **Return immediately** `{delegation_id: child_session.id, status:
    "started"}`. The MCP shim translates this to a short text the
-   model can quote: "Started delegation `<id>` to Vera. I'll receive
+   model can quote: "Started delegation `<id>` to Snape. I'll receive
    her reply as a follow-up turn."
 
 ### 5.2 Sub-session lifecycle
@@ -277,16 +277,16 @@ except two:
   `[agent-reply:…]` or `[agent-error:…]` turn has been delivered (or
   attempted) to the parent (`server/delegations.py:739`,
   `server/delegations.py:788`). This is load-bearing for nested
-  chains: Vera in Octo → Vera → Pete is idle while waiting for Pete,
-  but must remain live so Pete's terminal turn can reach her. The
+  chains: Snape in Dobby → Snape → Albus is idle while waiting for Albus,
+  but must remain live so Albus's terminal turn can reach her. The
   session is not auto-deleted — the user can still browse it from
-  Vera's archived-sessions list.
+  Snape's archived-sessions list.
 - **No bridge fan-out.** Bridges only broadcast to `origin='user'` (and
   maybe `bridge`) sessions; a delegation must not also notify the
   user's Feishu chat. Single line in `BridgeManager._on_broadcast`.
 
 Otherwise: same harness, same MCP set, same credentials, same memory
-dir as Vera's other sessions. Memory writes from concurrent
+dir as Snape's other sessions. Memory writes from concurrent
 delegations to the same agent share the agent's memory dir — see 5.8
 on concurrency. The split is reflected in `SessionManager`:
 `_AUTO_ARCHIVE_ORIGINS` is only `("schedule",)`, while
@@ -332,7 +332,7 @@ event kind:
 
 Other tool approval requests (e.g. dangerous shell command) stay in
 the child session — they're the *agent's* policy, not the user's. If
-Vera's tool policy needs a yes/no the user has to open Vera's session
+Snape's tool policy needs a yes/no the user has to open Snape's session
 and decide. Bubbling tool approvals would obliterate the "questions go
 through the model" rule.
 
@@ -442,9 +442,9 @@ REST endpoint
 but at the model's surface it's the same tool, distinguished by
 which id is present.
 
-The intended use of mode 2 is review/iteration loops: Octo asks
-Vera, Vera replies + auto-archives; on the next round Octo calls
-`ask` again with the previous `delegation_id` and Vera resumes with
+The intended use of mode 2 is review/iteration loops: Dobby asks
+Snape, Snape replies + auto-archives; on the next round Dobby calls
+`ask` again with the previous `delegation_id` and Snape resumes with
 her previous reply still visible in her own conversation — no
 re-reading of files, no re-establishing context. Mode 1 is still
 the right shape for **fresh / unrelated work**, and for **parallel
@@ -502,11 +502,11 @@ unchanged across rounds.
 optional `files=[…]` argument lets the parent name specific files;
 they're resolved against the parent's `working_dir` and rendered into
 the first user message as a path list. Missing paths are flagged as
-`(not found)` rather than rejected; Vera reads files with her own
+`(not found)` rather than rejected; Snape reads files with her own
 tools, just like a human would.
 
 We do **not** automatically include any of the parent's transcript.
-If Octo needs to give Vera context, it paraphrases.
+If Dobby needs to give Snape context, it paraphrases.
 
 ### 5.8 Multiple concurrent sessions per agent
 
@@ -516,26 +516,26 @@ multiple live sessions per agent. We rely on this and explicitly do
 
 Two consequences worth surfacing:
 
-- **Shared memory dir, concurrent writes.** Vera's per-agent memory
+- **Shared memory dir, concurrent writes.** Snape's per-agent memory
   directory is shared across all her concurrent sessions. Native
   memory is per-file markdown with no transactional guarantees; two
   sessions writing the same fact file at the same instant can lose
   one write. We accept this as a known small race in v1 (it's the
-  same race that already exists when Vera has, say, a user session
+  same race that already exists when Snape has, say, a user session
   open and a bridge session firing). If it becomes a problem we add
   a per-agent file lock around memory writes — but that's a
   `agent_memory.py` change, not a delegation-architecture change.
-- **Shared credential, shared rate limit.** All of Vera's concurrent
+- **Shared credential, shared rate limit.** All of Snape's concurrent
   sessions hit the same upstream API key. Not our problem to police;
   we just don't multiply rate limits by N.
 
 ### 5.9 Nested delegation, cycle and depth
 
-- **Depth cap: 3.** Root user → Octo → Vera → Pete is allowed. Pete
+- **Depth cap: 3.** Root user → Dobby → Snape → Albus is allowed. Albus
   cannot delegate further. The cap is enforced at creation time
   (walk the parent chain, count) and is a constant in code.
 - **Cycle check.** During the walk, fail if any ancestor session
-  belongs to the target agent. Octo → Vera → Octo is rejected.
+  belongs to the target agent. Dobby → Snape → Dobby is rejected.
   The walk also tracks visited session ids, so a corrupted pointer
   loop like A.parent=B / B.parent=A is rejected as a session-id cycle
   rather than mistaken for a valid short chain.
@@ -548,7 +548,7 @@ Two consequences worth surfacing:
   the ancestor row, reject; if the loop exhausts the safety cap, the
   `for/else` path rejects as pointer corruption (`server/delegations.py:399`,
   `server/delegations.py:470`, `server/delegations.py:488`).
-- **Self-delegation rejected.** Octo cannot ask Octo. (If we ever
+- **Self-delegation rejected.** Dobby cannot ask Dobby. (If we ever
   want "give yourself a fresh scratch session", that's a separate
   feature with a different tool name.)
 
@@ -556,11 +556,11 @@ Two consequences worth surfacing:
 
 Both fall out of the existing per-agent wiring:
 
-- Vera's child session has `agent_id=vera.id`, so
-  `_make_run_config()` reads Vera's memory dir, credentials, system
+- Snape's child session has `agent_id=vera.id`, so
+  `_make_run_config()` reads Snape's memory dir, credentials, system
   prompt, MCP set. No special-case code.
-- Octo's memory dir is never touched by Vera's session, and vice
-  versa. Memory writes during a delegation persist in *Vera's*
+- Dobby's memory dir is never touched by Snape's session, and vice
+  versa. Memory writes during a delegation persist in *Snape's*
   memory — which is the right thing: she's the one learning.
 
 ## 6. Frontend rendering
@@ -574,12 +574,12 @@ chat stream plus delegation store state:
 
   ```
   ┌──────────────────────────────────────────────────┐
-  │ 🐙 Octo → 🦁 Vera   • running   [delegation_id]  │
+  │ 🧦 Dobby → 🐍 Snape   • running   [delegation_id]  │
   │ "review the latest commit on dashboard branch"   │
   │                                                  │
   │ ▾ files: web/src/components/Dashboard.tsx        │
   │                                                  │
-  │ [ Open Vera's session →  ]   [ Cancel ]          │
+  │ [ Open Snape's session →  ]   [ Cancel ]          │
   └──────────────────────────────────────────────────┘
   ```
 
@@ -595,13 +595,13 @@ chat stream plus delegation store state:
 
 - **Delegation event card** — rendered in the parent's transcript
   whenever one of the three injected turns lands (`agent-reply`,
-  `agent-question`, `agent-error`). Card with Vera's identity in the
-  header (visually distinct from "Vera is the user" — she's speaking
-  from *outside* into Octo's session).
+  `agent-question`, `agent-error`). Card with Snape's identity in the
+  header (visually distinct from "Snape is the user" — she's speaking
+  from *outside* into Dobby's session).
 
   For `agent-question` cards specifically: the options are *not*
-  shown as clickable buttons in Octo's UI (the human is not supposed
-  to answer them — Octo is). They render as plain text inside the
+  shown as clickable buttons in Dobby's UI (the human is not supposed
+  to answer them — Dobby is). They render as plain text inside the
   card. This is a deliberate UX choice that enforces the principal
   chain rule.
 
@@ -614,11 +614,11 @@ chat stream plus delegation store state:
   terminal delegation children are usually archived by the time the
   user clicks through (`web/src/components/AgentDelegationRequestCard.tsx:142`).
 
-- **Child session view.** Vera's session renders normally, with a
+- **Child session view.** Snape's session renders normally, with a
   header banner:
 
   ```
-  Delegated from Octo (session a1b2c3)  •  Open parent →
+  Delegated from Dobby (session a1b2c3)  •  Open parent →
   ```
 
   No other change. The chat below is identical to a normal session
@@ -628,7 +628,7 @@ chat stream plus delegation store state:
   sessions list view (they'd otherwise flood it during heavy
   fan-out). Toggle: "Show delegations" in the filter dropdown. When
   hidden, an agent that has any open inbound delegations gets a
-  small badge: "Vera • 2 delegations".
+  small badge: "Snape • 2 delegations".
 
 ## 7. Implementation phases
 
@@ -658,16 +658,16 @@ archived-child UI navigation.
   `ask` / `cancel` / `list` tools.
 - Add to the default built-in set.
 - Cycle and depth guards.
-- Real end-to-end: a user tells Octo "ask Vera to summarise the
-  README"; Vera summarises; Octo gets the reply and relays.
+- Real end-to-end: a user tells Dobby "ask Snape to summarise the
+  README"; Snape summarises; Dobby gets the reply and relays.
   **Status: shipped.**
 
 **Phase 3 — Caller-aware `ask`, plus `mcp__ask_agent__answer`.**
 
 - Caller-aware question routing via the delegation broadcast listener.
 - `answer` tool on the `ask_agent` server.
-- Real end-to-end: Vera asks a clarifying question ("which file?"),
-  Octo answers from its own context, Vera finishes.
+- Real end-to-end: Snape asks a clarifying question ("which file?"),
+  Dobby answers from its own context, Snape finishes.
   **Status: shipped.**
 
 **Phase 4 — Frontend.**
@@ -680,8 +680,8 @@ archived-child UI navigation.
 
 **Phase 5 — Polish + nested delegation in anger.**
 
-- Pete-under-Vera tests (3 hops).
-- The "Octo asks the user when it doesn't know" loop is exercised in
+- Albus-under-Snape tests (3 hops).
+- The "Dobby asks the user when it doesn't know" loop is exercised in
   real-CLI/backend coverage.
 - Memory write-race observation under heavy fan-out (no fix in v1
   unless we actually see corruption).
@@ -708,7 +708,7 @@ delegations ignoring late questions, concurrent same-target
 delegations, bridge non-fan-out, and depth/cycle guards. The review
 fixes have direct regression tests: terminal auto-archive happens from
 `_inject_terminal`, the idle hook does not archive delegation parents
-too early, nested Pete-under-Vera delivery survives Vera's idle
+too early, nested Albus-under-Snape delivery survives Snape's idle
 window, archived ancestors are found through the DB fallback,
 session-id pointer cycles fail closed, cancellation cascade-cancels
 descendants, and cancellation injects exactly one terminal turn even
@@ -718,16 +718,16 @@ when interrupt emits an error broadcast.
 auto-skips when CLIs not on PATH. Two agents, both running the
 real harness:
 
-- Octo (claude-code) `mcp__ask_agent__ask` to Vera (claude-code), 2-turn
-  exchange. Vera's reply lands as a follow-up turn; Octo's next
+- Dobby (claude-code) `mcp__ask_agent__ask` to Snape (claude-code), 2-turn
+  exchange. Snape's reply lands as a follow-up turn; Dobby's next
   output references it.
-- Octo (claude-code) `mcp__ask_agent__ask` to Vera (codex), same shape — proves
+- Dobby (claude-code) `mcp__ask_agent__ask` to Snape (codex), same shape — proves
   the design is harness-agnostic.
-- Vera asks one question via `ask` → injected to Octo → the same
+- Snape asks one question via `ask` → injected to Dobby → the same
   manager answer path used by `mcp__ask_agent__answer` drains the
-  pending question → Vera completes.
-- 3-hop chain: user → Octo → Vera → Pete. Pete replies, Vera relays,
-  Octo summarises. Verifies depth-allowed-up-to-3 works.
+  pending question → Snape completes.
+- 3-hop chain: user → Dobby → Snape → Albus. Albus replies, Snape relays,
+  Dobby summarises. Verifies depth-allowed-up-to-3 works.
 
 **Frontend unit (vitest)**:
 
@@ -744,10 +744,10 @@ real harness:
 **E2E (Playwright)** — new spec `web/e2e/agent-collaboration.spec.ts`:
 
 The browser spec runs against Playwright's auto-started backend with a
-real `claude` binary. It covers `mcp__ask_agent__ask` spawning Vera's
+real `claude` binary. It covers `mcp__ask_agent__ask` spawning Snape's
 child session, the inline request card rendering and transitioning to
 `completed`, the injected `[agent-reply:…]` event card, click-through
-into the child session, the "Delegated from Octo" header, return to
+into the child session, the "Delegated from Dobby" header, return to
 the parent, and the sidebar's hidden-delegation pill/toggle. The
 question loop and 3-hop chain remain in backend real-CLI coverage,
 where they are cheaper and less flaky.
@@ -777,8 +777,8 @@ where they are cheaper and less flaky.
   decision, not the caller's.
 - **Bridges don't fan out delegation sessions.** Feishu (and any
   future bridge) ignores `origin='delegation'`.
-- **Cascade-cancel is part of v1.** Cancelling Vera also cancels
-  Pete if Vera asked Pete and Pete is still running. Each hop still
+- **Cascade-cancel is part of v1.** Cancelling Snape also cancels
+  Albus if Snape asked Albus and Albus is still running. Each hop still
   receives its own terminal turn; the cascade only prevents orphaned
   descendant work.
 - **Tool names.** The MCP server is mounted as `ask_agent`; the
@@ -796,15 +796,15 @@ where they are cheaper and less flaky.
 - **A "delegations" dashboard page.** The sidebar badge + filter
   toggle are enough for v1; a dedicated view can wait for evidence
   of need.
-- **Question forwarding shortcut UI.** Today: if Octo's model decides
+- **Question forwarding shortcut UI.** Today: if Dobby's model decides
   it can't answer, it manually invokes its own `ask` tool and then
   feeds the human's answer back via `mcp__ask_agent__answer`. A
   future `forward_agent_question(delegation_id)` shortcut tool could
   collapse this into one call, but only if the model proves bad at
   the two-step.
-- **Streaming replies.** Vera's reply is injected on `result`, as
+- **Streaming replies.** Snape's reply is injected on `result`, as
   one chunk. Future: stream `assistant_text` deltas into the parent
-  card so Octo's user can watch Vera type in real time. Worth doing
+  card so Dobby's user can watch Snape type in real time. Worth doing
   but not a v1 requirement.
 - **Memory write-lock under concurrent delegations.** Add when
   observed, not pre-emptively.
