@@ -24,6 +24,7 @@ from .bridges.manager import BridgeManager
 from .config import settings
 from .tunnel import CloudflareTunnel
 from .database import Database
+from .deploy import DeployLayout
 from .legacy_rename import migrate_legacy_state, rewrite_legacy_paths
 from .notifiers import notifier_manager
 from .agent_manager import AgentManager
@@ -33,6 +34,7 @@ from .parked_turns import ParkedTurnRunner
 from .scheduler import ScheduleRunner
 from .session_manager import session_manager
 from .task_board import task_repository
+from .task_board import workspaces as task_workspaces
 from .task_board.manager import task_board_manager
 
 logging.basicConfig(
@@ -305,7 +307,38 @@ async def health():
     if hasattr(app.state, "bridge_manager"):
         for name, bridge in app.state.bridge_manager._bridges.items():
             bridges_health[name] = {"healthy": bridge.healthy}
-    return {"status": "ok", "bridges": bridges_health}
+    sha, slot = await _running_deploy_sha_slot()
+    return {"status": "ok", "bridges": bridges_health, "sha": sha, "slot": slot}
+
+
+async def _running_deploy_sha_slot() -> tuple[str | None, str | None]:
+    """The build sha and slot this process is actually serving (local-deploy.md
+    §6/§7.3 step 4): the switcher's `_fetch_health_sha` compares this `sha`
+    against the handoff's `new_sha`/`old_sha` to confirm a flip (or a rollback
+    flip-back) actually took effect, so it must reflect `current` at request
+    time — not a DB row, which during probation still names the OLD live
+    deployment until the switcher's terminal journal line reconciles it.
+
+    `current_slot()` resolves the live symlink fresh on every call, and the
+    sha is that slot's own git HEAD — exactly the commit `deploy_stage`
+    detached-checked-out there (§5 step 2), so it equals the sha the deploy
+    pipeline staged/switched to. None/None when local deploy is disabled or
+    `current` does not resolve to a real slot (fail-closed, not a 500)."""
+    root = settings.resolved_deploy_root
+    if not root:
+        return None, None
+    layout = DeployLayout.at(root)
+    slot = layout.current_slot()
+    if slot is None:
+        return None, None
+    try:
+        rc, out, _ = await task_workspaces._git(
+            "rev-parse", "HEAD", cwd=str(layout.slot_path(slot))
+        )
+    except task_workspaces.WorkspaceError:
+        return None, slot
+    sha = out.strip() if rc == 0 and out else None
+    return sha, slot
 
 
 # Serve built frontend as static files (SPA catch-all).
