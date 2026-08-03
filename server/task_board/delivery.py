@@ -26,6 +26,7 @@ from ..connector_manager import ConnectorManager
 from . import workspaces as ws
 from .deploy_quiesce import BusySource, DeployQuiesce
 from .models import (
+    DELIVERED_OP_KINDS,
     DELIVERY_RETENTIONS,
     DeliveryConfirmationRequired,
     DeliveryRecord,
@@ -127,7 +128,7 @@ def _stage_success_status(
 
 
 # Op kinds whose success means the delivery was actually delivered (§4).
-_DELIVERED_OP_KINDS = frozenset({"push", "pull_request", "merge"})
+_DELIVERED_OP_KINDS = DELIVERED_OP_KINDS
 
 
 async def _github_create_pr(

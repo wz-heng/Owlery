@@ -840,3 +840,153 @@ async def test_switch_requires_a_staged_slot(store, monkeypatch):
     with pytest.raises(TaskConflictError, match="nothing_staged"):
         await coord.deploy_switch(task.id, run.id, server_root=layout.slot_path("a"))
     assert not [o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch"]
+
+
+# ------------------------------------- J. successful retry clears a switch-
+#                                          owned blocker (§9, micro-fix C2)
+
+
+async def _staged_with_push(db, repo, tmp, agent, monkeypatch):
+    """A staged delivery that was ALSO successfully pushed before staging —
+    the "was this delivery ever delivered" branch of the switch-success fold
+    must land `delivered`, not `ready`."""
+    src = tmp / "src"
+    _init_repo(src)
+    bare = tmp / "remote.git"
+    _git(tmp, "init", "-q", "--bare", str(bare))
+    _git(src, "remote", "add", "origin", str(bare))
+    board = await repo.create_board(
+        name=f"D-{uuid.uuid4().hex[:8]}", working_dir=str(src),
+        default_workspace_mode="git_worktree", allow_local_deploy=True,
+    )
+    task = await repo.create_task(
+        board_id=board.id, title="Ship it", status="todo", assignee_agent_id=agent
+    )
+    run_id = uuid.uuid4().hex[:12]
+    planned = str(Path(settings.resolved_task_workspaces_dir) / task.id / run_id)
+    run = await repo.claim_ready(
+        task.id, workspace_mode="git_worktree", workspace_path=planned, run_id=run_id
+    )
+    prepared = await prepare_workspace(
+        mode="git_worktree", source_dir=str(src), task_id=task.id,
+        run_id=run.id, attempt_no=run.attempt_no,
+    )
+    wt = Path(prepared.path)
+    (wt / "g.txt").write_text("worker change\n")
+    _git(wt, "add", ".")
+    _git(wt, "commit", "-qm", "worker change")
+    await repo.set_run_metadata(task.id, run.id, {"prepared": prepared.metadata})
+    await repo.complete_run(task.id, run.id, summary="did the work")
+    coord = _coord(db, repo)
+    delivery = await coord.accept(task.id, run.id)
+    delivery = await coord.deliver_op(task.id, run.id, kind="push")
+    assert delivery.status == "delivered" and delivery.pushed_ref
+    layout = _init_layout(tmp / "deploy", monkeypatch)
+    delivery = await coord.deploy_stage(
+        task.id, run.id, server_root=layout.slot_path("a"), stage_runner=FakeStageRunner()
+    )
+    assert delivery.status == "delivered"  # staging is transparent to a settled git status
+    staged = await repo.get_staged_deployment_for_delivery(delivery.id)
+    assert staged is not None and staged.slot == "b" and staged.state == "staged"
+    return task, await repo.get_run(run.id), delivery, layout, coord, staged
+
+
+async def _staged_then_conflicted(db, repo, tmp, agent, monkeypatch):
+    """A staged delivery whose status was independently pushed to `conflicted`
+    by a merge attempt — a REAL git conflict, never something the switch
+    machinery itself produced."""
+    _, task, run, delivery, layout, coord, staged = await _staged(db, repo, tmp, agent, monkeypatch)
+    src = Path(delivery.repository)
+    # Diverge the base branch so a fast-forward merge cannot proceed.
+    (src / "f.txt").write_text("diverged base\n")
+    _git(src, "commit", "-aqm", "diverge")
+    delivery = await coord.deliver_op(
+        task.id, run.id, kind="merge", merge_strategy="fast_forward_only"
+    )
+    assert delivery.status == "conflicted" and delivery.reason_kind == "conflict"
+    return task, run, delivery, layout, coord, staged
+
+
+@pytest.mark.asyncio
+async def test_successful_retry_clears_not_idle_blocker(store, monkeypatch):
+    db, repo, tmp, agent = store
+    _, task, run, delivery, layout, coord, staged = await _staged(db, repo, tmp, agent, monkeypatch)
+    _wire_switch(coord, FakeQuiesce([[BusySource("session_turn", "s1")]]))
+
+    d = await coord.deploy_switch(task.id, run.id, server_root=layout.slot_path("a"))
+    assert d.status == "blocked" and d.reason_kind == "not_idle"
+    assert (await repo.get_deployment(staged.id)).state == "staged"
+
+    # An explicit new attempt — a fresh `:retry:1` op, never a tick (§4).
+    _wire_switch(coord, FakeQuiesce([[]]))
+    await coord.deploy_switch(task.id, run.id, server_root=layout.slot_path("a"))
+    ops = [o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch"]
+    assert len(ops) == 2
+    retry_op = ops[1]
+    assert retry_op.source_key.endswith(":retry:1") and retry_op.state == "running"
+
+    _append(layout, retry_op.id, switcher.STEP_SWITCHED_OK, {"slot": "b", "sha": staged.sha})
+    m = _manager(db, repo)
+    assert await m.reconcile_deploy_switch_ops() is None  # terminal, no probation
+
+    final = await repo.get_delivery(delivery.id)
+    # A finally-successful, explicit switch retry clears the SWITCH-OWNED
+    # blocker its own earlier attempt produced — landing `ready` (no
+    # push/PR/merge ever succeeded on this delivery).
+    assert final.status == "ready"
+    assert final.reason_kind is None and final.reason_detail is None
+    assert final.deployed_sha == staged.sha and final.deployed_slot == "b"
+    assert (await repo.get_deployment(staged.id)).state == "live"
+
+
+@pytest.mark.asyncio
+async def test_successful_retry_after_push_lands_delivered(store, monkeypatch):
+    db, repo, tmp, agent = store
+    task, run, delivery, layout, coord, staged = await _staged_with_push(
+        db, repo, tmp, agent, monkeypatch
+    )
+    _wire_switch(coord, FakeQuiesce([[BusySource("session_turn", "s1")]]))
+
+    d = await coord.deploy_switch(task.id, run.id, server_root=layout.slot_path("a"))
+    assert d.status == "blocked" and d.reason_kind == "not_idle"
+
+    _wire_switch(coord, FakeQuiesce([[]]))
+    await coord.deploy_switch(task.id, run.id, server_root=layout.slot_path("a"))
+    retry_op = next(
+        o for o in await repo.list_delivery_ops(delivery.id)
+        if o.kind == "deploy_switch" and o.source_key.endswith(":retry:1")
+    )
+    _append(layout, retry_op.id, switcher.STEP_SWITCHED_OK, {"slot": "b", "sha": staged.sha})
+    m = _manager(db, repo)
+    assert await m.reconcile_deploy_switch_ops() is None
+
+    final = await repo.get_delivery(delivery.id)
+    # `was_delivered` is authoritative (the succeeded push op), not inferred
+    # from `pushed_ref` alone — the clear lands `delivered`, not `ready`.
+    assert final.status == "delivered"
+    assert final.reason_kind is None and final.reason_detail is None
+    assert final.pushed_ref  # the earlier delivery fact survives untouched
+
+
+@pytest.mark.asyncio
+async def test_switch_success_never_clears_real_conflict(store, monkeypatch):
+    db, repo, tmp, agent = store
+    task, run, delivery, layout, coord, staged = await _staged_then_conflicted(
+        db, repo, tmp, agent, monkeypatch
+    )
+    _wire_switch(coord, FakeQuiesce([[]]))
+
+    await coord.deploy_switch(task.id, run.id, server_root=layout.slot_path("a"))
+    op = next(o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch")
+    _append(layout, op.id, switcher.STEP_SWITCHED_OK, {"slot": "b", "sha": staged.sha})
+    m = _manager(db, repo)
+    assert await m.reconcile_deploy_switch_ops() is None
+
+    final = await repo.get_delivery(delivery.id)
+    # The switch itself succeeded (deployment live, sha/slot folded in) but a
+    # REAL git conflict — neither caused nor resolvable by the switch — must
+    # never be cleared by it, unlike a switch-owned `not_idle`/`health_failed`/
+    # `old_wont_die` blocker.
+    assert final.status == "conflicted" and final.reason_kind == "conflict"
+    assert final.deployed_sha == staged.sha and final.deployed_slot == "b"
+    assert (await repo.get_deployment(staged.id)).state == "live"

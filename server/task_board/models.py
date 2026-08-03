@@ -48,6 +48,21 @@ DELIVERY_REASON_KINDS = frozenset(
      # switch-op reasons (§7.1/§7.3/§8).
      "deploy_locked", "stage_failed", "not_idle", "health_failed", "old_wont_die"}
 )
+# The subset of DELIVERY_REASON_KINDS that only the switch machinery itself can
+# produce (§7.1/§7.3/§8) — never a real git block/conflict. `deploy_locked` is
+# deliberately excluded even though a switch precondition can raise it: it
+# reflects contention with a DIFFERENT in-flight deploy, not this switch's own
+# census/health/pid-wait outcome, so a later green switch here doesn't attest
+# to anything about that lock. A successful `switched_ok` retry clears a
+# blocker in this set (§9 C2), landing `delivered`/`ready` per whether a
+# push/PR/merge ever succeeded — every other blocked/conflicted reason is left
+# untouched.
+SWITCH_OWNED_REASON_KINDS = frozenset({"not_idle", "health_failed", "old_wont_die"})
+
+# Op kinds whose success means the delivery was actually delivered (§4). Shared
+# by delivery.py's post-stage status fold and repository.py's post-switch fold
+# so both compute "was this delivery ever delivered" identically.
+DELIVERED_OP_KINDS = frozenset({"push", "pull_request", "merge"})
 DELIVERY_RETENTIONS = frozenset(
     {"keep", "remove_worktree_keep_branch", "remove_all"}
 )

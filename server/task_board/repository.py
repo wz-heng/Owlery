@@ -24,12 +24,14 @@ import aiosqlite
 from .models import (
     ACTOR_KINDS,
     BLOCKED_KINDS,
+    DELIVERED_OP_KINDS,
     DELIVERY_EXTERNAL_OP_KINDS,
     DELIVERY_OP_KINDS,
     DELIVERY_REASON_KINDS,
     DELIVERY_RETENTIONS,
     DELIVERY_STATUSES,
     DEPLOYMENT_STATES,
+    SWITCH_OWNED_REASON_KINDS,
     WORKSPACE_MODES,
     ArtifactRecord,
     BoardRecord,
@@ -3134,6 +3136,36 @@ class TaskRepository:
             )
         return self._delivery_op_record(row)
 
+    async def _switch_success_status(
+        self, conn: aiosqlite.Connection, delivery_id: str
+    ) -> tuple[str, str | None, str | None, bool]:
+        """The `(status, reason_kind, reason_detail, set_reason)` a successful
+        `switched_ok` settles the delivery to: only a blocker THIS switch
+        machinery itself produced — a member of `SWITCH_OWNED_REASON_KINDS`
+        (docs/plans/local-deploy.md §9's switch-op reason kinds) — is
+        cleared, landing `delivered` if a
+        push/PR/merge op ever succeeded on this delivery, else `ready`. Any
+        other blocked/conflicted status (a real git conflict, `deploy_locked`,
+        `op_failed`, …) is a delivery-pipeline concern the switch never
+        resolves, so it is returned unchanged."""
+        row = await self._delivery_row(conn, delivery_id)
+        prior_status, prior_reason_kind = row["status"], row["reason_kind"]
+        if not (
+            prior_status in {"blocked", "conflicted"}
+            and prior_reason_kind in SWITCH_OWNED_REASON_KINDS
+        ):
+            return (prior_status, prior_reason_kind, row["reason_detail"], False)
+        op_rows = await self._fetchall(
+            conn,
+            "SELECT state, kind FROM task_delivery_ops WHERE delivery_id=?",
+            (delivery_id,),
+        )
+        was_delivered = any(
+            r["state"] == "succeeded" and r["kind"] in DELIVERED_OP_KINDS
+            for r in op_rows
+        )
+        return ("delivered" if was_delivered else "ready", None, None, True)
+
     async def _finalize_switch(
         self,
         op_id: str,
@@ -3152,12 +3184,23 @@ class TaskRepository:
         journal_excerpt: Mapping[str, Any] | None = None,
         target_slot: str | None = None,
         target_sha: str | None = None,
+        clear_switch_owned_blocker: bool = False,
     ) -> tuple[DeliveryRecord, DeploymentRecord | None, DeliveryOpRecord]:
         """One-transaction terminal for a running `deploy_switch` op (§8): CAS the
         op terminal, move the bound `switching` deployment to its final state
         (superseding the prior `live` on a successful `make_live`), fold the
         delivery, and emit the shared audit event. All boot-reconciliation rows
         of the §8 table go through here so op/deployment/delivery never disagree.
+
+        `clear_switch_owned_blocker` (only `finalize_deploy_switched` sets it):
+        an explicit, final `switched_ok` retry must clear a blocker that an
+        EARLIER switch attempt on this same delivery produced — `not_idle`,
+        `health_failed`, `old_wont_die` (docs/plans/local-deploy.md §9) — the
+        same "succeed back to ready/delivered" contract §4 already gives a
+        green `deploy_stage` (`_stage_success_status`). It must NEVER clear a
+        real git block/conflict (`conflict`, `deploy_locked`, `op_failed`, …);
+        those reasons are left untouched by construction (they are simply not
+        in `SWITCH_OWNED_REASON_KINDS`).
 
         `target_slot`/`target_sha` (the journal handoff's `to_slot`/`new_sha`) are
         a restricted fallback locator for the bound deployment row. The primary
@@ -3189,6 +3232,11 @@ class TaskRepository:
             )
             if cursor.rowcount != 1:
                 raise TaskConflictError("switch op lost the finish CAS")
+
+            if clear_switch_owned_blocker:
+                delivery_status, reason_kind, reason_detail, set_reason = (
+                    await self._switch_success_status(conn, op["delivery_id"])
+                )
 
             deployment: DeploymentRecord | None = None
             dep_row = await self._fetchone(
@@ -3256,8 +3304,12 @@ class TaskRepository:
         journal_excerpt: Mapping[str, Any] | None = None,
     ) -> tuple[DeliveryRecord, DeploymentRecord | None, DeliveryOpRecord]:
         """§8 `switched_ok`: op `succeeded`, deployment → `live` (prior live →
-        `superseded`), delivery folds `deployed_sha`/`deployed_slot`. The delivery
-        keeps its settled git status (the switch never advanced it)."""
+        `superseded`), delivery folds `deployed_sha`/`deployed_slot`. A settled
+        git status (ready/delivered) is left as-is, as is a real git block/
+        conflict; a blocker THIS switch machinery produced on an earlier
+        attempt (`not_idle`/`health_failed`/`old_wont_die`) is cleared — a
+        successful, explicit retry undoes it, same as a green `deploy_stage`
+        undoes `stage_failed`/`deploy_locked` (§4, §9)."""
         return await self._finalize_switch(
             op_id, op_state="succeeded", op_error=None,
             op_result={"deployed_sha": deployed_sha, "deployed_slot": deployed_slot},
@@ -3266,6 +3318,7 @@ class TaskRepository:
             deployed_sha=deployed_sha, deployed_slot=deployed_slot,
             journal_excerpt=journal_excerpt,
             target_slot=deployed_slot, target_sha=deployed_sha,
+            clear_switch_owned_blocker=True,
         )
 
     async def finalize_deploy_rolled_back(
