@@ -155,10 +155,8 @@ async def test_reconcile_after_rolled_back_before_bind(store, monkeypatch):
     `target_sha` fallback through `_apply_switch_terminal`'s terminal-step
     branches (§8), not just `reconcile_deploy_switch_ops`'s own interrupted
     branch. Reconciliation must still land the never-bound row on
-    `rolled_back`, never leave it `staged` forever (which would wedge the
-    global deploy lock — `deployments_one_active` treats `staged` as
-    re-deployable, but a stuck `switching` row from a half-applied fallback
-    would not be)."""
+    `rolled_back`, never leave it orphaned `staged` while the op itself goes
+    terminal (§8: op and deployment must never disagree)."""
     db, repo, tmp, agent = store
     task, run, delivery, layout, coord, staged, op = await _crash_before_bind(
         db, repo, tmp, agent, monkeypatch
