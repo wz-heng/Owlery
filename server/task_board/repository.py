@@ -3163,12 +3163,16 @@ class TaskRepository:
         a restricted fallback locator for the bound deployment row. The primary
         lookup is by `op_id`, but that binding lives on the deployment row itself
         (written by `begin_deployment_switching`, §7.2 step 3) — a row a rollback
-        can revert to its pre-handoff `staged`/`op_id=NULL` state by restoring the
-        pre-switch DB snapshot over it (§7.4), or that a crash between the journal
-        `handoff` line and that CAS can leave un-bound in the first place. Either
-        way the op-id lookup then finds nothing, so we fall back to this
-        delivery's still-`staged`/`switching` row for the exact slot+sha this op
-        targeted — never a terminal row, never a different switch attempt."""
+        can revert to its pre-handoff `staged` state by restoring the pre-switch
+        DB snapshot over it (§7.4). That revert does NOT clear `op_id` to NULL:
+        it restores whatever op_id the row held before THIS switch (typically the
+        earlier `deploy_stage` op — staging→staged never clears it, §5/§6), which
+        is simply the wrong op for this lookup. A crash between the journal
+        `handoff` line and the CAS can also leave the row genuinely un-bound in
+        the first place. Either way the op-id lookup then finds nothing, so we
+        fall back to this delivery's still-`staged`/`switching` row for the exact
+        slot+sha this op targeted — never a terminal row, never a different
+        switch attempt."""
         stamp = _now_iso()
         async with self._transaction() as conn:
             op = await self._fetchone(

@@ -681,16 +681,19 @@ async def test_reconcile_after_real_snapshot_restore(store, monkeypatch):
     finalize the deployment even though the pre-switch snapshot it restored
     (§7.4) predates the CAS that bound the deployment row to this op (§7.2:
     the snapshot is step 1, `begin_deployment_switching` is step 3) — so
-    restoring it reverts that row to its pre-handoff `staged`/`op_id=NULL`
-    state, exactly the way `server.switcher._restore_snapshot` does on a real
-    rollback. This drives the REAL snapshot file (checkpoint + copy, taken by
-    the coordinator during handoff) back over a fresh DB file/connection —
-    not a scripted journal fixture — so it exercises the actual on-disk
-    sequence, not just the reconciler's journal-reading half."""
+    restoring it reverts that row to its pre-handoff `staged` state, still
+    bound to the EARLIER `deploy_stage` op (never cleared on staging→staged,
+    §5/§6) rather than this `deploy_switch` op — exactly the way
+    `server.switcher._restore_snapshot` does on a real rollback. This drives
+    the REAL snapshot file (checkpoint + copy, taken by the coordinator
+    during handoff) back over a fresh DB file/connection — not a scripted
+    journal fixture — so it exercises the actual on-disk sequence, not just
+    the reconciler's journal-reading half."""
     db, repo, tmp, agent = store
     m, coord, op, staged, layout, (task, run, delivery) = await _handed_off(
         db, repo, tmp, agent, monkeypatch
     )
+    stage_op = next(o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_stage")
 
     # Sanity: the deployment row IS bound to this op right after handoff —
     # the CAS (§7.2 step 3) ran after the snapshot (§7.2 step 1).
@@ -720,9 +723,12 @@ async def test_reconcile_after_real_snapshot_restore(store, monkeypatch):
     await repo2.initialize()
     try:
         # The restore really did revert the binding — this is the trap: a
-        # naive `WHERE op_id=?` lookup now finds nothing for this op.
+        # naive `WHERE op_id=?` lookup for the deploy_switch op now finds
+        # nothing (the row's op_id points at the older deploy_stage op).
         dep_after_restore = await repo2.get_deployment(staged.id)
-        assert dep_after_restore.state == "staged" and dep_after_restore.op_id is None
+        assert dep_after_restore.state == "staged"
+        assert dep_after_restore.op_id == stage_op.id
+        assert dep_after_restore.op_id != op.id
 
         # The switcher's rollback then journals its verdict for this op (§8).
         _append(layout, op.id, switcher.STEP_ROLLED_BACK, {"reason": "health_timeout"})

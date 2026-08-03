@@ -883,6 +883,14 @@ class TaskBoardManager:
         if not root:
             # A running switch op but no deploy_root to find its journal — the
             # config changed out from under it. It cannot be confirmed; interrupt.
+            # No `target_slot`/`target_sha` fallback is possible here (unlike the
+            # journal-tail branches below): that locator is derived by reading the
+            # journal's `handoff` line, and with no `deploy_root` we cannot even
+            # find the journal file. If the bound deployment row's `op_id` was
+            # also reverted by a snapshot restore (§7.4) in this same window, it
+            # is left `staged`/`switching` — a narrower, config-loss-triggered gap
+            # than the snapshot-restore-during-a-live-journal case this change
+            # fixes; a human already has to intervene to restore `deploy_root`.
             for op in ops:
                 await self.repo.finalize_deploy_interrupted(
                     op.id, reason="deploy_root unset at boot; switch state unknown"
