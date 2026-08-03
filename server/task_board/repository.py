@@ -3150,12 +3150,25 @@ class TaskRepository:
         deployed_sha: str | None = None,
         deployed_slot: str | None = None,
         journal_excerpt: Mapping[str, Any] | None = None,
+        target_slot: str | None = None,
+        target_sha: str | None = None,
     ) -> tuple[DeliveryRecord, DeploymentRecord | None, DeliveryOpRecord]:
         """One-transaction terminal for a running `deploy_switch` op (§8): CAS the
         op terminal, move the bound `switching` deployment to its final state
         (superseding the prior `live` on a successful `make_live`), fold the
         delivery, and emit the shared audit event. All boot-reconciliation rows
-        of the §8 table go through here so op/deployment/delivery never disagree."""
+        of the §8 table go through here so op/deployment/delivery never disagree.
+
+        `target_slot`/`target_sha` (the journal handoff's `to_slot`/`new_sha`) are
+        a restricted fallback locator for the bound deployment row. The primary
+        lookup is by `op_id`, but that binding lives on the deployment row itself
+        (written by `begin_deployment_switching`, §7.2 step 3) — a row a rollback
+        can revert to its pre-handoff `staged`/`op_id=NULL` state by restoring the
+        pre-switch DB snapshot over it (§7.4), or that a crash between the journal
+        `handoff` line and that CAS can leave un-bound in the first place. Either
+        way the op-id lookup then finds nothing, so we fall back to this
+        delivery's still-`staged`/`switching` row for the exact slot+sha this op
+        targeted — never a terminal row, never a different switch attempt."""
         stamp = _now_iso()
         async with self._transaction() as conn:
             op = await self._fetchone(
@@ -3179,6 +3192,14 @@ class TaskRepository:
                 "SELECT * FROM deployments WHERE op_id=? ORDER BY created_at DESC LIMIT 1",
                 (op_id,),
             )
+            if dep_row is None and target_slot is not None and target_sha is not None:
+                dep_row = await self._fetchone(
+                    conn,
+                    "SELECT * FROM deployments WHERE delivery_id=? AND slot=? "
+                    "AND sha=? AND state IN ('staged', 'switching') "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (op["delivery_id"], target_slot, target_sha),
+                )
             if dep_row is not None and deployment_state is not None:
                 if make_live:
                     # Retire the prior live row FIRST, so `deployments_one_live`
@@ -3189,9 +3210,10 @@ class TaskRepository:
                         (stamp, dep_row["id"]),
                     )
                 await conn.execute(
-                    "UPDATE deployments SET state=?, journal=COALESCE(?, journal), "
-                    "updated_at=? WHERE id=?",
-                    (deployment_state, _json_object(journal_excerpt), stamp, dep_row["id"]),
+                    "UPDATE deployments SET state=?, op_id=?, "
+                    "journal=COALESCE(?, journal), updated_at=? WHERE id=?",
+                    (deployment_state, op_id, _json_object(journal_excerpt), stamp,
+                     dep_row["id"]),
                 )
                 fresh = await self._fetchone(
                     conn, "SELECT * FROM deployments WHERE id=?", (dep_row["id"],)
@@ -3239,11 +3261,13 @@ class TaskRepository:
             delivery_status=None, set_reason=False,
             deployed_sha=deployed_sha, deployed_slot=deployed_slot,
             journal_excerpt=journal_excerpt,
+            target_slot=deployed_slot, target_sha=deployed_sha,
         )
 
     async def finalize_deploy_rolled_back(
         self, op_id: str, *, reason: str,
         journal_excerpt: Mapping[str, Any] | None = None,
+        target_slot: str | None = None, target_sha: str | None = None,
     ) -> tuple[DeliveryRecord, DeploymentRecord | None, DeliveryOpRecord]:
         """§8 `rolled_back(reason)`: op `failed(health_failed)`, deployment →
         `rolled_back`, delivery `blocked(health_failed)` with the journal detail."""
@@ -3253,11 +3277,13 @@ class TaskRepository:
             delivery_status="blocked", set_reason=True,
             reason_kind="health_failed", reason_detail=reason,
             journal_excerpt=journal_excerpt,
+            target_slot=target_slot, target_sha=target_sha,
         )
 
     async def finalize_deploy_rollback_incomplete(
         self, op_id: str, *, reason: str,
         journal_excerpt: Mapping[str, Any] | None = None,
+        target_slot: str | None = None, target_sha: str | None = None,
     ) -> tuple[DeliveryRecord, DeploymentRecord | None, DeliveryOpRecord]:
         """§8 `rollback_incomplete(stage)`: a rollback that could not be proven
         total. op `failed(health_failed)`, deployment → `failed`, delivery
@@ -3269,11 +3295,13 @@ class TaskRepository:
             delivery_status="blocked", set_reason=True,
             reason_kind="health_failed", reason_detail=reason,
             journal_excerpt=journal_excerpt,
+            target_slot=target_slot, target_sha=target_sha,
         )
 
     async def finalize_deploy_old_wont_die(
         self, op_id: str, *, reason: str = "old server did not exit in time",
         journal_excerpt: Mapping[str, Any] | None = None,
+        target_slot: str | None = None, target_sha: str | None = None,
     ) -> tuple[DeliveryRecord, DeploymentRecord | None, DeliveryOpRecord]:
         """§8 `old_wont_die`: the flip never happened. op `failed(old_wont_die)`,
         deployment reverts `switching` → `staged` (still deployable, lock
@@ -3284,11 +3312,13 @@ class TaskRepository:
             delivery_status="blocked", set_reason=True,
             reason_kind="old_wont_die", reason_detail=reason,
             journal_excerpt=journal_excerpt,
+            target_slot=target_slot, target_sha=target_sha,
         )
 
     async def finalize_deploy_interrupted(
         self, op_id: str, *, reason: str,
         journal_excerpt: Mapping[str, Any] | None = None,
+        target_slot: str | None = None, target_sha: str | None = None,
     ) -> tuple[DeliveryRecord, DeploymentRecord | None, DeliveryOpRecord]:
         """§8 `handoff`-only / stale non-terminal: op `interrupted`, deployment →
         `failed`, delivery `blocked(interrupted)`. A human inspects `current`, the
@@ -3299,6 +3329,7 @@ class TaskRepository:
             delivery_status="blocked", set_reason=True,
             reason_kind="interrupted", reason_detail=reason,
             journal_excerpt=journal_excerpt,
+            target_slot=target_slot, target_sha=target_sha,
         )
 
 

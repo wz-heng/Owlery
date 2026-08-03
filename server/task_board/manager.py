@@ -909,8 +909,10 @@ class TaskBoardManager:
                     if step == switcher.STEP_FLIP_DONE
                     else "handoff recorded but switcher never confirmed"
                 )
+                target_slot, target_sha = self._handoff_target(entries)
                 await self.repo.finalize_deploy_interrupted(
-                    op.id, reason=reason, journal_excerpt={"tail": entries[-6:]}
+                    op.id, reason=reason, journal_excerpt={"tail": entries[-6:]},
+                    target_slot=target_slot, target_sha=target_sha,
                 )
         return probation
 
@@ -934,13 +936,33 @@ class TaskBoardManager:
                 await asyncio.sleep(self._probation_poll_interval)
             else:
                 # Still non-terminal after the health window → now stale.
+                target_slot, target_sha = self._handoff_target(
+                    journal.entries(probation.op_id)
+                )
                 await self.repo.finalize_deploy_interrupted(
                     probation.op_id,
                     reason="probation timed out; switcher never confirmed",
+                    target_slot=target_slot, target_sha=target_sha,
                 )
         finally:
             await on_release()
         return outcome
+
+    @staticmethod
+    def _handoff_target(entries: list[dict[str, Any]]) -> tuple[str | None, str | None]:
+        """The `to_slot`/`new_sha` this op's `handoff` journal line targeted, or
+        `(None, None)` if there is no handoff line yet — the restricted fallback
+        locator for a deployment row a snapshot restore can unbind from its op id
+        (§7.4; see `_finalize_switch`'s docstring in repository.py). Read from the
+        journal, never the DB, so it works even when the DB row itself is the
+        thing that reverted."""
+        for entry in entries:
+            if entry.get("step") == switcher.STEP_HANDOFF:
+                detail = entry.get("detail") or {}
+                slot = detail.get("to_slot")
+                sha = detail.get("new_sha")
+                return (str(slot) if slot else None, str(sha) if sha else None)
+        return (None, None)
 
     async def _apply_switch_terminal(
         self, op_id: str, entries: list[dict[str, Any]]
@@ -954,6 +976,7 @@ class TaskBoardManager:
             return None
         detail = (tail.get("detail") or {}) if tail else {}
         excerpt = {"tail": entries[-6:]}
+        target_slot, target_sha = self._handoff_target(entries)
         if step == switcher.STEP_SWITCHED_OK:
             await self.repo.finalize_deploy_switched(
                 op_id, deployed_sha=str(detail.get("sha", "")),
@@ -963,6 +986,7 @@ class TaskBoardManager:
             await self.repo.finalize_deploy_rolled_back(
                 op_id, reason=str(detail.get("reason", "health_failed")),
                 journal_excerpt=excerpt,
+                target_slot=target_slot, target_sha=target_sha,
             )
         elif step == switcher.STEP_ROLLBACK_INCOMPLETE:
             await self.repo.finalize_deploy_rollback_incomplete(
@@ -972,15 +996,18 @@ class TaskBoardManager:
                     f"({detail.get('reason', '?')})"
                 ),
                 journal_excerpt=excerpt,
+                target_slot=target_slot, target_sha=target_sha,
             )
         elif step == switcher.STEP_OLD_WONT_DIE:
             await self.repo.finalize_deploy_old_wont_die(
-                op_id, journal_excerpt=excerpt
+                op_id, journal_excerpt=excerpt,
+                target_slot=target_slot, target_sha=target_sha,
             )
         else:  # STEP_SWITCH_ERROR — a bad/missing handoff; the flip never happened.
             await self.repo.finalize_deploy_interrupted(
                 op_id, reason=f"switch_error: {detail.get('reason', '?')}",
                 journal_excerpt=excerpt,
+                target_slot=target_slot, target_sha=target_sha,
             )
         return step
 

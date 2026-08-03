@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -672,6 +673,76 @@ async def test_reconcile_stale_flip_done_is_interrupted(store, monkeypatch):
 
     op = next(o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch")
     assert op.state == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_after_real_snapshot_restore(store, monkeypatch):
+    """A rollback (or a boot reading the restored DB) must still locate and
+    finalize the deployment even though the pre-switch snapshot it restored
+    (§7.4) predates the CAS that bound the deployment row to this op (§7.2:
+    the snapshot is step 1, `begin_deployment_switching` is step 3) — so
+    restoring it reverts that row to its pre-handoff `staged`/`op_id=NULL`
+    state, exactly the way `server.switcher._restore_snapshot` does on a real
+    rollback. This drives the REAL snapshot file (checkpoint + copy, taken by
+    the coordinator during handoff) back over a fresh DB file/connection —
+    not a scripted journal fixture — so it exercises the actual on-disk
+    sequence, not just the reconciler's journal-reading half."""
+    db, repo, tmp, agent = store
+    m, coord, op, staged, layout, (task, run, delivery) = await _handed_off(
+        db, repo, tmp, agent, monkeypatch
+    )
+
+    # Sanity: the deployment row IS bound to this op right after handoff —
+    # the CAS (§7.2 step 3) ran after the snapshot (§7.2 step 1).
+    dep_before = await repo.get_deployment(staged.id)
+    assert dep_before.state == "switching" and dep_before.op_id == op.id
+
+    snapshot_path = layout.snapshots_path / f"{op.id}.db"
+    assert snapshot_path.is_file()
+    db_path = tmp / "owlery.db"
+
+    # Close both connections (a real rollback/boot never restores a snapshot
+    # over a live connection), then restore exactly as the switcher does
+    # (server/switcher.py `_restore_snapshot`): copy the snapshot over the
+    # live DB and drop any stale -wal/-shm sidecar of the live file.
+    await repo.close()
+    await db.close()
+    shutil.copyfile(str(snapshot_path), str(db_path))
+    for sidecar in (f"{db_path}-wal", f"{db_path}-shm"):
+        try:
+            os.unlink(sidecar)
+        except FileNotFoundError:
+            pass
+
+    db2 = Database(str(db_path))
+    await db2.initialize()
+    repo2 = TaskRepository(str(db_path))
+    await repo2.initialize()
+    try:
+        # The restore really did revert the binding — this is the trap: a
+        # naive `WHERE op_id=?` lookup now finds nothing for this op.
+        dep_after_restore = await repo2.get_deployment(staged.id)
+        assert dep_after_restore.state == "staged" and dep_after_restore.op_id is None
+
+        # The switcher's rollback then journals its verdict for this op (§8).
+        _append(layout, op.id, switcher.STEP_ROLLED_BACK, {"reason": "health_timeout"})
+
+        m2 = _manager(db2, repo2)
+        assert await m2.reconcile_deploy_switch_ops() is None  # terminal, no probation
+
+        op_after = next(
+            o for o in await repo2.list_delivery_ops(delivery.id) if o.kind == "deploy_switch"
+        )
+        assert op_after.state == "failed"
+        dep_final = await repo2.get_deployment(staged.id)
+        # Must land on the §8 terminal state, never remain `staged`/`switching`.
+        assert dep_final.state == "rolled_back"
+        assert dep_final.op_id == op.id  # re-bound by the fallback locator
+        d = await repo2.get_delivery(delivery.id)
+        assert d.status == "blocked" and d.reason_kind == "health_failed"
+    finally:
+        await repo2.close()
+        await db2.close()
 
 
 # --------------------------------------------------- H. probation
