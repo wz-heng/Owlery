@@ -990,3 +990,51 @@ async def test_switch_success_never_clears_real_conflict(store, monkeypatch):
     assert final.status == "conflicted" and final.reason_kind == "conflict"
     assert final.deployed_sha == staged.sha and final.deployed_slot == "b"
     assert (await repo.get_deployment(staged.id)).state == "live"
+
+
+@pytest.mark.asyncio
+async def test_successful_retry_after_deploy_locked_leaves_delivery_blocked(store, monkeypatch):
+    """A switch attempt that aborts `deploy_locked` (another deploy holds the
+    global lock at the `begin_deployment_switching` CAS, §7.2 step 3) blocks
+    the delivery. Releasing the holder and retrying explicitly then succeeds —
+    the deployment flips live and the delivery's sha/slot fold in — but
+    `deploy_locked` reflects contention with a DIFFERENT deploy, never this
+    switch's own outcome, so it is deliberately excluded from
+    `SWITCH_OWNED_REASON_KINDS` (§9): the retry's success must leave the
+    delivery blocked(deploy_locked), exactly like a real git conflict in
+    `test_switch_success_never_clears_real_conflict`."""
+    db, repo, tmp, agent = store
+    _, task, run, delivery, layout, coord, staged = await _staged(db, repo, tmp, agent, monkeypatch)
+    _wire_switch(coord, FakeQuiesce([[]]))
+
+    # Another deploy holds the global lock (a `staging` row) when this switch
+    # attempts its `begin_deployment_switching` CAS.
+    holder = await repo.begin_deployment_staging(
+        delivery_id=None, task_id="t-other", op_id=None,
+        slot="a", sha="deadbeef" * 5, source_repo=str(layout.root),
+    )
+
+    d = await coord.deploy_switch(task.id, run.id, server_root=layout.slot_path("a"))
+    assert d.status == "blocked" and d.reason_kind == "deploy_locked"
+    assert (await repo.get_deployment(staged.id)).state == "staged"  # never flipped
+
+    # Release the holder — the global lock is free again.
+    await repo.mark_deployment_failed(holder.id)
+
+    # An explicit new attempt — a fresh `:retry:1` op, never a tick (§4).
+    await coord.deploy_switch(task.id, run.id, server_root=layout.slot_path("a"))
+    ops = [o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch"]
+    assert len(ops) == 2
+    retry_op = ops[1]
+    assert retry_op.source_key.endswith(":retry:1") and retry_op.state == "running"
+
+    _append(layout, retry_op.id, switcher.STEP_SWITCHED_OK, {"slot": "b", "sha": staged.sha})
+    m = _manager(db, repo)
+    assert await m.reconcile_deploy_switch_ops() is None  # terminal, no probation
+
+    final = await repo.get_delivery(delivery.id)
+    # The retry succeeded — deployment live, sha/slot folded — but
+    # `deploy_locked` is not switch-owned, so it must survive untouched.
+    assert final.status == "blocked" and final.reason_kind == "deploy_locked"
+    assert final.deployed_sha == staged.sha and final.deployed_slot == "b"
+    assert (await repo.get_deployment(staged.id)).state == "live"
