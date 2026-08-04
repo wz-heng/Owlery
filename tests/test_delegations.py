@@ -229,10 +229,13 @@ async def test_deploy_admission_rejects_delegation_follow_up_before_new_run(
     rec = await dm.start_delegation(
         parent_session_id=parent.id, agent_name="vera", request="first"
     )
-    rec.state = "completed"
-    await db.finish_delegation_run(
-        rec.run_id, state="completed", error=None, finished_at="2026-08-05T00:00:00Z"
+    # A normal terminal result archives delegation children.  The admission
+    # check must win before this follow-up can unarchive that child.
+    await dm._on_broadcast(
+        {"type": "result", "session_id": rec.delegation_id, "is_error": False}
     )
+    assert rec.state == "completed"
+    assert mgr.get_session(rec.delegation_id) is None
     gate = DeployAdmissionGate()
     mgr.set_deploy_admission_gate(gate)
     await gate.close()
@@ -246,6 +249,7 @@ async def test_deploy_admission_rejects_delegation_follow_up_before_new_run(
 
     assert exc.value.status_code == 409
     assert len(await db.list_delegation_runs(rec.delegation_id)) == 1
+    assert mgr.get_session(rec.delegation_id) is None
 
 
 @pytest.mark.asyncio
