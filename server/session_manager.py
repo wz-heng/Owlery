@@ -35,6 +35,7 @@ from . import fork_helpers
 from .config import settings
 from .crypto import decrypt, encrypt
 from .database import Database
+from .deploy_admission import DeployAdmissionGate
 from .oauth_errors import RefreshErrorCode
 from .oauth_providers import OAuthTokenSet, get_provider
 from .models import (
@@ -312,6 +313,10 @@ class SessionManager:
         # own durable state. Producers may still create outbox rows, but no
         # model turn starts until every listener/recovery pass is ready.
         self._injection_dispatch_enabled: bool = True
+        # A deploy closes this gate before its final idle census.  It is kept
+        # separate from injection dispatch: direct WS/REST messages do not pass
+        # through the durable-injection outbox.
+        self._deploy_admission = DeployAdmissionGate()
 
     def set_notifier_manager(self, mgr: Any) -> None:
         self._notifier_manager = mgr
@@ -321,6 +326,10 @@ class SessionManager:
 
     def set_parked_turn_runner(self, runner: Any) -> None:
         self._parked_turns = runner
+
+    def set_deploy_admission_gate(self, gate: DeployAdmissionGate) -> None:
+        """Wire the process-wide deploy work-admission gate at boot."""
+        self._deploy_admission = gate
 
     async def initialize(self, db: Database) -> None:
         self.db = db
@@ -1913,6 +1922,10 @@ class SessionManager:
             injection_id=injection_id,
         )
 
+        # Reject a new user-visible message while a deploy owns admission.  A
+        # running turn is never cancelled; it merely cannot receive more work.
+        await self._deploy_admission.require_open()
+
         # Busy path: a turn is in flight → just queue. A fork can never be in
         # flight here, because fork_session only sets `_forking` against a
         # quiescent parent (no `_active_task`), so a running turn implies
@@ -1944,27 +1957,31 @@ class SessionManager:
         # lock: refuse if a fork is mid-saga, re-check for a turn another
         # coroutine may have started while we waited, then claim `_active_task`.
         async with session._lock:
-            if session._forking:
-                raise ValueError(f"Session {session_id} is busy (forking)")
-            # Re-check the park under the lock: a turn on this session could
-            # have limit-parked in the window between the fast-path check above
-            # and acquiring the lock, and we must not drive into that.
-            if await self._is_parked(session_id) or (
-                session._active_task and not session._active_task.done()
-            ):
-                session._pending_queue.append(queued)
-                await self._broadcast(
-                    {
-                        "type": "queued",
-                        "session_id": session_id,
-                        "content": prompt,
-                        "queue_length": len(session._pending_queue),
-                    }
+            # This second, serialized check makes a deploy close that races the
+            # idle-path claim deterministic: close either observes the claimed
+            # task in its final census or wins and rejects this message.
+            async with self._deploy_admission.admit():
+                if session._forking:
+                    raise ValueError(f"Session {session_id} is busy (forking)")
+                # Re-check the park under the lock: a turn on this session could
+                # have limit-parked in the window between the fast-path check above
+                # and acquiring the lock, and we must not drive into that.
+                if await self._is_parked(session_id) or (
+                    session._active_task and not session._active_task.done()
+                ):
+                    session._pending_queue.append(queued)
+                    await self._broadcast(
+                        {
+                            "type": "queued",
+                            "session_id": session_id,
+                            "content": prompt,
+                            "queue_length": len(session._pending_queue),
+                        }
+                    )
+                    return
+                session._active_task = asyncio.create_task(
+                    self._drive_messages(session_id, queued)
                 )
-                return
-            session._active_task = asyncio.create_task(
-                self._drive_messages(session_id, queued)
-            )
 
     async def _is_parked(self, session_id: str) -> bool:
         """Is a usage-limit park pending for this session? (limit-auto-resume.md
