@@ -331,6 +331,10 @@ class SessionManager:
         """Wire the process-wide deploy work-admission gate at boot."""
         self._deploy_admission = gate
 
+    @property
+    def deploy_admission_gate(self) -> DeployAdmissionGate:
+        return self._deploy_admission
+
     async def initialize(self, db: Database) -> None:
         self.db = db
         self._injection_dispatch_enabled = True

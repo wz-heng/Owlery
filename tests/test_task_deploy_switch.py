@@ -162,6 +162,8 @@ class FakeQuiesce:
         self._seq = [list(x) for x in busy_sequence]
         self.paused = 0
         self.resumed = 0
+        self.admission_closes = 0
+        self.admission_opens = 0
 
     async def census(self, *, exclude_op_id=None):
         if len(self._seq) > 1:
@@ -173,6 +175,12 @@ class FakeQuiesce:
 
     async def resume_from_drain(self):
         self.resumed += 1
+
+    async def close_admission(self):
+        self.admission_closes += 1
+
+    async def open_admission(self):
+        self.admission_opens += 1
 
 
 def _wire_switch(coord, quiesce):
@@ -415,6 +423,23 @@ async def test_drain_waits_then_proceeds(store, monkeypatch):
     assert len(coord.spawns) == 1 and coord.shutdowns == [True]
 
 
+@pytest.mark.asyncio
+async def test_final_census_closes_admission_and_abort_reopens_it(store, monkeypatch):
+    db, repo, tmp, agent = store
+    _, task, run, delivery, layout, coord, staged = await _staged(db, repo, tmp, agent, monkeypatch)
+    # The first census is idle, then work arrives before the handoff's final
+    # census. Admission must be closed before that second census and reopened
+    # once this still-live server refuses the switch.
+    q = FakeQuiesce([[], [BusySource("session_turn", "raced")]])
+    _wire_switch(coord, q)
+
+    d = await coord.deploy_switch(task.id, run.id, server_root=layout.slot_path("a"))
+
+    assert d.status == "blocked" and d.reason_kind == "not_idle"
+    assert q.admission_closes == 1 and q.admission_opens == 1
+    assert (await repo.get_deployment(staged.id)).state == "staged"
+
+
 # --------------------------------------- D. switch_when_idle non-durability
 
 
@@ -449,7 +474,8 @@ async def test_switch_when_idle_plans_and_is_not_durable(store, monkeypatch):
 async def test_handoff_snapshot_journal_spawn_broadcast_shutdown(store, monkeypatch):
     db, repo, tmp, agent = store
     _, task, run, delivery, layout, coord, staged = await _staged(db, repo, tmp, agent, monkeypatch)
-    _wire_switch(coord, FakeQuiesce([[]]))
+    q = FakeQuiesce([[]])
+    _wire_switch(coord, q)
 
     await coord.deploy_switch(task.id, run.id, server_root=layout.slot_path("a"))
 
@@ -480,6 +506,7 @@ async def test_handoff_snapshot_journal_spawn_broadcast_shutdown(store, monkeypa
     # The detached switcher was spawned from the OLD slot; restart is under way.
     assert coord.spawns[0]["from_slot"] == "a" and coord.spawns[0]["op_id"] == op.id
     assert coord.broadcasts[0]["type"] == "server_restarting"
+    assert q.admission_closes == 1 and q.admission_opens == 0
     assert coord.shutdowns == [True]
 
 

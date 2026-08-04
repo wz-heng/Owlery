@@ -1063,6 +1063,7 @@ class TaskBoardManager:
             bridge_manager_getter=bridge_manager_getter,
             scheduler_getter=scheduler_getter,
             parked_scheduler_getter=parked_scheduler_getter,
+            admission_gate=self.session_mgr.deploy_admission_gate,
         )
         self.delivery.bind_deploy(
             quiesce=quiesce,

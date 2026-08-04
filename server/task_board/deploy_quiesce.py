@@ -20,6 +20,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol
 
+from ..deploy_admission import DeployAdmissionGate
+
 
 @dataclass(frozen=True, slots=True)
 class BusySource:
@@ -59,6 +61,7 @@ class DeployQuiesce:
         bridge_manager_getter: Callable[[], Any] | None = None,
         scheduler_getter: Callable[[], Any] | None = None,
         parked_scheduler_getter: Callable[[], Any] | None = None,
+        admission_gate: DeployAdmissionGate | None = None,
     ) -> None:
         self._sm = session_manager
         self._repo = repo
@@ -73,6 +76,17 @@ class DeployQuiesce:
         self._bridge_getter = bridge_manager_getter
         self._scheduler_getter = scheduler_getter
         self._parked_scheduler_getter = parked_scheduler_getter
+        self._admission_gate = admission_gate
+
+    async def close_admission(self) -> None:
+        """Block new work before deploy's final idle census (§7.2)."""
+        if self._admission_gate is not None:
+            await self._admission_gate.close()
+
+    async def open_admission(self) -> None:
+        """Release new work after a pre-spawn deploy abort."""
+        if self._admission_gate is not None:
+            await self._admission_gate.open()
 
     # -- census -----------------------------------------------------------
 

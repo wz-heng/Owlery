@@ -984,6 +984,21 @@ class DeliveryCoordinator:
             logger.exception("switch_when_idle hold failed for op %s", ctx.op_id)
 
     async def _perform_switch_handoff(self, ctx: _SwitchCtx) -> DeliveryRecord:
+        """Close work admission, then execute the irreversible handoff.
+
+        Closing is deliberately adjacent to the final census in the helper: a
+        successful spawn keeps it closed until this process exits, while every
+        exception before that spawn reopens it before the caller settles the
+        aborted op.
+        """
+        await self.deploy_quiesce.close_admission()
+        try:
+            return await self._perform_switch_handoff_after_admission(ctx)
+        except Exception:
+            await self.deploy_quiesce.open_admission()
+            raise
+
+    async def _perform_switch_handoff_after_admission(self, ctx: _SwitchCtx) -> DeliveryRecord:
         """§7.2 handoff, five steps, each committed before the next: snapshot →
         journal `handoff` → deployment `switching` + op journal_ref → spawn the
         detached switcher → broadcast `server_restarting` + graceful shutdown.
