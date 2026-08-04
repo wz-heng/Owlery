@@ -329,28 +329,45 @@ class BgTaskManager:
             started_at=started_at,
             completed_at=None,
         )
-        await self._db.create_bg_task(
-            task_id=task_id,
-            session_id=session_id,
-            command=command,
-            description=description,
-            working_dir=working_dir,
-            started_at=started_at,
-        )
-        if self._broadcast_cb:
-            await self._broadcast_cb(
-                {
-                    "type": "bg_started",
-                    "session_id": session_id,
-                    "task_id": task_id,
-                    "command": command,
-                    "description": description,
-                    "started_at": started_at,
-                }
-            )
-
+        # Census observes ``_running``, not the DB.  Register the process
+        # synchronously before the next await so a closing deploy can never
+        # miss a successfully spawned child.  A failed DB write below must
+        # then terminate it before this admission claim is released.
         rt = _RunningTask(record, proc)
         self._running[task_id] = rt
+        try:
+            await self._db.create_bg_task(
+                task_id=task_id,
+                session_id=session_id,
+                command=command,
+                description=description,
+                working_dir=working_dir,
+                started_at=started_at,
+            )
+        except BaseException:
+            self._running.pop(task_id, None)
+            rt.cancel_requested = True
+            await self._terminate_proc(rt)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=6.0)
+            except (asyncio.TimeoutError, Exception):
+                logger.exception("bg task %s did not terminate after setup failure", task_id)
+            raise
+        if self._broadcast_cb:
+            try:
+                await self._broadcast_cb(
+                    {
+                        "type": "bg_started",
+                        "session_id": session_id,
+                        "task_id": task_id,
+                        "command": command,
+                        "description": description,
+                        "started_at": started_at,
+                    }
+                )
+            except Exception:
+                logger.exception("bg_started broadcast failed for %s", task_id)
+
         rt.task = asyncio.create_task(
             self._run_task(rt, timeout_seconds),
             name=f"bg-task-{task_id}",

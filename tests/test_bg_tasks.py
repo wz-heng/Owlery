@@ -32,6 +32,7 @@ from server.bg_tasks import (
     bg_task_manager,
     render_delivery_prompt,
 )
+import server.bg_tasks as bg_mod
 from server.database import Database
 from server.deploy_admission import DeployAdmissionClosedError, DeployAdmissionGate
 from server.main import app
@@ -132,6 +133,54 @@ async def test_deploy_admission_rejects_bg_task_before_spawn(manager, db, tmp_pa
 
     assert manager._running == {}
     assert await db.list_bg_tasks_for_session("s1") == []
+
+
+@pytest.mark.asyncio
+async def test_bg_setup_failure_terminates_registered_process(manager, db, tmp_path, monkeypatch):
+    await _make_session_row(db, "s1", str(tmp_path))
+    monkeypatch.setattr(bg_mod, "_short_id", lambda: "setup-failure")
+
+    async def fail_create(*_args, **_kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(db, "create_bg_task", fail_create)
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        await manager.start_task(session_id="s1", command="sleep 30", working_dir=str(tmp_path))
+
+    assert manager._running == {}
+
+
+@pytest.mark.asyncio
+async def test_deploy_close_waits_for_bg_admission_to_register_process(
+    manager, db, tmp_path, monkeypatch
+):
+    await _make_session_row(db, "s1", str(tmp_path))
+    gate = DeployAdmissionGate()
+    manager._admission_gate = gate
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_create = db.create_bg_task
+
+    async def block_create(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        await original_create(*args, **kwargs)
+
+    monkeypatch.setattr(db, "create_bg_task", block_create)
+    start = asyncio.create_task(
+        manager.start_task(session_id="s1", command="sleep 1", working_dir=str(tmp_path))
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    close = asyncio.create_task(gate.close())
+    await asyncio.sleep(0)
+    assert not close.done()
+    assert len(manager._running) == 1
+
+    release.set()
+    record = await asyncio.wait_for(start, timeout=1)
+    await asyncio.wait_for(close, timeout=1)
+    assert gate.closed
+    assert record.id in manager._running
 
 
 async def test_failing_command_records_failure(manager, db, tmp_path):
