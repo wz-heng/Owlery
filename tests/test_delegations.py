@@ -23,11 +23,15 @@ captured prompts are what matters.
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from server.agent_manager import AgentManager
 from server.database import Database
+from server.deploy_admission import DeployAdmissionGate
 from server.delegations import (
     DEPTH_CAP,
     DelegationError,
@@ -130,6 +134,118 @@ async def test_origin_delegation_round_trips(mgr, db):
     assert raw["origin"] == "delegation"
     assert raw["parent_session_id"] == parent.id
     assert raw["delegation_request"] == "please review"
+
+
+# ---------------------------------------------------------------------------
+# Deploy admission
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_deploy_admission_rejects_delegation_before_child_or_run(dm, mgr, db):
+    parent_agent = await db.get_default_agent()
+    await _make_agent(db, "Vera")
+    parent = await _make_session(mgr, parent_agent["id"])
+    gate = DeployAdmissionGate()
+    mgr.set_deploy_admission_gate(gate)
+    await gate.close()
+
+    with pytest.raises(DelegationError) as exc:
+        await dm.start_delegation(
+            parent_session_id=parent.id, agent_name="vera", request="review"
+        )
+
+    assert exc.value.status_code == 409
+    assert set(mgr.sessions) == {parent.id}
+    assert await db.list_running_delegation_runs() == []
+
+
+@pytest.mark.asyncio
+async def test_deploy_close_waits_for_delegation_admission(dm, mgr, db, monkeypatch):
+    parent_agent = await db.get_default_agent()
+    await _make_agent(db, "Vera")
+    parent = await _make_session(mgr, parent_agent["id"])
+    entered = asyncio.Event()
+    release_admission = asyncio.Event()
+    started = asyncio.Event()
+    release_worker = asyncio.Event()
+
+    class BlockingGate(DeployAdmissionGate):
+        def __init__(self) -> None:
+            super().__init__()
+            self._first = True
+
+        @asynccontextmanager
+        async def admit(self):
+            async with super().admit():
+                if self._first:
+                    self._first = False
+                    entered.set()
+                    await release_admission.wait()
+                yield
+
+    async def hold_worker(_session_id, _queued):
+        started.set()
+        await release_worker.wait()
+
+    gate = BlockingGate()
+    mgr.set_deploy_admission_gate(gate)
+    monkeypatch.setattr(mgr, "_consume_message", hold_worker)
+    start = asyncio.create_task(
+        dm.start_delegation(
+            parent_session_id=parent.id, agent_name="vera", request="review"
+        )
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    close = asyncio.create_task(gate.close())
+    await asyncio.sleep(0)
+    assert not close.done()
+
+    release_admission.set()
+    rec = await asyncio.wait_for(start, timeout=1)
+    await asyncio.wait_for(close, timeout=1)
+    assert gate.closed
+    assert [row["run_id"] for row in await db.list_running_delegation_runs()] == [rec.run_id]
+    worker = mgr.get_session(rec.delegation_id)
+    assert worker is not None
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    release_worker.set()
+    assert worker._active_task is not None
+    await asyncio.wait_for(worker._active_task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_deploy_admission_rejects_delegation_follow_up_before_new_run(
+    dm, mgr, db, monkeypatch
+):
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(mgr, "start_message", no_op)
+    parent_agent = await db.get_default_agent()
+    await _make_agent(db, "Vera")
+    parent = await _make_session(mgr, parent_agent["id"])
+    rec = await dm.start_delegation(
+        parent_session_id=parent.id, agent_name="vera", request="first"
+    )
+    rec.state = "completed"
+    await db.finish_delegation_run(
+        rec.run_id, state="completed", error=None, finished_at="2026-08-05T00:00:00Z"
+    )
+    gate = DeployAdmissionGate()
+    mgr.set_deploy_admission_gate(gate)
+    await gate.close()
+
+    with pytest.raises(DelegationError) as exc:
+        await dm.follow_up_delegation(
+            parent_session_id=parent.id,
+            delegation_id=rec.delegation_id,
+            request="second",
+        )
+
+    assert exc.value.status_code == 409
+    assert len(await db.list_delegation_runs(rec.delegation_id)) == 1
 
 
 @pytest.mark.asyncio

@@ -44,6 +44,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from .harness import join_text_blocks
+from .deploy_admission import DeployAdmissionClosedError
 
 if TYPE_CHECKING:
     from .database import Database
@@ -396,76 +397,72 @@ class DelegationManager:
         )
         parent_name = (parent_agent or {}).get("name") or "another agent"
 
-        child_backend = (target.get("backend") or "claude-code")
-        child_name = f"{target['name']} ← {parent_name}"
-        child = await self.session_mgr.create_session(
-            agent_id=target["id"],
-            name=child_name,
-            working_dir=parent.working_dir,
-            origin="delegation",
-            backend=child_backend,
-            parent_session_id=parent.id,
-            delegation_request=request,
-        )
+        async def create_and_start() -> DelegationRunState:
+            child = await self.session_mgr.create_session(
+                agent_id=target["id"],
+                name=f"{target['name']} ← {parent_name}",
+                working_dir=parent.working_dir,
+                origin="delegation",
+                backend=target.get("backend") or "claude-code",
+                parent_session_id=parent.id,
+                delegation_request=request,
+            )
+            run_id = uuid.uuid4().hex[:12]
+            start_seq = await self.db.max_message_seq(child.id)
+            created_at = datetime.now(timezone.utc).isoformat()
+            await self.db.create_delegation_run(
+                run_id=run_id,
+                delegation_id=child.id,
+                round_no=1,
+                request=request,
+                start_seq=start_seq,
+                created_at=created_at,
+            )
+            rec = DelegationRunState(
+                run_id=run_id,
+                delegation_id=child.id,
+                round_no=1,
+                start_seq=start_seq,
+                parent_session_id=parent.id,
+                target_agent_id=target["id"],
+                target_agent_name=target["name"],
+                request=request,
+                created_at=created_at,
+            )
+            # This record is the delegation portion of the final census.  It
+            # is registered before the admitted initial turn can broadcast.
+            self._records[child.id] = rec
+            composed = self._compose_initial_prompt(
+                parent_name=parent_name,
+                parent_session_id=parent.id,
+                request=request,
+                files=files or [],
+                working_dir=parent.working_dir,
+            )
+            try:
+                await self.session_mgr.start_message(child.id, composed)
+            except Exception as exc:
+                logger.exception("Failed to start child session %s for delegation", child.id)
+                rec.state = "failed"
+                rec.error = f"failed to start child session: {exc}"
+                rec.finished_at = datetime.now(timezone.utc).isoformat()
+                await self.db.finish_delegation_run(
+                    rec.run_id,
+                    state=rec.state,
+                    error=rec.error,
+                    finished_at=rec.finished_at,
+                )
+                await self._inject_terminal(rec)
+                raise DelegationError(
+                    f"failed to start delegation: {exc}", status_code=500
+                ) from exc
+            return rec
 
-        run_id = uuid.uuid4().hex[:12]
-        start_seq = await self.db.max_message_seq(child.id)
-        created_at = datetime.now(timezone.utc).isoformat()
-        await self.db.create_delegation_run(
-            run_id=run_id,
-            delegation_id=child.id,
-            round_no=1,
-            request=request,
-            start_seq=start_seq,
-            created_at=created_at,
-        )
-        rec = DelegationRunState(
-            run_id=run_id,
-            delegation_id=child.id,
-            round_no=1,
-            start_seq=start_seq,
-            parent_session_id=parent.id,
-            target_agent_id=target["id"],
-            target_agent_name=target["name"],
-            request=request,
-            created_at=created_at,
-        )
-        # Register BEFORE start_message: the broadcast may fire
-        # synchronously from inside start_message on a fast harness
-        # (test fakes, especially), and the listener needs to find
-        # us in _records.
-        self._records[child.id] = rec
-
-        composed = self._compose_initial_prompt(
-            parent_name=parent_name,
-            parent_session_id=parent.id,
-            request=request,
-            files=files or [],
-            working_dir=parent.working_dir,
-        )
         try:
-            await self.session_mgr.start_message(child.id, composed)
-        except Exception as exc:
-            # Surface as failure on the record so the parent still
-            # gets a terminal injection rather than a phantom run.
-            logger.exception(
-                "Failed to start child session %s for delegation", child.id
-            )
-            rec.state = "failed"
-            rec.error = f"failed to start child session: {exc}"
-            rec.finished_at = datetime.now(timezone.utc).isoformat()
-            await self.db.finish_delegation_run(
-                rec.run_id,
-                state=rec.state,
-                error=rec.error,
-                finished_at=rec.finished_at,
-            )
-            await self._inject_terminal(rec)
-            raise DelegationError(
-                f"failed to start delegation: {exc}", status_code=500
-            ) from exc
-
-        return rec
+            async with self.session_mgr.deploy_admission_gate.admit():
+                return await create_and_start()
+        except DeployAdmissionClosedError as exc:
+            raise DelegationError("deploy admission is closed", status_code=409) from exc
 
     async def cancel_delegation(
         self, delegation_id: str, *, reason: str | None = None
@@ -587,86 +584,79 @@ class DelegationManager:
                 status_code=409,
             )
 
-        child = self.session_mgr.get_session(prior.delegation_id)
-        if child is None:
-            # Try unarchive — the round-2 auto-archive policy means
-            # any terminal delegation child sits in the archived
-            # state by the time we get here.
+        async def create_and_start() -> DelegationRunState:
+            child = self.session_mgr.get_session(prior.delegation_id)
+            if child is None:
+                # An archived child is resumed as part of the same admission
+                # as its new durable round; a closed deploy must not revive it.
+                try:
+                    await self.session_mgr.unarchive_session(prior.delegation_id)
+                except ValueError as exc:
+                    raise DelegationError(
+                        f"Child session {prior.delegation_id!r} is gone and "
+                        "can't be reused; start a fresh delegation",
+                        status_code=409,
+                    ) from exc
+            start_seq = await self.db.max_message_seq(prior.delegation_id)
+            created_at = datetime.now(timezone.utc).isoformat()
+            run_id = uuid.uuid4().hex[:12]
+            await self.db.create_delegation_run(
+                run_id=run_id,
+                delegation_id=prior.delegation_id,
+                round_no=prior.round_no + 1,
+                request=request,
+                start_seq=start_seq,
+                created_at=created_at,
+            )
+            rec = DelegationRunState(
+                run_id=run_id,
+                delegation_id=prior.delegation_id,
+                round_no=prior.round_no + 1,
+                start_seq=start_seq,
+                parent_session_id=prior.parent_session_id,
+                target_agent_id=prior.target_agent_id,
+                target_agent_name=prior.target_agent_name,
+                request=request,
+                created_at=created_at,
+            )
+            self._records[rec.delegation_id] = rec
+            parent_live = self.session_mgr.get_session(parent_session_id)
+            parent_agent = (
+                await self.db.get_agent(parent_live.agent_id)
+                if parent_live and parent_live.agent_id
+                else None
+            )
+            parent_name = (parent_agent or {}).get("name") or "another agent"
+            composed = (
+                f"Agent **{parent_name}** has a follow-up for you in the "
+                f"same line of work — your previous reply is above in "
+                f"this transcript. Their new request follows.\n\n"
+                f"---\n{request.strip()}"
+            )
             try:
-                child = await self.session_mgr.unarchive_session(
-                    prior.delegation_id
+                await self.session_mgr.start_message(rec.delegation_id, composed)
+            except Exception as exc:
+                logger.exception("Failed to start follow-up turn on child %s", rec.delegation_id)
+                rec.state = "failed"
+                rec.error = f"failed to start follow-up: {exc}"
+                rec.finished_at = datetime.now(timezone.utc).isoformat()
+                await self.db.finish_delegation_run(
+                    rec.run_id,
+                    state=rec.state,
+                    error=rec.error,
+                    finished_at=rec.finished_at,
                 )
-            except ValueError as exc:
+                await self._inject_terminal(rec)
                 raise DelegationError(
-                    f"Child session {prior.delegation_id!r} is gone and "
-                    f"can't be reused; start a fresh delegation",
-                    status_code=409,
+                    f"failed to start follow-up: {exc}", status_code=500
                 ) from exc
+            return rec
 
-        # Append a new durable round; never overwrite the prior outcome.
-        start_seq = await self.db.max_message_seq(prior.delegation_id)
-        created_at = datetime.now(timezone.utc).isoformat()
-        run_id = uuid.uuid4().hex[:12]
-        await self.db.create_delegation_run(
-            run_id=run_id,
-            delegation_id=prior.delegation_id,
-            round_no=prior.round_no + 1,
-            request=request,
-            start_seq=start_seq,
-            created_at=created_at,
-        )
-        rec = DelegationRunState(
-            run_id=run_id,
-            delegation_id=prior.delegation_id,
-            round_no=prior.round_no + 1,
-            start_seq=start_seq,
-            parent_session_id=prior.parent_session_id,
-            target_agent_id=prior.target_agent_id,
-            target_agent_name=prior.target_agent_name,
-            request=request,
-            created_at=created_at,
-        )
-        self._records[rec.delegation_id] = rec
-
-        # Compose a thin reopen-the-conversation prompt. We don't
-        # repeat the original briefing — the child already has it in
-        # her transcript. We just frame the new turn as a follow-up.
-        parent_agent = (
-            await self.db.get_agent(
-                self.session_mgr.get_session(parent_session_id).agent_id
-            )
-            if self.session_mgr.get_session(parent_session_id)
-            and self.session_mgr.get_session(parent_session_id).agent_id
-            else None
-        )
-        parent_name = (parent_agent or {}).get("name") or "another agent"
-        composed = (
-            f"Agent **{parent_name}** has a follow-up for you in the "
-            f"same line of work — your previous reply is above in "
-            f"this transcript. Their new request follows.\n\n"
-            f"---\n{request.strip()}"
-        )
         try:
-            await self.session_mgr.start_message(rec.delegation_id, composed)
-        except Exception as exc:
-            logger.exception(
-                "Failed to start follow-up turn on child %s", rec.delegation_id
-            )
-            rec.state = "failed"
-            rec.error = f"failed to start follow-up: {exc}"
-            rec.finished_at = datetime.now(timezone.utc).isoformat()
-            await self.db.finish_delegation_run(
-                rec.run_id,
-                state=rec.state,
-                error=rec.error,
-                finished_at=rec.finished_at,
-            )
-            await self._inject_terminal(rec)
-            raise DelegationError(
-                f"failed to start follow-up: {exc}", status_code=500
-            ) from exc
-
-        return rec
+            async with self.session_mgr.deploy_admission_gate.admit():
+                return await create_and_start()
+        except DeployAdmissionClosedError as exc:
+            raise DelegationError("deploy admission is closed", status_code=409) from exc
 
     async def _cascade_cancel_descendants(
         self, parent_delegation_id: str, *, root_reason: str

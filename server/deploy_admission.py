@@ -22,6 +22,8 @@ class DeployAdmissionGate:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._closed = False
+        self._owner: asyncio.Task[object] | None = None
+        self._depth = 0
 
     @property
     def closed(self) -> bool:
@@ -42,7 +44,21 @@ class DeployAdmissionGate:
 
     @asynccontextmanager
     async def admit(self) -> AsyncIterator[None]:
+        owner = asyncio.current_task()
+        if owner is not None and self._owner is owner:
+            self._depth += 1
+            try:
+                yield
+            finally:
+                self._depth -= 1
+            return
         async with self._lock:
             if self._closed:
                 raise DeployAdmissionClosedError("deploy admission is closed")
-            yield
+            self._owner = owner
+            self._depth = 1
+            try:
+                yield
+            finally:
+                self._depth = 0
+                self._owner = None
