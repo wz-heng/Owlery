@@ -137,16 +137,41 @@ async def test_deploy_admission_rejects_bg_task_before_spawn(manager, db, tmp_pa
 
 @pytest.mark.asyncio
 async def test_bg_setup_failure_terminates_registered_process(manager, db, tmp_path, monkeypatch):
-    await _make_session_row(db, "s1", str(tmp_path))
     monkeypatch.setattr(bg_mod, "_short_id", lambda: "setup-failure")
+
+    class FakeProc:
+        pid = 12345
+        returncode = None
+
+        def __init__(self) -> None:
+            self.waited = False
+
+        async def wait(self) -> int:
+            self.waited = True
+            self.returncode = -15
+            return self.returncode
+
+    proc = FakeProc()
+    terminated = False
+
+    async def fake_spawn(*_args, **_kwargs):
+        return proc
+
+    async def fake_terminate(_rt):
+        nonlocal terminated
+        terminated = True
 
     async def fail_create(*_args, **_kwargs):
         raise RuntimeError("database unavailable")
 
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
+    monkeypatch.setattr(manager, "_terminate_proc", fake_terminate)
     monkeypatch.setattr(db, "create_bg_task", fail_create)
     with pytest.raises(RuntimeError, match="database unavailable"):
         await manager.start_task(session_id="s1", command="sleep 30", working_dir=str(tmp_path))
 
+    assert terminated is True
+    assert proc.waited is True
     assert manager._running == {}
 
 
