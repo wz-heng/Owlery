@@ -28,6 +28,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -874,6 +875,55 @@ async def test_fresh_flip_done_enters_probation(store, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_probation_uses_remaining_window_from_flip_done(store, monkeypatch):
+    db, repo, tmp, agent = store
+    m, coord, op, staged, layout, (task, run, delivery) = await _handed_off(db, repo, tmp, agent, monkeypatch)
+    monkeypatch.setattr(settings, "deploy_health_timeout_seconds", 0.06)
+    flipped_at = datetime.now(timezone.utc) - timedelta(seconds=0.045)
+    with open(layout.journal_path, "a") as f:
+        f.write(json.dumps({
+            "ts": flipped_at.isoformat(), "op_id": op.id,
+            "step": switcher.STEP_FLIP_DONE, "detail": {},
+        }) + "\n")
+
+    probation = await m.reconcile_deploy_switch_ops()
+    assert probation is not None
+    assert probation.health_deadline == flipped_at + timedelta(seconds=0.06)
+    released = []
+    started = time.monotonic()
+    outcome = await m.run_deploy_probation(probation, on_release=lambda: _release(released))
+
+    assert outcome == "timeout" and released == [True]
+    # A restarted server gets only the roughly 15ms remainder, not another 60ms.
+    assert time.monotonic() - started < 0.045
+
+
+@pytest.mark.asyncio
+async def test_probation_applies_terminal_tail_even_after_window_elapsed(store, monkeypatch):
+    db, repo, tmp, agent = store
+    m, coord, op, staged, layout, (task, run, delivery) = await _handed_off(db, repo, tmp, agent, monkeypatch)
+    _append(layout, op.id, switcher.STEP_FLIP_DONE, {"from_slot": "a", "to_slot": "b"})
+    probation = await m.reconcile_deploy_switch_ops()
+    assert probation is not None
+    _append(layout, op.id, switcher.STEP_SWITCHED_OK, {"slot": "b", "sha": staged.sha})
+    expired = DeployProbation(
+        op_id=probation.op_id,
+        journal_path=probation.journal_path,
+        health_deadline=datetime.now(timezone.utc) - timedelta(seconds=1),
+    )
+    released = []
+
+    outcome = await m.run_deploy_probation(expired, on_release=lambda: _release(released))
+
+    assert outcome == switcher.STEP_SWITCHED_OK and released == [True]
+    assert (await repo.get_deployment(staged.id)).state == "live"
+
+
+async def _release(released):
+    released.append(True)
+
+
+@pytest.mark.asyncio
 async def test_probation_releases_on_switched_ok(store, monkeypatch):
     db, repo, tmp, agent = store
     m, coord, op, staged, layout, (task, run, delivery) = await _handed_off(db, repo, tmp, agent, monkeypatch)
@@ -899,9 +949,9 @@ async def test_probation_releases_on_switched_ok(store, monkeypatch):
 async def test_probation_times_out_to_interrupted(store, monkeypatch):
     db, repo, tmp, agent = store
     m, coord, op, staged, layout, (task, run, delivery) = await _handed_off(db, repo, tmp, agent, monkeypatch)
+    monkeypatch.setattr(settings, "deploy_health_timeout_seconds", 0.05)
     _append(layout, op.id, switcher.STEP_FLIP_DONE, {"from_slot": "a", "to_slot": "b"})
     probation = await m.reconcile_deploy_switch_ops()
-    monkeypatch.setattr(settings, "deploy_health_timeout_seconds", 0.05)
 
     released = []
 

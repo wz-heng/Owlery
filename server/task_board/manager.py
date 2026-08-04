@@ -60,6 +60,10 @@ class DeployProbation:
 
     op_id: str
     journal_path: str
+    # The original switcher's health window, measured from its durable
+    # ``flip_done`` journal line.  A restarted server must consume only the
+    # remainder, never grant the unconfirmed switch a fresh full timeout.
+    health_deadline: datetime
 
 
 def _iso(value: datetime | None = None) -> str:
@@ -921,11 +925,18 @@ class TaskBoardManager:
                 continue
             tail = entries[-1] if entries else None
             step = tail.get("step") if tail else None
-            if step == switcher.STEP_FLIP_DONE and self._journal_fresh(
-                tail, now, health_timeout
+            flipped_at = self._journal_timestamp(tail)
+            if (
+                step == switcher.STEP_FLIP_DONE
+                and flipped_at is not None
+                and self._journal_fresh(tail, now, health_timeout)
             ):
                 # Flipped, fresh, not yet confirmed → this boot is under probation.
-                probation = DeployProbation(op_id=op.id, journal_path=str(journal.path))
+                probation = DeployProbation(
+                    op_id=op.id,
+                    journal_path=str(journal.path),
+                    health_deadline=flipped_at + timedelta(seconds=health_timeout),
+                )
             else:
                 reason = (
                     "stale flip_done; switcher never confirmed"
@@ -947,25 +958,27 @@ class TaskBoardManager:
         `on_release` (start the deferred producers). A bounded LOCAL poll — no
         network — so it never violates the boot barrier's S3 rule."""
         journal = switcher.Journal(probation.journal_path)
-        deadline = time.monotonic() + float(settings.deploy_health_timeout_seconds)
+        remaining = max(0.0, (probation.health_deadline - _now()).total_seconds())
+        deadline = time.monotonic() + remaining
         outcome = "timeout"
         try:
-            while time.monotonic() < deadline:
+            while True:
                 entries = journal.entries(probation.op_id)
                 applied = await self._apply_switch_terminal(probation.op_id, entries)
                 if applied is not None:
                     outcome = applied
                     break
-                await asyncio.sleep(self._probation_poll_interval)
-            else:
-                # Still non-terminal after the health window → now stale.
-                target_slot, target_sha = self._handoff_target(
-                    journal.entries(probation.op_id)
-                )
-                await self.repo.finalize_deploy_interrupted(
-                    probation.op_id,
-                    reason="probation timed out; switcher never confirmed",
-                    target_slot=target_slot, target_sha=target_sha,
+                if time.monotonic() >= deadline:
+                    # Still non-terminal after the original health window → now stale.
+                    target_slot, target_sha = self._handoff_target(entries)
+                    await self.repo.finalize_deploy_interrupted(
+                        probation.op_id,
+                        reason="probation timed out; switcher never confirmed",
+                        target_slot=target_slot, target_sha=target_sha,
+                    )
+                    break
+                await asyncio.sleep(
+                    min(self._probation_poll_interval, max(0.0, deadline - time.monotonic()))
                 )
         finally:
             await on_release()
@@ -1035,22 +1048,29 @@ class TaskBoardManager:
         return step
 
     @staticmethod
+    def _journal_timestamp(tail: Mapping[str, Any] | None) -> datetime | None:
+        """Parse a journal timestamp as UTC, or fail closed on malformed input."""
+        ts = tail.get("ts") if tail else None
+        if not ts:
+            return None
+        try:
+            when = datetime.fromisoformat(str(ts))
+        except ValueError:
+            return None
+        return when.replace(tzinfo=timezone.utc) if when.tzinfo is None else when
+
+    @staticmethod
     def _journal_fresh(
         tail: Mapping[str, Any] | None, now: datetime, timeout: float
     ) -> bool:
         """A journal line is fresh if it was written within the health window —
         the boundary between a live probation and a stale, abandoned switch (§8).
         An unparseable/absent timestamp reads as stale (fail-safe: interrupt)."""
-        ts = tail.get("ts") if tail else None
-        if not ts:
+        when = TaskBoardManager._journal_timestamp(tail)
+        if when is None:
             return False
-        try:
-            when = datetime.fromisoformat(str(ts))
-        except ValueError:
-            return False
-        if when.tzinfo is None:
-            when = when.replace(tzinfo=timezone.utc)
-        return (now - when).total_seconds() < timeout
+        age = (now - when).total_seconds()
+        return 0 <= age < timeout
 
     def bind_deploy_switch(
         self,

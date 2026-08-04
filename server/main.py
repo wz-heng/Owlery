@@ -44,6 +44,29 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+async def _begin_deploy_probation(
+    *,
+    admission_gate,
+    probation,
+    run_probation,
+    on_release,
+) -> asyncio.Task:
+    """Close admission before starting the boot-probation monitor.
+
+    The helper makes the ordering explicit and testable: the monitor always
+    observes a closed gate, while the first producer release observes it open.
+    It returns the monitor task so lifespan can intentionally leave the bounded
+    local poll off the startup critical path.
+    """
+    await admission_gate.close()
+
+    async def _release() -> None:
+        await admission_gate.open()
+        await on_release()
+
+    return asyncio.create_task(run_probation(probation, on_release=_release))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Octopus → Owlery (rename-owlery.md §3). Moves ~/.octopus and octopus.db
@@ -193,6 +216,7 @@ async def lifespan(app: FastAPI):
         # moving this earlier reintroduces the boot race. A due parked turn,
         # schedule, or bridge message can call start_message directly (outside the
         # injection outbox), so producers start only after the barrier too.
+        await session_manager.deploy_admission_gate.open()
         await session_manager.resume_session_injection_dispatch()
         await schedule_runner.initialize()
         await parked_turn_runner.initialize()
@@ -211,14 +235,19 @@ async def lifespan(app: FastAPI):
         # health window performs no user-visible work a snapshot restore could
         # undo — until the switcher's verdict lands (or the window elapses), then
         # release. /health is already served, so the switcher can confirm us.
+        # This boot is already serving /health for the switcher, but must not
+        # admit any new work that a rollback could invalidate.  Every producer
+        # claims the same gate before becoming census-visible; release happens
+        # only from the probation monitor's `on_release` callback above.
         logger.info(
             "deploy probation: holding producers until switch op %s settles",
             probation.op_id,
         )
-        asyncio.create_task(
-            task_board_manager.run_deploy_probation(
-                probation, on_release=_release_producers
-            )
+        await _begin_deploy_probation(
+            admission_gate=session_manager.deploy_admission_gate,
+            probation=probation,
+            run_probation=task_board_manager.run_deploy_probation,
+            on_release=_release_producers,
         )
 
     # Start Cloudflare Tunnel if enabled
