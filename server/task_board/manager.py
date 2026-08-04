@@ -14,6 +14,7 @@ from typing import Any, Awaitable, Callable, Mapping
 from .. import deploy, switcher
 from ..config import settings
 from ..connector_manager import ConnectorManager
+from ..deploy_admission import DeployAdmissionClosedError
 from .delivery import DeliveryCoordinator, delivery_coordinator
 from .deploy_quiesce import DeployQuiesce
 from .models import DeliveryRecord, RunRecord, TaskBoardError, TaskConflictError, TaskRecord
@@ -243,6 +244,11 @@ class TaskBoardManager:
                 return
             try:
                 await self._dispatch_task(task)
+            except DeployAdmissionClosedError:
+                # A deploy closed the final admission gate after this pass
+                # enumerated ``ready``.  Leave the task ready for the new
+                # process (or a pre-spawn deploy abort) to dispatch later.
+                continue
             except TaskBoardError:
                 # Expected CAS/capacity races: another task/tick owns it.
                 continue
@@ -266,13 +272,20 @@ class TaskBoardManager:
                 / run_id
             )
         lease = _iso(_now() + timedelta(seconds=settings.task_run_lease_seconds))
-        run = await self.repo.claim_ready(
-            task.id,
-            workspace_mode=mode,
-            workspace_path=planned_path,
-            lease_expires_at=lease,
-            run_id=run_id,
-        )
+        # ``claim_ready`` is the durable point at which a ready task becomes
+        # work the deploy census must wait for.  Keep exactly that claim under
+        # the shared admission gate: after ``close`` returns, the census sees
+        # this run, or no dispatcher run has been claimed.  Workspace setup is
+        # intentionally outside the gate -- it can involve slow git I/O, and
+        # a claimed run is already visible to the census while it is prepared.
+        async with self.session_mgr.deploy_admission_gate.admit():
+            run = await self.repo.claim_ready(
+                task.id,
+                workspace_mode=mode,
+                workspace_path=planned_path,
+                lease_expires_at=lease,
+                run_id=run_id,
+            )
         try:
             prepared = await prepare_workspace(
                 mode=mode,
