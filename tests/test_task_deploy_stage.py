@@ -23,6 +23,7 @@ import pytest
 
 from server.config import settings
 from server.database import Database
+from server.deploy_admission import DeployAdmissionGate
 from server.deploy import DeployLayout
 from server.task_board.delivery import DeliveryCoordinator
 from server.task_board.models import DeployLockedError, TaskConflictError
@@ -98,6 +99,18 @@ def _coord(db, repo):
     c = DeliveryCoordinator()
     c.bind(db=db, connectors=None, notify_terminal=None, repo=repo)
     return c
+
+
+def _bind_admission(coord: DeliveryCoordinator, gate: DeployAdmissionGate) -> None:
+    async def _broadcast(_payload):
+        return None
+
+    coord.bind_deploy(
+        quiesce=object(),
+        broadcast_restarting=_broadcast,
+        request_shutdown=lambda: None,
+        admission_gate=gate,
+    )
 
 
 def _init_layout(root: Path, monkeypatch, *, seed_idle: bool = False) -> DeployLayout:
@@ -241,6 +254,26 @@ async def test_stage_prepares_idle_slot_and_records_staged(store, tmp_path, monk
     # Op lifecycle emitted the shared audit events.
     kinds = [e.kind for e in await repo.list_task_events(task.id)]
     assert "delivery_op_started" in kinds and "delivery_op_finished" in kinds
+
+
+@pytest.mark.asyncio
+async def test_closed_admission_rejects_stage_before_it_is_planned(store, tmp_path, monkeypatch):
+    db, repo, tmp, agent = store
+    _board, task, run, _src, delivery = await _ready_delivery(db, repo, tmp, agent)
+    layout = _init_layout(tmp_path / "deploy", monkeypatch)
+    coord = _coord(db, repo)
+    gate = DeployAdmissionGate()
+    _bind_admission(coord, gate)
+    await gate.close()
+
+    with pytest.raises(TaskConflictError, match="deploy admission is closed"):
+        await coord.deploy_stage(
+            task.id, run.id, server_root=layout.slot_path("a"), stage_runner=FakeStageRunner()
+        )
+
+    assert [
+        op for op in await repo.list_delivery_ops(delivery.id) if op.kind == "deploy_stage"
+    ] == []
 
 
 @pytest.mark.asyncio

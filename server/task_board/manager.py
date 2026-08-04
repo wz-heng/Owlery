@@ -1085,6 +1085,7 @@ class TaskBoardManager:
             broadcast_restarting=broadcast_restarting,
             request_shutdown=request_shutdown,
             spawn_switcher=spawn_switcher,
+            admission_gate=self.session_mgr.deploy_admission_gate,
         )
 
     async def reconcile_interrupted_prs(self) -> None:

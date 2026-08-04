@@ -14,6 +14,7 @@ import logging
 import os
 import shutil
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -23,6 +24,7 @@ import httpx
 from .. import deploy, switcher
 from ..config import settings
 from ..connector_manager import ConnectorManager
+from ..deploy_admission import DeployAdmissionClosedError, DeployAdmissionGate
 from . import workspaces as ws
 from .deploy_quiesce import BusySource, DeployQuiesce
 from .models import (
@@ -207,6 +209,9 @@ class DeliveryCoordinator:
         self._switch_host = "127.0.0.1"
         self._drain_poll_interval = 0.5
         self._idle_switch_waiters: set[asyncio.Task[None]] = set()
+        # Bound only in a live server.  Tests and offline delivery tooling keep
+        # their established behavior without a process-wide admission gate.
+        self._admission_gate: DeployAdmissionGate | None = None
 
     def bind(
         self,
@@ -229,6 +234,7 @@ class DeliveryCoordinator:
         broadcast_restarting: Callable[[dict[str, Any]], Awaitable[None]],
         request_shutdown: Callable[[], None],
         spawn_switcher: Callable[..., int] | None = None,
+        admission_gate: DeployAdmissionGate | None = None,
     ) -> None:
         """Wire the deploy-switch effects that only exist inside a live server
         (docs/plans/local-deploy.md §7.2): the quiesce census/drain primitives,
@@ -238,6 +244,7 @@ class DeliveryCoordinator:
         self.deploy_quiesce = quiesce
         self.broadcast_restarting = broadcast_restarting
         self.request_shutdown = request_shutdown
+        self._admission_gate = admission_gate
         if spawn_switcher is not None:
             self.spawn_switcher = spawn_switcher
 
@@ -300,6 +307,25 @@ class DeliveryCoordinator:
             and delivery.status in {"delivered", "conflicted", "blocked", "failed"}
         ):
             await self._notify_terminal(task, delivery)
+
+    @asynccontextmanager
+    async def _admit_delivery_op(self):
+        """Atomically claim a new running delivery operation, if live-bound.
+
+        The gate protects only the durable ``plan -> running`` transition.  On
+        release, the operation is already visible to the deploy quiesce census,
+        so its (possibly slow) git/network work may continue safely while a
+        switch closes admission and observes that running row.
+        """
+        try:
+            if self._admission_gate is None:
+                yield
+            else:
+                async with self._admission_gate.admit():
+                    yield
+        except DeployAdmissionClosedError as exc:
+            # Delivery endpoints already map TaskConflictError to a stable 409.
+            raise TaskConflictError("deploy admission is closed") from exc
 
     # --- accept / baseline ----------------------------------------------
 
@@ -471,22 +497,23 @@ class DeliveryCoordinator:
 
     async def _begin(self, delivery, kind, *, request, actor_kind, actor_agent_id):
         """Plan + start one goal op, returning its id. Retries get a fresh key."""
-        ops = await self.repo.list_delivery_ops(delivery.id)
-        n = sum(1 for o in ops if o.kind == kind)
-        suffix = "" if n == 0 else f":retry:{n}"
-        source_key = f"task:{delivery.task_id}:run:{delivery.run_id}:delivery:{kind}{suffix}"
-        op = await self.repo.plan_op(
-            delivery.id,
-            kind=kind,
-            source_key=source_key,
-            request=request,
-            actor_kind=actor_kind,
-            actor_agent_id=actor_agent_id,
-        )
-        await self.repo.start_op(
-            delivery.id, op.id, advance_delivering=True, allowed_statuses=_GOAL_START_STATES
-        )
-        return op.id
+        async with self._admit_delivery_op():
+            ops = await self.repo.list_delivery_ops(delivery.id)
+            n = sum(1 for o in ops if o.kind == kind)
+            suffix = "" if n == 0 else f":retry:{n}"
+            source_key = f"task:{delivery.task_id}:run:{delivery.run_id}:delivery:{kind}{suffix}"
+            op = await self.repo.plan_op(
+                delivery.id,
+                kind=kind,
+                source_key=source_key,
+                request=request,
+                actor_kind=actor_kind,
+                actor_agent_id=actor_agent_id,
+            )
+            await self.repo.start_op(
+                delivery.id, op.id, advance_delivering=True, allowed_statuses=_GOAL_START_STATES
+            )
+            return op.id
 
     async def _op_commit(self, task, run, board, delivery, actor_kind, actor_agent_id):
         if delivery.status != "ready":
@@ -1185,25 +1212,33 @@ class DeliveryCoordinator:
         policy = retention or board.git_delivery_retention
         if policy not in DELIVERY_RETENTIONS:
             raise TaskValidationError("invalid Git delivery retention")
-        delivery = await self.repo.record_delivery_retention(
-            delivery.id,
-            policy,
-            actor_kind=actor_kind,
-            actor_agent_id=actor_agent_id,
-        )
-        repo = delivery.repository
-        # Live dirty check (S1) — never trust the stale complete-time snapshot.
-        force_dirty = bool(confirmations.get("force_discard_dirty"))
+        # Claim before the first durable teardown write — even `keep` changes
+        # retention durably, and may not sneak through after a switch has closed
+        # new-work admission.  If this starts worktree removal, its running op
+        # is visible to the final census before the gate is released.
         worktree = run.workspace_path
-        if policy != "keep" and Path(worktree).is_dir():
-            live_dirty = not await ws.repo_is_clean(worktree)
-            if live_dirty and not force_dirty:
-                raise DeliveryConfirmationRequired(
-                    "worktree has uncommitted changes at teardown time",
-                    confirmation="force_discard_dirty", action="teardown", current=delivery,
+        wt_op: str | None = None
+        async with self._admit_delivery_op():
+            delivery = await self.repo.record_delivery_retention(
+                delivery.id,
+                policy,
+                actor_kind=actor_kind,
+                actor_agent_id=actor_agent_id,
+            )
+            # Live dirty check (S1) — never trust the stale complete-time snapshot.
+            force_dirty = bool(confirmations.get("force_discard_dirty"))
+            if policy != "keep" and Path(worktree).is_dir():
+                live_dirty = not await ws.repo_is_clean(worktree)
+                if live_dirty and not force_dirty:
+                    raise DeliveryConfirmationRequired(
+                        "worktree has uncommitted changes at teardown time",
+                        confirmation="force_discard_dirty", action="teardown", current=delivery,
+                    )
+                wt_op = await self._begin_teardown_op(
+                    delivery, "worktree_remove", {"force": force_dirty}, actor_kind, actor_agent_id
                 )
-            wt_op = await self._begin_teardown_op(delivery, "worktree_remove",
-                                                  {"force": force_dirty}, actor_kind, actor_agent_id)
+        repo = delivery.repository
+        if wt_op is not None:
             try:
                 await ws.remove_git_worktree(repo, worktree, force=force_dirty)
                 await self.repo.finish_op(delivery.id, wt_op, state="succeeded",
@@ -1237,15 +1272,16 @@ class DeliveryCoordinator:
         return await self._published(task, final)
 
     async def _begin_teardown_op(self, delivery, kind, request, actor_kind, actor_agent_id):
-        ops = await self.repo.list_delivery_ops(delivery.id)
-        n = sum(1 for o in ops if o.kind == kind)
-        suffix = "" if n == 0 else f":retry:{n}"
-        source_key = f"task:{delivery.task_id}:run:{delivery.run_id}:delivery:{kind}{suffix}"
-        op = await self.repo.plan_op(delivery.id, kind=kind, source_key=source_key,
-                                     request=request, actor_kind=actor_kind, actor_agent_id=actor_agent_id)
-        await self.repo.start_op(delivery.id, op.id, advance_delivering=False,
-                                 allowed_statuses=_TEARDOWN_START_STATES)
-        return op.id
+        async with self._admit_delivery_op():
+            ops = await self.repo.list_delivery_ops(delivery.id)
+            n = sum(1 for o in ops if o.kind == kind)
+            suffix = "" if n == 0 else f":retry:{n}"
+            source_key = f"task:{delivery.task_id}:run:{delivery.run_id}:delivery:{kind}{suffix}"
+            op = await self.repo.plan_op(delivery.id, kind=kind, source_key=source_key,
+                                         request=request, actor_kind=actor_kind, actor_agent_id=actor_agent_id)
+            await self.repo.start_op(delivery.id, op.id, advance_delivering=False,
+                                     allowed_statuses=_TEARDOWN_START_STATES)
+            return op.id
 
     # --- connector resolution (B3) --------------------------------------
 
