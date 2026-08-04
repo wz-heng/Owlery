@@ -183,7 +183,7 @@ async def test_claimed_dispatch_starts_while_deploy_admission_is_closed(
     monkeypatch.setattr(repo, "attach_run_session", close_after_claim)
     try:
         await manager._dispatch_task(task)
-        await started.wait()
+        await asyncio.wait_for(started.wait(), timeout=1)
 
         current = await repo.get_task(task.id)
         run = await repo.get_run(current.current_run_id)
@@ -199,7 +199,7 @@ async def test_claimed_dispatch_starts_while_deploy_admission_is_closed(
             None,
         )
         if worker is not None and worker._active_task is not None:
-            await worker._active_task
+            await asyncio.wait_for(worker._active_task, timeout=1)
 
 
 @pytest.mark.asyncio

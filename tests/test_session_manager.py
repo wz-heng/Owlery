@@ -261,6 +261,14 @@ def test_deploy_admission_closed_is_a_session_input_error():
 
 
 @pytest.mark.asyncio
+async def test_admission_claimed_message_requires_task_worker(manager):
+    session = await _new(manager, "ordinary")
+
+    with pytest.raises(ValueError, match="require a task worker run"):
+        await manager.start_message(session.id, "not a task", admission_claimed=True)
+
+
+@pytest.mark.asyncio
 async def test_start_message_queues_when_busy(manager, monkeypatch):
     session = await _new(manager,"Q")
     consumed: list[str] = []

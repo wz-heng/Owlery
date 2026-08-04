@@ -1920,6 +1920,10 @@ class SessionManager:
         session = self.sessions.get(session_id)
         if session is None:
             raise ValueError(f"Session {session_id} not found")
+        if admission_claimed and (
+            session.origin != "task" or not session.task_run_id
+        ):
+            raise ValueError("admission-claimed messages require a task worker run")
 
         if attachment_ids and len(attachment_ids) > MAX_ATTACHMENTS_PER_MESSAGE:
             raise ValueError(
