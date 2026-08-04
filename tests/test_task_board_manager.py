@@ -161,6 +161,48 @@ async def test_dispatch_does_not_claim_when_deploy_admission_is_closed(task_runt
 
 
 @pytest.mark.asyncio
+async def test_claimed_dispatch_starts_while_deploy_admission_is_closed(
+    task_runtime, monkeypatch: pytest.MonkeyPatch
+):
+    _db, repo, sessions, manager, root = task_runtime
+    _board, task, _ = await _ready_task(_db, repo, sessions, root)
+    started = asyncio.Event()
+    keep_running = asyncio.Event()
+
+    async def hold_worker(_session_id, _queued):
+        started.set()
+        await keep_running.wait()
+
+    original_attach = repo.attach_run_session
+
+    async def close_after_claim(task_id, run_id, session_id):
+        await sessions.deploy_admission_gate.close()
+        return await original_attach(task_id, run_id, session_id)
+
+    monkeypatch.setattr(sessions, "_drive_messages", hold_worker)
+    monkeypatch.setattr(repo, "attach_run_session", close_after_claim)
+    try:
+        await manager._dispatch_task(task)
+        await started.wait()
+
+        current = await repo.get_task(task.id)
+        run = await repo.get_run(current.current_run_id)
+        worker = sessions.get_session(run.session_id)
+        assert current.status == "running"
+        assert run.state == "running"
+        assert sessions.deploy_admission_gate.closed is True
+        assert worker._active_task is not None and not worker._active_task.done()
+    finally:
+        keep_running.set()
+        worker = next(
+            (session for session in sessions.sessions.values() if session.task_id == task.id),
+            None,
+        )
+        if worker is not None and worker._active_task is not None:
+            await worker._active_task
+
+
+@pytest.mark.asyncio
 async def test_worker_complete_captures_artifact_and_enqueues_origin(task_runtime):
     db, repo, sessions, manager, root = task_runtime
     _board, task, origin = await _ready_task(db, repo, sessions, root, origin=True)

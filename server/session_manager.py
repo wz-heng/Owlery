@@ -1903,13 +1903,19 @@ class SessionManager:
         prompt: str,
         attachment_ids: list[str] | None = None,
         injection_id: str | None = None,
+        *,
+        admission_claimed: bool = False,
     ) -> None:
         """Kick off a message, or queue it if the session is already running.
 
         `attachment_ids` are previously-uploaded files (see
         `POST /api/sessions/{id}/attachments`). They're carried with the
         prompt through the queue and resolved to absolute paths at spawn
-        time so the agent's `Read` tool can open them.
+        time so the agent's `Read` tool can open them.  ``admission_claimed``
+        is reserved for Task Board's dispatcher: it has already atomically
+        claimed a durable running run under the deploy admission gate, so its
+        initial worker turn must be allowed to start while a drain waits for
+        that admitted run to finish.
         """
         session = self.sessions.get(session_id)
         if session is None:
@@ -1941,7 +1947,7 @@ class SessionManager:
         # gate as the idle path: otherwise a deploy can close after a mere
         # pre-check and before this prompt is appended, leaving a newly-admitted
         # queued turn for the active driver to drain after the final census.
-        async with self._deploy_admission.admit():
+        async def enqueue_if_busy() -> bool:
             if await self._is_parked(session_id) or (
                 session._active_task and not session._active_task.done()
             ):
@@ -1954,7 +1960,16 @@ class SessionManager:
                         "queue_length": len(session._pending_queue),
                     }
                 )
+                return True
+            return False
+
+        if admission_claimed:
+            if await enqueue_if_busy():
                 return
+        else:
+            async with self._deploy_admission.admit():
+                if await enqueue_if_busy():
+                    return
 
         # Idle path: the session lock is free (send_message only holds it during
         # a turn), so acquiring it here is non-blocking and gives a real mutex
@@ -1962,10 +1977,7 @@ class SessionManager:
         # lock: refuse if a fork is mid-saga, re-check for a turn another
         # coroutine may have started while we waited, then claim `_active_task`.
         async with session._lock:
-            # This second, serialized check makes a deploy close that races the
-            # idle-path claim deterministic: close either observes the claimed
-            # task in its final census or wins and rejects this message.
-            async with self._deploy_admission.admit():
+            async def claim_idle_turn() -> None:
                 if session._forking:
                     raise ValueError(f"Session {session_id} is busy (forking)")
                 # Re-check the park under the lock: a turn on this session could
@@ -1987,6 +1999,15 @@ class SessionManager:
                 session._active_task = asyncio.create_task(
                     self._drive_messages(session_id, queued)
                 )
+
+            # This second, serialized check makes a deploy close that races the
+            # idle-path claim deterministic: close either observes the claimed
+            # task in its final census or wins and rejects this message.
+            if admission_claimed:
+                await claim_idle_turn()
+            else:
+                async with self._deploy_admission.admit():
+                    await claim_idle_turn()
 
     async def _is_parked(self, session_id: str) -> bool:
         """Is a usage-limit park pending for this session? (limit-auto-resume.md

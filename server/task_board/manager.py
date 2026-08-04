@@ -317,7 +317,9 @@ class TaskBoardManager:
             prompt = render_assignment_prompt(
                 task=task, board=board, run=run, workspace=prepared.path
             )
-            await self.session_mgr.start_message(session.id, prompt)
+            await self.session_mgr.start_message(
+                session.id, prompt, admission_claimed=True
+            )
             await self.publish_task_update(task.id)
         except Exception as exc:
             try:
