@@ -66,6 +66,7 @@ async def lifespan(app: FastAPI):
         db=db,
         deliver_cb=session_manager.deliver_bg_result,
         broadcast_cb=session_manager._broadcast,
+        admission_gate=session_manager.deploy_admission_gate,
     )
     delegation_manager.bind(session_mgr=session_manager, db=db)
     research_manager.bind(session_mgr=session_manager, db=db)

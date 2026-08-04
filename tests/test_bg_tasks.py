@@ -33,6 +33,7 @@ from server.bg_tasks import (
     render_delivery_prompt,
 )
 from server.database import Database
+from server.deploy_admission import DeployAdmissionClosedError, DeployAdmissionGate
 from server.main import app
 from server.session_manager import session_manager
 
@@ -117,6 +118,20 @@ async def test_start_task_returns_immediately_and_completes(manager, db, tmp_pat
     row = await db.get_bg_task(rec.id)
     assert row["status"] == "completed"
     assert "hello world" in row["stdout"]
+
+
+@pytest.mark.asyncio
+async def test_deploy_admission_rejects_bg_task_before_spawn(manager, db, tmp_path):
+    await _make_session_row(db, "s1", str(tmp_path))
+    gate = DeployAdmissionGate()
+    manager._admission_gate = gate
+    await gate.close()
+
+    with pytest.raises(DeployAdmissionClosedError):
+        await manager.start_task(session_id="s1", command="echo nope", working_dir=str(tmp_path))
+
+    assert manager._running == {}
+    assert await db.list_bg_tasks_for_session("s1") == []
 
 
 async def test_failing_command_records_failure(manager, db, tmp_path):

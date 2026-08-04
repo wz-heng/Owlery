@@ -39,6 +39,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .database import Database
+from .deploy_admission import DeployAdmissionGate
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +169,7 @@ class BgTaskManager:
         self._db: Database | None = None
         self._deliver_cb: DeliveryCallback | None = None
         self._broadcast_cb: BroadcastCallback | None = None
+        self._admission_gate: DeployAdmissionGate | None = None
         self._running: dict[str, _RunningTask] = {}
         self._started: bool = False
 
@@ -178,11 +180,13 @@ class BgTaskManager:
         db: Database,
         deliver_cb: DeliveryCallback,
         broadcast_cb: BroadcastCallback,
+        admission_gate: DeployAdmissionGate | None = None,
     ) -> None:
         """Wire up dependencies. Called once from main.py lifespan."""
         self._db = db
         self._deliver_cb = deliver_cb
         self._broadcast_cb = broadcast_cb
+        self._admission_gate = admission_gate
 
     async def start(self) -> None:
         """Make orphaned execution truthful and close delivery gaps."""
@@ -260,6 +264,33 @@ class BgTaskManager:
         orchestration task will update the row in the DB later; callers
         that need the latest state should re-fetch via get_task().
         """
+        if self._admission_gate is None:
+            return await self._start_task(
+                session_id=session_id,
+                command=command,
+                working_dir=working_dir,
+                description=description,
+                timeout_seconds=timeout_seconds,
+            )
+        async with self._admission_gate.admit():
+            return await self._start_task(
+                session_id=session_id,
+                command=command,
+                working_dir=working_dir,
+                description=description,
+                timeout_seconds=timeout_seconds,
+            )
+
+    async def _start_task(
+        self,
+        *,
+        session_id: str,
+        command: str,
+        working_dir: str,
+        description: str | None = None,
+        timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    ) -> BgTaskRecord:
+        """Start one task while its admission has already been claimed."""
         assert self._db is not None, "BgTaskManager not bound"
         task_id = _short_id()
         started_at = _now_iso()
