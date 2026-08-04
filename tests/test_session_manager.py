@@ -1,5 +1,6 @@
 import asyncio
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -206,6 +207,51 @@ async def test_deploy_admission_rejects_new_messages_without_cancelling_turn(man
     await asyncio.wait_for(active, timeout=1)
     await gate.open()
     await manager.start_message(session.id, "reopened")
+    await asyncio.wait_for(session._active_task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_deploy_admission_close_waits_for_busy_enqueue(manager, monkeypatch):
+    session = await _new(manager, "Deploy gate busy race")
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def stub_consume(session_id: str, queued) -> None:
+        if queued.prompt == "first":
+            first_started.set()
+            await release_first.wait()
+
+    monkeypatch.setattr(manager, "_consume_message", stub_consume)
+    await manager.start_message(session.id, "first")
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+
+    entered = asyncio.Event()
+    release_admission = asyncio.Event()
+
+    class BlockingGate(DeployAdmissionGate):
+        @asynccontextmanager
+        async def admit(self):
+            async with super().admit():
+                entered.set()
+                await release_admission.wait()
+                yield
+
+    gate = BlockingGate()
+    manager.set_deploy_admission_gate(gate)
+    enqueue = asyncio.create_task(manager.start_message(session.id, "second"))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+
+    closing = asyncio.create_task(gate.close())
+    await asyncio.sleep(0)
+    assert not closing.done(), "close must wait for the in-flight admission"
+
+    release_admission.set()
+    await asyncio.wait_for(enqueue, timeout=1)
+    await asyncio.wait_for(closing, timeout=1)
+    assert gate.closed
+    assert [queued.prompt for queued in session._pending_queue] == ["second"]
+
+    release_first.set()
     await asyncio.wait_for(session._active_task, timeout=1)
 
 
