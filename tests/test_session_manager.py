@@ -209,6 +209,11 @@ async def test_deploy_admission_rejects_new_messages_without_cancelling_turn(man
     await asyncio.wait_for(session._active_task, timeout=1)
 
 
+def test_deploy_admission_closed_is_a_session_input_error():
+    """WS already maps ``ValueError`` from start_message to a client error."""
+    assert issubclass(DeployAdmissionClosedError, ValueError)
+
+
 @pytest.mark.asyncio
 async def test_start_message_queues_when_busy(manager, monkeypatch):
     session = await _new(manager,"Q")

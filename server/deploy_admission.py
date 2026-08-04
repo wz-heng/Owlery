@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 
-class DeployAdmissionClosedError(RuntimeError):
+class DeployAdmissionClosedError(ValueError):
     """Raised when a new unit of work arrives while deployment owns admission."""
 
 

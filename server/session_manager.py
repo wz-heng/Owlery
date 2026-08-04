@@ -1922,10 +1922,6 @@ class SessionManager:
             injection_id=injection_id,
         )
 
-        # Reject a new user-visible message while a deploy owns admission.  A
-        # running turn is never cancelled; it merely cannot receive more work.
-        await self._deploy_admission.require_open()
-
         # Busy path: a turn is in flight → just queue. A fork can never be in
         # flight here, because fork_session only sets `_forking` against a
         # quiescent parent (no `_active_task`), so a running turn implies
@@ -1937,19 +1933,24 @@ class SessionManager:
         # Hold the message — the auto-resume drains the queue once the limit
         # resets. The wake-up deletes the park row BEFORE it re-drives the turn
         # (parked_turns._wake), so this guard never blocks the resume itself.
-        if await self._is_parked(session_id) or (
-            session._active_task and not session._active_task.done()
-        ):
-            session._pending_queue.append(queued)
-            await self._broadcast(
-                {
-                    "type": "queued",
-                    "session_id": session_id,
-                    "content": prompt,
-                    "queue_length": len(session._pending_queue),
-                }
-            )
-            return
+        # The busy enqueue is a work admission too.  It must claim the same
+        # gate as the idle path: otherwise a deploy can close after a mere
+        # pre-check and before this prompt is appended, leaving a newly-admitted
+        # queued turn for the active driver to drain after the final census.
+        async with self._deploy_admission.admit():
+            if await self._is_parked(session_id) or (
+                session._active_task and not session._active_task.done()
+            ):
+                session._pending_queue.append(queued)
+                await self._broadcast(
+                    {
+                        "type": "queued",
+                        "session_id": session_id,
+                        "content": prompt,
+                        "queue_length": len(session._pending_queue),
+                    }
+                )
+                return
 
         # Idle path: the session lock is free (send_message only holds it during
         # a turn), so acquiring it here is non-blocking and gives a real mutex
