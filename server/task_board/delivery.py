@@ -992,13 +992,28 @@ class DeliveryCoordinator:
         aborted op.
         """
         await self.deploy_quiesce.close_admission()
+        spawned = False
+
+        def _mark_spawned() -> None:
+            nonlocal spawned
+            spawned = True
+
         try:
-            return await self._perform_switch_handoff_after_admission(ctx)
-        except Exception:
-            await self.deploy_quiesce.open_admission()
+            return await self._perform_switch_handoff_after_admission(
+                ctx, on_spawned=_mark_spawned
+            )
+        except BaseException:
+            # `spawn_switcher` returning is the point of no return.  A later
+            # broadcast/shutdown/read error cannot safely reopen the old process:
+            # the detached switcher may already flip or restart it.  Conversely
+            # cancellation before spawn is still an abort and must release work.
+            if not spawned:
+                await self.deploy_quiesce.open_admission()
             raise
 
-    async def _perform_switch_handoff_after_admission(self, ctx: _SwitchCtx) -> DeliveryRecord:
+    async def _perform_switch_handoff_after_admission(
+        self, ctx: _SwitchCtx, *, on_spawned: Callable[[], None]
+    ) -> DeliveryRecord:
         """§7.2 handoff, five steps, each committed before the next: snapshot →
         journal `handoff` → deployment `switching` + op journal_ref → spawn the
         detached switcher → broadcast `server_restarting` + graceful shutdown.
@@ -1062,6 +1077,7 @@ class DeliveryCoordinator:
             switch_timeout=float(settings.deploy_switch_timeout_seconds),
             health_timeout=float(settings.deploy_health_timeout_seconds),
         )
+        on_spawned()
 
         # 5. Broadcast the restart banner, then initiate the normal graceful
         # shutdown (§7.2 step 5). The switcher waits for this process to exit.

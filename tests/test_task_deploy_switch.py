@@ -21,6 +21,7 @@ The §14 switch/boot bullets covered:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -440,6 +441,42 @@ async def test_final_census_closes_admission_and_abort_reopens_it(store, monkeyp
     assert (await repo.get_deployment(staged.id)).state == "staged"
 
 
+@pytest.mark.asyncio
+async def test_pre_spawn_cancellation_reopens_admission(store, monkeypatch):
+    db, repo, tmp, agent = store
+    _, task, run, delivery, layout, coord, staged = await _staged(db, repo, tmp, agent, monkeypatch)
+    q = FakeQuiesce([[]])
+    _wire_switch(coord, q)
+
+    async def _cancel_snapshot(*args, **kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(coord, "_snapshot_db", _cancel_snapshot)
+    with pytest.raises(asyncio.CancelledError):
+        await coord.deploy_switch(task.id, run.id, server_root=layout.slot_path("a"))
+
+    assert q.admission_closes == 1 and q.admission_opens == 1
+    assert coord.spawns == []
+
+
+@pytest.mark.asyncio
+async def test_post_spawn_exception_keeps_admission_closed(store, monkeypatch):
+    db, repo, tmp, agent = store
+    _, task, run, delivery, layout, coord, staged = await _staged(db, repo, tmp, agent, monkeypatch)
+    q = FakeQuiesce([[]])
+    _wire_switch(coord, q)
+
+    async def _broadcast_failure(message):
+        raise RuntimeError("broadcast unavailable after spawn")
+
+    coord.broadcast_restarting = _broadcast_failure
+    with pytest.raises(RuntimeError, match="broadcast unavailable"):
+        await coord.deploy_switch(task.id, run.id, server_root=layout.slot_path("a"))
+
+    assert len(coord.spawns) == 1
+    assert q.admission_closes == 1 and q.admission_opens == 0
+
+
 # --------------------------------------- D. switch_when_idle non-durability
 
 
@@ -465,6 +502,47 @@ async def test_switch_when_idle_plans_and_is_not_durable(store, monkeypatch):
     finally:
         for t in list(coord._idle_switch_waiters):
             t.cancel()
+
+
+@pytest.mark.asyncio
+async def test_switch_when_idle_handoff_closes_admission(store, monkeypatch):
+    db, repo, tmp, agent = store
+    _, task, run, delivery, layout, coord, staged = await _staged(db, repo, tmp, agent, monkeypatch)
+    q = FakeQuiesce([[BusySource("task_run", "r1")], [], []])
+    _wire_switch(coord, q)
+    coord._drain_poll_interval = 0.01
+
+    await coord.deploy_switch(
+        task.id, run.id, switch_when_idle=True, server_root=layout.slot_path("a")
+    )
+    for _ in range(50):
+        if coord.spawns:
+            break
+        await asyncio.sleep(0.01)
+
+    assert len(coord.spawns) == 1
+    assert q.admission_closes == 1 and q.admission_opens == 0
+
+
+@pytest.mark.asyncio
+async def test_switch_when_idle_final_census_abort_reopens_admission(store, monkeypatch):
+    db, repo, tmp, agent = store
+    _, task, run, delivery, layout, coord, staged = await _staged(db, repo, tmp, agent, monkeypatch)
+    q = FakeQuiesce([[BusySource("task_run", "r1")], [], [BusySource("session_turn", "raced")]])
+    _wire_switch(coord, q)
+    coord._drain_poll_interval = 0.01
+
+    await coord.deploy_switch(
+        task.id, run.id, switch_when_idle=True, server_root=layout.slot_path("a")
+    )
+    for _ in range(50):
+        op = next(o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch")
+        if op.state == "failed":
+            break
+        await asyncio.sleep(0.01)
+
+    assert op.state == "failed"
+    assert q.admission_closes == 1 and q.admission_opens == 1
 
 
 # ---------------------------------------------- E. handoff + snapshot
