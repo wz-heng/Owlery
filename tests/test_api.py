@@ -1,9 +1,14 @@
 """End-to-end tests for REST API using FastAPI TestClient."""
 
+import subprocess
+from pathlib import Path
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from server.config import settings
 from server.database import Database
+from server.deploy import DeployLayout
 from server.main import app
 from server.session_manager import session_manager
 
@@ -32,6 +37,75 @@ async def test_health(client):
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == "ok"
+    # Local deploy disabled by default (no `deploy_root`) → fail-closed None,
+    # not a 500 (docs/plans/local-deploy.md §6/§13.2).
+    assert data["sha"] is None
+    assert data["slot"] is None
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True)
+
+
+@pytest.mark.asyncio
+async def test_health_reports_running_slot_sha(client, tmp_path, monkeypatch):
+    """The switcher's `_fetch_health_sha` (server/switcher.py) polls `/health`
+    and compares its `sha` against the handoff's `new_sha`/`old_sha` to confirm
+    a flip (or rollback flip-back) actually took effect — so `sha`/`slot` must
+    reflect whichever slot `current` resolves to right now, matching that
+    slot's own git HEAD (the exact commit `deploy_stage` checked out there,
+    §5 step 2)."""
+    root = tmp_path / "deploy"
+    root.mkdir()
+    layout = DeployLayout.at(root)
+
+    # A separate source repo (never itself a slot) at two commits — one per
+    # slot, exactly like `deploy_stage`'s local-path fetch + detached checkout
+    # of an exact sha (§5 steps 1-2). Building each slot from its own clone at
+    # its own commit means a later commit in `src` never rewrites a slot that
+    # already checked out an earlier one.
+    src = tmp_path / "src"
+    src.mkdir()
+    _git(src, "init", "-q")
+    _git(src, "config", "user.email", "a@b.c")
+    _git(src, "config", "user.name", "T")
+    (src / "f.txt").write_text("base\n")
+    _git(src, "add", ".")
+    _git(src, "commit", "-qm", "base")
+    _git(src, "branch", "-M", "main")
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(src),
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    _git(root, "clone", "-q", str(src), str(layout.slot_path("a")))
+
+    (src / "f.txt").write_text("changed\n")
+    _git(src, "commit", "-qam", "second")
+    new_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(src),
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    _git(root, "clone", "-q", str(src), str(layout.slot_path("b")))
+
+    layout.snapshots_path.mkdir(exist_ok=True)
+    layout.journal_path.touch()
+    layout.switch_current("a")
+
+    monkeypatch.setattr(settings, "deploy_root", str(root))
+
+    resp = await client.get("/health")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["sha"] == head
+    assert data["slot"] == "a"
+
+    # A flip to 'b' (the switcher's atomic `current` move, §13.1) is visible on
+    # the very next request — no caching, no stale DB row during probation.
+    layout.switch_current("b")
+    resp2 = await client.get("/health")
+    data2 = resp2.json()
+    assert data2["slot"] == "b"
+    assert data2["sha"] == new_head
 
 
 @pytest.mark.asyncio

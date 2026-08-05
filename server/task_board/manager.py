@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Awaitable, Callable, Mapping
 
+from .. import deploy, switcher
 from ..config import settings
 from ..connector_manager import ConnectorManager
+from ..deploy_admission import DeployAdmissionClosedError
 from .delivery import DeliveryCoordinator, delivery_coordinator
+from .deploy_quiesce import DeployQuiesce
 from .models import DeliveryRecord, RunRecord, TaskBoardError, TaskConflictError, TaskRecord
 from .prompts import render_assignment_prompt
 from .repository import TaskRepository, task_repository
@@ -34,6 +38,32 @@ logger = logging.getLogger(__name__)
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# Switcher journal steps that terminate a deploy_switch op — the boot reconciler
+# and the probation monitor both key off these (docs/plans/local-deploy.md §8).
+_SWITCH_TERMINAL_STEPS = frozenset({
+    switcher.STEP_SWITCHED_OK,
+    switcher.STEP_ROLLED_BACK,
+    switcher.STEP_ROLLBACK_INCOMPLETE,
+    switcher.STEP_OLD_WONT_DIE,
+    switcher.STEP_SWITCH_ERROR,
+})
+
+
+@dataclass(frozen=True, slots=True)
+class DeployProbation:
+    """A booting server that flipped but has not yet seen the switcher's verdict
+    (docs/plans/local-deploy.md §7.5). Its op is left `running`; the probation
+    monitor holds the producers paused until the journal goes terminal or the
+    health window elapses, then finalizes the op and releases them."""
+
+    op_id: str
+    journal_path: str
+    # The original switcher's health window, measured from its durable
+    # ``flip_done`` journal line.  A restarted server must consume only the
+    # remainder, never grant the unconfirmed switch a fresh full timeout.
+    health_deadline: datetime
 
 
 def _iso(value: datetime | None = None) -> str:
@@ -58,6 +88,11 @@ class TaskBoardManager:
         self._last_error: str | None = None
         self._idle_checks: dict[str, asyncio.Task[None]] = {}
         self.delivery: DeliveryCoordinator = delivery_coordinator
+        # Transient (never persisted) dispatcher pause for a deploy drain
+        # (docs/plans/local-deploy.md §7.1). In-memory so a restart clears it —
+        # unlike per-board `dispatch_enabled`, which must survive a deploy.
+        self._deploy_paused = False
+        self._probation_poll_interval = 0.5
 
     def bind(
         self,
@@ -193,7 +228,18 @@ class TaskBoardManager:
                 self._last_error = str(exc)
                 logger.exception("Task Board dispatcher pass failed")
 
+    def pause_dispatch_for_deploy(self) -> None:
+        """Transiently stop the dispatcher claiming new runs during a deploy drain
+        (§7.1). Running runs are untouched — a deploy never kills work."""
+        self._deploy_paused = True
+
+    def resume_dispatch_for_deploy(self) -> None:
+        self._deploy_paused = False
+        self._wake.set()
+
     async def _dispatcher_pass(self) -> None:
+        if self._deploy_paused:
+            return
         await self.repo.reconcile_eligibility()
         await self._refresh_liveness()
         ready = await self.repo.list_tasks(status="ready", limit=1000)
@@ -202,6 +248,11 @@ class TaskBoardManager:
                 return
             try:
                 await self._dispatch_task(task)
+            except DeployAdmissionClosedError:
+                # A deploy closed the final admission gate after this pass
+                # enumerated ``ready``.  Leave the task ready for the new
+                # process (or a pre-spawn deploy abort) to dispatch later.
+                continue
             except TaskBoardError:
                 # Expected CAS/capacity races: another task/tick owns it.
                 continue
@@ -225,13 +276,20 @@ class TaskBoardManager:
                 / run_id
             )
         lease = _iso(_now() + timedelta(seconds=settings.task_run_lease_seconds))
-        run = await self.repo.claim_ready(
-            task.id,
-            workspace_mode=mode,
-            workspace_path=planned_path,
-            lease_expires_at=lease,
-            run_id=run_id,
-        )
+        # ``claim_ready`` is the durable point at which a ready task becomes
+        # work the deploy census must wait for.  Keep exactly that claim under
+        # the shared admission gate: after ``close`` returns, the census sees
+        # this run, or no dispatcher run has been claimed.  Workspace setup is
+        # intentionally outside the gate -- it can involve slow git I/O, and
+        # a claimed run is already visible to the census while it is prepared.
+        async with self.session_mgr.deploy_admission_gate.admit():
+            run = await self.repo.claim_ready(
+                task.id,
+                workspace_mode=mode,
+                workspace_path=planned_path,
+                lease_expires_at=lease,
+                run_id=run_id,
+            )
         try:
             prepared = await prepare_workspace(
                 mode=mode,
@@ -263,7 +321,9 @@ class TaskBoardManager:
             prompt = render_assignment_prompt(
                 task=task, board=board, run=run, workspace=prepared.path
             )
-            await self.session_mgr.start_message(session.id, prompt)
+            await self.session_mgr.start_message(
+                session.id, prompt, admission_claimed=True
+            )
             await self.publish_task_update(task.id)
         except Exception as exc:
             try:
@@ -783,13 +843,29 @@ class TaskBoardManager:
             prompt=prompt,
         )
 
-    async def recover_deliveries(self) -> None:
+    async def recover_deliveries(self) -> DeployProbation | None:
         """Boot recovery for deliveries (task-git-delivery.md §16). DB-only — no
-        hosting-platform network I/O in the injection-paused barrier (S3)."""
+        hosting-platform network I/O in the injection-paused barrier (S3).
+
+        Returns a `DeployProbation` when this boot is a flipped-but-unconfirmed
+        deploy candidate (§7.5): the caller must then keep producers paused and
+        run `run_deploy_probation` before starting them."""
         if self.session_mgr is not None and not self.session_mgr.session_injection_dispatch_paused:
             raise RuntimeError("delivery recovery requires paused injection dispatch")
+        # deploy_switch ops FIRST: a running one is not "unknown", it is journal-
+        # reconciled (§8), and must be resolved before the generic interrupt
+        # sweep (which deliberately skips deploy_switch) can run.
+        probation = await self.reconcile_deploy_switch_ops()
         await self.repo.interrupt_running_delivery_ops(
             reason="server restarted; delivery op outcome unknown"
+        )
+        # A deploy_stage that died mid-pipeline leaves its `deployments` row
+        # `staging`, which holds the global deploy lock; interrupting the op does
+        # not release it. Fail those orphans so deploys are not wedged forever
+        # (docs/plans/local-deploy.md §5). The staging never touched the running
+        # instance, so this is DB-only and safe inside the boot barrier.
+        await self.repo.fail_orphan_staging_deployments(
+            reason="server restarted; deploy_stage interrupted"
         )
         await self.repo.reset_preparing_deliveries()
         if self.session_mgr is None or self.db is None:
@@ -807,6 +883,230 @@ class TaskBoardManager:
                 )
                 continue
             await self._notify_delivery_terminal(task, delivery)
+        return probation
+
+    # --- deploy_switch boot reconciliation + probation (§7.5/§8) ---------
+
+    async def reconcile_deploy_switch_ops(self) -> DeployProbation | None:
+        """For every `deploy_switch` op left `running`, read the switcher journal
+        and settle it per the §8 table — DB-and-local-file only, no network (S3).
+
+        Fast path: no running switch op → return immediately, reading no journal
+        (the common boot's one cheap DB query). At most one op can be a probation
+        candidate (the global deploy lock serializes deploys); it is returned and
+        left `running` for the probation monitor."""
+        ops = await self.repo.list_running_deploy_switch_ops()
+        if not ops:
+            return None
+        root = settings.resolved_deploy_root
+        if not root:
+            # A running switch op but no deploy_root to find its journal — the
+            # config changed out from under it. It cannot be confirmed; interrupt.
+            # No `target_slot`/`target_sha` fallback is possible here (unlike the
+            # journal-tail branches below): that locator is derived by reading the
+            # journal's `handoff` line, and with no `deploy_root` we cannot even
+            # find the journal file. If the bound deployment row's `op_id` was
+            # also reverted by a snapshot restore (§7.4) in this same window, it
+            # is left `staged`/`switching` — a narrower, config-loss-triggered gap
+            # than the snapshot-restore-during-a-live-journal case this change
+            # fixes; a human already has to intervene to restore `deploy_root`.
+            for op in ops:
+                await self.repo.finalize_deploy_interrupted(
+                    op.id, reason="deploy_root unset at boot; switch state unknown"
+                )
+            return None
+        journal = switcher.Journal(str(Path(root) / deploy.JOURNAL_NAME))
+        now = _now()
+        health_timeout = float(settings.deploy_health_timeout_seconds)
+        probation: DeployProbation | None = None
+        for op in ops:
+            entries = journal.entries(op.id)
+            if await self._apply_switch_terminal(op.id, entries) is not None:
+                continue
+            tail = entries[-1] if entries else None
+            step = tail.get("step") if tail else None
+            flipped_at = self._journal_timestamp(tail)
+            if (
+                step == switcher.STEP_FLIP_DONE
+                and flipped_at is not None
+                and self._journal_fresh(tail, now, health_timeout)
+            ):
+                # Flipped, fresh, not yet confirmed → this boot is under probation.
+                probation = DeployProbation(
+                    op_id=op.id,
+                    journal_path=str(journal.path),
+                    health_deadline=flipped_at + timedelta(seconds=health_timeout),
+                )
+            else:
+                reason = (
+                    "stale flip_done; switcher never confirmed"
+                    if step == switcher.STEP_FLIP_DONE
+                    else "handoff recorded but switcher never confirmed"
+                )
+                target_slot, target_sha = self._handoff_target(entries)
+                await self.repo.finalize_deploy_interrupted(
+                    op.id, reason=reason, journal_excerpt={"tail": entries[-6:]},
+                    target_slot=target_slot, target_sha=target_sha,
+                )
+        return probation
+
+    async def run_deploy_probation(
+        self, probation: DeployProbation, *, on_release: Callable[[], Awaitable[None]]
+    ) -> str:
+        """Hold under probation (§7.5): poll the switcher journal until it goes
+        terminal or `deploy_health_timeout_seconds` elapses, finalize the op, then
+        `on_release` (start the deferred producers). A bounded LOCAL poll — no
+        network — so it never violates the boot barrier's S3 rule."""
+        journal = switcher.Journal(probation.journal_path)
+        remaining = max(0.0, (probation.health_deadline - _now()).total_seconds())
+        deadline = time.monotonic() + remaining
+        outcome = "timeout"
+        try:
+            while True:
+                entries = journal.entries(probation.op_id)
+                applied = await self._apply_switch_terminal(probation.op_id, entries)
+                if applied is not None:
+                    outcome = applied
+                    break
+                if time.monotonic() >= deadline:
+                    # Still non-terminal after the original health window → now stale.
+                    target_slot, target_sha = self._handoff_target(entries)
+                    await self.repo.finalize_deploy_interrupted(
+                        probation.op_id,
+                        reason="probation timed out; switcher never confirmed",
+                        target_slot=target_slot, target_sha=target_sha,
+                    )
+                    break
+                await asyncio.sleep(
+                    min(self._probation_poll_interval, max(0.0, deadline - time.monotonic()))
+                )
+        finally:
+            await on_release()
+        return outcome
+
+    @staticmethod
+    def _handoff_target(entries: list[dict[str, Any]]) -> tuple[str | None, str | None]:
+        """The `to_slot`/`new_sha` this op's `handoff` journal line targeted, or
+        `(None, None)` if there is no handoff line yet — the restricted fallback
+        locator for a deployment row a snapshot restore can unbind from its op id
+        (§7.4; see `_finalize_switch`'s docstring in repository.py). Read from the
+        journal, never the DB, so it works even when the DB row itself is the
+        thing that reverted."""
+        for entry in entries:
+            if entry.get("step") == switcher.STEP_HANDOFF:
+                detail = entry.get("detail") or {}
+                slot = detail.get("to_slot")
+                sha = detail.get("new_sha")
+                return (str(slot) if slot else None, str(sha) if sha else None)
+        return (None, None)
+
+    async def _apply_switch_terminal(
+        self, op_id: str, entries: list[dict[str, Any]]
+    ) -> str | None:
+        """If the journal tail for `op_id` is terminal, settle the op per §8 and
+        return the step name; otherwise return None. Shared by boot reconciliation
+        and the probation monitor so both apply the §8 table identically."""
+        tail = entries[-1] if entries else None
+        step = tail.get("step") if tail else None
+        if step not in _SWITCH_TERMINAL_STEPS:
+            return None
+        detail = (tail.get("detail") or {}) if tail else {}
+        excerpt = {"tail": entries[-6:]}
+        target_slot, target_sha = self._handoff_target(entries)
+        if step == switcher.STEP_SWITCHED_OK:
+            await self.repo.finalize_deploy_switched(
+                op_id, deployed_sha=str(detail.get("sha", "")),
+                deployed_slot=str(detail.get("slot", "")), journal_excerpt=excerpt,
+            )
+        elif step == switcher.STEP_ROLLED_BACK:
+            await self.repo.finalize_deploy_rolled_back(
+                op_id, reason=str(detail.get("reason", "health_failed")),
+                journal_excerpt=excerpt,
+                target_slot=target_slot, target_sha=target_sha,
+            )
+        elif step == switcher.STEP_ROLLBACK_INCOMPLETE:
+            await self.repo.finalize_deploy_rollback_incomplete(
+                op_id,
+                reason=(
+                    f"rollback_incomplete at {detail.get('stage', '?')} "
+                    f"({detail.get('reason', '?')})"
+                ),
+                journal_excerpt=excerpt,
+                target_slot=target_slot, target_sha=target_sha,
+            )
+        elif step == switcher.STEP_OLD_WONT_DIE:
+            await self.repo.finalize_deploy_old_wont_die(
+                op_id, journal_excerpt=excerpt,
+                target_slot=target_slot, target_sha=target_sha,
+            )
+        else:  # STEP_SWITCH_ERROR — a bad/missing handoff; the flip never happened.
+            await self.repo.finalize_deploy_interrupted(
+                op_id, reason=f"switch_error: {detail.get('reason', '?')}",
+                journal_excerpt=excerpt,
+                target_slot=target_slot, target_sha=target_sha,
+            )
+        return step
+
+    @staticmethod
+    def _journal_timestamp(tail: Mapping[str, Any] | None) -> datetime | None:
+        """Parse a journal timestamp as UTC, or fail closed on malformed input."""
+        ts = tail.get("ts") if tail else None
+        if not ts:
+            return None
+        try:
+            when = datetime.fromisoformat(str(ts))
+        except ValueError:
+            return None
+        return when.replace(tzinfo=timezone.utc) if when.tzinfo is None else when
+
+    @staticmethod
+    def _journal_fresh(
+        tail: Mapping[str, Any] | None, now: datetime, timeout: float
+    ) -> bool:
+        """A journal line is fresh if it was written within the health window —
+        the boundary between a live probation and a stale, abandoned switch (§8).
+        An unparseable/absent timestamp reads as stale (fail-safe: interrupt)."""
+        when = TaskBoardManager._journal_timestamp(tail)
+        if when is None:
+            return False
+        age = (now - when).total_seconds()
+        return 0 <= age < timeout
+
+    def bind_deploy_switch(
+        self,
+        *,
+        broadcast_restarting: Callable[[dict[str, Any]], Awaitable[None]],
+        request_shutdown: Callable[[], None],
+        bg_task_manager: Any = None,
+        research_manager: Any = None,
+        bridge_manager_getter: Callable[[], Any] | None = None,
+        scheduler_getter: Callable[[], Any] | None = None,
+        parked_scheduler_getter: Callable[[], Any] | None = None,
+        spawn_switcher: Callable[..., int] | None = None,
+    ) -> None:
+        """Assemble the quiesce provider from the live subsystems and wire the
+        switch effects into the delivery coordinator (§7). Called from the
+        FastAPI lifespan once every producer exists."""
+        quiesce = DeployQuiesce(
+            session_manager=self.session_mgr,
+            repo=self.repo,
+            db=self.db,
+            bg_task_manager=bg_task_manager,
+            research_manager=research_manager,
+            pause_dispatch=self.pause_dispatch_for_deploy,
+            resume_dispatch=self.resume_dispatch_for_deploy,
+            bridge_manager_getter=bridge_manager_getter,
+            scheduler_getter=scheduler_getter,
+            parked_scheduler_getter=parked_scheduler_getter,
+            admission_gate=self.session_mgr.deploy_admission_gate,
+        )
+        self.delivery.bind_deploy(
+            quiesce=quiesce,
+            broadcast_restarting=broadcast_restarting,
+            request_shutdown=request_shutdown,
+            spawn_switcher=spawn_switcher,
+            admission_gate=self.session_mgr.deploy_admission_gate,
+        )
 
     async def reconcile_interrupted_prs(self) -> None:
         """Off the boot critical path (S3): bounded read-only reconcile of any

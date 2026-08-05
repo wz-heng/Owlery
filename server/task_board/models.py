@@ -27,22 +27,55 @@ DELIVERY_STATUSES = frozenset(
      "delivered", "conflicted", "blocked", "failed"}
 )
 DELIVERY_OP_KINDS = frozenset(
-    {"commit", "push", "pull_request", "merge", "branch_delete", "worktree_remove"}
+    {"commit", "push", "pull_request", "merge", "branch_delete", "worktree_remove",
+     "deploy_stage", "deploy_switch"}
 )
 # Which op kinds mutate state outside Owlery's own database (§3, §4.2).
-DELIVERY_EXTERNAL_OP_KINDS = frozenset({"push", "pull_request", "merge"})
+# `deploy_stage` is local and idempotent (it only prepares the idle slot), so it
+# is NOT external — like `commit`. `deploy_switch` is the single sharpest
+# external op in the system: its side effect includes the recorder's own death,
+# so it is external=1 and never auto-retried (docs/plans/local-deploy.md §4).
+DELIVERY_EXTERNAL_OP_KINDS = frozenset({"push", "pull_request", "merge", "deploy_switch"})
 DELIVERY_OP_STATES = frozenset(
     {"planned", "running", "succeeded", "failed", "interrupted"}
 )
 DELIVERY_REASON_KINDS = frozenset(
     {"no_remote", "no_connector", "ambiguous_connector", "base_ambiguous",
      "conflict", "destructive", "interrupted", "op_failed", "push_auth_failed",
-     "workspace_gone_no_effect"}
+     "workspace_gone_no_effect",
+     # Local deploy (docs/plans/local-deploy.md §9). `deploy_locked`/`stage_failed`
+     # are stage-op reasons; `not_idle`/`health_failed`/`old_wont_die` are the
+     # switch-op reasons (§7.1/§7.3/§8).
+     "deploy_locked", "stage_failed", "not_idle", "health_failed", "old_wont_die"}
 )
+# The subset of DELIVERY_REASON_KINDS that only the switch machinery itself can
+# produce (§7.1/§7.3/§8) — never a real git block/conflict. `deploy_locked` is
+# deliberately excluded even though a switch precondition can raise it: it
+# reflects contention with a DIFFERENT in-flight deploy, not this switch's own
+# census/health/pid-wait outcome, so a later green switch here doesn't attest
+# to anything about that lock. A successful `switched_ok` retry clears a
+# blocker in this set (§9 C2), landing `delivered`/`ready` per whether a
+# push/PR/merge ever succeeded — every other blocked/conflicted reason is left
+# untouched.
+SWITCH_OWNED_REASON_KINDS = frozenset({"not_idle", "health_failed", "old_wont_die"})
+
+# Op kinds whose success means the delivery was actually delivered (§4). Shared
+# by delivery.py's post-stage status fold and repository.py's post-switch fold
+# so both compute "was this delivery ever delivered" identically.
+DELIVERED_OP_KINDS = frozenset({"push", "pull_request", "merge"})
 DELIVERY_RETENTIONS = frozenset(
     {"keep", "remove_worktree_keep_branch", "remove_all"}
 )
 DELIVERY_MERGE_STRATEGIES = frozenset({"fast_forward_only", "no_conflict_merge"})
+
+# Local deploy-and-restart (docs/plans/local-deploy.md §6). A deployment row's
+# lifecycle: `staging` → `staged` (settled after deploy_stage), then `switching`
+# → `live` at switch time, with `rolled_back`/`superseded`/`failed` as terminals.
+# `staging` and `switching` are the in-flight states the global deploy lock
+# (deployments_one_active) covers.
+DEPLOYMENT_STATES = frozenset(
+    {"staging", "staged", "switching", "live", "rolled_back", "superseded", "failed"}
+)
 
 
 class TaskBoardError(RuntimeError):
@@ -61,6 +94,14 @@ class TaskNotFoundError(TaskBoardError):
 
 class TaskConflictError(TaskBoardError):
     code = "conflict"
+
+
+class DeployLockedError(TaskConflictError):
+    """A second deploy raced onto the global deploy lock (docs/plans/
+    local-deploy.md §4). Distinct from a plain conflict so the coordinator can
+    fold it into a ``deploy_locked`` op result naming the holder."""
+
+    code = "deploy_locked"
 
 
 class TaskValidationError(TaskBoardError):
@@ -97,6 +138,7 @@ class BoardRecord(Record):
     git_delivery_author_email: str
     git_delivery_default_draft_pr: bool
     git_delivery_default_merge: str
+    allow_local_deploy: bool
     created_at: str
     updated_at: str
 
@@ -108,6 +150,7 @@ class BoardRecord(Record):
         values["git_delivery_default_draft_pr"] = bool(
             values["git_delivery_default_draft_pr"]
         )
+        values["allow_local_deploy"] = bool(values["allow_local_deploy"])
         return cls(**values)
 
 
@@ -237,6 +280,11 @@ class DeliveryRecord(Record):
     retention: str | None
     reason_kind: str | None
     reason_detail: str | None
+    # Local deploy (docs/plans/local-deploy.md §8): the sha/slot that a
+    # successful `deploy_switch` op made live, folded into the delivery the same
+    # way `pushed_ref`/`pr_number` fold a git op's external effect.
+    deployed_sha: str | None
+    deployed_slot: str | None
     created_at: str
     updated_at: str
 
@@ -257,6 +305,24 @@ class DeliveryOpRecord(Record):
     started_at: str | None
     finished_at: str | None
     created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class DeploymentRecord(Record):
+    """A row of the `deployments` table (docs/plans/local-deploy.md §6): what
+    version the local instance staged/ran, and how it got there."""
+
+    id: str
+    delivery_id: str | None
+    task_id: str | None
+    op_id: str | None
+    slot: str
+    sha: str
+    source_repo: str
+    state: str
+    journal: dict[str, Any] | None
+    created_at: str
+    updated_at: str
 
 
 class DeliveryConfirmationRequired(TaskConflictError):

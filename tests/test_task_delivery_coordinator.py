@@ -5,6 +5,7 @@ off-critical-path interrupted-PR reconcile (S3).
 """
 from __future__ import annotations
 
+import asyncio
 import subprocess
 import uuid
 from pathlib import Path
@@ -13,6 +14,8 @@ import pytest
 
 from server.config import settings
 from server.database import Database
+from server.deploy_admission import DeployAdmissionGate
+from server.task_board import delivery as delivery_module
 from server.task_board.delivery import DeliveryCoordinator
 from server.task_board.models import DeliveryConfirmationRequired, TaskConflictError
 from server.task_board.repository import TaskRepository
@@ -105,6 +108,18 @@ def _coord(db, repo, connectors):
     return c
 
 
+def _bind_admission(coord: DeliveryCoordinator, gate: DeployAdmissionGate) -> None:
+    async def _broadcast(_payload):
+        return None
+
+    coord.bind_deploy(
+        quiesce=object(),
+        broadcast_restarting=_broadcast,
+        request_shutdown=lambda: None,
+        admission_gate=gate,
+    )
+
+
 @pytest.mark.asyncio
 async def test_accept_captures_baseline(store):
     db, repo, tmp, agent = store
@@ -131,6 +146,92 @@ async def test_commit_dirty_then_ready(store):
         ["git", "log", "-1", "--format=%an"], cwd=str(wt), capture_output=True, text=True
     ).stdout.strip()
     assert head_author.startswith("Owlery Task")
+
+
+@pytest.mark.asyncio
+async def test_closed_admission_rejects_delivery_op_before_it_is_planned(store):
+    db, repo, tmp, agent = store
+    _board, task, run, _src, _wt = await _ready_delivery(
+        db, repo, tmp, agent, worker_commits=False
+    )
+    coord = _coord(db, repo, FakeConnectors({}))
+    gate = DeployAdmissionGate()
+    _bind_admission(coord, gate)
+    await coord.accept(task.id, run.id)
+    await gate.close()
+
+    with pytest.raises(TaskConflictError, match="deploy admission is closed"):
+        await coord.deliver_op(task.id, run.id, kind="commit")
+
+    delivery = await repo.get_delivery_by_run(run.id)
+    assert await repo.list_delivery_ops(delivery.id) == []
+
+
+@pytest.mark.asyncio
+async def test_closed_admission_rejects_teardown_before_retention_write(store):
+    db, repo, tmp, agent = store
+    _board, task, run, _src, _wt = await _ready_delivery(db, repo, tmp, agent)
+    coord = _coord(db, repo, FakeConnectors({}))
+    gate = DeployAdmissionGate()
+    _bind_admission(coord, gate)
+    before = await coord.accept(task.id, run.id)
+    await gate.close()
+
+    with pytest.raises(TaskConflictError, match="deploy admission is closed"):
+        await coord.teardown(task.id, run.id, retention="keep")
+
+    after = await repo.get_delivery(before.id)
+    assert after.retention == before.retention
+    assert await repo.list_delivery_ops(after.id) == []
+
+
+@pytest.mark.asyncio
+async def test_close_waits_for_delivery_claim_then_census_sees_running_op(store, monkeypatch):
+    db, repo, tmp, agent = store
+    _board, task, run, _src, _wt = await _ready_delivery(
+        db, repo, tmp, agent, worker_commits=False
+    )
+    coord = _coord(db, repo, FakeConnectors({}))
+    gate = DeployAdmissionGate()
+    _bind_admission(coord, gate)
+    await coord.accept(task.id, run.id)
+
+    entered_start = asyncio.Event()
+    release_start = asyncio.Event()
+    commit_started = asyncio.Event()
+    release_commit = asyncio.Event()
+    original_start = repo.start_op
+    original_commit = delivery_module.ws.commit_all
+
+    async def blocked_start(*args, **kwargs):
+        entered_start.set()
+        await release_start.wait()
+        return await original_start(*args, **kwargs)
+
+    async def blocked_commit(*args, **kwargs):
+        commit_started.set()
+        await release_commit.wait()
+        return await original_commit(*args, **kwargs)
+
+    monkeypatch.setattr(repo, "start_op", blocked_start)
+    monkeypatch.setattr(delivery_module.ws, "commit_all", blocked_commit)
+    operation = asyncio.create_task(coord.deliver_op(task.id, run.id, kind="commit"))
+    try:
+        await asyncio.wait_for(entered_start.wait(), timeout=1)
+        closing = asyncio.create_task(gate.close())
+        await asyncio.sleep(0)
+        assert not closing.done()
+
+        release_start.set()
+        await asyncio.wait_for(commit_started.wait(), timeout=1)
+        await asyncio.wait_for(closing, timeout=1)
+        delivery = await repo.get_delivery_by_run(run.id)
+        ops = await repo.list_running_delivery_ops()
+        assert [(op.delivery_id, op.kind) for op in ops] == [(delivery.id, "commit")]
+    finally:
+        release_start.set()
+        release_commit.set()
+        await operation
 
 
 @pytest.mark.asyncio

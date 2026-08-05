@@ -18,6 +18,7 @@ from pydantic import BaseModel
 
 from ..auth import verify_token
 from ..bg_tasks import BgTaskError, BgTaskRecord, bg_task_manager
+from ..deploy_admission import DeployAdmissionClosedError
 from ..session_manager import session_manager
 
 router = APIRouter(prefix="/api/sessions", tags=["bg-tasks"])
@@ -84,6 +85,8 @@ async def start_bg_task(
         )
     except BgTaskError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
+    except DeployAdmissionClosedError as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(e))
     return _record_to_json(rec)
 
 

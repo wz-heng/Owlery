@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from ..config import settings
+from ..deploy_admission import DeployAdmissionClosedError
 from ..harness import get_harness, has_backend
 from .orchestrator import ResearchLimits, ResearchProgress, run_research
 
@@ -157,18 +158,25 @@ class ResearchManager:
                 status_code=409,
             )
 
-        job_id = uuid.uuid4().hex[:12]
-        await self.db.create_research_job(job_id, session_id, question, _now())
-        await self._broadcast({
-            "type": "research_started",
-            "session_id": session_id,
-            "research_id": job_id,
-            "question": question,
-        })
-        task = asyncio.create_task(self._run_job(job_id, session_id, question))
-        self._tasks[job_id] = task
-        task.add_done_callback(lambda _t, jid=job_id: self._tasks.pop(jid, None))
-        return await self.db.get_research_job(job_id)
+        try:
+            # The in-memory task is the census authority, so publish the
+            # durable row and register that task in the same admission claim.
+            # Once deploy close returns, census sees this job or no job exists.
+            async with self.session_mgr.deploy_admission_gate.admit():
+                job_id = uuid.uuid4().hex[:12]
+                await self.db.create_research_job(job_id, session_id, question, _now())
+                await self._broadcast({
+                    "type": "research_started",
+                    "session_id": session_id,
+                    "research_id": job_id,
+                    "question": question,
+                })
+                task = asyncio.create_task(self._run_job(job_id, session_id, question))
+                self._tasks[job_id] = task
+                task.add_done_callback(lambda _t, jid=job_id: self._tasks.pop(jid, None))
+                return await self.db.get_research_job(job_id)
+        except DeployAdmissionClosedError as exc:
+            raise ResearchError("deploy admission is closed", status_code=409) from exc
 
     # ------------------------------------------------------------------- run
 

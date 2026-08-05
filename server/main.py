@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import signal
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from .bridges.manager import BridgeManager
 from .config import settings
 from .tunnel import CloudflareTunnel
 from .database import Database
+from .deploy import DeployLayout
 from .legacy_rename import migrate_legacy_state, rewrite_legacy_paths
 from .notifiers import notifier_manager
 from .agent_manager import AgentManager
@@ -32,6 +34,7 @@ from .parked_turns import ParkedTurnRunner
 from .scheduler import ScheduleRunner
 from .session_manager import session_manager
 from .task_board import task_repository
+from .task_board import workspaces as task_workspaces
 from .task_board.manager import task_board_manager
 
 logging.basicConfig(
@@ -39,6 +42,29 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+async def _begin_deploy_probation(
+    *,
+    admission_gate,
+    probation,
+    run_probation,
+    on_release,
+) -> asyncio.Task:
+    """Close admission before starting the boot-probation monitor.
+
+    The helper makes the ordering explicit and testable: the monitor always
+    observes a closed gate, while the first producer release observes it open.
+    It returns the monitor task so lifespan can intentionally leave the bounded
+    local poll off the startup critical path.
+    """
+    await admission_gate.close()
+
+    async def _release() -> None:
+        await admission_gate.open()
+        await on_release()
+
+    return asyncio.create_task(run_probation(probation, on_release=_release))
 
 
 @asynccontextmanager
@@ -63,6 +89,7 @@ async def lifespan(app: FastAPI):
         db=db,
         deliver_cb=session_manager.deliver_bg_result,
         broadcast_cb=session_manager._broadcast,
+        admission_gate=session_manager.deploy_admission_gate,
     )
     delegation_manager.bind(session_mgr=session_manager, db=db)
     research_manager.bind(session_mgr=session_manager, db=db)
@@ -160,27 +187,68 @@ async def lifespan(app: FastAPI):
 
     # Git delivery recovery (task-git-delivery.md §16): interrupt in-flight
     # delivery ops, reset stuck baselines, and reconstruct terminal-delivery
-    # notifications. DB-only — no hosting-platform I/O in this barrier.
-    await task_board_manager.recover_deliveries()
+    # notifications. DB-only — no hosting-platform I/O in this barrier. Also
+    # reconciles any interrupted `deploy_switch` op from the switcher journal
+    # (local-deploy.md §8); a flipped-but-unconfirmed boot returns a probation.
+    probation = await task_board_manager.recover_deliveries()
 
-    # Domain recovery is now complete and all broadcast listeners are live.
-    # Drain only after that barrier; a replay can immediately start a model
-    # turn, so moving this earlier reintroduces the boot race.
-    await session_manager.resume_session_injection_dispatch()
+    # Wire the deploy-switch effects that only exist in a live server
+    # (local-deploy.md §7.2): the quiesce census/drain primitives, the
+    # `server_restarting` broadcast, and the in-process graceful-shutdown trigger
+    # (send ourselves the same SIGTERM uvicorn already turns into this teardown).
+    task_board_manager.bind_deploy_switch(
+        broadcast_restarting=session_manager._broadcast,
+        request_shutdown=lambda: os.kill(os.getpid(), signal.SIGTERM),
+        bg_task_manager=bg_task_manager,
+        research_manager=research_manager,
+        bridge_manager_getter=lambda: getattr(app.state, "bridge_manager", None),
+        scheduler_getter=lambda: getattr(
+            getattr(app.state, "schedule_runner", None), "_scheduler", None
+        ),
+        parked_scheduler_getter=lambda: getattr(
+            getattr(app.state, "parked_turn_runner", None), "_scheduler", None
+        ),
+    )
 
-    # Only now start autonomous producers. A due parked turn, schedule, or
-    # bridge message can call start_message directly (outside the injection
-    # outbox), so starting any of them before the recovery barrier would bypass
-    # paused injection dispatch.
-    await schedule_runner.initialize()
-    await parked_turn_runner.initialize()
-    await bridge_manager.start_all()
-    await task_board_manager.start()
+    async def _release_producers() -> None:
+        # Domain recovery is complete and all broadcast listeners are live. Drain
+        # only after that barrier; a replay can immediately start a model turn, so
+        # moving this earlier reintroduces the boot race. A due parked turn,
+        # schedule, or bridge message can call start_message directly (outside the
+        # injection outbox), so producers start only after the barrier too.
+        await session_manager.deploy_admission_gate.open()
+        await session_manager.resume_session_injection_dispatch()
+        await schedule_runner.initialize()
+        await parked_turn_runner.initialize()
+        await bridge_manager.start_all()
+        await task_board_manager.start()
+        # Off the boot critical path (task-git-delivery.md §16, S3): a bounded,
+        # read-only reconcile of any interrupted PR op. Fire-and-forget so it
+        # never blocks the dispatcher, the injection drain, or any session's turn.
+        asyncio.create_task(task_board_manager.reconcile_interrupted_prs())
 
-    # Off the boot critical path (task-git-delivery.md §16, S3): a bounded,
-    # read-only reconcile of any interrupted PR op. Fire-and-forget so it never
-    # blocks the dispatcher, the injection drain, or any session's turn.
-    asyncio.create_task(task_board_manager.reconcile_interrupted_prs())
+    if probation is None:
+        await _release_producers()
+    else:
+        # Boot probation (local-deploy.md §7.5): this server flipped but the
+        # switcher has not yet confirmed health. Hold every producer paused — the
+        # health window performs no user-visible work a snapshot restore could
+        # undo — until the switcher's verdict lands (or the window elapses), then
+        # release. /health is already served, so the switcher can confirm us.
+        # This boot is already serving /health for the switcher, but must not
+        # admit any new work that a rollback could invalidate.  Every producer
+        # claims the same gate before becoming census-visible; release happens
+        # only from the probation monitor's `on_release` callback above.
+        logger.info(
+            "deploy probation: holding producers until switch op %s settles",
+            probation.op_id,
+        )
+        await _begin_deploy_probation(
+            admission_gate=session_manager.deploy_admission_gate,
+            probation=probation,
+            run_probation=task_board_manager.run_deploy_probation,
+            on_release=_release_producers,
+        )
 
     # Start Cloudflare Tunnel if enabled
     tunnel: CloudflareTunnel | None = None
@@ -269,7 +337,38 @@ async def health():
     if hasattr(app.state, "bridge_manager"):
         for name, bridge in app.state.bridge_manager._bridges.items():
             bridges_health[name] = {"healthy": bridge.healthy}
-    return {"status": "ok", "bridges": bridges_health}
+    sha, slot = await _running_deploy_sha_slot()
+    return {"status": "ok", "bridges": bridges_health, "sha": sha, "slot": slot}
+
+
+async def _running_deploy_sha_slot() -> tuple[str | None, str | None]:
+    """The build sha and slot this process is actually serving (local-deploy.md
+    §6/§7.3 step 4): the switcher's `_fetch_health_sha` compares this `sha`
+    against the handoff's `new_sha`/`old_sha` to confirm a flip (or a rollback
+    flip-back) actually took effect, so it must reflect `current` at request
+    time — not a DB row, which during probation still names the OLD live
+    deployment until the switcher's terminal journal line reconciles it.
+
+    `current_slot()` resolves the live symlink fresh on every call, and the
+    sha is that slot's own git HEAD — exactly the commit `deploy_stage`
+    detached-checked-out there (§5 step 2), so it equals the sha the deploy
+    pipeline staged/switched to. None/None when local deploy is disabled or
+    `current` does not resolve to a real slot (fail-closed, not a 500)."""
+    root = settings.resolved_deploy_root
+    if not root:
+        return None, None
+    layout = DeployLayout.at(root)
+    slot = layout.current_slot()
+    if slot is None:
+        return None, None
+    try:
+        rc, out, _ = await task_workspaces._git(
+            "rev-parse", "HEAD", cwd=str(layout.slot_path(slot))
+        )
+    except task_workspaces.WorkspaceError:
+        return None, slot
+    sha = out.strip() if rc == 0 and out else None
+    return sha, slot
 
 
 # Serve built frontend as static files (SPA catch-all).

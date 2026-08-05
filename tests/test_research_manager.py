@@ -14,6 +14,7 @@ import pytest
 
 from server.agent_manager import AgentManager
 from server.database import Database
+from server.deploy_admission import DeployAdmissionGate
 from server.research import manager as rm_mod
 from server.research.manager import ResearchManager
 from server.research.orchestrator import ResearchProgress, ResearchReport
@@ -124,6 +125,20 @@ async def test_start_rejects_backend_without_web(rm, mgr, db, monkeypatch):
     with pytest.raises(rm_mod.ResearchError) as ei:
         await rm.start(session.id, "q")
     assert ei.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_deploy_admission_rejects_research_before_creating_job(rm, mgr, db):
+    session = await _session(mgr, db)
+    gate = DeployAdmissionGate()
+    mgr.set_deploy_admission_gate(gate)
+    await gate.close()
+
+    with pytest.raises(rm_mod.ResearchError) as exc:
+        await rm.start(session.id, "what is X?")
+
+    assert exc.value.status_code == 409
+    assert rm._tasks == {}
 
 
 @pytest.mark.asyncio

@@ -453,6 +453,12 @@ CREATE TABLE IF NOT EXISTS task_boards (
     git_delivery_default_merge TEXT NOT NULL DEFAULT 'none' CHECK (
         git_delivery_default_merge IN ('none', 'fast_forward_only')
     ),
+    -- Local deploy (docs/plans/local-deploy.md §9). A board whose runs may
+    -- deploy to the production instance is an explicit decision; default 0
+    -- (off) backfills every existing board, so no board silently gains the
+    -- power to restart production. _apply_migrations adds it to old rows.
+    allow_local_deploy INTEGER NOT NULL DEFAULT 0
+        CHECK (allow_local_deploy IN (0, 1)),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -608,6 +614,8 @@ CREATE TABLE IF NOT EXISTS task_deliveries (
     retention TEXT,
     reason_kind TEXT,                      -- blocked|conflicted|failed reason (task-git-delivery.md §11.1)
     reason_detail TEXT,
+    deployed_sha TEXT,                     -- sha a successful deploy_switch made live (local-deploy.md §8)
+    deployed_slot TEXT,                    -- slot ('a'/'b') that sha runs in
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (run_id)
@@ -620,7 +628,8 @@ CREATE TABLE IF NOT EXISTS task_delivery_ops (
     id TEXT PRIMARY KEY,
     delivery_id TEXT NOT NULL REFERENCES task_deliveries(id) ON DELETE CASCADE,
     kind TEXT NOT NULL CHECK (kind IN (
-        'commit', 'push', 'pull_request', 'merge', 'branch_delete', 'worktree_remove'
+        'commit', 'push', 'pull_request', 'merge', 'branch_delete', 'worktree_remove',
+        'deploy_stage', 'deploy_switch'
     )),
     source_key TEXT NOT NULL,             -- stable at-most-once key
     external INTEGER NOT NULL CHECK (external IN (0, 1)),
@@ -641,6 +650,40 @@ CREATE UNIQUE INDEX IF NOT EXISTS task_delivery_ops_one_running
   ON task_delivery_ops(delivery_id) WHERE state = 'running';
 CREATE INDEX IF NOT EXISTS task_delivery_ops_delivery
   ON task_delivery_ops(delivery_id, created_at);
+
+-- Local deploy-and-restart (docs/plans/local-deploy.md §6). What version the
+-- local production instance is running, and how it got there. Exactly one row
+-- is `live` at any time (the partial unique index), and at most one deploy is
+-- `staging`/`switching` across all boards — that second index is the global
+-- deploy lock (§4). New-table-only — CREATE IF NOT EXISTS is a no-op migration.
+CREATE TABLE IF NOT EXISTS deployments (
+    id TEXT PRIMARY KEY,
+    delivery_id TEXT REFERENCES task_deliveries(id) ON DELETE SET NULL,
+    task_id TEXT,                        -- denormalized for display; survives delivery GC
+    op_id TEXT,                          -- the deploy_switch op, once one exists
+    slot TEXT NOT NULL,                  -- 'a' | 'b'
+    sha TEXT NOT NULL,
+    source_repo TEXT NOT NULL,
+    -- Lifecycle: staging → staged → switching → live, with rolled_back /
+    -- superseded / failed as terminals. `staging` and `switching` are the
+    -- in-flight states the deployments_one_active lock (below) covers; `staged`
+    -- is the settled post-stage state and is deliberately NOT locked, so future
+    -- op code must insert `staging` (not `staged`) while a stage runs or it will
+    -- bypass the global lock.
+    state TEXT NOT NULL,                 -- staging|staged|switching|live|rolled_back|superseded|failed
+    journal TEXT,                        -- JSON: final journal excerpt for this deploy
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS deployments_one_live
+  ON deployments(state) WHERE state = 'live';
+-- The global deploy lock (§4): at most ONE row is staging-OR-switching across
+-- all boards. The predicate spans two state values, so it is indexed on the
+-- constant (1) — the literal `ON deployments(state)` of §6 would only bound
+-- each value on its own, letting a `staging` and a `switching` coexist (two
+-- pipelines), which §4's "one instance, one pipeline at a time" forbids.
+CREATE UNIQUE INDEX IF NOT EXISTS deployments_one_active
+  ON deployments((1)) WHERE state IN ('staging', 'switching');
 
 -- Parked turns awaiting a usage-limit reset (limit-auto-resume.md §4). A turn
 -- that failed on the USER'S OWN limit is persisted here, not slept on: the
@@ -773,12 +816,38 @@ class Database:
             "git_delivery_default_draft_pr INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE task_boards ADD COLUMN "
             "git_delivery_default_merge TEXT NOT NULL DEFAULT 'none'",
+            # Local deploy (docs/plans/local-deploy.md §9). DEFAULT 0 backfills
+            # every existing board to "may not deploy production" — fail-closed.
+            "ALTER TABLE task_boards ADD COLUMN "
+            "allow_local_deploy INTEGER NOT NULL DEFAULT 0",
         ):
             try:
                 await self._conn.execute(ddl)
-            except Exception:
-                pass
+            except aiosqlite.OperationalError as exc:
+                # The only benign outcome of these catch-up ADD COLUMNs is
+                # "duplicate column" — the column already exists on a newer DB.
+                # Anything else (a genuinely malformed/failed migration) must
+                # surface here, not be swallowed to crash later at a misleading
+                # site when a NOT NULL column reads back missing.
+                if "duplicate column" not in str(exc).lower():
+                    logger.error("board migration failed: %s (%s)", ddl, exc)
+                    raise
 
+        # Local deploy (docs/plans/local-deploy.md §8). A successful deploy_switch
+        # folds the live sha/slot into the delivery; these back-fill NULL on rows
+        # created before the switch op landed. New DBs get them from _SCHEMA.
+        for ddl in (
+            "ALTER TABLE task_deliveries ADD COLUMN deployed_sha TEXT",
+            "ALTER TABLE task_deliveries ADD COLUMN deployed_slot TEXT",
+        ):
+            try:
+                await self._conn.execute(ddl)
+            except aiosqlite.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    logger.error("delivery migration failed: %s (%s)", ddl, exc)
+                    raise
+
+        await self._migrate_delivery_op_kinds()
         await self._migrate_agents()
         await self._migrate_schedule_recurrence()
         await self._migrate_schedule_run_at()
@@ -1036,6 +1105,76 @@ class Database:
                 return bool(row[3])
         return False
 
+    async def _migrate_delivery_op_kinds(self) -> None:
+        """Widen ``task_delivery_ops.kind``'s CHECK to admit ``deploy_stage`` and
+        ``deploy_switch`` (docs/plans/local-deploy.md §4). SQLite cannot ALTER a
+        CHECK constraint,
+        so a DB created before local deploy needs the table rebuilt; new DBs get
+        the widened CHECK straight from ``_SCHEMA``.
+
+        Guarded on the live table's own DDL text so it runs exactly once, and a
+        no-op when the table is absent. Nothing references ``task_delivery_ops``
+        by foreign key, so the drop-and-rename is safe with foreign_keys ON, as
+        with the other rebuilds in this module. Every existing row already
+        satisfies the widened CHECK (it only ADDS an allowed value), so the copy
+        never loses a row."""
+        cur = await self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='task_delivery_ops'"
+        )
+        row = await cur.fetchone()
+        # Guard on the NEWEST admitted kind so a DB widened for `deploy_stage`
+        # (but not yet `deploy_switch`) is still rebuilt exactly once more.
+        if row is None or "deploy_switch" in (row[0] or ""):
+            return
+        # Clear any scratch table left by a prior rebuild that was interrupted
+        # between CREATE and RENAME — otherwise the CREATE below would fail and
+        # (because aiosqlite's executescript deadlocks on a mid-script error)
+        # hang the boot. Every live op row satisfies the widened table by
+        # construction: the CHECK only ADDS a kind, and NOT NULL / the CASCADE
+        # and SET-NULL FKs are unchanged, so the copy cannot lose or reject a row
+        # (an FK orphan could never have been inserted under the identical old
+        # FKs), and thus cannot itself error mid-script.
+        await self._conn.executescript(
+            """
+            DROP TABLE IF EXISTS task_delivery_ops__new;
+            CREATE TABLE task_delivery_ops__new (
+                id TEXT PRIMARY KEY,
+                delivery_id TEXT NOT NULL REFERENCES task_deliveries(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL CHECK (kind IN (
+                    'commit', 'push', 'pull_request', 'merge', 'branch_delete',
+                    'worktree_remove', 'deploy_stage', 'deploy_switch'
+                )),
+                source_key TEXT NOT NULL,
+                external INTEGER NOT NULL CHECK (external IN (0, 1)),
+                state TEXT NOT NULL CHECK (state IN (
+                    'planned', 'running', 'succeeded', 'failed', 'interrupted'
+                )),
+                request TEXT NOT NULL DEFAULT '{}',
+                result TEXT,
+                error TEXT,
+                actor_kind TEXT NOT NULL CHECK (actor_kind IN ('user', 'agent')),
+                actor_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE (source_key)
+            );
+            INSERT INTO task_delivery_ops__new
+                (id, delivery_id, kind, source_key, external, state, request,
+                 result, error, actor_kind, actor_agent_id, started_at,
+                 finished_at, created_at)
+                SELECT id, delivery_id, kind, source_key, external, state, request,
+                       result, error, actor_kind, actor_agent_id, started_at,
+                       finished_at, created_at FROM task_delivery_ops;
+            DROP TABLE task_delivery_ops;
+            ALTER TABLE task_delivery_ops__new RENAME TO task_delivery_ops;
+            CREATE UNIQUE INDEX IF NOT EXISTS task_delivery_ops_one_running
+              ON task_delivery_ops(delivery_id) WHERE state = 'running';
+            CREATE INDEX IF NOT EXISTS task_delivery_ops_delivery
+              ON task_delivery_ops(delivery_id, created_at);
+            """
+        )
+
     async def _migrate_agents(self) -> None:
         """First-class Agents refactor migration (agent-refactor.md §4.5).
 
@@ -1214,10 +1353,40 @@ class Database:
             await self._conn.commit()
             self._dirty = False
 
+    async def wal_checkpoint_truncate(self) -> tuple[int, int, int]:
+        """Fully checkpoint the WAL and truncate it (`PRAGMA wal_checkpoint(TRUNCATE)`),
+        returning SQLite's `(busy, log_frames, checkpointed_frames)` row.
+
+        Used by the deploy snapshot (docs/plans/local-deploy.md §7.2/§7.4): after a
+        clean TRUNCATE (``busy == 0``) every committed frame is folded into the main
+        DB file and the WAL is emptied, so a plain file copy is a complete, self-
+        contained snapshot. ``busy != 0`` means a concurrent reader blocked the
+        truncate — the caller must NOT treat a bare file copy as complete
+        (the WAL still holds committed frames), which is exactly the silent-busy
+        data-loss trap SQLite's TRUNCATE checkpoint hides behind a non-raising
+        return."""
+        await self._ensure_connected()
+        # Commit our own pending writes first so they are in the WAL to fold in.
+        if self._dirty:
+            await self._conn.commit()
+            self._dirty = False
+        cursor = await self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:  # pragma: no cover - PRAGMA always returns a row
+            return (1, -1, -1)
+        return (int(row[0]), int(row[1]), int(row[2]))
+
     @property
     def conn(self) -> aiosqlite.Connection:
         assert self._conn is not None, "Database not initialized"
         return self._conn
+
+    @property
+    def path(self) -> str:
+        """The on-disk path of this database file (the deploy snapshot copies it
+        and the switcher restores over it, docs/plans/local-deploy.md §7.4)."""
+        return self._db_path
 
     async def save_session(
         self,

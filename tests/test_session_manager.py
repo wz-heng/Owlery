@@ -1,11 +1,13 @@
 import asyncio
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from server.database import Database
+from server.deploy_admission import DeployAdmissionClosedError, DeployAdmissionGate
 from server.models import SessionStatus
 from server.session_manager import SessionManager
 
@@ -168,6 +170,102 @@ async def test_initialize_restores_sessions():
 # ---------------------------------------------------------------------------
 # Message queue + interrupt
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_deploy_admission_rejects_new_messages_without_cancelling_turn(manager, monkeypatch):
+    session = await _new(manager, "Deploy gate")
+    gate = DeployAdmissionGate()
+    manager.set_deploy_admission_gate(gate)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def stub_consume(session_id: str, queued) -> None:
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(manager, "_consume_message", stub_consume)
+
+    await gate.close()
+    with pytest.raises(DeployAdmissionClosedError):
+        await manager.start_message(session.id, "blocked")
+    assert session._active_task is None
+    assert session._pending_queue == []
+
+    await gate.open()
+    await manager.start_message(session.id, "running")
+    await asyncio.wait_for(started.wait(), timeout=1)
+    active = session._active_task
+    assert active is not None and not active.done()
+
+    await gate.close()
+    with pytest.raises(DeployAdmissionClosedError):
+        await manager.start_message(session.id, "also blocked")
+    assert session._active_task is active and not active.done()
+
+    release.set()
+    await asyncio.wait_for(active, timeout=1)
+    await gate.open()
+    await manager.start_message(session.id, "reopened")
+    await asyncio.wait_for(session._active_task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_deploy_admission_close_waits_for_busy_enqueue(manager, monkeypatch):
+    session = await _new(manager, "Deploy gate busy race")
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def stub_consume(session_id: str, queued) -> None:
+        if queued.prompt == "first":
+            first_started.set()
+            await release_first.wait()
+
+    monkeypatch.setattr(manager, "_consume_message", stub_consume)
+    await manager.start_message(session.id, "first")
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+
+    entered = asyncio.Event()
+    release_admission = asyncio.Event()
+
+    class BlockingGate(DeployAdmissionGate):
+        @asynccontextmanager
+        async def admit(self):
+            async with super().admit():
+                entered.set()
+                await release_admission.wait()
+                yield
+
+    gate = BlockingGate()
+    manager.set_deploy_admission_gate(gate)
+    enqueue = asyncio.create_task(manager.start_message(session.id, "second"))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+
+    closing = asyncio.create_task(gate.close())
+    await asyncio.sleep(0)
+    assert not closing.done(), "close must wait for the in-flight admission"
+
+    release_admission.set()
+    await asyncio.wait_for(enqueue, timeout=1)
+    await asyncio.wait_for(closing, timeout=1)
+    assert gate.closed
+    assert [queued.prompt for queued in session._pending_queue] == ["second"]
+
+    release_first.set()
+    await asyncio.wait_for(session._active_task, timeout=1)
+
+
+def test_deploy_admission_closed_is_a_session_input_error():
+    """WS already maps ``ValueError`` from start_message to a client error."""
+    assert issubclass(DeployAdmissionClosedError, ValueError)
+
+
+@pytest.mark.asyncio
+async def test_admission_claimed_message_requires_task_worker(manager):
+    session = await _new(manager, "ordinary")
+
+    with pytest.raises(ValueError, match="require a task worker run"):
+        await manager.start_message(session.id, "not a task", admission_claimed=True)
 
 
 @pytest.mark.asyncio

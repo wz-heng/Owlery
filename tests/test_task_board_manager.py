@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -9,6 +10,7 @@ import pytest
 
 from server.config import settings
 from server.database import Database
+from server.deploy_admission import DeployAdmissionClosedError, DeployAdmissionGate
 from server.session_manager import SessionManager
 from server.task_board.manager import TaskBoardManager
 from server.task_board.repository import TaskRepository
@@ -107,6 +109,97 @@ async def test_dispatch_creates_trusted_task_worker(task_runtime):
     config = sessions._run_config(worker)
     assert config.task_id == task.id
     assert config.task_run_id == run.id
+
+
+@pytest.mark.asyncio
+async def test_dispatch_claim_is_atomic_with_deploy_admission_close(task_runtime):
+    _db, repo, sessions, manager, root = task_runtime
+    _board, task, _ = await _ready_task(_db, repo, sessions, root)
+    sessions.start_message = AsyncMock()
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingGate(DeployAdmissionGate):
+        @asynccontextmanager
+        async def admit(self):
+            async with self._lock:
+                if self._closed:
+                    raise DeployAdmissionClosedError("deploy admission is closed")
+                entered.set()
+                await release.wait()
+                yield
+
+    gate = BlockingGate()
+    sessions.set_deploy_admission_gate(gate)
+    dispatch = asyncio.create_task(manager._dispatch_task(task))
+    await entered.wait()
+    close = asyncio.create_task(gate.close())
+    await asyncio.sleep(0)
+    assert not close.done()
+
+    release.set()
+    await dispatch
+    await close
+
+    claimed = await repo.get_task(task.id)
+    assert claimed.status == "running"
+    assert gate.closed is True
+
+
+@pytest.mark.asyncio
+async def test_dispatch_does_not_claim_when_deploy_admission_is_closed(task_runtime):
+    _db, repo, sessions, manager, root = task_runtime
+    _board, task, _ = await _ready_task(_db, repo, sessions, root)
+    sessions.start_message = AsyncMock()
+    await sessions.deploy_admission_gate.close()
+
+    with pytest.raises(DeployAdmissionClosedError):
+        await manager._dispatch_task(task)
+
+    assert (await repo.get_task(task.id)).status == "ready"
+
+
+@pytest.mark.asyncio
+async def test_claimed_dispatch_starts_while_deploy_admission_is_closed(
+    task_runtime, monkeypatch: pytest.MonkeyPatch
+):
+    _db, repo, sessions, manager, root = task_runtime
+    _board, task, _ = await _ready_task(_db, repo, sessions, root)
+    started = asyncio.Event()
+    keep_running = asyncio.Event()
+
+    async def hold_worker(_session_id, _queued):
+        started.set()
+        await keep_running.wait()
+
+    original_attach = repo.attach_run_session
+
+    async def close_after_claim(task_id, run_id, session_id):
+        await sessions.deploy_admission_gate.close()
+        return await original_attach(task_id, run_id, session_id)
+
+    monkeypatch.setattr(sessions, "_drive_messages", hold_worker)
+    monkeypatch.setattr(repo, "attach_run_session", close_after_claim)
+    try:
+        await manager._dispatch_task(task)
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        current = await repo.get_task(task.id)
+        run = await repo.get_run(current.current_run_id)
+        worker = sessions.get_session(run.session_id)
+        assert current.status == "running"
+        assert run.state == "running"
+        assert sessions.deploy_admission_gate.closed is True
+        assert worker._active_task is not None and not worker._active_task.done()
+    finally:
+        keep_running.set()
+        worker = next(
+            (session for session in sessions.sessions.values() if session.task_id == task.id),
+            None,
+        )
+        if worker is not None and worker._active_task is not None:
+            await asyncio.wait_for(worker._active_task, timeout=1)
 
 
 @pytest.mark.asyncio

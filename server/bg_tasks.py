@@ -39,6 +39,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .database import Database
+from .deploy_admission import DeployAdmissionGate
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +169,7 @@ class BgTaskManager:
         self._db: Database | None = None
         self._deliver_cb: DeliveryCallback | None = None
         self._broadcast_cb: BroadcastCallback | None = None
+        self._admission_gate: DeployAdmissionGate | None = None
         self._running: dict[str, _RunningTask] = {}
         self._started: bool = False
 
@@ -178,11 +180,13 @@ class BgTaskManager:
         db: Database,
         deliver_cb: DeliveryCallback,
         broadcast_cb: BroadcastCallback,
+        admission_gate: DeployAdmissionGate | None = None,
     ) -> None:
         """Wire up dependencies. Called once from main.py lifespan."""
         self._db = db
         self._deliver_cb = deliver_cb
         self._broadcast_cb = broadcast_cb
+        self._admission_gate = admission_gate
 
     async def start(self) -> None:
         """Make orphaned execution truthful and close delivery gaps."""
@@ -260,6 +264,33 @@ class BgTaskManager:
         orchestration task will update the row in the DB later; callers
         that need the latest state should re-fetch via get_task().
         """
+        if self._admission_gate is None:
+            return await self._start_task(
+                session_id=session_id,
+                command=command,
+                working_dir=working_dir,
+                description=description,
+                timeout_seconds=timeout_seconds,
+            )
+        async with self._admission_gate.admit():
+            return await self._start_task(
+                session_id=session_id,
+                command=command,
+                working_dir=working_dir,
+                description=description,
+                timeout_seconds=timeout_seconds,
+            )
+
+    async def _start_task(
+        self,
+        *,
+        session_id: str,
+        command: str,
+        working_dir: str,
+        description: str | None = None,
+        timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    ) -> BgTaskRecord:
+        """Start one task while its admission has already been claimed."""
         assert self._db is not None, "BgTaskManager not bound"
         task_id = _short_id()
         started_at = _now_iso()
@@ -298,28 +329,45 @@ class BgTaskManager:
             started_at=started_at,
             completed_at=None,
         )
-        await self._db.create_bg_task(
-            task_id=task_id,
-            session_id=session_id,
-            command=command,
-            description=description,
-            working_dir=working_dir,
-            started_at=started_at,
-        )
-        if self._broadcast_cb:
-            await self._broadcast_cb(
-                {
-                    "type": "bg_started",
-                    "session_id": session_id,
-                    "task_id": task_id,
-                    "command": command,
-                    "description": description,
-                    "started_at": started_at,
-                }
-            )
-
+        # Census observes ``_running``, not the DB.  Register the process
+        # synchronously before the next await so a closing deploy can never
+        # miss a successfully spawned child.  A failed DB write below must
+        # then terminate it before this admission claim is released.
         rt = _RunningTask(record, proc)
         self._running[task_id] = rt
+        try:
+            await self._db.create_bg_task(
+                task_id=task_id,
+                session_id=session_id,
+                command=command,
+                description=description,
+                working_dir=working_dir,
+                started_at=started_at,
+            )
+        except BaseException:
+            self._running.pop(task_id, None)
+            rt.cancel_requested = True
+            await self._terminate_proc(rt)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=6.0)
+            except (asyncio.TimeoutError, Exception):
+                logger.exception("bg task %s did not terminate after setup failure", task_id)
+            raise
+        if self._broadcast_cb:
+            try:
+                await self._broadcast_cb(
+                    {
+                        "type": "bg_started",
+                        "session_id": session_id,
+                        "task_id": task_id,
+                        "command": command,
+                        "description": description,
+                        "started_at": started_at,
+                    }
+                )
+            except Exception:
+                logger.exception("bg_started broadcast failed for %s", task_id)
+
         rt.task = asyncio.create_task(
             self._run_task(rt, timeout_seconds),
             name=f"bg-task-{task_id}",

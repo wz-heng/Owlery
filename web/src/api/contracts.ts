@@ -2302,6 +2302,11 @@ export interface components {
              * @enum {string}
              */
             git_delivery_default_merge: "none" | "fast_forward_only";
+            /**
+             * Allow Local Deploy
+             * @default false
+             */
+            allow_local_deploy: boolean;
         };
         /** BoardPatch */
         BoardPatch: {
@@ -2335,6 +2340,8 @@ export interface components {
             git_delivery_default_draft_pr?: boolean | null;
             /** Git Delivery Default Merge */
             git_delivery_default_merge?: ("none" | "fast_forward_only") | null;
+            /** Allow Local Deploy */
+            allow_local_deploy?: boolean | null;
             /** Updated At */
             updated_at?: string | null;
         };
