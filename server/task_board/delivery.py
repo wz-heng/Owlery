@@ -95,7 +95,8 @@ class _SwitchCtx:
     task: TaskRecord
     run: RunRecord
     delivery: DeliveryRecord
-    staged: DeploymentRecord
+    target: DeploymentRecord
+    target_state: str
     from_slot: str
     layout: "deploy.DeployLayout"
     actor_kind: str
@@ -903,7 +904,7 @@ class DeliveryCoordinator:
             )
 
         ctx = _SwitchCtx(
-            task=task, run=run, delivery=delivery, staged=staged,
+            task=task, run=run, delivery=delivery, target=staged, target_state="staged",
             from_slot=from_slot, layout=layout,
             actor_kind=actor_kind, actor_agent_id=actor_agent_id,
         )
@@ -944,6 +945,85 @@ class DeliveryCoordinator:
             return await self._published(task, final)
         # Success: the switcher is spawned and shutdown is under way. Producers are
         # deliberately NOT resumed — the restart restores them in the new server.
+        return await self._published(task, result)
+
+    async def deploy_rollback(
+        self,
+        deployment_id: str,
+        *,
+        confirm_rollback: bool,
+        actor_kind: str = "user",
+        actor_agent_id: str | None = None,
+        server_root: Path | None = None,
+    ) -> DeliveryRecord:
+        """Switch the live process back to its most recent superseded slot.
+
+        This is deliberately a normal, fresh ``deploy_switch`` operation: it
+        follows the exact handoff, quiesce, snapshot, and health-verification
+        path as a forward release.  The one extra guard is typed confirmation,
+        because it intentionally discards the currently running version.
+        """
+        live = await self.repo.get_deployment(deployment_id)
+        if live.state != "live":
+            raise TaskConflictError("only the current live deployment can be rolled back")
+        target = await self.repo.get_rollback_target(live.id)
+        if target is None or target.delivery_id is None:
+            raise TaskConflictError("no superseded deployment is available for rollback")
+        delivery = await self.repo.get_delivery(target.delivery_id)
+        if not confirm_rollback:
+            raise DeliveryConfirmationRequired(
+                "rollback replaces the running local version; confirmation is required",
+                confirmation="confirm_rollback",
+                action="rollback",
+                current=delivery,
+            )
+        task, run, board = await self._load(delivery.task_id, delivery.run_id)
+        if not board.allow_local_deploy:
+            raise TaskConflictError(
+                "this board may not deploy the local instance "
+                "(enable allow_local_deploy on the board first)", current=delivery,
+            )
+        check = deploy.deploy_precheck(settings, server_root=server_root)
+        if not check.ok:
+            raise TaskConflictError(check.message, current=delivery)
+        if delivery.status not in _SWITCH_START_STATES:
+            raise TaskConflictError("delivery is not in a state that accepts a deploy", current=delivery)
+        layout = deploy.DeployLayout.at(settings.resolved_deploy_root)
+        from_slot = layout.current_slot()
+        if from_slot != live.slot:
+            raise TaskConflictError("current deploy slot no longer matches the live deployment", current=delivery)
+        if target.slot == from_slot:
+            raise TaskConflictError("rollback target is already current", current=delivery)
+        if (
+            self.deploy_quiesce is None
+            or self.broadcast_restarting is None
+            or self.request_shutdown is None
+        ):
+            raise TaskConflictError("deploy switch is unavailable on this instance", current=delivery)
+
+        ctx = _SwitchCtx(
+            task=task,
+            run=run,
+            delivery=delivery,
+            target=target,
+            target_state="superseded",
+            from_slot=from_slot,
+            layout=layout,
+            actor_kind=actor_kind,
+            actor_agent_id=actor_agent_id,
+        )
+        op_id = await self._plan_and_start_switch_op(delivery, actor_kind, actor_agent_id)
+        ctx.op_id = op_id
+        try:
+            busy = await self.deploy_quiesce.census(exclude_op_id=op_id)
+            if busy:
+                raise DeploySwitchAbort("not_idle", busy=busy)
+            result = await self._perform_switch_handoff(ctx)
+        except DeploySwitchAbort as exc:
+            final = await self._fail_switch(
+                delivery.id, op_id, exc, actor_kind, actor_agent_id
+            )
+            return await self._published(task, final)
         return await self._published(task, result)
 
     async def _plan_switch_op(self, delivery, actor_kind, actor_agent_id):
@@ -1064,9 +1144,9 @@ class DeliveryCoordinator:
         old_sha = await self._current_sha(layout, ctx.from_slot)
         handoff_detail = {
             "from_slot": ctx.from_slot,
-            "to_slot": ctx.staged.slot,
+            "to_slot": ctx.target.slot,
             "old_sha": old_sha,
-            "new_sha": ctx.staged.sha,
+            "new_sha": ctx.target.sha,
             "old_pid": os.getpid(),
             "host": self._switch_host,
             "port": int(settings.port),
@@ -1084,14 +1164,15 @@ class DeliveryCoordinator:
         # pin the op's journal_ref, both durable before we spawn (§7.2 step 3).
         try:
             await self.repo.begin_deployment_switching(
-                deployment_id=ctx.staged.id, op_id=ctx.op_id
+                deployment_id=ctx.target.id, op_id=ctx.op_id,
+                expected_state=ctx.target_state,
             )
         except DeployLockedError as exc:
             raise DeploySwitchAbort("deploy_locked", message=str(exc)) from exc
         await self.repo.record_switch_journal_ref(
             ctx.op_id, journal_ref=str(layout.journal_path),
-            detail={"from_slot": ctx.from_slot, "to_slot": ctx.staged.slot,
-                    "new_sha": ctx.staged.sha},
+            detail={"from_slot": ctx.from_slot, "to_slot": ctx.target.slot,
+                    "new_sha": ctx.target.sha},
         )
 
         # 4. Spawn the switcher fully detached from the OLD slot's trusted code
@@ -1112,8 +1193,8 @@ class DeliveryCoordinator:
             "type": "server_restarting",
             "op_id": ctx.op_id,
             "from_slot": ctx.from_slot,
-            "to_slot": ctx.staged.slot,
-            "sha": ctx.staged.sha,
+            "to_slot": ctx.target.slot,
+            "sha": ctx.target.sha,
         })
         self.request_shutdown()
         return await self.repo.get_delivery(ctx.delivery.id)

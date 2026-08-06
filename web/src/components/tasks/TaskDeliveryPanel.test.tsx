@@ -186,6 +186,21 @@ describe("TaskDeliveryPanel", () => {
     await waitFor(() => expect(deployments).toHaveBeenCalled());
   });
 
+  it("renders rollback only for this delivery's live deployment", async () => {
+    seed(delivery({ deployed_sha: "bbbbbbbbbbbb", deployed_slot: "b" }));
+    useTaskStore.setState({ token: "token" });
+    vi.spyOn(taskApi, "deployments").mockResolvedValue({
+      deployments: [{
+        id: "live-1", delivery_id: "delivery-1", task_id: run.task_id, op_id: "op-2",
+        slot: "b", sha: "bbbbbbbbbbbb", source_repo: "/repo", state: "live", journal: null,
+        created_at: "2026-07-27T00:00:00Z", updated_at: "2026-07-27T00:00:00Z",
+      }],
+      live: null,
+    });
+    render(<TaskDeliveryPanel run={run} allowLocalDeploy />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Rollback" })).toBeEnabled());
+  });
+
   it("requires the typed destructive phrase before resubmitting", async () => {
     seed(delivery({ status: "blocked" }));
     useTaskStore.setState({

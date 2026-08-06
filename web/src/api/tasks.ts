@@ -587,4 +587,8 @@ export const taskApi = {
     ),
   deployments: (token: string) =>
     get<{ deployments: Deployment[]; live: Deployment | null }>(token, "/api/deployments"),
+  rollbackDeployment: (token: string, deploymentId: string, confirmRollback = false) =>
+    mutate<TaskDelivery>(token, `/api/deployments/${deploymentId}/rollback`, "POST", {
+      confirm_rollback: confirmRollback,
+    }),
 };

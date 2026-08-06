@@ -30,6 +30,7 @@ export type DeliveryActionKind =
   | "merge"
   | "deploy_stage"
   | "deploy_switch"
+  | "rollback"
   | "teardown";
 
 export interface DeliveryConfirmation {
@@ -39,6 +40,7 @@ export interface DeliveryConfirmation {
   confirmation: string;
   verb: string;
   message: string;
+  deploymentId?: string;
 }
 
 export interface DeliveryActionOptions {
@@ -185,6 +187,7 @@ interface TaskState {
     runId: string,
     options?: { retention?: string; confirmations?: Record<string, boolean> }
   ): Promise<boolean>;
+  rollbackDeployment(taskId: string, runId: string, deploymentId: string, confirm?: boolean): Promise<boolean>;
   clearDeliveryConfirmation(): void;
 }
 
@@ -243,7 +246,8 @@ async function runDeliveryCall(
   taskId: string,
   runId: string,
   action: DeliveryActionKind,
-  call: () => Promise<TaskDelivery>
+  call: () => Promise<TaskDelivery>,
+  deploymentId?: string,
 ): Promise<boolean> {
   set({ mutating: true, error: null });
   try {
@@ -264,6 +268,7 @@ async function runDeliveryCall(
           confirmation: error.confirmation,
           verb: error.action ?? action,
           message: error.message,
+          deploymentId,
         },
       });
       return false;
@@ -678,6 +683,10 @@ export const useTaskStore = create<TaskState>((set, get) => ({
         retention: options.retention,
         confirmations: options.confirmations,
       })
+    ),
+  rollbackDeployment: (taskId, runId, deploymentId, confirm = false) =>
+    runDeliveryCall(set, taskId, runId, "rollback", () =>
+      taskApi.rollbackDeployment(get().token, deploymentId, confirm), deploymentId
     ),
   clearDeliveryConfirmation: () => set({ deliveryConfirmation: null }),
 }));

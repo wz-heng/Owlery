@@ -1097,6 +1097,10 @@ class DeploySwitchRequest(BaseModel):
     switch_when_idle: bool = False
 
 
+class DeployRollbackRequest(BaseModel):
+    confirm_rollback: bool = False
+
+
 class WorkerDeliveryRequest(BaseModel):
     note: str | None = None
 
@@ -1277,6 +1281,31 @@ async def list_deployments(_: str = Depends(verify_token)):
         "deployments": [_dict(item) for item in deployments],
         "live": _dict(live) if live is not None else None,
     }
+
+
+@router.post("/api/deployments/{deployment_id}/rollback")
+async def deployment_rollback(
+    deployment_id: str,
+    req: DeployRollbackRequest,
+    caller_session_id: str | None = Header(default=None, alias="X-Owlery-Session-ID"),
+    _: str = Depends(verify_token),
+):
+    actor_kind, actor_agent_id = await _delivery_actor(caller_session_id)
+    if actor_kind != "user":
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            {"code": "deploy_rollback_user_only", "message": "deploy rollback requires a human caller"},
+        )
+    return _dict(
+        await _run(
+            _get_manager().deploy_rollback(
+                deployment_id,
+                confirm_rollback=req.confirm_rollback,
+                actor_kind=actor_kind,
+                actor_agent_id=actor_agent_id,
+            )
+        )
+    )
 
 
 @router.post("/api/task-worker/current/delivery/request")

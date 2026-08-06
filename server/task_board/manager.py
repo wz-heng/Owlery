@@ -826,6 +826,14 @@ class TaskBoardManager:
         """Return the durable local-deploy history for the operator surface."""
         return await self.repo.list_deployments()
 
+    async def deploy_rollback(
+        self, deployment_id: str, **kwargs: Any
+    ) -> DeliveryRecord:
+        """Run a confirmed rollback through the ordinary deploy-switch path."""
+        delivery = await self.delivery.deploy_rollback(deployment_id, **kwargs)
+        await self.publish_task_update(delivery.task_id)
+        return delivery
+
     @staticmethod
     def _delivery_terminal_source(task_id: str, run_id: str) -> str:
         return f"task:{task_id}:run:{run_id}:delivery:terminal"

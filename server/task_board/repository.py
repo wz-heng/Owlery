@@ -3048,6 +3048,31 @@ class TaskRepository:
             )
         return self._deployment_record(row) if row else None
 
+    async def get_rollback_target(
+        self, live_deployment_id: str
+    ) -> DeploymentRecord | None:
+        """The newest superseded slot eligible to replace this live deployment.
+
+        A local layout has two slots, so the most recently superseded deployment
+        is the one a confirmed rollback may switch to.  Requiring a different
+        slot prevents a malformed historical row from selecting the live tree
+        itself.
+        """
+        async with self._lock:
+            live = await self._fetchone(
+                self.conn, "SELECT slot FROM deployments WHERE id=? AND state='live'",
+                (live_deployment_id,),
+            )
+            if live is None:
+                return None
+            row = await self._fetchone(
+                self.conn,
+                "SELECT * FROM deployments WHERE state='superseded' AND slot != ? "
+                "ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+                (live["slot"],),
+            )
+        return self._deployment_record(row) if row else None
+
     async def begin_deployment_staging(
         self,
         *,
@@ -3205,22 +3230,26 @@ class TaskRepository:
         return [self._delivery_op_record(r) for r in rows]
 
     async def begin_deployment_switching(
-        self, *, deployment_id: str, op_id: str
+        self, *, deployment_id: str, op_id: str, expected_state: str = "staged"
     ) -> DeploymentRecord:
-        """CAS a `staged` deployment to `switching`, binding it to the switch op
+        """CAS a switch target to `switching`, binding it to the switch op
         and taking the global deploy lock (docs/plans/local-deploy.md §6/§7.2).
 
         `switching` is a `deployments_one_active` state, so a concurrent
         staging/switching deploy makes the unique index reject this and raise
         `DeployLockedError` naming the holder — the same lock the stage op
-        contends for. A non-`staged` source is a lost race (`TaskConflictError`)."""
+        contends for. The normal path consumes `staged`; the only other allowed
+        source is `superseded`, for an explicitly confirmed rollback (§10/§12).
+        Any other source is a lost race (`TaskConflictError`)."""
+        if expected_state not in {"staged", "superseded"}:
+            raise TaskValidationError("invalid deploy switch source state")
         stamp = _now_iso()
         async with self._transaction() as conn:
             try:
                 cursor = await conn.execute(
                     "UPDATE deployments SET state='switching', op_id=?, updated_at=? "
-                    "WHERE id=? AND state='staged'",
-                    (op_id, stamp, deployment_id),
+                    "WHERE id=? AND state=?",
+                    (op_id, stamp, deployment_id, expected_state),
                 )
             except aiosqlite.IntegrityError as exc:
                 holder = await self._fetchone(
@@ -3238,7 +3267,7 @@ class TaskRepository:
                 raise DeployLockedError(f"deploy_locked: {detail}") from exc
             if cursor.rowcount != 1:
                 raise TaskConflictError(
-                    f"deployment {deployment_id!r} is not staged; cannot switch"
+                    f"deployment {deployment_id!r} is not {expected_state!r}; cannot switch"
                 )
             row = await self._fetchone(
                 conn, "SELECT * FROM deployments WHERE id=?", (deployment_id,)
@@ -3349,7 +3378,8 @@ class TaskRepository:
         is simply the wrong op for this lookup. A crash between the journal
         `handoff` line and the CAS can also leave the row genuinely un-bound in
         the first place. Either way the op-id lookup then finds nothing, so we
-        fall back to this delivery's still-`staged`/`switching` row for the exact
+        fall back to this delivery's still-eligible `staged`/`switching`/`superseded`
+        row for the exact
         slot+sha this op targeted — never a terminal row, never a different
         switch attempt."""
         stamp = _now_iso()
@@ -3384,7 +3414,7 @@ class TaskRepository:
                 dep_row = await self._fetchone(
                     conn,
                     "SELECT * FROM deployments WHERE delivery_id=? AND slot=? "
-                    "AND sha=? AND state IN ('staged', 'switching') "
+                    "AND sha=? AND state IN ('staged', 'switching', 'superseded') "
                     "ORDER BY created_at DESC LIMIT 1",
                     (op["delivery_id"], target_slot, target_sha),
                 )

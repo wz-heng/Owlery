@@ -173,6 +173,9 @@ export function TaskDeliveryPanel({ run, allowLocalDeploy }: TaskDeliveryPanelPr
   const staged = deployments.find(
     (deployment) => deployment.delivery_id === delivery.id && deployment.state === "staged"
   );
+  const live = deployments.find(
+    (deployment) => deployment.delivery_id === delivery.id && deployment.state === "live"
+  );
 
   const opLog = ops ?? [];
   const activeConfirmation =
@@ -332,6 +335,15 @@ export function TaskDeliveryPanel({ run, allowLocalDeploy }: TaskDeliveryPanelPr
               destructive
               onClick={() => void store.deliveryAction(taskId, runId, "deploy_switch").then(refreshDeployments)}
             />
+            {live && (
+              <DeliveryActionButton
+                label="Rollback"
+                icon={<IconAlertTriangle size={14} />}
+                disabled={busy}
+                destructive
+                onClick={() => void store.rollbackDeployment(taskId, runId, live.id).then(refreshDeployments)}
+              />
+            )}
           </div>
         </section>
       )}
@@ -408,6 +420,14 @@ function ConfirmationDialog({ confirmation }: { confirmation: DeliveryConfirmati
     store.clearDeliveryConfirmation();
     if (confirmation.action === "accept") {
       void store.acceptDelivery(confirmation.taskId, confirmation.runId, undefined, confirmations);
+    } else if (confirmation.action === "rollback" && confirmation.deploymentId) {
+      void store.rollbackDeployment(
+        confirmation.taskId, confirmation.runId, confirmation.deploymentId, true
+      );
+    } else if (confirmation.action === "rollback") {
+      // A malformed rollback confirmation cannot name a deployment, so it must
+      // never fall through to a delivery action with a different meaning.
+      return;
     } else if (confirmation.action === "teardown") {
       void store.teardownDelivery(confirmation.taskId, confirmation.runId, { confirmations });
     } else {
