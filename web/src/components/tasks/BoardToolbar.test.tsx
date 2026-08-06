@@ -24,6 +24,7 @@ function board(overrides: Partial<TaskBoard> = {}): TaskBoard {
     git_delivery_author_email: "owlery-tasks@localhost",
     git_delivery_default_draft_pr: true,
     git_delivery_default_merge: "none",
+    allow_local_deploy: false,
     archived: false,
     created_at: "2026-07-28T00:00:00Z",
     updated_at: "2026-07-28T00:00:00Z",
