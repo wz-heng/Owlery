@@ -49,6 +49,7 @@ from .models import (
     TaskRecord,
     TaskValidationError,
 )
+from ..model_routing import ModelBackendError, validate_model_for_backend
 
 _DELIVERY_TERMINAL_STATUSES = frozenset(
     {"delivered", "conflicted", "blocked", "failed"}
@@ -268,6 +269,37 @@ class TaskRepository:
             conn, "SELECT 1 FROM agents WHERE id = ? AND archived = 0", (agent_id,)
         )
         return row is not None
+
+    async def _agent_backend(
+        self, conn: aiosqlite.Connection, agent_id: str | None
+    ) -> str | None:
+        """The backend ('claude-code' | 'codex') the given agent runs on, or
+        None when there's no agent. Used to validate a task's model override
+        against the backend it would dispatch onto."""
+        if not agent_id:
+            return None
+        row = await self._fetchone(
+            conn, "SELECT backend FROM agents WHERE id = ?", (agent_id,)
+        )
+        return (row["backend"] if row else None) or "claude-code"
+
+    async def _validate_task_model(
+        self,
+        conn: aiosqlite.Connection,
+        *,
+        assignee_agent_id: str | None,
+        model: str | None,
+    ) -> None:
+        """Reject a task model that can't run on its assignee's backend
+        (budget-model-routing.md §4.3). Only enforceable when the task has an
+        assignee — an unassigned task is re-checked at dispatch."""
+        if not model or not assignee_agent_id:
+            return
+        backend = await self._agent_backend(conn, assignee_agent_id)
+        try:
+            validate_model_for_backend(backend, model)
+        except ModelBackendError as exc:
+            raise TaskValidationError(str(exc)) from exc
 
     async def _eligible(
         self, conn: aiosqlite.Connection, task: Mapping[str, Any], now: str
@@ -662,6 +694,7 @@ class TaskRepository:
         scheduled_at: str | None = None,
         workspace_mode: str | None = None,
         working_dir_override: str | None = None,
+        model: str | None = None,
         created_by_kind: str = "user",
         created_by_agent_id: str | None = None,
         creator_run_id: str | None = None,
@@ -719,6 +752,9 @@ class TaskRepository:
                 conn, assignee_agent_id
             ):
                 raise TaskValidationError("assignee Agent does not exist or is archived")
+            await self._validate_task_model(
+                conn, assignee_agent_id=assignee_agent_id, model=model
+            )
             if creator_run_id is not None:
                 creator = await self._run_row(conn, creator_run_id)
                 creator_task = await self._task_row(conn, creator["task_id"])
@@ -738,8 +774,8 @@ class TaskRepository:
                     "INSERT INTO tasks "
                     "(id,board_id,parent_task_id,title,body,status,assignee_agent_id,priority,"
                     "origin_session_id,idempotency_key,scheduled_at,workspace_mode,"
-                    "working_dir_override,created_by_kind,created_by_agent_id,created_at,updated_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "working_dir_override,model,created_by_kind,created_by_agent_id,created_at,updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         ident,
                         board_id,
@@ -754,6 +790,7 @@ class TaskRepository:
                         scheduled_at,
                         workspace_mode,
                         working_dir_override,
+                        model,
                         created_by_kind,
                         created_by_agent_id,
                         stamp,
@@ -1156,24 +1193,43 @@ class TaskRepository:
         task_id: str,
         *,
         body: str | None = None,
+        model: str | None = None,
+        set_model: bool = False,
         actor_kind: str = "user",
         actor_agent_id: str | None = None,
     ) -> TaskRecord:
+        """Move a triage task to `todo`, optionally rewriting its body and/or
+        its model override. `set_model` distinguishes "leave model untouched"
+        (False) from "set model to `model`, possibly clearing it" (True), so a
+        caller can explicitly null a previously-set model
+        (budget-model-routing.md §4.2)."""
         stamp = _now_iso()
         async with self._transaction() as conn:
             task = await self._task_row(conn, task_id)
             if task["status"] != "triage":
                 raise TaskConflictError("only triage tasks may be specified", current=TaskRecord.from_row(task))
+            if set_model:
+                await self._validate_task_model(
+                    conn,
+                    assignee_agent_id=task["assignee_agent_id"],
+                    model=model,
+                )
+            # Assemble the SET clauses and their params in the same order.
+            sets: list[str] = []
+            params: list[Any] = []
             if body is not None:
-                await conn.execute(
-                    "UPDATE tasks SET body = ?, status = 'todo', updated_at = ? WHERE id = ?",
-                    (body, stamp, task_id),
-                )
-            else:
-                await conn.execute(
-                    "UPDATE tasks SET status = 'todo', updated_at = ? WHERE id = ?",
-                    (stamp, task_id),
-                )
+                sets.append("body = ?")
+                params.append(body)
+            if set_model:
+                sets.append("model = ?")
+                params.append(model)
+            sets.append("status = 'todo'")
+            sets.append("updated_at = ?")
+            params.append(stamp)
+            await conn.execute(
+                f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?",
+                (*params, task_id),
+            )
             updated = await self._recompute_one(
                 conn,
                 task_id,
@@ -1238,6 +1294,12 @@ class TaskRepository:
                 raise TaskConflictError("running/done tasks cannot be reassigned", current=TaskRecord.from_row(task))
             if agent_id is not None and not await self._agent_is_live(conn, agent_id):
                 raise TaskValidationError("assignee Agent does not exist or is archived")
+            # Reassignment is a backend-changing write entry (§4.3): reject a new
+            # assignee whose backend can't run the task's existing model up front,
+            # rather than letting it fail only after the run is claimed at dispatch.
+            await self._validate_task_model(
+                conn, assignee_agent_id=agent_id, model=task["model"]
+            )
             await conn.execute(
                 "UPDATE tasks SET assignee_agent_id = ?, updated_at = ? WHERE id = ?",
                 (agent_id, stamp, task_id),

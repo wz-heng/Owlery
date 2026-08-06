@@ -34,6 +34,10 @@ class StartDelegationRequest(BaseModel):
     # verbatim; we don't validate existence here (the child's tools
     # will report missing files naturally).
     files: list[str] | None = None
+    # Optional per-delegation model override (budget-model-routing.md §4.2):
+    # the caller picks the difficulty tier for the child session. Validated
+    # against the child agent's backend (cross-family mismatch → 422).
+    model: str | None = None
 
 
 class CancelDelegationRequest(BaseModel):
@@ -91,6 +95,7 @@ async def start_delegation(
     - 404 if the parent session is gone or the target agent name
       doesn't resolve
     - 409 on cycle, depth, self-delegation, or ambiguous name
+    - 422 if `model` can't run on the child agent's backend
     """
     _require_session(session_id)
     try:
@@ -99,6 +104,7 @@ async def start_delegation(
             agent_name=req.agent_name,
             request=req.request,
             files=req.files,
+            model=req.model,
         )
     except DelegationError as e:
         raise HTTPException(e.status_code, str(e))

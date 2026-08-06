@@ -9,6 +9,7 @@ import {
 } from "@tabler/icons-react";
 import { parkedTurnFromSnapshot } from "../hooks/useWebSocket";
 import { useSessionStore, type SessionInfo } from "../stores/sessionStore";
+import { modelSuggestions } from "../lib/models";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 
@@ -30,8 +31,10 @@ export function SessionList({
 }) {
   const [newName, setNewName] = useState("");
   const [workingDir, setWorkingDir] = useState("");
+  const [model, setModel] = useState("");
   const [credentialId, setCredentialId] = useState<string>("");
   const [backend, setBackend] = useState<string>("claude-code");
+  const [createError, setCreateError] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
   const token = useSessionStore((s) => s.token);
@@ -60,6 +63,7 @@ export function SessionList({
     if (formOpen) {
       setBackend(agentBackend);
       setCredentialId("");
+      setModel("");
     }
   }, [formOpen, agentBackend]);
 
@@ -88,6 +92,7 @@ export function SessionList({
 
   const createSession = async () => {
     const name = newName.trim() || "New Session";
+    setCreateError(null);
     try {
       const res = await fetch(`${API_URL}/api/agents/${agentId}/sessions`, {
         method: "POST",
@@ -97,6 +102,9 @@ export function SessionList({
           working_dir: workingDir.trim() || null,
           credential_id: credentialId || null,
           backend,
+          // Optional per-session model override (budget-model-routing.md §4.1);
+          // blank inherits the agent's model, then the backend default.
+          model: model.trim() || null,
         }),
       });
       if (res.ok) {
@@ -107,12 +115,22 @@ export function SessionList({
         setActiveSessionId(session.id);
         setNewName("");
         setWorkingDir("");
+        setModel("");
         setCredentialId("");
         setBackend("claude-code");
         onCloseForm();
+      } else {
+        // Most likely a cross-family model↔backend mismatch (422,
+        // budget-model-routing.md §4.3); surface it rather than silently
+        // dropping the click.
+        const body = await res.json().catch(() => null);
+        setCreateError(
+          (body && typeof body.detail === "string" && body.detail) ||
+            `Failed to create session (${res.status})`
+        );
       }
     } catch {
-      // ignore
+      setCreateError("Network error creating session");
     }
   };
 
@@ -297,6 +315,24 @@ export function SessionList({
             onChange={(e) => setWorkingDir(e.target.value)}
             placeholder="Working directory (optional)"
           />
+          {/* Optional per-session model override (budget-model-routing.md
+           * §4.1). Free text — the datalist only autocompletes common picks per
+           * backend; anything typed is valid, and blank inherits the agent's
+           * model then the backend default. The datalist id is agent-scoped
+           * because one SessionList renders per agent. */}
+          <Input
+            type="text"
+            className="session-model-input h-9 text-sm"
+            value={model}
+            onChange={(e) => setModel(e.target.value)}
+            placeholder="Model (optional — blank = agent default)"
+            list={`session-model-suggestions-${agentId}`}
+          />
+          <datalist id={`session-model-suggestions-${agentId}`}>
+            {modelSuggestions(backend).map((m) => (
+              <option key={m} value={m} />
+            ))}
+          </datalist>
           {codexAvailable && (
             <div
               className="session-backend-select flex gap-2"
@@ -341,6 +377,11 @@ export function SessionList({
               ))}
             </select>
           )}
+          {createError && (
+            <p className="session-create-error text-xs text-destructive">
+              {createError}
+            </p>
+          )}
           <div className="flex justify-end gap-2">
             <Button
               variant="ghost"
@@ -348,6 +389,8 @@ export function SessionList({
               onClick={() => {
                 setNewName("");
                 setWorkingDir("");
+                setModel("");
+                setCreateError(null);
                 onCloseForm();
               }}
             >

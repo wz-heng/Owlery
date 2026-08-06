@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class SessionStatus(str, Enum):
@@ -29,6 +29,10 @@ class CreateSessionRequest(BaseModel):
     # Which AI backend drives this session (codex-backend.md §4.1). None =
     # inherit the owning agent's default backend (resolved in the route).
     backend: BackendKind | None = None
+    # Optional per-session model override (budget-model-routing.md §4.1). None
+    # = inherit the agent's model / backend default. Validated against the
+    # resolved backend (cross-family mismatches → 422).
+    model: str | None = None
 
 
 class ForkSessionRequest(BaseModel):
@@ -87,6 +91,9 @@ class SessionInfo(BaseModel):
     origin: str = "user"
     # Which AI backend drives this session.
     backend: BackendKind = BackendKind.claude_code
+    # Per-session model override (budget-model-routing.md §4.1); None = inherit
+    # the agent's model / backend default.
+    model: str | None = None
     # Agent-to-agent: set on delegation sessions to point at the parent
     # session that spawned them; NULL elsewhere. The verbatim original
     # delegation prompt is kept alongside for UI display.
@@ -535,3 +542,53 @@ class UpdateNotifierRequest(BaseModel):
     label: str | None = None
     config: dict[str, Any] | None = None
     enabled: bool | None = None
+
+
+# Budgets (budget-model-routing.md §3)
+
+
+class BudgetRead(BaseModel):
+    id: str
+    scope: Literal["global", "agent"]
+    agent_id: str | None = None
+    window: Literal["daily", "weekly", "monthly"]
+    limit_usd: float
+    soft_pct: float
+    enabled: bool
+    created_at: str
+    updated_at: str
+
+
+class CreateBudgetRequest(BaseModel):
+    scope: Literal["global", "agent"]
+    agent_id: str | None = None
+    window: Literal["daily", "weekly", "monthly"]
+    limit_usd: float = Field(gt=0)
+    soft_pct: float = Field(default=0.8, gt=0, le=1)
+    enabled: bool = True
+
+    @model_validator(mode="after")
+    def _scope_agent_consistency(self) -> "CreateBudgetRequest":
+        if self.scope == "agent" and not self.agent_id:
+            raise ValueError("agent-scoped budget requires agent_id")
+        if self.scope == "global" and self.agent_id is not None:
+            raise ValueError("global budget must not carry an agent_id")
+        return self
+
+
+class UpdateBudgetRequest(BaseModel):
+    window: Literal["daily", "weekly", "monthly"] | None = None
+    limit_usd: float | None = Field(default=None, gt=0)
+    soft_pct: float | None = Field(default=None, gt=0, le=1)
+    enabled: bool | None = None
+
+
+class BudgetStatusEntry(BaseModel):
+    """One enabled budget with live spend for its current window; the
+    frontend derives the water level from limit/spent (§3.3)."""
+
+    scope: Literal["global", "agent"]
+    agent_id: str | None = None
+    window: Literal["daily", "weekly", "monthly"]
+    limit_usd: float
+    spent_usd: float

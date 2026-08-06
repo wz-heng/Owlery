@@ -18,6 +18,7 @@ from typing import Any
 
 from . import agent_memory
 from .database import Database
+from .model_routing import validate_model_for_backend
 
 
 class AgentError(Exception):
@@ -59,6 +60,8 @@ class AgentManager:
             raise AgentError("Agent name is required")
         if await self.db.get_agent_by_name(name) is not None:
             raise AgentError(f"An agent named {name!r} already exists")
+        # Reject a model the backend can't run (budget-model-routing.md §4.3).
+        validate_model_for_backend(backend, model)
         agent_id = uuid.uuid4().hex[:12]
         now = datetime.now(timezone.utc).isoformat()
         await self.db.save_agent(
@@ -94,6 +97,19 @@ class AgentManager:
             if clash is not None and clash["id"] != agent_id:
                 raise AgentError(f"An agent named {new_name!r} already exists")
             fields["name"] = new_name
+        # Validate the RESULTING (backend, model) pair — a PATCH that changes
+        # only the backend must still be checked against the existing model,
+        # and vice-versa (budget-model-routing.md §4.3).
+        #
+        # backend uses `or`, not "in fields": it's a non-null column, so the DB
+        # ignores a null backend update (keeps the existing one). An explicit
+        # `{"backend": null, "model": "gpt-5"}` would otherwise validate against
+        # None (→ passes) while the model still persists onto the kept backend.
+        # model uses "in fields" because it IS nullable — an explicit null
+        # clears it, and we validate the new (possibly-cleared) value.
+        eff_backend = fields.get("backend") or agent.get("backend")
+        eff_model = fields.get("model") if "model" in fields else agent.get("model")
+        validate_model_for_backend(eff_backend, eff_model)
         await self.db.update_agent(agent_id, **fields)
         updated = await self.db.get_agent(agent_id)
         assert updated is not None

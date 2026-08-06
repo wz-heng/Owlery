@@ -10,6 +10,7 @@ import {
 import type { ReactNode } from "react";
 import { AgentSeal } from "./ui/seal";
 import { Skeleton } from "./ui/skeleton";
+import { BudgetPanel } from "./BudgetPanel";
 
 const API_URL = window.location.origin;
 
@@ -145,6 +146,22 @@ export function UsageDialog({ open, onOpenChange }: Props) {
             selected window. Codex reports tokens only, so its cost shows “—”.
           </DialogDescription>
         </DialogHeader>
+
+        {/* Global spend caps (budget-model-routing.md §3.3). A pre-run gate on
+         * Claude USD spend per window — soft threshold warns in-session, hard
+         * threshold blocks the next turn. Per-agent budgets live in that
+         * agent's settings; these apply across every agent. */}
+        <section className="usage-budgets space-y-2">
+          <div>
+            <h3 className="text-sm font-semibold text-foreground">Budgets</h3>
+            <p className="text-xs text-muted-foreground">
+              Cap Claude spend per window. A turn is warned near the limit and
+              blocked once spent reaches it. Codex turns report no cost and
+              aren’t counted.
+            </p>
+          </div>
+          <BudgetPanel scope="global" refreshKey={open} />
+        </section>
 
         <div className="usage-controls flex flex-wrap items-center gap-2">
           <div className="flex rounded-lg border border-ink-300 bg-ink-100 shadow-[var(--elevation-inset)] p-1">
