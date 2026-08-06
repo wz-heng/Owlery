@@ -28,7 +28,8 @@ from server.deploy import DeployLayout
 from server.task_board.delivery import DeliveryCoordinator
 from server.task_board.models import DeployLockedError, TaskConflictError
 from server.task_board.repository import TaskRepository
-from server.task_board.workspaces import prepare_workspace
+from server.task_board import workspaces as ws
+from server.task_board.workspaces import prepare_workspace, strip_remote_userinfo
 
 
 def _git(cwd, *args):
@@ -280,6 +281,12 @@ async def test_stage_refuses_an_unpushed_commit_before_planning(store, tmp_path,
             task.id, run.id, server_root=layout.slot_path("a"), stage_runner=FakeStageRunner()
         )
     assert [op for op in await repo.list_delivery_ops(delivery.id) if op.kind == "deploy_stage"] == []
+    assert await repo.list_deployments() == []
+    assert await repo.get_delivery(delivery.id) == delivery
+    assert not [
+        event for event in await repo.list_task_events(task.id)
+        if event.kind.startswith("delivery_op_")
+    ]
 
 
 @pytest.mark.asyncio
@@ -302,6 +309,64 @@ async def test_stage_clones_a_verified_remote_commit(store, tmp_path, monkeypatc
     assert fetch == ["git", "fetch", str(bare), delivery.attempt_head]
     deployment = (await repo.list_deployments())[0]
     assert deployment.source_repo == str(bare)
+
+
+@pytest.mark.asyncio
+async def test_stage_verifies_the_exact_ssh_url_it_fetches(store, tmp_path, monkeypatch):
+    """SSH's `git@` is an identity, not disposable HTTP credential userinfo."""
+    db, repo, tmp, agent = store
+    _board, task, run, _src, delivery = await _ready_delivery(db, repo, tmp, agent)
+    source = "ssh://git@example.test/owner/owlery.git"
+    seen: list[str] = []
+
+    _git(Path(delivery.repository), "remote", "add", "origin", source)
+
+    async def remote_has_commit(_repo, remote, _sha):
+        seen.append(remote)
+        return True
+
+    monkeypatch.setattr(ws, "remote_has_commit", remote_has_commit)
+    layout = _init_layout(tmp_path / "deploy", monkeypatch)
+    coord = DeliveryCoordinator()
+    coord.bind(db=db, connectors=None, notify_terminal=None, repo=repo)
+    runner = FakeStageRunner()
+
+    await coord.deploy_stage(
+        task.id, run.id, server_root=layout.slot_path("a"), stage_runner=runner
+    )
+    assert strip_remote_userinfo(source) == source
+    assert strip_remote_userinfo("https://token@example.test/owner/owlery.git") == (
+        "https://example.test/owner/owlery.git"
+    )
+    assert seen == [source]
+    fetch = next(argv for argv, _, _ in runner.calls if argv[:2] == ["git", "fetch"])
+    assert fetch == ["git", "fetch", source, delivery.attempt_head]
+
+
+@pytest.mark.asyncio
+async def test_stage_refuses_an_unreachable_remote_before_planning(store, tmp_path, monkeypatch):
+    db, repo, tmp, agent = store
+    _board, task, run, _src, delivery = await _ready_delivery(db, repo, tmp, agent)
+    _git(Path(delivery.repository), "remote", "add", "origin", "https://example.test/owner/owlery.git")
+    layout = _init_layout(tmp_path / "deploy", monkeypatch)
+    coord = DeliveryCoordinator()
+    coord.bind(db=db, connectors=None, notify_terminal=None, repo=repo)
+
+    async def unavailable(_repo, _remote, _sha):
+        raise ws.WorkspaceError("network unreachable")
+
+    monkeypatch.setattr(ws, "remote_has_commit", unavailable)
+    with pytest.raises(TaskConflictError, match="remote_source_unavailable"):
+        await coord.deploy_stage(
+            task.id, run.id, server_root=layout.slot_path("a"), stage_runner=FakeStageRunner()
+        )
+    assert [op for op in await repo.list_delivery_ops(delivery.id) if op.kind == "deploy_stage"] == []
+    assert await repo.list_deployments() == []
+    assert await repo.get_delivery(delivery.id) == delivery
+    assert not [
+        event for event in await repo.list_task_events(task.id)
+        if event.kind.startswith("delivery_op_")
+    ]
 
 
 @pytest.mark.asyncio

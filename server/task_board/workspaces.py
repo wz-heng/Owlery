@@ -332,12 +332,13 @@ async def _git(
 
 
 def strip_remote_userinfo(url: str | None) -> str | None:
-    """Drop any ``user[:pass]@`` from an https remote URL (secret hygiene, §13)."""
+    """Drop HTTP(S) inline credentials, but preserve SSH login identities."""
     if not url:
         return url
-    # Only scheme://userinfo@host forms carry inline secrets; scp-style
-    # ``git@host:owner/repo`` has no password and is left as-is.
-    match = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@]*@(.*)$", url)
+    # ``ssh://git@host/...`` needs its `git` login user to work.  Only HTTP(S)
+    # userinfo can be an inline password/token we must keep out of durable rows
+    # and subprocess arguments. Scp-style ``git@host:owner/repo`` is unchanged.
+    match = re.match(r"^(https?://)[^/@]*@(.*)$", url, flags=re.IGNORECASE)
     if match:
         return f"{match.group(1)}{match.group(2)}"
     return url

@@ -310,7 +310,7 @@ class DeliveryCoordinator:
             )
         try:
             present = await ws.remote_has_commit(
-                delivery.repository, remote, delivery.attempt_head or ""
+                delivery.repository, remote_url, delivery.attempt_head or ""
             )
         except ws.WorkspaceError as exc:
             raise TaskConflictError(

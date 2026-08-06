@@ -435,8 +435,9 @@ def stage_slot(
 
       0. clone the board repo into the slot if it has no checkout yet — the idle
          slot may be staged lazily on the first deploy (§3.1);
-      1. ``git fetch <repo_path> <sha>`` — bring the exact reviewed object in by
-         local path, no network (§2);
+      1. ``git fetch <repo_path> <sha>`` — bring the exact remote-verified
+         object into the slot. ``repo_path`` is the configured remote URL, not
+         an unchecked local worktree (§2);
       2. ``git checkout --detach <sha>`` — the exact sha, never a branch name
          that could move (§5.2);
       3. create the slot venv at its final path if absent, then
