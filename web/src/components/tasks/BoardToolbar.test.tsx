@@ -117,4 +117,15 @@ describe("BoardToolbar concurrency limits", () => {
       expect.objectContaining({ max_running: 4, max_running_per_agent: null })
     );
   });
+
+  it("prefills and saves the local deployment opt-in", async () => {
+    const { onUpdateBoard } = renderToolbar({ selectedBoard: board({ allow_local_deploy: true }) });
+    openSettings();
+    const optIn = screen.getByLabelText("Enable local deployment");
+    expect(optIn).toBeChecked();
+    fireEvent.click(optIn);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onUpdateBoard).toHaveBeenCalledTimes(1));
+    expect(onUpdateBoard).toHaveBeenCalledWith(expect.objectContaining({ allow_local_deploy: false }));
+  });
 });

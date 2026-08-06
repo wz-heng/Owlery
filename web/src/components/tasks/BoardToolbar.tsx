@@ -281,6 +281,7 @@ function BoardFormDialog({ mode, board, mutating, onClose, onSave, onArchive }: 
   const [defaultMerge, setDefaultMerge] = useState<"none" | "fast_forward_only">(
     board?.git_delivery_default_merge ?? "none"
   );
+  const [allowLocalDeploy, setAllowLocalDeploy] = useState(board?.allow_local_deploy ?? false);
   const maxRunningParsed = parseLimit(maxRunning);
   const maxRunningPerAgentParsed = parseLimit(maxRunningPerAgent);
   const limitsValid = maxRunningParsed.valid && maxRunningPerAgentParsed.valid;
@@ -303,6 +304,7 @@ function BoardFormDialog({ mode, board, mutating, onClose, onSave, onArchive }: 
             git_delivery_author_email: deliveryAuthorEmail.trim(),
             git_delivery_default_draft_pr: draftPr,
             git_delivery_default_merge: defaultMerge,
+            allow_local_deploy: allowLocalDeploy,
           });
         }}
       >
@@ -356,6 +358,7 @@ function BoardFormDialog({ mode, board, mutating, onClose, onSave, onArchive }: 
               <Field label="Author email"><input required type="email" className="task-input" value={deliveryAuthorEmail} onChange={(event) => setDeliveryAuthorEmail(event.target.value)} /></Field>
               <Field label="Default merge"><select className="task-input" value={defaultMerge} onChange={(event) => setDefaultMerge(event.target.value as "none" | "fast_forward_only")}><option value="none">No automatic merge</option><option value="fast_forward_only">Fast-forward only</option></select></Field>
               <label className="flex items-center gap-2 self-end pb-2 text-xs text-ink-700"><input type="checkbox" checked={draftPr} onChange={(event) => setDraftPr(event.target.checked)} /> Open pull requests as drafts</label>
+              <label className="flex items-center gap-2 text-xs text-ink-700 sm:col-span-2"><input type="checkbox" checked={allowLocalDeploy} onChange={(event) => setAllowLocalDeploy(event.target.checked)} aria-label="Enable local deployment" /> Enable local deployment (stage, switch, and rollback)</label>
             </div>
           </fieldset>
         </div>
