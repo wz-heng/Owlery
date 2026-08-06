@@ -186,6 +186,11 @@ interface SessionStore {
   connected: boolean;
   setConnected: (c: boolean) => void;
 
+  // Ephemeral deployment handoff notice. It is set from the server-wide WS
+  // broadcast and cleared once the replacement server's health endpoint is up.
+  deployRestarting: { opId: string; toSlot: string; sha: string } | null;
+  setDeployRestarting: (notice: { opId: string; toSlot: string; sha: string } | null) => void;
+
   // FileViewerDialog is mounted at the App level and reads this slot.
   // null = closed; non-null = open and fetching the named file. Set
   // by ChatView when the `/showme` resolver returns a concrete path.
@@ -473,6 +478,9 @@ export const useSessionStore = create<SessionStore>((set) => ({
 
   connected: false,
   setConnected: (c) => set({ connected: c }),
+
+  deployRestarting: null,
+  setDeployRestarting: (notice) => set({ deployRestarting: notice }),
 
   viewer: null,
   openViewer: (sessionId, path) => set({ viewer: { sessionId, path } }),

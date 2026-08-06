@@ -41,6 +41,16 @@ export function shouldApplyWsEvent(
   return seq > b;
 }
 
+/** Reload only after a completed handoff actually changed the served build.
+ * A health-check rollback returns to the original sha, so it must not turn a
+ * temporary restart notice into an unnecessary reload loop. */
+export function shouldReloadForDeploySha(
+  loadedSha: string | null,
+  healthySha: string | null
+): boolean {
+  return !!loadedSha && !!healthySha && loadedSha !== healthySha;
+}
+
 /** Map a session snapshot's `pending_park` (from `GET /api/sessions/{id}`) to
  * the store's ParkedTurn, or null when the session isn't parked.
  *
@@ -72,6 +82,7 @@ function handleWsMessage(data: Record<string, unknown>) {
     removePendingQuestion,
     setLastAppliedSeq,
     lastAppliedSeq,
+    setDeployRestarting,
   } = getState();
   const sessionId = data.session_id as string;
   const type = data.type as string;
@@ -85,6 +96,13 @@ function handleWsMessage(data: Record<string, unknown>) {
   }
 
   switch (type) {
+    case "server_restarting":
+      setDeployRestarting({
+        opId: String(data.op_id ?? ""),
+        toSlot: String(data.to_slot ?? ""),
+        sha: String(data.sha ?? ""),
+      });
+      break;
     case "task_event": {
       const boardId = typeof data.board_id === "string" ? data.board_id : "";
       const taskId = typeof data.task_id === "string" ? data.task_id : null;
@@ -427,6 +445,7 @@ function handleWsMessage(data: Record<string, unknown>) {
 export function useWebSocket() {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const deployShaRef = useRef<string | null>(null);
   const token = useSessionStore((s) => s.token);
 
   useEffect(() => {
@@ -442,6 +461,23 @@ export function useWebSocket() {
       ws.onopen = () => {
         getState().setConnected(true);
         if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+
+        // The handoff briefly disconnects this socket. Compare the new server's
+        // build sha before clearing the notice: a changed Vite asset graph needs
+        // one hard reload; an automatic health rollback serves the old sha again
+        // and keeps this tab intact.
+        void fetch(`${window.location.origin}/health`)
+          .then((response) => (response.ok ? response.json() : null))
+          .then((health) => {
+            const sha = typeof health?.sha === "string" ? health.sha : null;
+            if (shouldReloadForDeploySha(deployShaRef.current, sha)) {
+              window.location.reload();
+              return;
+            }
+            if (sha) deployShaRef.current = sha;
+            getState().setDeployRestarting(null);
+          })
+          .catch(() => {});
 
         // Re-fetch state after reconnect
         const { activeSessionId, token: t } = getState();
