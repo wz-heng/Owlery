@@ -28,6 +28,9 @@ export type DeliveryActionKind =
   | "push"
   | "pull_request"
   | "merge"
+  | "deploy_stage"
+  | "deploy_switch"
+  | "rollback"
   | "teardown";
 
 export interface DeliveryConfirmation {
@@ -37,6 +40,7 @@ export interface DeliveryConfirmation {
   confirmation: string;
   verb: string;
   message: string;
+  deploymentId?: string;
 }
 
 export interface DeliveryActionOptions {
@@ -44,6 +48,8 @@ export interface DeliveryActionOptions {
   mergeStrategy?: MergeStrategy;
   connectorInstallationId?: string;
   draft?: boolean;
+  drain?: boolean;
+  switchWhenIdle?: boolean;
 }
 
 export type TaskBoardView = "kanban" | "tree";
@@ -173,7 +179,7 @@ interface TaskState {
   deliveryAction(
     taskId: string,
     runId: string,
-    action: "commit" | "push" | "pull_request" | "merge",
+    action: "commit" | "push" | "pull_request" | "merge" | "deploy_stage" | "deploy_switch",
     options?: DeliveryActionOptions
   ): Promise<boolean>;
   teardownDelivery(
@@ -181,6 +187,7 @@ interface TaskState {
     runId: string,
     options?: { retention?: string; confirmations?: Record<string, boolean> }
   ): Promise<boolean>;
+  rollbackDeployment(taskId: string, runId: string, deploymentId: string, confirm?: boolean): Promise<boolean>;
   clearDeliveryConfirmation(): void;
 }
 
@@ -239,7 +246,8 @@ async function runDeliveryCall(
   taskId: string,
   runId: string,
   action: DeliveryActionKind,
-  call: () => Promise<TaskDelivery>
+  call: () => Promise<TaskDelivery>,
+  deploymentId?: string,
 ): Promise<boolean> {
   set({ mutating: true, error: null });
   try {
@@ -260,6 +268,7 @@ async function runDeliveryCall(
           confirmation: error.confirmation,
           verb: error.action ?? action,
           message: error.message,
+          deploymentId,
         },
       });
       return false;
@@ -657,6 +666,13 @@ export const useTaskStore = create<TaskState>((set, get) => ({
             merge_strategy: options.mergeStrategy,
             confirmations: options.confirmations,
           });
+        case "deploy_stage":
+          return taskApi.deployStage(token, taskId, runId);
+        case "deploy_switch":
+          return taskApi.deploySwitch(token, taskId, runId, {
+            drain: options.drain,
+            switch_when_idle: options.switchWhenIdle,
+          });
       }
       throw new Error(`Unknown delivery action: ${action}`);
     });
@@ -667,6 +683,10 @@ export const useTaskStore = create<TaskState>((set, get) => ({
         retention: options.retention,
         confirmations: options.confirmations,
       })
+    ),
+  rollbackDeployment: (taskId, runId, deploymentId, confirm = false) =>
+    runDeliveryCall(set, taskId, runId, "rollback", () =>
+      taskApi.rollbackDeployment(get().token, deploymentId, confirm), deploymentId
     ),
   clearDeliveryConfirmation: () => set({ deliveryConfirmation: null }),
 }));

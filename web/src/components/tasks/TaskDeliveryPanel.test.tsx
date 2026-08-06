@@ -54,6 +54,8 @@ function delivery(overrides: Partial<TaskDelivery> = {}): TaskDelivery {
     retention: "keep",
     reason_kind: null,
     reason_detail: null,
+    deployed_sha: null,
+    deployed_slot: null,
     created_at: "2026-07-27T00:02:01Z",
     updated_at: "2026-07-27T00:02:01Z",
     ...overrides,
@@ -100,7 +102,7 @@ describe("TaskDeliveryPanel", () => {
     const accept = vi.spyOn(taskApi, "acceptDelivery").mockResolvedValue(
       delivery({ status: "ready" })
     );
-    render(<TaskDeliveryPanel run={run} />);
+    render(<TaskDeliveryPanel run={run} allowLocalDeploy={false} />);
     useTaskStore.setState({ token: "token" });
 
     expect(screen.getByText("Not accepted")).toBeInTheDocument();
@@ -115,7 +117,7 @@ describe("TaskDeliveryPanel", () => {
 
   it("enables only legal actions and renders the durable op log", () => {
     seed(delivery(), [op()]);
-    render(<TaskDeliveryPanel run={run} />);
+    render(<TaskDeliveryPanel run={run} allowLocalDeploy={false} />);
 
     expect(screen.getByLabelText("Git delivery")).toHaveTextContent("ready");
     expect(screen.getByRole("button", { name: "Accept" })).toBeDisabled();
@@ -138,7 +140,7 @@ describe("TaskDeliveryPanel", () => {
       }),
       [op({ state: "interrupted", error: "server restarted" })]
     );
-    render(<TaskDeliveryPanel run={run} />);
+    render(<TaskDeliveryPanel run={run} allowLocalDeploy={false} />);
 
     expect(screen.getByText(/interrupted:/)).toBeInTheDocument();
     expect(screen.getByText(/external effect is unknown/)).toBeInTheDocument();
@@ -151,7 +153,7 @@ describe("TaskDeliveryPanel", () => {
     const teardown = vi.spyOn(taskApi, "teardownDelivery").mockResolvedValue(
       delivery({ status: "delivered", retention: "remove_worktree_keep_branch" })
     );
-    render(<TaskDeliveryPanel run={run} />);
+    render(<TaskDeliveryPanel run={run} allowLocalDeploy={false} />);
     useTaskStore.setState({ token: "token" });
 
     fireEvent.change(screen.getByLabelText("Retention"), {
@@ -164,6 +166,39 @@ describe("TaskDeliveryPanel", () => {
         confirmations: undefined,
       })
     );
+  });
+
+  it("shows the opt-in deploy controls and stages a settled delivery", async () => {
+    seed(delivery());
+    useTaskStore.setState({ token: "token" });
+    const deployments = vi.spyOn(taskApi, "deployments").mockResolvedValue({
+      deployments: [],
+      live: null,
+    });
+    const stage = vi.spyOn(taskApi, "deployStage").mockResolvedValue(delivery());
+
+    render(<TaskDeliveryPanel run={run} allowLocalDeploy />);
+
+    expect(screen.getByLabelText("Local deploy")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Switch" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Stage" }));
+    await waitFor(() => expect(stage).toHaveBeenCalledWith("token", run.task_id, run.id));
+    await waitFor(() => expect(deployments).toHaveBeenCalled());
+  });
+
+  it("renders rollback only for this delivery's live deployment", async () => {
+    seed(delivery({ deployed_sha: "bbbbbbbbbbbb", deployed_slot: "b" }));
+    useTaskStore.setState({ token: "token" });
+    vi.spyOn(taskApi, "deployments").mockResolvedValue({
+      deployments: [{
+        id: "live-1", delivery_id: "delivery-1", task_id: run.task_id, op_id: "op-2",
+        slot: "b", sha: "bbbbbbbbbbbb", source_repo: "/repo", state: "live", journal: null,
+        created_at: "2026-07-27T00:00:00Z", updated_at: "2026-07-27T00:00:00Z",
+      }],
+      live: null,
+    });
+    render(<TaskDeliveryPanel run={run} allowLocalDeploy />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Rollback" })).toBeEnabled());
   });
 
   it("requires the typed destructive phrase before resubmitting", async () => {
@@ -183,7 +218,7 @@ describe("TaskDeliveryPanel", () => {
       delivery({ status: "delivered", pushed_ref: "refs/heads/owlery/task-1-run-1" })
     );
 
-    render(<TaskDeliveryPanel run={run} />);
+    render(<TaskDeliveryPanel run={run} allowLocalDeploy={false} />);
     const confirm = screen.getByRole("button", { name: "Confirm" });
     expect(confirm).toBeDisabled();
     fireEvent.change(screen.getByLabelText("confirmation phrase"), {

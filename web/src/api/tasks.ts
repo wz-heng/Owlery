@@ -186,6 +186,8 @@ export type DeliveryOpKind =
   | "push"
   | "pull_request"
   | "merge"
+  | "deploy_stage"
+  | "deploy_switch"
   | "branch_delete"
   | "worktree_remove";
 
@@ -221,6 +223,31 @@ export interface TaskDelivery {
   retention: DeliveryRetention;
   reason_kind: string | null;
   reason_detail: string | null;
+  deployed_sha: string | null;
+  deployed_slot: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export type DeploymentState =
+  | "staging"
+  | "staged"
+  | "switching"
+  | "live"
+  | "rolled_back"
+  | "superseded"
+  | "failed";
+
+export interface Deployment {
+  id: string;
+  delivery_id: string | null;
+  task_id: string | null;
+  op_id: string | null;
+  slot: string;
+  sha: string;
+  source_repo: string;
+  state: DeploymentState;
+  journal: Record<string, unknown> | null;
   created_at: string;
   updated_at: string;
 }
@@ -539,5 +566,29 @@ export const taskApi = {
     mutate<TaskDelivery>(token, `/api/tasks/${taskId}/runs/${runId}/delivery/teardown`, "POST", {
       retention: body.retention,
       confirmations: body.confirmations ?? {},
+    }),
+  deployStage: (token: string, taskId: string, runId: string) =>
+    mutate<TaskDelivery>(
+      token,
+      `/api/tasks/${taskId}/runs/${runId}/delivery/deploy/stage`,
+      "POST"
+    ),
+  deploySwitch: (
+    token: string,
+    taskId: string,
+    runId: string,
+    body: { drain?: boolean; switch_when_idle?: boolean } = {}
+  ) =>
+    mutate<TaskDelivery>(
+      token,
+      `/api/tasks/${taskId}/runs/${runId}/delivery/deploy/switch`,
+      "POST",
+      body
+    ),
+  deployments: (token: string) =>
+    get<{ deployments: Deployment[]; live: Deployment | null }>(token, "/api/deployments"),
+  rollbackDeployment: (token: string, deploymentId: string, confirmRollback = false) =>
+    mutate<TaskDelivery>(token, `/api/deployments/${deploymentId}/rollback`, "POST", {
+      confirm_rollback: confirmRollback,
     }),
 };

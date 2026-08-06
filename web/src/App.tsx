@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { IconClipboardList, IconMenu2 } from "@tabler/icons-react";
+import { IconClipboardList, IconLoader2, IconMenu2 } from "@tabler/icons-react";
 import { AccountDropdown } from "./components/AccountDropdown";
 import { AgentList } from "./components/AgentList";
 import { AgentSettings } from "./components/AgentSettings";
@@ -105,6 +105,7 @@ function AuthenticatedApp({
   const { sendMessage, interrupt, approveTool, denyTool, answerQuestion } =
     useWebSocket();
   const connected = useSessionStore((s) => s.connected);
+  const deployRestarting = useSessionStore((s) => s.deployRestarting);
   const token = useSessionStore((s) => s.token);
   const setToken = useSessionStore((s) => s.setToken);
   const agents = useSessionStore((s) => s.agents);
@@ -147,6 +148,12 @@ function AuthenticatedApp({
 
   return (
     <div className="app-layout">
+      {deployRestarting && (
+        <div className="fixed inset-x-0 top-0 z-[60] flex items-center justify-center gap-2 border-b border-attention/30 bg-attention-surface px-4 py-2 text-xs font-medium text-attention shadow-sm" role="status">
+          <IconLoader2 size={15} className="animate-spin" />
+          Deploying {deployRestarting.sha.slice(0, 10)} to slot {deployRestarting.toSlot} — back in a moment.
+        </div>
+      )}
       <aside
         className={`sidebar ${sidebarOpen ? "open" : ""}`}
         aria-label="Sidebar"

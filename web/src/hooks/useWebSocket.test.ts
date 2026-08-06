@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { parkedTurnFromSnapshot, shouldApplyWsEvent } from "./useWebSocket";
+import { parkedTurnFromSnapshot, shouldApplyWsEvent, shouldReloadForDeploySha } from "./useWebSocket";
 
 /** Snapshot-baseline dedup primitive.
  *
@@ -37,6 +37,15 @@ describe("shouldApplyWsEvent", () => {
     // baseline=0 means "seq 0 is in the snapshot, but seq 1+ are not"
     expect(shouldApplyWsEvent(0, 0)).toBe(false);
     expect(shouldApplyWsEvent(1, 0)).toBe(true);
+  });
+});
+
+describe("shouldReloadForDeploySha", () => {
+  it("reloads only when a known served build changes", () => {
+    expect(shouldReloadForDeploySha("old", "new")).toBe(true);
+    expect(shouldReloadForDeploySha("same", "same")).toBe(false);
+    expect(shouldReloadForDeploySha(null, "new")).toBe(false);
+    expect(shouldReloadForDeploySha("old", null)).toBe(false);
   });
 });
 

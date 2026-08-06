@@ -63,6 +63,8 @@ function delivery(overrides: Partial<TaskDelivery> = {}): TaskDelivery {
     retention: "keep",
     reason_kind: null,
     reason_detail: null,
+    deployed_sha: null,
+    deployed_slot: null,
     created_at: "2026-07-26T00:00:00Z",
     updated_at: "2026-07-26T00:00:00Z",
     ...overrides,

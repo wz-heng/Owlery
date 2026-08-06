@@ -42,7 +42,7 @@ from server.deploy import DeployLayout
 from server.task_board.delivery import DeliveryCoordinator
 from server.task_board.deploy_quiesce import BusySource, DeployQuiesce
 from server.task_board.manager import DeployProbation, TaskBoardManager
-from server.task_board.models import TaskConflictError
+from server.task_board.models import DeliveryConfirmationRequired, TaskConflictError
 from server.task_board.repository import TaskRepository
 from server.task_board.workspaces import prepare_workspace
 
@@ -702,6 +702,62 @@ async def test_reconcile_switched_ok_supersedes_prior_live(store, monkeypatch):
 
     assert (await repo.get_deployment("priorlive")).state == "superseded"
     assert (await repo.get_deployment(staged.id)).state == "live"
+
+
+@pytest.mark.asyncio
+async def test_confirmed_rollback_reuses_the_switch_handoff(store, monkeypatch):
+    """A later rollback is a fresh deploy_switch targeting the superseded slot,
+    with the same snapshot/journal/quiesce handoff — never a direct symlink flip."""
+    db, repo, tmp, agent = store
+    m, coord, op, staged, layout, (task, run, delivery) = await _handed_off(
+        db, repo, tmp, agent, monkeypatch
+    )
+    async with repo._transaction() as conn:
+        await conn.execute(
+            "INSERT INTO deployments (id, delivery_id, task_id, op_id, slot, sha, "
+            "source_repo, state, journal, created_at, updated_at) VALUES "
+            "('priorlive', ?, ?, NULL, 'a', 'oldsha', 'x', 'live', NULL, "
+            "'2020-01-01T00:00:00+00:00', '2020-01-01T00:00:00+00:00')",
+            (delivery.id, task.id),
+        )
+    _append(layout, op.id, switcher.STEP_SWITCHED_OK, {"slot": "b", "sha": staged.sha})
+    await m.reconcile_deploy_switch_ops()
+    layout.switch_current("b")
+
+    with pytest.raises(DeliveryConfirmationRequired) as refused:
+        await coord.deploy_rollback(
+            staged.id, confirm_rollback=False, server_root=layout.slot_path("b")
+        )
+    assert refused.value.confirmation == "confirm_rollback"
+
+    await coord.deploy_rollback(
+        staged.id, confirm_rollback=True, server_root=layout.slot_path("b")
+    )
+    target = await repo.get_deployment("priorlive")
+    assert target.state == "switching"
+    rollback_op = [
+        item for item in await repo.list_delivery_ops(delivery.id)
+        if item.kind == "deploy_switch" and item.id != op.id
+    ]
+    assert len(rollback_op) == 1 and rollback_op[0].state == "running"
+    entries = switcher.Journal(str(layout.journal_path)).entries(rollback_op[0].id)
+    tail = entries[-1]
+    assert tail["detail"]["to_slot"] == "a" and tail["detail"]["new_sha"] == "oldsha"
+
+    # A failed health check restores the pre-handoff DB snapshot. That snapshot
+    # predates `superseded -> switching`, so terminal reconciliation must locate
+    # the exact rollback target without its op_id binding.
+    async with repo._transaction() as conn:
+        await conn.execute(
+            "UPDATE deployments SET state='superseded', op_id=NULL WHERE id='priorlive'"
+        )
+    await repo.finalize_deploy_rolled_back(
+        rollback_op[0].id,
+        reason="health_timeout",
+        target_slot="a",
+        target_sha="oldsha",
+    )
+    assert (await repo.get_deployment("priorlive")).state == "rolled_back"
 
 
 @pytest.mark.asyncio

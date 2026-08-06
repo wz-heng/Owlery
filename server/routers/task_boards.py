@@ -1092,6 +1092,15 @@ class DeliveryTeardownRequest(BaseModel):
     confirmations: dict[str, bool] = Field(default_factory=dict)
 
 
+class DeploySwitchRequest(BaseModel):
+    drain: bool = False
+    switch_when_idle: bool = False
+
+
+class DeployRollbackRequest(BaseModel):
+    confirm_rollback: bool = False
+
+
 class WorkerDeliveryRequest(BaseModel):
     note: str | None = None
 
@@ -1211,6 +1220,89 @@ async def delivery_teardown(
                 task_id, run_id, retention=req.retention,
                 confirmations=req.confirmations,
                 actor_kind=actor_kind, actor_agent_id=actor_agent_id,
+            )
+        )
+    )
+
+
+@router.post("/api/tasks/{task_id}/runs/{run_id}/delivery/deploy/stage")
+async def delivery_deploy_stage(
+    task_id: str,
+    run_id: str,
+    caller_session_id: str | None = Header(default=None, alias="X-Owlery-Session-ID"),
+    _: str = Depends(verify_token),
+):
+    """Stage may be requested by a human or a trusted orchestrator agent."""
+    actor_kind, actor_agent_id = await _delivery_actor(caller_session_id)
+    return _dict(
+        await _run(
+            _get_manager().deploy_stage(
+                task_id, run_id, actor_kind=actor_kind, actor_agent_id=actor_agent_id,
+            )
+        )
+    )
+
+
+@router.post("/api/tasks/{task_id}/runs/{run_id}/delivery/deploy/switch")
+async def delivery_deploy_switch(
+    task_id: str,
+    run_id: str,
+    req: DeploySwitchRequest | None = None,
+    caller_session_id: str | None = Header(default=None, alias="X-Owlery-Session-ID"),
+    _: str = Depends(verify_token),
+):
+    """A restart is deliberately human-only; agents may stage but never switch."""
+    actor_kind, actor_agent_id = await _delivery_actor(caller_session_id)
+    if actor_kind != "user":
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            {"code": "deploy_switch_user_only", "message": "deploy switch requires a human caller"},
+        )
+    req = req or DeploySwitchRequest()
+    return _dict(
+        await _run(
+            _get_manager().deploy_switch(
+                task_id,
+                run_id,
+                drain=req.drain,
+                switch_when_idle=req.switch_when_idle,
+                actor_kind=actor_kind,
+                actor_agent_id=actor_agent_id,
+            )
+        )
+    )
+
+
+@router.get("/api/deployments")
+async def list_deployments(_: str = Depends(verify_token)):
+    deployments = await _run(_get_manager().list_deployments())
+    live = next((item for item in deployments if item.state == "live"), None)
+    return {
+        "deployments": [_dict(item) for item in deployments],
+        "live": _dict(live) if live is not None else None,
+    }
+
+
+@router.post("/api/deployments/{deployment_id}/rollback")
+async def deployment_rollback(
+    deployment_id: str,
+    req: DeployRollbackRequest,
+    caller_session_id: str | None = Header(default=None, alias="X-Owlery-Session-ID"),
+    _: str = Depends(verify_token),
+):
+    actor_kind, actor_agent_id = await _delivery_actor(caller_session_id)
+    if actor_kind != "user":
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            {"code": "deploy_rollback_user_only", "message": "deploy rollback requires a human caller"},
+        )
+    return _dict(
+        await _run(
+            _get_manager().deploy_rollback(
+                deployment_id,
+                confirm_rollback=req.confirm_rollback,
+                actor_kind=actor_kind,
+                actor_agent_id=actor_agent_id,
             )
         )
     )
