@@ -51,6 +51,20 @@ class _Manager:
         self.calls.append(("teardown", {"task_id": task_id, "run_id": run_id, **kw}))
         return _Delivery(status="delivered")
 
+    async def deploy_stage(self, task_id, run_id, **kw):
+        self.calls.append(("deploy_stage", {"task_id": task_id, "run_id": run_id, **kw}))
+        return _Delivery(status="ready")
+
+    async def deploy_switch(self, task_id, run_id, **kw):
+        self.calls.append(("deploy_switch", {"task_id": task_id, "run_id": run_id, **kw}))
+        return _Delivery(status="ready")
+
+    async def list_deployments(self):
+        return [
+            type("Deployment", (), {"state": "live", "to_dict": lambda self: {"id": "dep1", "state": "live"}})(),
+            type("Deployment", (), {"state": "superseded", "to_dict": lambda self: {"id": "dep0", "state": "superseded"}})(),
+        ]
+
     async def request_delivery(self, task_id, run_id, session_id, **kw):
         self.calls.append(("worker_request", {"task_id": task_id, "run_id": run_id,
                                               "session_id": session_id, **kw}))
@@ -136,6 +150,42 @@ async def test_requires_confirmation_409(client):
     assert detail["code"] == "requires_confirmation"
     assert detail["confirmation"] == "allow_force_push" and detail["action"] == "push"
     assert detail["current"]["status"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_deploy_stage_switch_and_history_routing(client, monkeypatch):
+    c, manager = client
+    r = await c.post("/api/tasks/t1/runs/r1/delivery/deploy/stage", headers=HEADERS)
+    assert r.status_code == 200
+    assert manager.calls[-1] == ("deploy_stage", {
+        "task_id": "t1", "run_id": "r1", "actor_kind": "user", "actor_agent_id": None,
+    })
+
+    r = await c.post(
+        "/api/tasks/t1/runs/r1/delivery/deploy/switch",
+        json={"drain": True, "switch_when_idle": True}, headers=HEADERS,
+    )
+    assert r.status_code == 200
+    assert manager.calls[-1] == ("deploy_switch", {
+        "task_id": "t1", "run_id": "r1", "drain": True, "switch_when_idle": True,
+        "actor_kind": "user", "actor_agent_id": None,
+    })
+
+    r = await c.get("/api/deployments", headers=HEADERS)
+    assert r.status_code == 200
+    assert r.json() == {
+        "deployments": [{"id": "dep1", "state": "live"}, {"id": "dep0", "state": "superseded"}],
+        "live": {"id": "dep1", "state": "live"},
+    }
+
+    async def agent_actor(_session_id):
+        return "agent", "a1"
+
+    monkeypatch.setattr(routes, "_delivery_actor", agent_actor)
+    r = await c.post("/api/tasks/t1/runs/r1/delivery/deploy/switch", headers=HEADERS)
+    assert r.status_code == 403
+    assert r.json()["detail"]["code"] == "deploy_switch_user_only"
+    assert manager.calls[-1][0] == "deploy_switch"
 
 
 @pytest.mark.asyncio
