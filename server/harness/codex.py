@@ -222,6 +222,14 @@ class CodexEventParser(EventParser):
 
     def __init__(self) -> None:
         self._captured_thread_id: str | None = None
+        # Whether this turn produced ANY item output (a message, reasoning, or
+        # a tool call). A `turn.completed` with none of these — and no error /
+        # turn.failed — is the silent-empty-turn bug (e.g. a Codex session
+        # pinned to a Claude model name): we synthesize an explicit error
+        # instead of reporting a healthy but empty turn
+        # (budget-model-routing.md §4.3).
+        self._saw_output = False
+        self._saw_error = False
 
     def parse(self, obj: dict[str, Any]) -> ParseOutput:
         kind = obj.get("type")
@@ -239,6 +247,31 @@ class CodexEventParser(EventParser):
             return ParseOutput()
 
         if kind == "turn.completed":
+            if not self._saw_output and not self._saw_error:
+                # Nothing was emitted this turn and nothing failed — surface a
+                # concrete error rather than a silent, healthy-looking empty
+                # result. The most common cause is a model incompatible with
+                # the Codex backend (a Claude model name), which the routing
+                # validation layer now rejects up front; this is the last-line
+                # backstop for anything that slips through.
+                return ParseOutput(
+                    events=[
+                        HarnessEvent(
+                            type="result",
+                            session_id=self._captured_thread_id,
+                            is_error=True,
+                            content=(
+                                "Codex produced no output for this turn. This "
+                                "usually means the configured model is not valid "
+                                "for the Codex backend (for example, a Claude "
+                                "model name). Check the session/agent model."
+                            ),
+                            num_turns=1,
+                            raw=obj,
+                        )
+                    ],
+                    end_of_stream=True,
+                )
             usage = obj.get("usage") or {}
             return ParseOutput(
                 events=[
@@ -255,6 +288,7 @@ class CodexEventParser(EventParser):
             )
 
         if kind == "turn.failed":
+            self._saw_error = True
             err = obj.get("error")
             msg = err if isinstance(err, str) else (
                 (err or {}).get("message") if isinstance(err, dict) else None
@@ -273,6 +307,7 @@ class CodexEventParser(EventParser):
             )
 
         if kind == "error":
+            self._saw_error = True
             return ParseOutput(
                 events=[
                     HarnessEvent(
@@ -285,7 +320,10 @@ class CodexEventParser(EventParser):
             )
 
         if isinstance(kind, str) and kind.startswith("item."):
-            return ParseOutput(events=self._item_events(kind, obj))
+            events = self._item_events(kind, obj)
+            if events:
+                self._saw_output = True
+            return ParseOutput(events=events)
 
         logger.debug("Unhandled codex event type: %s", kind)
         return ParseOutput()

@@ -62,6 +62,22 @@ export interface Message {
   // (session-rewind.md §6.1). Absent on freshly-streamed messages until
   // the next detail reload.
   seq?: number;
+  // Structured error discriminator, present on `error` messages the backend
+  // tags — e.g. "budget_exceeded" for a hard budget block
+  // (budget-model-routing.md §3.2). Lets the chat render an actionable card
+  // instead of a generic red crash box.
+  code?: string;
+  // Budget detail carried by a hard-block error and by budget_warning
+  // messages (budget-model-routing.md §3.3), so the UI can show the offending
+  // scope/window/limit/spend.
+  budget?: {
+    scope: string;
+    agent_id: string | null;
+    window: string;
+    limit_usd: number;
+    spent_usd: number;
+    soft_pct?: number;
+  };
 }
 
 export interface QuestionOption {

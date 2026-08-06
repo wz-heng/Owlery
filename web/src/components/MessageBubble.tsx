@@ -8,6 +8,7 @@ import {
   IconFeather,
   IconRobot,
   IconAlertTriangle,
+  IconWallet,
 } from "@tabler/icons-react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -290,7 +291,32 @@ export function MessageBubble({
         </div>
       );
 
+    // Soft budget threshold crossed (budget-model-routing.md §3.2): the turn
+    // still ran, this is just a heads-up. Calm amber banner, centered — not an
+    // error, not attributed to a speaker.
+    case "budget_warning":
+      return (
+        <div className="msg msg-budget-warning flex justify-center py-1">
+          <div className="budget-warning-banner max-w-[85%] flex items-start gap-2 rounded-lg border border-attention/40 bg-attention-surface px-3 py-2 text-xs text-foreground">
+            <IconAlertTriangle
+              size={15}
+              className="text-attention-solid shrink-0 mt-0.5"
+            />
+            <span className="whitespace-pre-wrap break-words">
+              {message.content}
+            </span>
+          </div>
+        </div>
+      );
+
     case "error":
+      // A hard budget block is an expected, actionable stop — not a crash.
+      // Render it as its own calm card with the offending budget and the two
+      // ways forward (raise/disable the budget, or use a different agent),
+      // rather than the alarming red error box (budget-model-routing.md §3.2).
+      if (message.code === "budget_exceeded") {
+        return <BudgetBlockCard message={message} />;
+      }
       return (
         <div className="msg msg-error">
           <div className="msg-content sheet border border-destructive/40 bg-destructive-surface text-sm text-destructive shadow-[var(--elevation-raised)]">
@@ -310,6 +336,46 @@ export function MessageBubble({
     default:
       return null;
   }
+}
+
+/** Hard budget block (budget-model-routing.md §3.2). The turn was refused
+ * before running; the session stays healthy and resumable once the user raises
+ * or disables the budget (or routes the work to a different agent). */
+function BudgetBlockCard({ message }: { message: Message }) {
+  const b = message.budget;
+  const scopeLabel = b
+    ? b.scope === "global"
+      ? "Global"
+      : "Agent"
+    : "";
+  return (
+    <div className="msg msg-budget-block">
+      <div className="msg-content sheet border border-attention/40 bg-attention-surface text-sm text-foreground shadow-[var(--elevation-raised)]">
+        <Seal side="left" tone="ink">
+          <IconWallet />
+        </Seal>
+        <div className="msg-label sheet-rule">
+          <span>Budget reached</span>
+        </div>
+        <div className="whitespace-pre-wrap break-words">{message.content}</div>
+        {b && (
+          <div className="budget-block-detail mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+            <span>
+              {scopeLabel} · {b.window}
+            </span>
+            <span>
+              ${b.spent_usd.toFixed(4)} / ${b.limit_usd.toFixed(2)} spent
+            </span>
+          </div>
+        )}
+        <div className="budget-block-actions mt-2 text-xs text-muted-foreground">
+          Next steps: raise or disable this budget in Usage → Budgets
+          {b?.scope === "agent" ? " (or the agent's settings)" : ""}, or send
+          this work to a different agent.
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function ToolUseBlock({

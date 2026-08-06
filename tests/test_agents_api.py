@@ -435,3 +435,111 @@ async def test_schedule_from_text_unknown_agent(client):
         headers=HEADERS,
     )
     assert resp.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# Model routing validation (budget-model-routing.md §4.3)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_create_agent_cross_family_model_422(client):
+    resp = await client.post(
+        "/api/agents",
+        json={"name": "BadCodex", "backend": "codex", "model": "claude-opus-4"},
+        headers=HEADERS,
+    )
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+async def test_patch_agent_backend_switch_422(client):
+    agent = await _create_agent(
+        client, name="Switcher", backend="claude-code", model="claude-opus-4"
+    )
+    resp = await client.patch(
+        f"/api/agents/{agent['id']}",
+        json={"backend": "codex"},
+        headers=HEADERS,
+    )
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+async def test_create_agent_session_cross_family_model_422(client):
+    agent = await _create_agent(client, name="Coder", backend="codex")
+    resp = await client.post(
+        f"/api/agents/{agent['id']}/sessions",
+        json={"model": "claude-opus-4"},
+        headers=HEADERS,
+    )
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+async def test_create_session_with_valid_model_persists(client):
+    agent = await _create_agent(client, name="Pinned", backend="claude-code")
+    resp = await client.post(
+        "/api/sessions",
+        json={"agent_id": agent["id"], "model": "claude-opus-4"},
+        headers=HEADERS,
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["model"] == "claude-opus-4"
+
+
+@pytest.mark.asyncio
+async def test_create_session_cross_family_model_422(client):
+    agent = await _create_agent(client, name="Coder2", backend="codex")
+    resp = await client.post(
+        "/api/sessions",
+        json={"agent_id": agent["id"], "model": "claude-opus-4"},
+        headers=HEADERS,
+    )
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+async def test_create_session_backend_override_inherited_model_422(client):
+    """A backend override that omits `model` inherits the agent's model at run
+    time; validating only the request's model would let a cross-family
+    inherited mismatch through (Snape review — effective-model bypass)."""
+    agent = await _create_agent(
+        client, name="ClaudeAgent", backend="claude-code", model="claude-opus-4"
+    )
+    # /api/sessions with codex backend, model omitted → inherited claude model.
+    resp = await client.post(
+        "/api/sessions",
+        json={"agent_id": agent["id"], "backend": "codex"},
+        headers=HEADERS,
+    )
+    assert resp.status_code == 422, resp.text
+    # Same guard on the agent-scoped session route.
+    resp2 = await client.post(
+        f"/api/agents/{agent['id']}/sessions",
+        json={"backend": "codex"},
+        headers=HEADERS,
+    )
+    assert resp2.status_code == 422, resp2.text
+
+
+@pytest.mark.asyncio
+async def test_patch_agent_null_backend_still_validates_model(client):
+    """An explicit null backend in a PATCH keeps the existing backend (the DB
+    ignores a null on the non-null column), so a cross-family model in the same
+    PATCH must still be rejected against that kept backend (Snape review)."""
+    agent = await _create_agent(client, name="Keeper", backend="claude-code")
+    resp = await client.patch(
+        f"/api/agents/{agent['id']}",
+        json={"backend": None, "model": "gpt-5"},
+        headers=HEADERS,
+    )
+    assert resp.status_code == 422, resp.text
+    # Sanity: a valid model in the same null-backend shape still succeeds.
+    ok = await client.patch(
+        f"/api/agents/{agent['id']}",
+        json={"backend": None, "model": "claude-opus-4"},
+        headers=HEADERS,
+    )
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["model"] == "claude-opus-4"

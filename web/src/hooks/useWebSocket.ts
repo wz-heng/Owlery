@@ -9,6 +9,7 @@ import {
   type SessionStatus,
 } from "../stores/sessionStore";
 import { useTaskStore } from "../stores/taskStore";
+import { budgetWarningMessage, budgetErrorDetail } from "../lib/budgetEvents";
 
 type BgTaskStatus = BgTask["status"];
 
@@ -232,11 +233,24 @@ function handleWsMessage(data: Record<string, unknown>) {
       });
       break;
 
+    case "budget_warning":
+      // Soft-threshold notice injected once per window before a turn runs
+      // (budget-model-routing.md §3.2). Persisted server-side, so it also
+      // arrives in the snapshot on reload; render it as a calm inline banner.
+      // The wire→message lift is a pure, unit-tested mapper (lib/budgetEvents).
+      addMessage(sessionId, budgetWarningMessage(data));
+      break;
+
     case "error":
       addMessage(sessionId || "__global", {
         role: "system",
         type: "error",
         content: data.message as string,
+        // Carry the structured discriminator + budget detail when the turn was
+        // refused by a hard budget block (budget-model-routing.md §3.2) so the
+        // chat can render an actionable "budget reached" card.
+        code: typeof data.code === "string" ? (data.code as string) : undefined,
+        budget: budgetErrorDetail(data),
       });
       // The turn hit the user's own usage limit and is parked until the window
       // resets (limit-auto-resume.md §4). It comes back on its own — show the

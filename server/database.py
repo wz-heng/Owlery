@@ -52,6 +52,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     agent_id TEXT REFERENCES agents(id) ON DELETE CASCADE,  -- owner; nullable in SQLite, required by API
     origin TEXT NOT NULL DEFAULT 'user',   -- 'user' | 'schedule' | 'bridge' | 'delegation'
     backend TEXT NOT NULL DEFAULT 'claude-code',  -- 'claude-code' | 'codex' (codex-backend.md §4.1)
+    -- Session-level model override (budget-model-routing.md §4.1). NULL means
+    -- "inherit the owning agent's model, else the backend default"; a value
+    -- wins over the agent's model in resolve_model().
+    model TEXT,
     -- Agent-to-agent: a delegation child session points at the parent
     -- session it was spawned from. SET NULL on parent delete (orphan beats
     -- mass-delete; sessions are precious). NULL on every non-delegation
@@ -417,6 +421,37 @@ CREATE INDEX IF NOT EXISTS idx_turn_usage_agent_time
 CREATE INDEX IF NOT EXISTS idx_turn_usage_session
   ON turn_usage(session_id);
 
+-- Self-set spend gates (budget-model-routing.md §3.1). A budget caps Claude
+-- USD spend (turn_usage.cost) over a natural-calendar window, globally or per
+-- agent. Global and per-agent budgets co-exist; the tighter one wins at the
+-- pre-run checkpoint. `soft_warned_window` records the window-start key we last
+-- surfaced a soft warning for, so the one-time-per-window warning never
+-- re-fires within a window (a compare-and-set on write dedupes concurrent
+-- turns). No FK on agent_id: a budget outliving an agent-delete is harmless —
+-- it resolves to zero applicable spend — and the router already guards create.
+CREATE TABLE IF NOT EXISTS budgets (
+    id TEXT PRIMARY KEY,
+    scope TEXT NOT NULL CHECK (scope IN ('global', 'agent')),
+    agent_id TEXT,
+    window TEXT NOT NULL CHECK (window IN ('daily', 'weekly', 'monthly')),
+    limit_usd REAL NOT NULL CHECK (limit_usd > 0),
+    soft_pct REAL NOT NULL DEFAULT 0.8 CHECK (soft_pct > 0 AND soft_pct <= 1),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    soft_warned_window TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (
+        (scope = 'global' AND agent_id IS NULL)
+        OR (scope = 'agent' AND agent_id IS NOT NULL)
+    )
+);
+-- At most one budget per (scope, agent, window): a global daily + global weekly
+-- may co-exist, but not two global dailies.
+CREATE UNIQUE INDEX IF NOT EXISTS budgets_global_window
+  ON budgets(window) WHERE scope = 'global';
+CREATE UNIQUE INDEX IF NOT EXISTS budgets_agent_window
+  ON budgets(agent_id, window) WHERE scope = 'agent';
+
 -- Durable intent/coordination layer (task-board.md). TaskRepository owns all
 -- writes through a dedicated SQLite connection; this connection installs the
 -- additive schema and may read it for integration/recovery.
@@ -481,6 +516,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     workspace_mode TEXT
         CHECK (workspace_mode IS NULL OR workspace_mode IN ('shared', 'copy', 'git_worktree')),
     working_dir_override TEXT,
+    -- Per-task model override passed to the worker session at dispatch
+    -- (budget-model-routing.md §4.2). NULL = inherit the assignee agent's
+    -- model / backend default.
+    model TEXT,
     current_run_id TEXT,
     blocked_kind TEXT CHECK (
         blocked_kind IS NULL OR blocked_kind IN
@@ -848,6 +887,27 @@ class Database:
                     raise
 
         await self._migrate_delivery_op_kinds()
+
+        # sessions.model — per-session model override (budget-model-routing.md
+        # §4.1). Nullable, no DEFAULT: existing rows stay NULL and keep
+        # inheriting the agent/backend default via resolve_model().
+        try:
+            await self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN model TEXT"
+            )
+        except Exception:
+            pass
+
+        # tasks.model — per-task model override for the worker session
+        # (budget-model-routing.md §4.2). Nullable; the task board schema is a
+        # CREATE-IF-NOT-EXISTS in _SCHEMA (so new DBs already have it), this
+        # ALTER backfills pre-existing rows.
+        try:
+            await self._conn.execute(
+                "ALTER TABLE tasks ADD COLUMN model TEXT"
+            )
+        except Exception:
+            pass
         await self._migrate_agents()
         await self._migrate_schedule_recurrence()
         await self._migrate_schedule_run_at()
@@ -1401,14 +1461,15 @@ class Database:
         backend: str = "claude-code",
         parent_session_id: str | None = None,
         delegation_request: str | None = None,
+        model: str | None = None,
     ) -> None:
         await self._ensure_connected()
         await self._conn.execute(
             "INSERT INTO sessions "
             "(id, name, working_dir, created_at, claude_session_id, "
             " credential_id, agent_id, origin, backend, "
-            " parent_session_id, delegation_request) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " parent_session_id, delegation_request, model) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 session_id,
                 name,
@@ -1421,6 +1482,7 @@ class Database:
                 backend,
                 parent_session_id,
                 delegation_request,
+                model,
             ),
         )
         await self._conn.commit()
@@ -1444,6 +1506,7 @@ class Database:
         resume_id: str | None,
         fork_after_seq: int,
         fork_metadata: str | None = None,
+        model: str | None = None,
     ) -> None:
         """The DB-only half of the fork saga (session-rewind.md §5.1 step
         5): INSERT the fork `sessions` row (origin='fork',
@@ -1461,15 +1524,15 @@ class Database:
             await self._conn.execute(
                 "INSERT INTO sessions "
                 "(id, name, working_dir, created_at, claude_session_id, "
-                " credential_id, agent_id, origin, backend, "
+                " credential_id, agent_id, origin, backend, model, "
                 " forked_from_session_id, fork_after_seq, fork_needs_replay, "
                 " fork_status, fork_metadata) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'fork', ?, ?, ?, 0, "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'fork', ?, ?, ?, ?, 0, "
                 " 'initializing', ?)",
                 (
                     fork_id, name, working_dir, created_at, resume_id,
-                    credential_id, agent_id, backend, parent_id, fork_after_seq,
-                    fork_metadata,
+                    credential_id, agent_id, backend, model, parent_id,
+                    fork_after_seq, fork_metadata,
                 ),
             )
             await self._conn.execute(
@@ -1494,7 +1557,7 @@ class Database:
         await self._ensure_connected()
         query = (
             "SELECT id, name, working_dir, created_at, claude_session_id, "
-            "credential_id, archived, agent_id, origin, backend, "
+            "credential_id, archived, agent_id, origin, backend, model, "
             "parent_session_id, delegation_request, forked_from_session_id, "
             "fork_after_seq, fork_needs_replay, fork_metadata, "
             "fork_revert_record, fork_status FROM sessions"
@@ -1515,14 +1578,15 @@ class Database:
                 "agent_id": row[7],
                 "origin": row[8] or "user",
                 "backend": row[9] or "claude-code",
-                "parent_session_id": row[10],
-                "delegation_request": row[11],
-                "forked_from_session_id": row[12],
-                "fork_after_seq": row[13],
-                "fork_needs_replay": bool(row[14]),
-                "fork_metadata": row[15],
-                "fork_revert_record": row[16],
-                "fork_status": row[17],
+                "model": row[10],
+                "parent_session_id": row[11],
+                "delegation_request": row[12],
+                "forked_from_session_id": row[13],
+                "fork_after_seq": row[14],
+                "fork_needs_replay": bool(row[15]),
+                "fork_metadata": row[16],
+                "fork_revert_record": row[17],
+                "fork_status": row[18],
             }
             for row in rows
         ]
@@ -3602,3 +3666,154 @@ class Database:
             "reasoning_tokens": agg[6] or 0,
             "total_tokens": agg[7] or 0,
         }
+
+    # --- Budgets (budget-model-routing.md §3) ---
+
+    _BUDGET_COLS = (
+        "id, scope, agent_id, window, limit_usd, soft_pct, enabled, "
+        "soft_warned_window, created_at, updated_at"
+    )
+
+    @staticmethod
+    def _row_to_budget(row: Any) -> dict[str, Any]:
+        return {
+            "id": row[0],
+            "scope": row[1],
+            "agent_id": row[2],
+            "window": row[3],
+            "limit_usd": row[4],
+            "soft_pct": row[5],
+            "enabled": bool(row[6]),
+            "soft_warned_window": row[7],
+            "created_at": row[8],
+            "updated_at": row[9],
+        }
+
+    async def create_budget(
+        self,
+        *,
+        scope: str,
+        window: str,
+        limit_usd: float,
+        agent_id: str | None = None,
+        soft_pct: float = 0.8,
+        enabled: bool = True,
+    ) -> dict[str, Any]:
+        """Insert a budget. Raises sqlite3.IntegrityError on a duplicate
+        (scope, agent, window) or a CHECK violation — the router maps those
+        to 409/422 respectively."""
+        await self._ensure_connected()
+        budget_id = uuid.uuid4().hex[:12]
+        now = datetime.now(timezone.utc).isoformat()
+        await self._conn.execute(
+            "INSERT INTO budgets (id, scope, agent_id, window, limit_usd, "
+            "soft_pct, enabled, soft_warned_window, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+            (
+                budget_id,
+                scope,
+                agent_id,
+                window,
+                limit_usd,
+                soft_pct,
+                int(bool(enabled)),
+                now,
+                now,
+            ),
+        )
+        await self._conn.commit()
+        created = await self.get_budget(budget_id)
+        assert created is not None
+        return created
+
+    async def list_budgets(
+        self, *, enabled_only: bool = False
+    ) -> list[dict[str, Any]]:
+        await self._ensure_connected()
+        query = f"SELECT {self._BUDGET_COLS} FROM budgets"
+        if enabled_only:
+            query += " WHERE enabled = 1"
+        query += " ORDER BY created_at, id"
+        cursor = await self._conn.execute(query)
+        return [self._row_to_budget(r) for r in await cursor.fetchall()]
+
+    async def get_budget(self, budget_id: str) -> dict[str, Any] | None:
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            f"SELECT {self._BUDGET_COLS} FROM budgets WHERE id = ?",
+            (budget_id,),
+        )
+        row = await cursor.fetchone()
+        return self._row_to_budget(row) if row else None
+
+    async def update_budget(
+        self, budget_id: str, **fields: Any
+    ) -> dict[str, Any] | None:
+        """Patch mutable fields (window/limit_usd/soft_pct/enabled). scope and
+        agent_id are identity and never change here. Unknown/None fields are
+        ignored; a no-op patch still returns the current row."""
+        await self._ensure_connected()
+        allowed = {"window", "limit_usd", "soft_pct", "enabled"}
+        updates: dict[str, Any] = {}
+        for k, v in fields.items():
+            if k not in allowed or v is None:
+                continue
+            updates[k] = int(bool(v)) if k == "enabled" else v
+        if updates:
+            updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+            set_clause = ", ".join(f"{k} = ?" for k in updates)
+            values = list(updates.values()) + [budget_id]
+            await self._conn.execute(
+                f"UPDATE budgets SET {set_clause} WHERE id = ?", values
+            )
+            await self._conn.commit()
+        return await self.get_budget(budget_id)
+
+    async def delete_budget(self, budget_id: str) -> bool:
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            "DELETE FROM budgets WHERE id = ?", (budget_id,)
+        )
+        await self._conn.commit()
+        return cursor.rowcount > 0
+
+    async def budget_spent_usd(
+        self, *, window_start: str, agent_id: str | None = None
+    ) -> float:
+        """Claude USD spent since `window_start` (inclusive).
+
+        `window_start` is a UTC `datetime.isoformat()` lower bound, the same
+        vocabulary as `turn_usage.created_at`, so the plain TEXT `>=` compare
+        the usage aggregation already relies on stays correct. SUM(cost)
+        ignores NULL costs (Codex turns → 0); COALESCE turns an all-NULL or
+        empty window into 0.0. When `agent_id` is given (agent-scoped budget)
+        only that agent's rows count; global budgets pass None and see all
+        spend, including `origin='research'`."""
+        await self._ensure_connected()
+        query = "SELECT COALESCE(SUM(cost), 0.0) FROM turn_usage WHERE created_at >= ?"
+        params: list[Any] = [window_start]
+        if agent_id is not None:
+            query += " AND agent_id = ?"
+            params.append(agent_id)
+        cursor = await self._conn.execute(query, params)
+        row = await cursor.fetchone()
+        return float(row[0] or 0.0)
+
+    async def mark_budget_soft_warned(
+        self, budget_id: str, window_key: str
+    ) -> bool:
+        """Compare-and-set the soft-warned marker to `window_key`. Returns True
+        only for the caller that actually flipped it — i.e. the first turn to
+        cross the soft threshold this window. Concurrent turns for the same
+        agent race here and all but one get False, so the warning fires once
+        per window (§3.2)."""
+        await self._ensure_connected()
+        now = datetime.now(timezone.utc).isoformat()
+        cursor = await self._conn.execute(
+            "UPDATE budgets SET soft_warned_window = ?, updated_at = ? "
+            "WHERE id = ? AND (soft_warned_window IS NULL "
+            "OR soft_warned_window != ?)",
+            (window_key, now, budget_id, window_key),
+        )
+        await self._conn.commit()
+        return cursor.rowcount > 0

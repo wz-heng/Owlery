@@ -272,6 +272,9 @@ class TaskCreate(BaseModel):
     scheduled_at: str | None = None
     workspace_mode: Literal["shared", "copy", "git_worktree"] | None = None
     working_dir_override: str | None = None
+    # Per-task model override for the worker session (budget-model-routing.md
+    # §4.2). Validated against the assignee agent's backend when one is set.
+    model: str | None = None
 
     @model_validator(mode="after")
     def validate_assignee(self):
@@ -311,6 +314,10 @@ class CommentRequest(BaseModel):
 
 class SpecifyRequest(BaseModel):
     body: str | None = None
+    # Optional model override set at specify time. Distinguished from "omitted"
+    # via model_fields_set so a caller can explicitly null it
+    # (budget-model-routing.md §4.2).
+    model: str | None = None
 
 
 class BlockRequest(BaseModel):
@@ -742,10 +749,15 @@ async def specify_task(
     _: str = Depends(verify_token),
 ):
     actor_kind, actor_agent_id, _origin = await _actor(caller_session_id)
+    # Only touch the model column when the caller explicitly sent it (so an
+    # ordinary specify doesn't clobber a previously-set model with null).
+    set_model = "model" in req.model_fields_set
     row = await _run(
         task_repository.specify_task(
             task_id,
             body=req.body,
+            model=req.model,
+            set_model=set_model,
             actor_kind=actor_kind,
             actor_agent_id=actor_agent_id,
         )

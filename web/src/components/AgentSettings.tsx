@@ -14,6 +14,8 @@ import {
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { AgentSeal } from "./ui/seal";
+import { BudgetPanel } from "./BudgetPanel";
+import { modelSuggestions } from "../lib/models";
 
 const API = `${window.location.origin}/api/agents`;
 // Every built-in in-app MCP server the form can toggle — also the default set
@@ -337,9 +339,18 @@ export function AgentSettings({ open, onOpenChange, initialAgentId }: Props) {
                 id="agent-model"
                 value={model}
                 onChange={(e) => setModel(e.target.value)}
-                placeholder="claude-opus-4-7 (blank = backend default)"
+                placeholder="claude-opus-4-8 (blank = backend default)"
                 className="h-9"
+                list="agent-model-suggestions"
               />
+              {/* Suggestions only — free text stays valid. The backend rejects
+               * only cross-family mismatches (budget-model-routing.md §4.3),
+               * not unknown model names. */}
+              <datalist id="agent-model-suggestions">
+                {modelSuggestions(backend).map((m) => (
+                  <option key={m} value={m} />
+                ))}
+              </datalist>
             </div>
 
             {/* Default harness for this agent's new sessions. Shown only when
@@ -463,6 +474,22 @@ export function AgentSettings({ open, onOpenChange, initialAgentId }: Props) {
                   })}
                 </div>
               )}
+            </div>
+
+            {/* Per-agent spend cap (budget-model-routing.md §3.3). Applies on
+             * top of any global budget — whichever crosses first blocks. Needs
+             * a saved agent id, so it's gated to existing agents. */}
+            <div className="agent-budget space-y-1.5">
+              <Label>Budget</Label>
+              <p className="text-xs text-muted-foreground">
+                Cap this agent’s Claude spend per window. Applies alongside any
+                global budget; whichever limit is reached first blocks the turn.
+              </p>
+              <BudgetPanel
+                scope="agent"
+                agentId={selected?.id}
+                refreshKey={`${open}:${selectedId}`}
+              />
             </div>
 
             <div className="grid grid-cols-2 gap-2">

@@ -32,6 +32,7 @@ from ..file_viewer import (
     resolve_safe_path,
 )
 from ..harness import get_harness
+from ..model_routing import resolve_model
 from ..models import ShowMeResolveRequest, ShowMeResolveResponse
 from ..session_manager import session_manager
 from ..showme_ai import resolve_showme_reference
@@ -108,7 +109,9 @@ async def resolve_showme(
         result = await resolve_showme_reference(
             req.text,
             harness=harness,
-            model=agent.get("model"),
+            # Same resolution as the turn engine: session override wins over the
+            # agent's default model (budget-model-routing.md §4.1).
+            model=resolve_model(session, agent),
             credential=credential,
             working_dir=session.working_dir,
             messages=await session_manager.db.load_messages(session_id),

@@ -427,3 +427,34 @@ async def test_showme_resolve_attached_credential_is_normalized(
     assert cred.secret == "sk-ant-test"
 
 
+
+
+async def test_showme_resolve_uses_session_model_override(client, monkeypatch, tmp_path):
+    """The /showme resolver must run the session's effective model — a session
+    override wins over the agent default (budget-model-routing.md §4.1)."""
+    from server.models import ShowMeResolveResponse
+    from server.routers import files as files_mod
+
+    captured = {}
+
+    async def _fake_resolve(text, *, harness, model, credential, working_dir,
+                            messages, session_name):
+        captured["model"] = model
+        return ShowMeResolveResponse(path=None, message="stub")
+
+    monkeypatch.setattr(files_mod, "resolve_showme_reference", _fake_resolve)
+
+    agent = await session_manager.db.get_default_agent()
+    await session_manager.db.update_agent(agent["id"], model="claude-haiku")
+    root = tmp_path / "wd2"
+    root.mkdir()
+    sess = await session_manager.create_session(
+        agent["id"], name="showme-model", working_dir=str(root), model="claude-opus-4",
+    )
+    r = await client.post(
+        f"/api/sessions/{sess.id}/showme/resolve",
+        json={"text": "the plan"},
+        headers=HEADERS,
+    )
+    assert r.status_code == 200, r.text
+    assert captured["model"] == "claude-opus-4"  # session override, not agent's haiku
