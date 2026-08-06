@@ -142,6 +142,7 @@ export function TaskBoardPage({ token, agents, activeAgentId, liveEvent, onOpenS
           artifacts={store.artifacts[selectedTask.id] ?? []}
           allTasks={allTasks}
           agents={agents}
+          allowLocalDeploy={selectedBoard?.allow_local_deploy ?? false}
           loading={store.loadingDetail}
           busy={store.mutating}
           error={store.error}

@@ -28,6 +28,8 @@ export type DeliveryActionKind =
   | "push"
   | "pull_request"
   | "merge"
+  | "deploy_stage"
+  | "deploy_switch"
   | "teardown";
 
 export interface DeliveryConfirmation {
@@ -44,6 +46,8 @@ export interface DeliveryActionOptions {
   mergeStrategy?: MergeStrategy;
   connectorInstallationId?: string;
   draft?: boolean;
+  drain?: boolean;
+  switchWhenIdle?: boolean;
 }
 
 export type TaskBoardView = "kanban" | "tree";
@@ -173,7 +177,7 @@ interface TaskState {
   deliveryAction(
     taskId: string,
     runId: string,
-    action: "commit" | "push" | "pull_request" | "merge",
+    action: "commit" | "push" | "pull_request" | "merge" | "deploy_stage" | "deploy_switch",
     options?: DeliveryActionOptions
   ): Promise<boolean>;
   teardownDelivery(
@@ -656,6 +660,13 @@ export const useTaskStore = create<TaskState>((set, get) => ({
           return taskApi.mergeDelivery(token, taskId, runId, {
             merge_strategy: options.mergeStrategy,
             confirmations: options.confirmations,
+          });
+        case "deploy_stage":
+          return taskApi.deployStage(token, taskId, runId);
+        case "deploy_switch":
+          return taskApi.deploySwitch(token, taskId, runId, {
+            drain: options.drain,
+            switch_when_idle: options.switchWhenIdle,
           });
       }
       throw new Error(`Unknown delivery action: ${action}`);
