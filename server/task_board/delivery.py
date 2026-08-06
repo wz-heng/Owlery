@@ -210,6 +210,12 @@ class DeliveryCoordinator:
         self._switch_host = "127.0.0.1"
         self._drain_poll_interval = 0.5
         self._idle_switch_waiters: set[asyncio.Task[None]] = set()
+        # Resolves the immutable source for stage. Production deliberately uses
+        # the configured remote, never a worker's local checkout; focused tests
+        # replace this seam with a fake remote URI.
+        self.resolve_deploy_source: Callable[[Any, DeliveryRecord], Awaitable[str]] = (
+            self._resolve_deploy_source
+        )
         # Bound only in a live server.  Tests and offline delivery tooling keep
         # their established behavior without a process-wide admission gate.
         self._admission_gate: DeployAdmissionGate | None = None
@@ -287,6 +293,36 @@ class DeliveryCoordinator:
         if delivery is None:
             raise TaskNotFoundError("no delivery for this run; accept it first")
         return delivery
+
+    async def _resolve_deploy_source(self, board: Any, delivery: DeliveryRecord) -> str:
+        """Return a remote URL only after it advertises the delivery's exact sha.
+
+        This is a precondition, not a stage-op outcome: the remote repository is
+        the release source of truth, so an unreachable/missing/unpushed commit
+        leaves no deployment row and no delivery mutation.
+        """
+        remote = board.git_delivery_remote
+        remote_url = await ws.remote_url(delivery.repository, remote)
+        if remote_url is None:
+            raise TaskConflictError(
+                f"remote_source_missing: configured remote {remote!r} is unavailable",
+                current=delivery,
+            )
+        try:
+            present = await ws.remote_has_commit(
+                delivery.repository, remote, delivery.attempt_head or ""
+            )
+        except ws.WorkspaceError as exc:
+            raise TaskConflictError(
+                f"remote_source_unavailable: cannot verify {remote!r}", current=delivery
+            ) from exc
+        if not present:
+            raise TaskConflictError(
+                "remote_commit_missing: push the delivery commit to the configured remote "
+                "before staging",
+                current=delivery,
+            )
+        return remote_url
 
     async def _commit_message(self, task: TaskRecord, run: Any) -> str:
         agent_name = "an Owlery Agent"
@@ -734,6 +770,11 @@ class DeliveryCoordinator:
                 "nothing_to_deliver: no commits ahead of base", current=delivery
             )
 
+        # The remote, not this potentially dirty/stale local checkout, is the
+        # release source of truth. Verify it before planning an op or taking the
+        # global deployment lock, so an unpushed SHA is a clean 409 no-op.
+        source_remote = await self.resolve_deploy_source(board, delivery)
+
         # deploy_precheck guaranteed a resolvable layout; read the idle slot now
         # so the deployments row and the pipeline agree on a single target.
         layout = deploy.DeployLayout.at(settings.resolved_deploy_root)
@@ -745,7 +786,7 @@ class DeliveryCoordinator:
         op_id = await self._begin(
             delivery,
             "deploy_stage",
-            request={"slot": slot, "sha": delivery.attempt_head},
+            request={"slot": slot, "sha": delivery.attempt_head, "source_remote": source_remote},
             actor_kind=actor_kind,
             actor_agent_id=actor_agent_id,
         )
@@ -761,7 +802,7 @@ class DeliveryCoordinator:
                 op_id=op_id,
                 slot=slot,
                 sha=delivery.attempt_head,
-                source_repo=delivery.repository,
+                source_repo=source_remote,
             )
         except DeployLockedError as exc:
             final = await self._fail(
@@ -775,7 +816,7 @@ class DeliveryCoordinator:
                 deploy.stage_slot,
                 layout,
                 slot,
-                repo_path=delivery.repository,
+                repo_path=source_remote,
                 sha=delivery.attempt_head,
                 timeout=settings.deploy_stage_timeout_seconds,
                 runner=runner,

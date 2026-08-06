@@ -98,6 +98,11 @@ async def _ready_delivery(db, repo, tmp, agent, *, worker_commits=True):
 def _coord(db, repo):
     c = DeliveryCoordinator()
     c.bind(db=db, connectors=None, notify_terminal=None, repo=repo)
+
+    async def fake_remote_source(_board, _delivery):
+        return "https://example.invalid/owlery.git"
+
+    c.resolve_deploy_source = fake_remote_source
     return c
 
 
@@ -215,9 +220,10 @@ async def test_stage_prepares_idle_slot_and_records_staged(store, tmp_path, monk
         "clone", "fetch", "checkout", "venv", "pip", "bun_install", "build",
         "import_probe",
     ]
-    # The exact sha, by local path, and a DETACHED checkout — never a branch.
+    # The exact sha, from the configured remote rather than a local worktree,
+    # and a DETACHED checkout — never a branch.
     fetch = next(a for a, _, _ in runner.calls if a[:2] == ["git", "fetch"])
-    assert fetch == ["git", "fetch", delivery.repository, delivery.attempt_head]
+    assert fetch == ["git", "fetch", "https://example.invalid/owlery.git", delivery.attempt_head]
     checkout = next(a for a, _, _ in runner.calls if a[:2] == ["git", "checkout"])
     assert checkout == ["git", "checkout", "--detach", delivery.attempt_head]
     # The venv is created at the slot's FINAL path (venvs are not relocatable).
@@ -246,7 +252,7 @@ async def test_stage_prepares_idle_slot_and_records_staged(store, tmp_path, monk
     dep = deployments[0]
     assert dep.state == "staged" and dep.slot == "b"
     assert dep.sha == delivery.attempt_head
-    assert dep.source_repo == delivery.repository
+    assert dep.source_repo == "https://example.invalid/owlery.git"
     assert dep.delivery_id == delivery.id and dep.task_id == task.id
     assert await repo.get_active_deployment() is None
     assert op.result["deployment_id"] == dep.id
@@ -254,6 +260,48 @@ async def test_stage_prepares_idle_slot_and_records_staged(store, tmp_path, monk
     # Op lifecycle emitted the shared audit events.
     kinds = [e.kind for e in await repo.list_task_events(task.id)]
     assert "delivery_op_started" in kinds and "delivery_op_finished" in kinds
+
+
+@pytest.mark.asyncio
+async def test_stage_refuses_an_unpushed_commit_before_planning(store, tmp_path, monkeypatch):
+    """The remote is authoritative: a local attempt_head with no remote ref is
+    a clean precondition failure, not a local-path deployment."""
+    db, repo, tmp, agent = store
+    _board, task, run, _src, delivery = await _ready_delivery(db, repo, tmp, agent)
+    bare = tmp / "origin.git"
+    _git(tmp, "init", "-q", "--bare", str(bare))
+    _git(Path(delivery.repository), "remote", "add", "origin", str(bare))
+    layout = _init_layout(tmp_path / "deploy", monkeypatch)
+    coord = DeliveryCoordinator()
+    coord.bind(db=db, connectors=None, notify_terminal=None, repo=repo)
+
+    with pytest.raises(TaskConflictError, match="remote_commit_missing"):
+        await coord.deploy_stage(
+            task.id, run.id, server_root=layout.slot_path("a"), stage_runner=FakeStageRunner()
+        )
+    assert [op for op in await repo.list_delivery_ops(delivery.id) if op.kind == "deploy_stage"] == []
+
+
+@pytest.mark.asyncio
+async def test_stage_clones_a_verified_remote_commit(store, tmp_path, monkeypatch):
+    db, repo, tmp, agent = store
+    _board, task, run, _src, delivery = await _ready_delivery(db, repo, tmp, agent)
+    bare = tmp / "origin.git"
+    _git(tmp, "init", "-q", "--bare", str(bare))
+    _git(Path(delivery.repository), "remote", "add", "origin", str(bare))
+    _git(Path(delivery.repository), "push", "origin", delivery.attempt_branch)
+    layout = _init_layout(tmp_path / "deploy", monkeypatch)
+    coord = DeliveryCoordinator()
+    coord.bind(db=db, connectors=None, notify_terminal=None, repo=repo)
+    runner = FakeStageRunner()
+
+    await coord.deploy_stage(
+        task.id, run.id, server_root=layout.slot_path("a"), stage_runner=runner
+    )
+    fetch = next(argv for argv, _, _ in runner.calls if argv[:2] == ["git", "fetch"])
+    assert fetch == ["git", "fetch", str(bare), delivery.attempt_head]
+    deployment = (await repo.list_deployments())[0]
+    assert deployment.source_repo == str(bare)
 
 
 @pytest.mark.asyncio

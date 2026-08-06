@@ -82,6 +82,11 @@ def _init_repo(path: Path) -> None:
 def _coord(db, repo) -> DeliveryCoordinator:
     c = DeliveryCoordinator()
     c.bind(db=db, connectors=None, notify_terminal=None, repo=repo)
+
+    async def fake_remote_source(_board, _delivery):
+        return "https://example.invalid/owlery.git"
+
+    c.resolve_deploy_source = fake_remote_source
     return c
 
 

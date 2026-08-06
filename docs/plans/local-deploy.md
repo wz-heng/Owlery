@@ -366,7 +366,9 @@ New `reason_kind` values (same column, same semantics):
 ## 10. Permissions and destructive-action protection
 
 - `deploy_stage`: human via REST/UI, or an orchestrator Agent via MCP —
-  staging is side-effect-free for the running instance.
+  staging is side-effect-free for the running instance. The candidate SHA must
+  be advertised by the board's configured Git remote; the slot clones that
+  remote URL, never a local worktree path.
 - `deploy_switch`: **human via REST/UI only** in v1. No MCP verb executes a
   switch; a worker's `request_delivery(note)` may carry a deploy hint, an
   orchestrator may stage, but restarting production on model initiative is
