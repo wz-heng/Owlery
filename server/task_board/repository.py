@@ -43,6 +43,7 @@ from .models import (
     DeployLockedError,
     EventRecord,
     ReleaseDeploymentRecord,
+    ReleaseDeploymentOpRecord,
     RunRecord,
     TaskCapacityError,
     TaskConflictError,
@@ -3168,6 +3169,42 @@ class TaskRepository:
                 conn, "SELECT * FROM release_deployments WHERE id=?", (ident,)
             )
         return self._release_deployment_record(fresh)
+
+    @staticmethod
+    def _release_op_record(row: Mapping[str, Any]) -> ReleaseDeploymentOpRecord:
+        values = dict(row)
+        values["request"] = _load_object(values["request"]) or {}
+        values["result"] = _load_object(values["result"])
+        return ReleaseDeploymentOpRecord(**values)
+
+    async def plan_release_op(
+        self,
+        release_id: str,
+        *,
+        kind: str,
+        request: Mapping[str, Any],
+        actor_kind: str,
+        actor_agent_id: str | None,
+    ) -> ReleaseDeploymentOpRecord:
+        if kind not in {"stage", "switch", "rollback"}:
+            raise TaskValidationError("invalid release operation")
+        stamp = _now_iso()
+        async with self._transaction() as conn:
+            await self._fetchone(
+                conn, "SELECT id FROM release_deployments WHERE id=?", (release_id,)
+            )
+            ident = _short_id()
+            await conn.execute(
+                "INSERT INTO release_deployment_ops "
+                "(id,release_id,kind,state,request,actor_kind,actor_agent_id,created_at) "
+                "VALUES (?,?,?,'planned',?,?,?,?)",
+                (ident, release_id, kind, _json_object(request), actor_kind,
+                 actor_agent_id, stamp),
+            )
+            row = await self._fetchone(
+                conn, "SELECT * FROM release_deployment_ops WHERE id=?", (ident,)
+            )
+        return self._release_op_record(row)
 
     async def get_live_deployment(self) -> DeploymentRecord | None:
         """The single ``live`` deployment row — what the instance is running

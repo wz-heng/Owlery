@@ -754,6 +754,31 @@ CREATE INDEX IF NOT EXISTS release_deployments_board_created
 CREATE UNIQUE INDEX IF NOT EXISTS release_deployments_one_active
   ON release_deployments((1)) WHERE state IN ('staging', 'switching');
 
+-- Release operations deliberately do not reuse task_delivery_ops: a release
+-- can include many tasks and must remain auditable even when task retention
+-- removes a worktree or delivery record.
+CREATE TABLE IF NOT EXISTS release_deployment_ops (
+    id TEXT PRIMARY KEY,
+    release_id TEXT NOT NULL REFERENCES release_deployments(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('stage', 'switch', 'rollback')),
+    state TEXT NOT NULL CHECK (state IN (
+        'planned', 'running', 'succeeded', 'failed', 'interrupted'
+    )),
+    request TEXT NOT NULL DEFAULT '{}',
+    result TEXT,
+    error TEXT,
+    journal_ref TEXT,
+    actor_kind TEXT NOT NULL CHECK (actor_kind IN ('user', 'agent', 'system')),
+    actor_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS release_deployment_ops_one_running
+  ON release_deployment_ops(release_id) WHERE state = 'running';
+CREATE INDEX IF NOT EXISTS release_deployment_ops_release
+  ON release_deployment_ops(release_id, created_at);
+
 -- Parked turns awaiting a usage-limit reset (limit-auto-resume.md §4). A turn
 -- that failed on the USER'S OWN limit is persisted here, not slept on: the
 -- wait is multi-hour, so it must survive a restart — on boot these rows

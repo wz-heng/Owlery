@@ -350,6 +350,23 @@ class ReleaseDeploymentRecord(Record):
     updated_at: str
 
 
+@dataclass(frozen=True, slots=True)
+class ReleaseDeploymentOpRecord(Record):
+    id: str
+    release_id: str
+    kind: str
+    state: str
+    request: dict[str, Any]
+    result: dict[str, Any] | None
+    error: str | None
+    journal_ref: str | None
+    actor_kind: str
+    actor_agent_id: str | None
+    started_at: str | None
+    finished_at: str | None
+    created_at: str
+
+
 class DeliveryConfirmationRequired(TaskConflictError):
     """A destructive delivery action needs an explicit typed confirmation flag.
 
