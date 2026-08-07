@@ -874,3 +874,23 @@ async def test_assign_rejects_incompatible_backend_for_existing_model(task_store
     codex_agent = await AgentManager(db).create_agent(name="CoderAssign", backend="codex")
     with pytest.raises(TaskValidationError):
         await repo.assign_task(task.id, codex_agent["id"])
+
+
+@pytest.mark.asyncio
+async def test_release_plan_records_human_version_and_immutable_sha(task_store):
+    _db, repo, root, _agent = task_store
+    board = await _board(repo, root)
+    release = await repo.plan_release_deployment(
+        board_id=board.id,
+        source_ref="main",
+        sha="a" * 40,
+        source_repo="https://example.test/acme/owlery.git",
+        actor_kind="user",
+        actor_agent_id=None,
+    )
+    assert release.version.startswith("r")
+    assert release.version.endswith(".01")
+    assert release.source_ref == "main"
+    assert release.sha == "a" * 40
+    assert release.state == "planned"
+    assert [item.id for item in await repo.list_release_deployments(board.id)] == [release.id]

@@ -42,6 +42,7 @@ from .models import (
     DeploymentRecord,
     DeployLockedError,
     EventRecord,
+    ReleaseDeploymentRecord,
     RunRecord,
     TaskCapacityError,
     TaskConflictError,
@@ -377,6 +378,7 @@ class TaskRepository:
         git_delivery_default_draft_pr: bool = True,
         git_delivery_default_merge: str = "none",
         allow_local_deploy: bool = False,
+        deploy_release_ref: str = "main",
         board_id: str | None = None,
     ) -> BoardRecord:
         clean_name = name.strip()
@@ -395,6 +397,9 @@ class TaskRepository:
             raise TaskValidationError("Git delivery remote is required")
         if not git_delivery_author_name or not git_delivery_author_email:
             raise TaskValidationError("Git delivery author name and email are required")
+        deploy_release_ref = deploy_release_ref.strip()
+        if not deploy_release_ref or deploy_release_ref.startswith("-"):
+            raise TaskValidationError("deploy release ref is required")
         for value, label in (
             (max_running, "max_running"),
             (max_running_per_agent, "max_running_per_agent"),
@@ -415,8 +420,8 @@ class TaskRepository:
                     "dispatch_enabled,git_delivery_remote,git_delivery_retention,"
                     "git_delivery_author_name,git_delivery_author_email,"
                     "git_delivery_default_draft_pr,git_delivery_default_merge,"
-                    "allow_local_deploy,"
-                    "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "allow_local_deploy,deploy_release_ref,"
+                    "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         ident,
                         clean_name,
@@ -436,6 +441,7 @@ class TaskRepository:
                         int(bool(git_delivery_default_draft_pr)),
                         git_delivery_default_merge,
                         int(bool(allow_local_deploy)),
+                        deploy_release_ref,
                         stamp,
                         stamp,
                     ),
@@ -481,6 +487,7 @@ class TaskRepository:
             "git_delivery_default_draft_pr",
             "git_delivery_default_merge",
             "allow_local_deploy",
+            "deploy_release_ref",
         }
         unknown = set(updates) - allowed
         if unknown:
@@ -521,6 +528,10 @@ class TaskRepository:
             )
         if "allow_local_deploy" in updates:
             updates["allow_local_deploy"] = int(bool(updates["allow_local_deploy"]))
+        if "deploy_release_ref" in updates:
+            updates["deploy_release_ref"] = str(updates["deploy_release_ref"]).strip()
+            if not updates["deploy_release_ref"] or updates["deploy_release_ref"].startswith("-"):
+                raise TaskValidationError("deploy release ref is required")
         for field in (
             "max_running",
             "max_running_per_agent",
@@ -3089,6 +3100,74 @@ class TaskRepository:
                 self.conn, "SELECT * FROM deployments ORDER BY created_at, id"
             )
         return [self._deployment_record(r) for r in rows]
+
+    # --- Release-line deployments -----------------------------------------
+
+    @staticmethod
+    def _release_deployment_record(row: Mapping[str, Any]) -> ReleaseDeploymentRecord:
+        return ReleaseDeploymentRecord(**dict(row))
+
+    async def list_release_deployments(
+        self, board_id: str
+    ) -> list[ReleaseDeploymentRecord]:
+        async with self._lock:
+            rows = await self._fetchall(
+                self.conn,
+                "SELECT * FROM release_deployments WHERE board_id=? "
+                "ORDER BY created_at DESC, id DESC",
+                (board_id,),
+            )
+        return [self._release_deployment_record(row) for row in rows]
+
+    async def get_release_deployment(self, release_id: str) -> ReleaseDeploymentRecord:
+        async with self._lock:
+            row = await self._fetchone(
+                self.conn, "SELECT * FROM release_deployments WHERE id=?", (release_id,)
+            )
+        if row is None:
+            raise TaskNotFoundError(f"release deployment {release_id!r} not found")
+        return self._release_deployment_record(row)
+
+    async def plan_release_deployment(
+        self,
+        *,
+        board_id: str,
+        source_ref: str,
+        sha: str,
+        source_repo: str,
+        actor_kind: str,
+        actor_agent_id: str | None,
+    ) -> ReleaseDeploymentRecord:
+        """Persist a release candidate after its remote ref has resolved.
+
+        The caller must resolve ``source_ref`` at the configured remote first.
+        This method never accepts a moving ref in place of ``sha``; the stored
+        SHA is what subsequent stage/switch operations use.
+        """
+        stamp = _now_iso()
+        day = datetime.now(timezone.utc).strftime("%Y%m%d")
+        async with self._transaction() as conn:
+            await self._board_row(conn, board_id)
+            row = await self._fetchone(
+                conn,
+                "SELECT COUNT(*) AS n FROM release_deployments "
+                "WHERE board_id=? AND version GLOB ?",
+                (board_id, f"r{day}.*"),
+            )
+            version = f"r{day}.{int(row['n']) + 1:02d}"
+            ident = _short_id()
+            await conn.execute(
+                "INSERT INTO release_deployments "
+                "(id,board_id,version,source_ref,sha,source_repo,state,actor_kind,"
+                "actor_agent_id,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?, 'planned', ?,?,?,?)",
+                (ident, board_id, version, source_ref, sha, source_repo,
+                 actor_kind, actor_agent_id, stamp, stamp),
+            )
+            fresh = await self._fetchone(
+                conn, "SELECT * FROM release_deployments WHERE id=?", (ident,)
+            )
+        return self._release_deployment_record(fresh)
 
     async def get_live_deployment(self) -> DeploymentRecord | None:
         """The single ``live`` deployment row — what the instance is running

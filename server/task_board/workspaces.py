@@ -461,6 +461,33 @@ async def remote_branch_tip(repo: str, remote: str, branch: str) -> str | None:
     return out.split()[0] if out.split() else None
 
 
+async def remote_release_ref_tip(repo: str, remote: str, ref: str) -> str:
+    """Resolve one configured release branch at the remote to an immutable SHA.
+
+    Release deployment accepts a branch/ref *only* as a lookup key.  The
+    caller persists and stages the returned SHA, never the mutable branch name.
+    Tags and arbitrary revisions are intentionally excluded from the first
+    release-line UI: a board may publish only a branch under ``refs/heads``.
+    """
+    clean = ref.strip()
+    if clean.startswith("refs/heads/"):
+        qualified = clean
+    elif clean and not clean.startswith("refs/") and not any(c.isspace() for c in clean):
+        qualified = f"refs/heads/{clean}"
+    else:
+        raise WorkspaceError("release ref must name a branch")
+    rc, out, err = await _git("ls-remote", "--refs", remote, qualified, cwd=repo)
+    if rc:
+        raise WorkspaceError(err or "unable to query the configured Git remote")
+    fields = out.split()
+    if len(fields) < 2 or fields[1] != qualified:
+        raise WorkspaceError(f"release ref {clean!r} was not found at the configured remote")
+    sha = fields[0]
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", sha):
+        raise WorkspaceError("configured release ref did not resolve to a commit SHA")
+    return sha.lower()
+
+
 async def remote_has_commit(repo: str, remote: str, sha: str) -> bool:
     """Verify an immutable commit is advertised by ``remote`` without trusting
     the local object database.  A stage uses this before it creates any durable

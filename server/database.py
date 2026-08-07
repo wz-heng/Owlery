@@ -494,6 +494,9 @@ CREATE TABLE IF NOT EXISTS task_boards (
     -- power to restart production. _apply_migrations adds it to old rows.
     allow_local_deploy INTEGER NOT NULL DEFAULT 0
         CHECK (allow_local_deploy IN (0, 1)),
+    -- Release-line deployment defaults to the protected integration branch.
+    -- Task branches are delivery artifacts, never a production source.
+    deploy_release_ref TEXT NOT NULL DEFAULT 'main',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -703,6 +706,7 @@ CREATE TABLE IF NOT EXISTS deployments (
     slot TEXT NOT NULL,                  -- 'a' | 'b'
     sha TEXT NOT NULL,
     source_repo TEXT NOT NULL,
+    release_id TEXT,
     -- Lifecycle: staging → staged → switching → live, with rolled_back /
     -- superseded / failed as terminals. `staging` and `switching` are the
     -- in-flight states the deployments_one_active lock (below) covers; `staged`
@@ -723,6 +727,32 @@ CREATE UNIQUE INDEX IF NOT EXISTS deployments_one_live
 -- pipelines), which §4's "one instance, one pipeline at a time" forbids.
 CREATE UNIQUE INDEX IF NOT EXISTS deployments_one_active
   ON deployments((1)) WHERE state IN ('staging', 'switching');
+
+-- Board-level release intent. A human-readable release number is an audit aid;
+-- `sha` remains the immutable identity used for staging and switching.
+CREATE TABLE IF NOT EXISTS release_deployments (
+    id TEXT PRIMARY KEY,
+    board_id TEXT NOT NULL REFERENCES task_boards(id) ON DELETE CASCADE,
+    version TEXT NOT NULL,
+    source_ref TEXT NOT NULL,
+    sha TEXT NOT NULL,
+    source_repo TEXT NOT NULL,
+    deployment_id TEXT REFERENCES deployments(id) ON DELETE SET NULL,
+    state TEXT NOT NULL CHECK (state IN (
+        'planned', 'staging', 'staged', 'switching', 'live',
+        'superseded', 'rolled_back', 'failed'
+    )),
+    actor_kind TEXT NOT NULL CHECK (actor_kind IN ('user', 'agent', 'system')),
+    actor_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (board_id, version)
+);
+CREATE INDEX IF NOT EXISTS release_deployments_board_created
+  ON release_deployments(board_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS release_deployments_one_active
+  ON release_deployments((1)) WHERE state IN ('staging', 'switching');
 
 -- Parked turns awaiting a usage-limit reset (limit-auto-resume.md §4). A turn
 -- that failed on the USER'S OWN limit is persisted here, not slept on: the
@@ -859,6 +889,8 @@ class Database:
             # every existing board to "may not deploy production" — fail-closed.
             "ALTER TABLE task_boards ADD COLUMN "
             "allow_local_deploy INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE task_boards ADD COLUMN "
+            "deploy_release_ref TEXT NOT NULL DEFAULT 'main'",
         ):
             try:
                 await self._conn.execute(ddl)
@@ -887,6 +919,17 @@ class Database:
                     raise
 
         await self._migrate_delivery_op_kinds()
+
+        # Release-line deploy (§ release workflow). Existing task-scoped
+        # deployments remain valid history; only new release records populate
+        # this nullable association.
+        try:
+            await self._conn.execute(
+                "ALTER TABLE deployments ADD COLUMN release_id TEXT"
+            )
+        except aiosqlite.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
 
         # sessions.model — per-session model override (budget-model-routing.md
         # §4.1). Nullable, no DEFAULT: existing rows stay NULL and keep

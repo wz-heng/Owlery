@@ -139,6 +139,7 @@ class BoardRecord(Record):
     git_delivery_default_draft_pr: bool
     git_delivery_default_merge: str
     allow_local_deploy: bool
+    deploy_release_ref: str
     created_at: str
     updated_at: str
 
@@ -323,8 +324,28 @@ class DeploymentRecord(Record):
     slot: str
     sha: str
     source_repo: str
+    release_id: str | None
     state: str
     journal: dict[str, Any] | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReleaseDeploymentRecord(Record):
+    """A board-level release candidate and its immutable remote SHA."""
+
+    id: str
+    board_id: str
+    version: str
+    source_ref: str
+    sha: str
+    source_repo: str
+    deployment_id: str | None
+    state: str
+    actor_kind: str
+    actor_agent_id: str | None
+    error: str | None
     created_at: str
     updated_at: str
 
