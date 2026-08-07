@@ -25,6 +25,7 @@ function board(overrides: Partial<TaskBoard> = {}): TaskBoard {
     git_delivery_default_draft_pr: true,
     git_delivery_default_merge: "none",
     allow_local_deploy: false,
+    deploy_release_ref: "main",
     archived: false,
     created_at: "2026-07-28T00:00:00Z",
     updated_at: "2026-07-28T00:00:00Z",
@@ -127,5 +128,14 @@ describe("BoardToolbar concurrency limits", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(onUpdateBoard).toHaveBeenCalledTimes(1));
     expect(onUpdateBoard).toHaveBeenCalledWith(expect.objectContaining({ allow_local_deploy: false }));
+  });
+
+  it("saves the selected release branch", async () => {
+    const { onUpdateBoard } = renderToolbar({ selectedBoard: board({ allow_local_deploy: true }) });
+    openSettings();
+    fireEvent.change(screen.getByLabelText("Release branch"), { target: { value: "release/local" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onUpdateBoard).toHaveBeenCalledTimes(1));
+    expect(onUpdateBoard).toHaveBeenCalledWith(expect.objectContaining({ deploy_release_ref: "release/local" }));
   });
 });

@@ -54,6 +54,7 @@ export interface TaskBoard {
   git_delivery_default_draft_pr: boolean;
   git_delivery_default_merge: "none" | "fast_forward_only";
   allow_local_deploy: boolean;
+  deploy_release_ref: string;
   archived: boolean;
   created_at: string;
   updated_at: string;
@@ -310,6 +311,7 @@ export interface CreateBoardInput {
   git_delivery_default_draft_pr?: boolean;
   git_delivery_default_merge?: "none" | "fast_forward_only";
   allow_local_deploy?: boolean;
+  deploy_release_ref?: string;
 }
 
 export type UpdateBoardInput = Partial<CreateBoardInput> & {

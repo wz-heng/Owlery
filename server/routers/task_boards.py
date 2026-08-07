@@ -226,6 +226,7 @@ class BoardCreate(BaseModel):
     git_delivery_default_draft_pr: bool = True
     git_delivery_default_merge: Literal["none", "fast_forward_only"] = "none"
     allow_local_deploy: bool = False
+    deploy_release_ref: str = Field(default="main", min_length=1, max_length=255)
 
 
 class BoardPatch(BaseModel):
@@ -253,6 +254,7 @@ class BoardPatch(BaseModel):
     git_delivery_default_draft_pr: bool | None = None
     git_delivery_default_merge: Literal["none", "fast_forward_only"] | None = None
     allow_local_deploy: bool | None = None
+    deploy_release_ref: str | None = Field(default=None, min_length=1, max_length=255)
     updated_at: str | None = None
 
 
