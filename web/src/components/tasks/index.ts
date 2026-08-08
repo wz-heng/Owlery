@@ -7,3 +7,4 @@ export { TaskDrawer } from "./TaskDrawer";
 export { TaskRunTimeline } from "./TaskRunTimeline";
 export { TaskDeliveryPanel } from "./TaskDeliveryPanel";
 export { TaskComments } from "./TaskComments";
+export { ReleasePanel } from "./ReleasePanel";

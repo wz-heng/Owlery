@@ -28,7 +28,6 @@ from ..deploy_admission import DeployAdmissionClosedError, DeployAdmissionGate
 from . import workspaces as ws
 from .deploy_quiesce import BusySource, DeployQuiesce
 from .models import (
-    DELIVERED_OP_KINDS,
     DELIVERY_RETENTIONS,
     BoardRecord,
     DeliveryConfirmationRequired,
@@ -59,10 +58,6 @@ _GOAL_START_STATES = frozenset({"ready", "delivered", "blocked", "conflicted"})
 _TEARDOWN_START_STATES = frozenset(
     {"ready", "delivered", "blocked", "conflicted", "failed"}
 )
-
-# Delivery block reasons that a deploy_stage itself produced — a later green
-# stage clears these, unlike a real git block/conflict (local-deploy.md §4).
-_DEPLOY_BLOCK_REASONS = frozenset({"stage_failed", "deploy_locked"})
 
 NotifyTerminal = Callable[[TaskRecord, DeliveryRecord], Awaitable[None]]
 
@@ -131,34 +126,6 @@ class _ReleaseSwitchCtx:
     op_id: str = ""
 
 
-def _stage_success_status(
-    prior_status: str,
-    prior_reason_kind: str | None,
-    prior_reason_detail: str | None,
-    *,
-    was_delivered: bool,
-) -> tuple[str, str | None, str | None]:
-    """The (status, reason_kind, reason_detail) a successful deploy_stage settles
-    the delivery to (docs/plans/local-deploy.md §4 — "succeed back to
-    ready/delivered"). Staging is transparent to genuine git state but never
-    perpetuates its OWN prior failure.
-
-    ``was_delivered`` is authoritative — whether a push/PR/merge op actually
-    succeeded — not inferred from delivery fields (``merge_strategy`` is set on a
-    conflicted merge too, so it cannot stand in for "was delivered")."""
-    if prior_status in {"blocked", "conflicted"} and prior_reason_kind in _DEPLOY_BLOCK_REASONS:
-        # Only a prior deploy attempt blocked this delivery; a green stage undoes
-        # it. Land delivered if it was ever actually delivered, else ready.
-        return ("delivered" if was_delivered else "ready", None, None)
-    if prior_status in {"blocked", "conflicted"}:
-        # A real git block/conflict — a stage does not resolve it; keep it.
-        return (prior_status, prior_reason_kind, prior_reason_detail)
-    # A settled ready/delivered — keep it, with no lingering reason.
-    return (prior_status, None, None)
-
-
-# Op kinds whose success means the delivery was actually delivered (§4).
-_DELIVERED_OP_KINDS = DELIVERED_OP_KINDS
 
 
 async def _github_create_pr(
@@ -236,13 +203,6 @@ class DeliveryCoordinator:
         # (§7.3 step 4). Poll cadence for the drain/idle census waits.
         self._switch_host = "127.0.0.1"
         self._drain_poll_interval = 0.5
-        self._idle_switch_waiters: set[asyncio.Task[None]] = set()
-        # Resolves the immutable source for stage. Production deliberately uses
-        # the configured remote, never a worker's local checkout; focused tests
-        # replace this seam with a fake remote URI.
-        self.resolve_deploy_source: Callable[[Any, DeliveryRecord], Awaitable[str]] = (
-            self._resolve_deploy_source
-        )
         # Bound only in a live server.  Tests and offline delivery tooling keep
         # their established behavior without a process-wide admission gate.
         self._admission_gate: DeployAdmissionGate | None = None
@@ -320,36 +280,6 @@ class DeliveryCoordinator:
         if delivery is None:
             raise TaskNotFoundError("no delivery for this run; accept it first")
         return delivery
-
-    async def _resolve_deploy_source(self, board: Any, delivery: DeliveryRecord) -> str:
-        """Return a remote URL only after it advertises the delivery's exact sha.
-
-        This is a precondition, not a stage-op outcome: the remote repository is
-        the release source of truth, so an unreachable/missing/unpushed commit
-        leaves no deployment row and no delivery mutation.
-        """
-        remote = board.git_delivery_remote
-        remote_url = await ws.remote_url(delivery.repository, remote)
-        if remote_url is None:
-            raise TaskConflictError(
-                f"remote_source_missing: configured remote {remote!r} is unavailable",
-                current=delivery,
-            )
-        try:
-            present = await ws.remote_has_commit(
-                delivery.repository, remote_url, delivery.attempt_head or ""
-            )
-        except ws.WorkspaceError as exc:
-            raise TaskConflictError(
-                f"remote_source_unavailable: cannot verify {remote!r}", current=delivery
-            ) from exc
-        if not present:
-            raise TaskConflictError(
-                "remote_commit_missing: push the delivery commit to the configured remote "
-                "before staging",
-                current=delivery,
-            )
-        return remote_url
 
     async def _commit_message(self, task: TaskRecord, run: Any) -> str:
         agent_name = "an Owlery Agent"
@@ -734,286 +664,7 @@ class DeliveryCoordinator:
             final = await self._fail(delivery.id, op_id, "op_failed", str(exc), actor_kind, actor_agent_id)
         return await self._published(task, final)
 
-    # --- deploy_stage (docs/plans/local-deploy.md §4, §5) ----------------
-
-    async def deploy_stage(
-        self,
-        task_id: str,
-        run_id: str,
-        *,
-        actor_kind: str = "user",
-        actor_agent_id: str | None = None,
-        server_root: Path | None = None,
-        stage_runner: deploy.StageRunner | None = None,
-    ) -> DeliveryRecord:
-        """Stage the delivered sha into the idle deploy slot (local-deploy §5).
-
-        A local, idempotent, re-runnable delivery op under the same
-        ``task_delivery_ops`` machinery as ``commit`` (§4). It fetches the exact
-        reviewed sha from the board repo by local path, prepares the idle slot
-        completely (venv + build + import probe), and records a ``deployments``
-        row — all while the running instance is untouched by construction.
-
-        The board opt-in, the instance fail-closed guard, and the git
-        prerequisites (§2/§9) are preconditions: they refuse without creating an
-        op or mutating the delivery, exactly like ``deliver_op``'s baseline/state
-        checks. Only an attempt that actually starts creates an op — which fails
-        to ``blocked(stage_failed)`` on a bad step, or ``blocked(deploy_locked)``
-        if the global deploy lock is already held (§4, §5, §12)."""
-        task, run, board = await self._load(task_id, run_id)
-
-        # 1. Board opt-in (§9). Touching the production instance is an explicit
-        #    per-board decision; a board that never opted in is refused outright.
-        if not board.allow_local_deploy:
-            raise TaskConflictError(
-                "this board may not deploy the local instance "
-                "(enable allow_local_deploy on the board first)",
-                current=await self._delivery_for(run_id),
-            )
-
-        # 2. Instance fail-closed guard (§3.1). A config/instance problem, not a
-        #    delivery one — refuse without touching this (or any) delivery.
-        check = deploy.deploy_precheck(settings, server_root=server_root)
-        if not check.ok:
-            raise TaskConflictError(check.message, current=await self._delivery_for(run_id))
-
-        delivery = await self._delivery_for(run_id)
-
-        # 3. Git prerequisites (§2) — same shape as deliver_op's preconditions.
-        if delivery.status not in _GOAL_START_STATES:
-            raise TaskConflictError(
-                "delivery is not in a state that accepts a deploy", current=delivery
-            )
-        if delivery.base_head is None:
-            raise TaskConflictError("delivery has no baseline; accept it first", current=delivery)
-        if delivery.dirty:
-            raise TaskConflictError(
-                "worktree is dirty; run the commit op before deploying", current=delivery
-            )
-        if not delivery.attempt_head:
-            raise TaskConflictError("delivery has no committed head to deploy", current=delivery)
-        if (delivery.commits_ahead or 0) < 1:
-            raise TaskConflictError(
-                "nothing_to_deliver: no commits ahead of base", current=delivery
-            )
-
-        # The remote, not this potentially dirty/stale local checkout, is the
-        # release source of truth. Verify it before planning an op or taking the
-        # global deployment lock, so an unpushed SHA is a clean 409 no-op.
-        source_remote = await self.resolve_deploy_source(board, delivery)
-
-        # deploy_precheck guaranteed a resolvable layout; read the idle slot now
-        # so the deployments row and the pipeline agree on a single target.
-        layout = deploy.DeployLayout.at(settings.resolved_deploy_root)
-        slot = layout.idle_slot()
-
-        prior_status = delivery.status
-        prior_reason_kind = delivery.reason_kind
-        prior_reason_detail = delivery.reason_detail
-        op_id = await self._begin(
-            delivery,
-            "deploy_stage",
-            request={"slot": slot, "sha": delivery.attempt_head, "source_remote": source_remote},
-            actor_kind=actor_kind,
-            actor_agent_id=actor_agent_id,
-        )
-
-        # 4. Global deploy lock (§4/§12): a durable outcome. Whether the holder
-        #    was already there or raced in, begin_deployment_staging's unique
-        #    index rejects the insert and the op fails to blocked(deploy_locked)
-        #    naming the holder — an explicit new op is required to try again.
-        try:
-            deployment = await self.repo.begin_deployment_staging(
-                delivery_id=delivery.id,
-                task_id=task.id,
-                op_id=op_id,
-                slot=slot,
-                sha=delivery.attempt_head,
-                source_repo=source_remote,
-            )
-        except DeployLockedError as exc:
-            final = await self._fail(
-                delivery.id, op_id, "deploy_locked", str(exc), actor_kind, actor_agent_id
-            )
-            return await self._published(task, final)
-
-        runner = stage_runner or deploy._default_stage_runner
-        try:
-            result = await asyncio.to_thread(
-                deploy.stage_slot,
-                layout,
-                slot,
-                repo_path=source_remote,
-                sha=delivery.attempt_head,
-                timeout=settings.deploy_stage_timeout_seconds,
-                runner=runner,
-            )
-        except Exception as exc:  # pragma: no cover - defensive; steps return rc
-            await self.repo.mark_deployment_failed(deployment.id)
-            final = await self._fail(
-                delivery.id, op_id, "stage_failed",
-                f"stage pipeline crashed: {exc}", actor_kind, actor_agent_id,
-            )
-            return await self._published(task, final)
-
-        if not result.ok:
-            await self.repo.mark_deployment_failed(deployment.id)
-            detail = f"stage step {result.failed_step!r} failed:\n{result.output}".strip()
-            final = await self._fail(
-                delivery.id, op_id, "stage_failed", detail, actor_kind, actor_agent_id
-            )
-            return await self._published(task, final)
-
-        staged = await self.repo.mark_deployment_staged(deployment.id)
-        # A successful stage must "succeed back to ready/delivered" (§4). Staging
-        # is otherwise transparent to the git-delivery status:
-        #   - a delivery blocked by THIS pipeline's own prior failure
-        #     (stage_failed / deploy_locked) is cleared — a green restage undoes
-        #     it, landing delivered iff a push/PR/merge op actually succeeded,
-        #     else ready;
-        #   - a block/conflict from real git work (a merge conflict, an
-        #     interrupted push) is preserved — a stage does not resolve it;
-        #   - a settled ready/delivered is kept as-is.
-        ops = await self.repo.list_delivery_ops(delivery.id)
-        was_delivered = any(
-            o.state == "succeeded" and o.kind in _DELIVERED_OP_KINDS for o in ops
-        )
-        new_status, new_reason_kind, new_reason_detail = _stage_success_status(
-            prior_status, prior_reason_kind, prior_reason_detail,
-            was_delivered=was_delivered,
-        )
-        final, _ = await self.repo.finish_op(
-            delivery.id,
-            op_id,
-            state="succeeded",
-            delivery_status=new_status,
-            reason_kind=new_reason_kind,
-            reason_detail=new_reason_detail,
-            result={
-                "staged_sha": result.sha,
-                "staged_slot": result.slot,
-                "deployment_id": staged.id,
-            },
-            actor_kind=actor_kind,
-            actor_agent_id=actor_agent_id,
-        )
-        return await self._published(task, final)
-
-    # --- deploy_switch (docs/plans/local-deploy.md §7.1/§7.2) ------------
-
-    async def deploy_switch(
-        self,
-        task_id: str,
-        run_id: str,
-        *,
-        drain: bool = False,
-        switch_when_idle: bool = False,
-        actor_kind: str = "user",
-        actor_agent_id: str | None = None,
-        server_root: Path | None = None,
-    ) -> DeliveryRecord:
-        """Flip the staged slot live — the at-most-once restart (local-deploy §7).
-
-        The single sharpest external op in the system: its side effect includes
-        this process's own death. It is `external=1`, uniquely keyed, and NEVER
-        auto-retried — every repeat is an explicit new `:retry:<n>` op (§4/§13.3).
-
-        Preconditions (board opt-in, instance fail-closed guard, a staged slot to
-        switch to, a real slot flip) refuse WITHOUT planning an op. From the op
-        onward everything is durable: the quiesce gate (§7.1) fails the op to
-        `blocked(not_idle)` with the exact busy census if work is running;
-        `drain=true` pauses producers and waits `deploy_quiesce_timeout_seconds`
-        before the same refusal; `switch_when_idle=true` plans the op and holds
-        it in memory (a hold that does NOT survive a restart) until the census
-        first reaches zero. There is **no force override** — running work is never
-        killed to deploy (§7.1, invariant §13.4)."""
-        task, run, board = await self._load(task_id, run_id)
-
-        if not board.allow_local_deploy:
-            raise TaskConflictError(
-                "this board may not deploy the local instance "
-                "(enable allow_local_deploy on the board first)",
-                current=await self._delivery_for(run_id),
-            )
-        check = deploy.deploy_precheck(settings, server_root=server_root)
-        if not check.ok:
-            raise TaskConflictError(check.message, current=await self._delivery_for(run_id))
-
-        delivery = await self._delivery_for(run_id)
-        if delivery.status not in _SWITCH_START_STATES:
-            raise TaskConflictError(
-                "delivery is not in a state that accepts a deploy", current=delivery
-            )
-        staged = await self.repo.get_staged_deployment_for_delivery(delivery.id)
-        if staged is None:
-            raise TaskConflictError(
-                "nothing_staged: run the deploy_stage op before switching",
-                current=delivery,
-            )
-        layout = deploy.DeployLayout.at(settings.resolved_deploy_root)
-        from_slot = layout.current_slot()
-        if from_slot is None:
-            raise TaskConflictError(
-                "deploy layout has no current slot; run `owlery deploy init`",
-                current=delivery,
-            )
-        if staged.slot == from_slot:
-            raise TaskConflictError(
-                "the staged slot is already current; nothing to switch",
-                current=delivery,
-            )
-        if (
-            self.deploy_quiesce is None
-            or self.broadcast_restarting is None
-            or self.request_shutdown is None
-        ):
-            raise TaskConflictError(
-                "deploy switch is unavailable on this instance", current=delivery
-            )
-
-        ctx = _SwitchCtx(
-            task=task, run=run, delivery=delivery, target=staged, target_state="staged",
-            from_slot=from_slot, layout=layout,
-            actor_kind=actor_kind, actor_agent_id=actor_agent_id,
-        )
-
-        if switch_when_idle:
-            # Plan (never start) the op; hold in memory until the census first
-            # reaches zero, then execute. A restart before that leaves the op
-            # `planned` — boot leaves planned ops alone (§3), so the hold never
-            # survives a restart (§7.1).
-            op = await self._plan_switch_op(delivery, actor_kind, actor_agent_id)
-            ctx.op_id = op.id
-            self._spawn_idle_waiter(ctx)
-            return await self._published(task, await self.repo.get_delivery(delivery.id))
-
-        # Immediate / drain: start the at-most-once op inside the CAS window, then
-        # census. The one-running index makes this the sole in-flight op.
-        op_id = await self._plan_and_start_switch_op(delivery, actor_kind, actor_agent_id)
-        ctx.op_id = op_id
-
-        drained = False
-        try:
-            busy = await self.deploy_quiesce.census(exclude_op_id=op_id)
-            if busy and drain:
-                await self.deploy_quiesce.pause_for_drain()
-                drained = True
-                busy = await self._drain_wait(op_id)
-            if busy:
-                raise DeploySwitchAbort("not_idle", busy=busy)
-            result = await self._perform_switch_handoff(ctx)
-        except DeploySwitchAbort as exc:
-            # We aborted before the point of no return: hand producers back (if we
-            # drained) and fail the op durably. The instance keeps running.
-            if drained:
-                await self.deploy_quiesce.resume_from_drain()
-            final = await self._fail_switch(
-                delivery.id, op_id, exc, actor_kind, actor_agent_id
-            )
-            return await self._published(task, final)
-        # Success: the switcher is spawned and shutdown is under way. Producers are
-        # deliberately NOT resumed — the restart restores them in the new server.
-        return await self._published(task, result)
+    # --- deploy_rollback (docs/plans/local-deploy.md §7.1/§7.2) -----
 
     async def deploy_rollback(
         self,
@@ -1128,35 +779,6 @@ class DeliveryCoordinator:
                 return []
             await asyncio.sleep(self._drain_poll_interval)
         return await self.deploy_quiesce.census(exclude_op_id=op_id)
-
-    def _spawn_idle_waiter(self, ctx: _SwitchCtx) -> None:
-        task = asyncio.create_task(self._await_idle_then_switch(ctx))
-        self._idle_switch_waiters.add(task)
-        task.add_done_callback(self._idle_switch_waiters.discard)
-
-    async def _await_idle_then_switch(self, ctx: _SwitchCtx) -> None:
-        """`switch_when_idle` hold: wait for the census to first reach zero, then
-        start the planned op and hand off. In-memory only — cancelled on shutdown,
-        leaving the op `planned` for boot to ignore (§7.1)."""
-        try:
-            while True:
-                busy = await self.deploy_quiesce.census(exclude_op_id=ctx.op_id)
-                if not busy:
-                    break
-                await asyncio.sleep(self._drain_poll_interval)
-            await self.repo.start_op(
-                ctx.delivery.id, ctx.op_id, advance_delivering=False,
-                allowed_statuses=_SWITCH_START_STATES,
-            )
-            await self._perform_switch_handoff(ctx)
-        except asyncio.CancelledError:
-            raise
-        except DeploySwitchAbort as exc:
-            await self._fail_switch(
-                ctx.delivery.id, ctx.op_id, exc, ctx.actor_kind, ctx.actor_agent_id
-            )
-        except Exception:
-            logger.exception("switch_when_idle hold failed for op %s", ctx.op_id)
 
     async def _perform_switch_handoff(self, ctx: _SwitchCtx) -> DeliveryRecord:
         """Close work admission, then execute the irreversible handoff.

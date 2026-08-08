@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import {
   IconAlertTriangle,
   IconExternalLink,
@@ -14,12 +14,10 @@ import type {
   DeliveryRetention,
   DeliveryOpState,
   DeliveryStatus,
-  Deployment,
   TaskDelivery,
   TaskDeliveryOp,
   TaskRun,
 } from "../../api/tasks";
-import { taskApi } from "../../api/tasks";
 import {
   useTaskStore,
   type DeliveryConfirmation,
@@ -92,10 +90,9 @@ function DeliveryActionButton({ label, icon, onClick, disabled, destructive }: D
 
 interface TaskDeliveryPanelProps {
   run: TaskRun;
-  allowLocalDeploy: boolean;
 }
 
-export function TaskDeliveryPanel({ run, allowLocalDeploy }: TaskDeliveryPanelProps) {
+export function TaskDeliveryPanel({ run }: TaskDeliveryPanelProps) {
   const taskId = run.task_id;
   const runId = run.id;
   const delivery = useTaskStore((state) => state.deliveries[runId]) as TaskDelivery | undefined;
@@ -104,23 +101,10 @@ export function TaskDeliveryPanel({ run, allowLocalDeploy }: TaskDeliveryPanelPr
   );
   const mutating = useTaskStore((state) => state.mutating);
   const confirmation = useTaskStore((state) => state.deliveryConfirmation);
-  const token = useTaskStore((state) => state.token);
   const [retention, setRetention] = useState<DeliveryRetention>(
     delivery?.retention ?? "keep"
   );
-  const [deployments, setDeployments] = useState<Deployment[]>([]);
   const store = useTaskStore.getState();
-
-  const refreshDeployments = useCallback(async () => {
-    if (!allowLocalDeploy || !token) return;
-    try {
-      const result = await taskApi.deployments(token);
-      setDeployments(result.deployments);
-    } catch {
-      // The normal task-store error surface already reports deploy mutations.
-      // A read-only status refresh should not obscure the delivery panel.
-    }
-  }, [allowLocalDeploy, token]);
 
   useEffect(() => {
     void useTaskStore.getState().loadDelivery(taskId, runId);
@@ -129,10 +113,6 @@ export function TaskDeliveryPanel({ run, allowLocalDeploy }: TaskDeliveryPanelPr
   useEffect(() => {
     if (delivery) setRetention(delivery.retention);
   }, [delivery?.retention]);
-
-  useEffect(() => {
-    void refreshDeployments();
-  }, [refreshDeployments]);
 
   if (!delivery) {
     return (
@@ -168,14 +148,6 @@ export function TaskDeliveryPanel({ run, allowLocalDeploy }: TaskDeliveryPanelPr
   const canOpenPr = !!delivery.pushed_ref && delivery.pr_number == null;
   const canMerge = delivery.pr_number != null && status !== "delivered";
   const canTeardown = (["delivered", "failed", "blocked", "conflicted"] as DeliveryStatus[]).includes(status);
-  const canStage = !delivery.dirty && !!delivery.attempt_head && (delivery.commits_ahead ?? 0) > 0
-    && (["ready", "delivered", "blocked"] as DeliveryStatus[]).includes(status);
-  const staged = deployments.find(
-    (deployment) => deployment.delivery_id === delivery.id && deployment.state === "staged"
-  );
-  const live = deployments.find(
-    (deployment) => deployment.delivery_id === delivery.id && deployment.state === "live"
-  );
 
   const opLog = ops ?? [];
   const activeConfirmation =
@@ -305,49 +277,6 @@ export function TaskDeliveryPanel({ run, allowLocalDeploy }: TaskDeliveryPanelPr
         </label>
       </div>
 
-      {allowLocalDeploy && (
-        <section className="mt-3 rounded-lg border border-primary-200 bg-primary-50/40 p-3" aria-label="Local deploy">
-          <header className="flex flex-wrap items-center gap-2">
-            <span className="text-xs font-semibold text-ink-800">Local deploy</span>
-            {staged ? (
-              <span className="rounded-full bg-attention-surface px-2 py-0.5 text-[10px] font-semibold uppercase text-attention">
-                Staged · {shortSha(staged.sha)} · slot {staged.slot}
-              </span>
-            ) : delivery.deployed_sha ? (
-              <span className="rounded-full bg-success-surface px-2 py-0.5 text-[10px] font-semibold uppercase text-success">
-                Live · {shortSha(delivery.deployed_sha)} · slot {delivery.deployed_slot}
-              </span>
-            ) : (
-              <span className="text-[11px] text-muted-foreground">Stage a settled delivery into the inactive slot.</span>
-            )}
-          </header>
-          <div className="mt-2 flex flex-wrap gap-2">
-            <DeliveryActionButton
-              label="Stage"
-              icon={<IconUpload size={14} />}
-              disabled={busy || !canStage}
-              onClick={() => void store.deliveryAction(taskId, runId, "deploy_stage").then(refreshDeployments)}
-            />
-            <DeliveryActionButton
-              label="Switch"
-              icon={<IconGitMerge size={14} />}
-              disabled={busy || !staged}
-              destructive
-              onClick={() => void store.deliveryAction(taskId, runId, "deploy_switch").then(refreshDeployments)}
-            />
-            {live && (
-              <DeliveryActionButton
-                label="Rollback"
-                icon={<IconAlertTriangle size={14} />}
-                disabled={busy}
-                destructive
-                onClick={() => void store.rollbackDeployment(taskId, runId, live.id).then(refreshDeployments)}
-              />
-            )}
-          </div>
-        </section>
-      )}
-
       <div className="mt-3">
         <p className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
           Operations <span className="font-normal">{opLog.length}</span>
@@ -420,14 +349,6 @@ function ConfirmationDialog({ confirmation }: { confirmation: DeliveryConfirmati
     store.clearDeliveryConfirmation();
     if (confirmation.action === "accept") {
       void store.acceptDelivery(confirmation.taskId, confirmation.runId, undefined, confirmations);
-    } else if (confirmation.action === "rollback" && confirmation.deploymentId) {
-      void store.rollbackDeployment(
-        confirmation.taskId, confirmation.runId, confirmation.deploymentId, true
-      );
-    } else if (confirmation.action === "rollback") {
-      // A malformed rollback confirmation cannot name a deployment, so it must
-      // never fall through to a delivery action with a different meaning.
-      return;
     } else if (confirmation.action === "teardown") {
       void store.teardownDelivery(confirmation.taskId, confirmation.runId, { confirmations });
     } else {

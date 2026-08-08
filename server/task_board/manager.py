@@ -824,22 +824,6 @@ class TaskBoardManager:
         await self.publish_task_update(task_id)
         return delivery
 
-    async def deploy_stage(
-        self, task_id: str, run_id: str, **kwargs: Any
-    ) -> DeliveryRecord:
-        """Stage a delivered run into the inactive local-deploy slot."""
-        delivery = await self.delivery.deploy_stage(task_id, run_id, **kwargs)
-        await self.publish_task_update(task_id)
-        return delivery
-
-    async def deploy_switch(
-        self, task_id: str, run_id: str, **kwargs: Any
-    ) -> DeliveryRecord:
-        """Start the explicitly user-authorized local deploy handoff."""
-        delivery = await self.delivery.deploy_switch(task_id, run_id, **kwargs)
-        await self.publish_task_update(task_id)
-        return delivery
-
     async def list_deployments(self) -> list[Any]:
         """Return the durable local-deploy history for the operator surface."""
         return await self.repo.list_deployments()

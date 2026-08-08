@@ -6,6 +6,7 @@ import type { Agent } from "../../stores/sessionStore";
 import { filterTasks, useTaskStore } from "../../stores/taskStore";
 import { BoardToolbar } from "./BoardToolbar";
 import { KanbanColumns } from "./KanbanColumns";
+import { ReleasePanel } from "./ReleasePanel";
 import { TaskDrawer } from "./TaskDrawer";
 import { TaskTree } from "./TaskTree";
 import "./tasks.css";
@@ -103,6 +104,8 @@ export function TaskBoardPage({ token, agents, activeAgentId, liveEvent, onOpenS
         </div>
       )}
 
+      {selectedBoard && selectedBoard.allow_local_deploy && <ReleasePanel board={selectedBoard} />}
+
       {store.error && (
         <div className="mx-4 mb-2 flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive-surface px-3 py-2 text-xs text-destructive md:mx-6">
           <IconAlertTriangle size={15} className="mt-0.5 shrink-0" />
@@ -142,7 +145,6 @@ export function TaskBoardPage({ token, agents, activeAgentId, liveEvent, onOpenS
           artifacts={store.artifacts[selectedTask.id] ?? []}
           allTasks={allTasks}
           agents={agents}
-          allowLocalDeploy={selectedBoard?.allow_local_deploy ?? false}
           loading={store.loadingDetail}
           busy={store.mutating}
           error={store.error}

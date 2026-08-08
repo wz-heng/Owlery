@@ -681,6 +681,54 @@ async def test_release_switch_refuses_not_idle_with_census(store, tmp_path, monk
 
 
 @pytest.mark.asyncio
+async def test_release_switch_drain_times_out_resumes_and_refuses(store, tmp_path, monkeypatch):
+    """`drain=True` pauses producers and waits `deploy_quiesce_timeout_seconds`
+    before the same `not_idle` refusal (local-deploy.md §7.1) — the release
+    verb's own `drain` support, the per-run mirror of which lived on the now-
+    removed `deploy_switch` (release-line-deploy.md §3.1 point 2)."""
+    db, repo, tmp, _agent = store
+    board_id, _src, _sha, layout, coord, release = await _staged_release(
+        db, repo, tmp, tmp_path, monkeypatch
+    )
+    monkeypatch.setattr(settings, "deploy_quiesce_timeout_seconds", 0.05)
+    q = FakeQuiesce([[BusySource("task_run", "r1")]])  # busy forever
+    _wire_switch(coord, q)
+
+    _result_release, op = await coord.release_switch(
+        board_id, drain=True, server_root=layout.slot_path("a")
+    )
+
+    assert op.state == "failed"
+    assert "not_idle" in (op.error or "")
+    assert q.paused == 1 and q.resumed == 1  # producers handed back on timeout
+    assert coord.spawns == []
+    assert (await repo.get_deployment(release.deployment_id)).state == "staged"
+
+
+@pytest.mark.asyncio
+async def test_release_switch_drain_waits_then_proceeds(store, tmp_path, monkeypatch):
+    db, repo, tmp, _agent = store
+    board_id, _src, sha, layout, coord, release = await _staged_release(
+        db, repo, tmp, tmp_path, monkeypatch
+    )
+    monkeypatch.setattr(settings, "deploy_quiesce_timeout_seconds", 5)
+    # Busy at the gate, idle once drained.
+    q = FakeQuiesce([[BusySource("task_run", "r1")], []])
+    _wire_switch(coord, q)
+
+    result_release, op = await coord.release_switch(
+        board_id, drain=True, server_root=layout.slot_path("a")
+    )
+
+    assert q.paused == 1 and q.resumed == 0  # proceeded; restart restores producers
+    assert len(coord.spawns) == 1 and coord.shutdowns == [True]
+    assert op.state == "running" and result_release.id == release.id
+    entries = switcher.Journal(str(layout.journal_path)).entries(op.id)
+    handoff = next(e for e in entries if e["step"] == switcher.STEP_HANDOFF)
+    assert handoff["detail"]["new_sha"] == sha
+
+
+@pytest.mark.asyncio
 async def test_release_switch_nothing_staged_refuses(store, tmp_path, monkeypatch):
     db, repo, tmp, _agent = store
     board_id, _src, _sha = await _board_with_remote(repo, tmp)

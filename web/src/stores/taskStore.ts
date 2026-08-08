@@ -7,6 +7,8 @@ import {
   type CreateTaskInput,
   type DispatcherStatus,
   type MergeStrategy,
+  type ReleaseDeployment,
+  type ReleaseOpResponse,
   type Task,
   type TaskArtifact,
   type TaskBoard,
@@ -28,9 +30,6 @@ export type DeliveryActionKind =
   | "push"
   | "pull_request"
   | "merge"
-  | "deploy_stage"
-  | "deploy_switch"
-  | "rollback"
   | "teardown";
 
 export interface DeliveryConfirmation {
@@ -40,7 +39,6 @@ export interface DeliveryConfirmation {
   confirmation: string;
   verb: string;
   message: string;
-  deploymentId?: string;
 }
 
 export interface DeliveryActionOptions {
@@ -48,8 +46,16 @@ export interface DeliveryActionOptions {
   mergeStrategy?: MergeStrategy;
   connectorInstallationId?: string;
   draft?: boolean;
-  drain?: boolean;
-  switchWhenIdle?: boolean;
+}
+
+export type ReleaseActionKind = "stage" | "switch" | "rollback";
+
+export interface ReleaseConfirmation {
+  boardId: string;
+  action: ReleaseActionKind;
+  confirmation: string;
+  verb: string;
+  message: string;
 }
 
 export type TaskBoardView = "kanban" | "tree";
@@ -125,6 +131,8 @@ interface TaskState {
   deliveries: Record<string, TaskDelivery>;
   deliveryOps: Record<string, TaskDeliveryOp[]>;
   deliveryConfirmation: DeliveryConfirmation | null;
+  releases: Record<string, ReleaseDeployment[]>;
+  releaseConfirmation: ReleaseConfirmation | null;
   dispatcher: Record<string, DispatcherStatus>;
   lastEventSeq: Record<string, number>;
   filters: TaskFilters;
@@ -179,7 +187,7 @@ interface TaskState {
   deliveryAction(
     taskId: string,
     runId: string,
-    action: "commit" | "push" | "pull_request" | "merge" | "deploy_stage" | "deploy_switch",
+    action: "commit" | "push" | "pull_request" | "merge",
     options?: DeliveryActionOptions
   ): Promise<boolean>;
   teardownDelivery(
@@ -187,8 +195,13 @@ interface TaskState {
     runId: string,
     options?: { retention?: string; confirmations?: Record<string, boolean> }
   ): Promise<boolean>;
-  rollbackDeployment(taskId: string, runId: string, deploymentId: string, confirm?: boolean): Promise<boolean>;
   clearDeliveryConfirmation(): void;
+
+  loadReleases(boardId: string): Promise<void>;
+  stageRelease(boardId: string): Promise<boolean>;
+  switchRelease(boardId: string, drain?: boolean): Promise<boolean>;
+  rollbackRelease(boardId: string, confirm?: boolean): Promise<boolean>;
+  clearReleaseConfirmation(): void;
 }
 
 function message(error: unknown): string {
@@ -247,7 +260,6 @@ async function runDeliveryCall(
   runId: string,
   action: DeliveryActionKind,
   call: () => Promise<TaskDelivery>,
-  deploymentId?: string,
 ): Promise<boolean> {
   set({ mutating: true, error: null });
   try {
@@ -268,7 +280,49 @@ async function runDeliveryCall(
           confirmation: error.confirmation,
           verb: error.action ?? action,
           message: error.message,
-          deploymentId,
+        },
+      });
+      return false;
+    }
+    set({ error: message(error) });
+    return false;
+  } finally {
+    set({ mutating: false });
+  }
+}
+
+type TaskGet = () => TaskState;
+
+/** Shared reconcile for the release mutations: mutating/finally + confirmation
+ * decode, mirroring `runDeliveryCall`. A release op response carries only the
+ * one release row it touched, so success also reloads the board's full
+ * history — the UI needs the whole list (staged/live/superseded), not a
+ * single row. */
+async function runReleaseCall(
+  set: DeliverySet,
+  get: TaskGet,
+  boardId: string,
+  action: ReleaseActionKind,
+  call: () => Promise<ReleaseOpResponse>,
+): Promise<boolean> {
+  set({ mutating: true, error: null });
+  try {
+    await call();
+    await get().loadReleases(boardId);
+    return true;
+  } catch (error) {
+    if (
+      error instanceof TaskApiError &&
+      error.code === "requires_confirmation" &&
+      error.confirmation
+    ) {
+      set({
+        releaseConfirmation: {
+          boardId,
+          action,
+          confirmation: error.confirmation,
+          verb: error.action ?? action,
+          message: error.message,
         },
       });
       return false;
@@ -295,6 +349,8 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   deliveries: {},
   deliveryOps: {},
   deliveryConfirmation: null,
+  releases: {},
+  releaseConfirmation: null,
   dispatcher: {},
   lastEventSeq: {},
   filters: EMPTY_FILTERS,
@@ -666,13 +722,6 @@ export const useTaskStore = create<TaskState>((set, get) => ({
             merge_strategy: options.mergeStrategy,
             confirmations: options.confirmations,
           });
-        case "deploy_stage":
-          return taskApi.deployStage(token, taskId, runId);
-        case "deploy_switch":
-          return taskApi.deploySwitch(token, taskId, runId, {
-            drain: options.drain,
-            switch_when_idle: options.switchWhenIdle,
-          });
       }
       throw new Error(`Unknown delivery action: ${action}`);
     });
@@ -684,11 +733,29 @@ export const useTaskStore = create<TaskState>((set, get) => ({
         confirmations: options.confirmations,
       })
     ),
-  rollbackDeployment: (taskId, runId, deploymentId, confirm = false) =>
-    runDeliveryCall(set, taskId, runId, "rollback", () =>
-      taskApi.rollbackDeployment(get().token, deploymentId, confirm), deploymentId
-    ),
   clearDeliveryConfirmation: () => set({ deliveryConfirmation: null }),
+
+  loadReleases: async (boardId) => {
+    const { token } = get();
+    if (!token) return;
+    try {
+      const result = await taskApi.releases(token, boardId);
+      set((state) => ({ releases: { ...state.releases, [boardId]: result.releases } }));
+    } catch (error) {
+      set({ error: message(error) });
+    }
+  },
+  stageRelease: (boardId) =>
+    runReleaseCall(set, get, boardId, "stage", () => taskApi.releaseStage(get().token, boardId)),
+  switchRelease: (boardId, drain = false) =>
+    runReleaseCall(set, get, boardId, "switch", () =>
+      taskApi.releaseSwitch(get().token, boardId, { drain })
+    ),
+  rollbackRelease: (boardId, confirm = false) =>
+    runReleaseCall(set, get, boardId, "rollback", () =>
+      taskApi.releaseRollback(get().token, boardId, confirm)
+    ),
+  clearReleaseConfirmation: () => set({ releaseConfirmation: null }),
 }));
 
 export function resetTaskStore(): void {
@@ -707,6 +774,8 @@ export function resetTaskStore(): void {
     deliveries: {},
     deliveryOps: {},
     deliveryConfirmation: null,
+    releases: {},
+    releaseConfirmation: null,
     dispatcher: {},
     lastEventSeq: {},
     filters: EMPTY_FILTERS,

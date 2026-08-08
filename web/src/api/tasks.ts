@@ -247,10 +247,60 @@ export interface Deployment {
   slot: string;
   sha: string;
   source_repo: string;
+  release_id: string | null;
   state: DeploymentState;
   journal: Record<string, unknown> | null;
   created_at: string;
   updated_at: string;
+}
+
+export type ReleaseDeploymentState =
+  | "planned"
+  | "staging"
+  | "staged"
+  | "switching"
+  | "live"
+  | "rolled_back"
+  | "superseded"
+  | "failed";
+
+export interface ReleaseDeployment {
+  id: string;
+  board_id: string;
+  version: string;
+  source_ref: string;
+  sha: string;
+  source_repo: string;
+  deployment_id: string | null;
+  state: ReleaseDeploymentState;
+  actor_kind: string;
+  actor_agent_id: string | null;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export type ReleaseOpKind = "stage" | "switch" | "rollback";
+
+export interface ReleaseDeploymentOp {
+  id: string;
+  release_id: string;
+  kind: ReleaseOpKind;
+  state: DeliveryOpState;
+  request: Record<string, unknown>;
+  result: Record<string, unknown> | null;
+  error: string | null;
+  journal_ref: string | null;
+  actor_kind: string;
+  actor_agent_id: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string;
+}
+
+export interface ReleaseOpResponse {
+  release: ReleaseDeployment | null;
+  op: ReleaseDeploymentOp;
 }
 
 export interface TaskDeliveryOp {
@@ -569,28 +619,29 @@ export const taskApi = {
       retention: body.retention,
       confirmations: body.confirmations ?? {},
     }),
-  deployStage: (token: string, taskId: string, runId: string) =>
-    mutate<TaskDelivery>(
-      token,
-      `/api/tasks/${taskId}/runs/${runId}/delivery/deploy/stage`,
-      "POST"
-    ),
-  deploySwitch: (
-    token: string,
-    taskId: string,
-    runId: string,
-    body: { drain?: boolean; switch_when_idle?: boolean } = {}
-  ) =>
-    mutate<TaskDelivery>(
-      token,
-      `/api/tasks/${taskId}/runs/${runId}/delivery/deploy/switch`,
-      "POST",
-      body
-    ),
   deployments: (token: string) =>
     get<{ deployments: Deployment[]; live: Deployment | null }>(token, "/api/deployments"),
   rollbackDeployment: (token: string, deploymentId: string, confirmRollback = false) =>
     mutate<TaskDelivery>(token, `/api/deployments/${deploymentId}/rollback`, "POST", {
+      confirm_rollback: confirmRollback,
+    }),
+  releaseStage: (token: string, boardId: string) =>
+    mutate<ReleaseOpResponse>(token, `/api/task-boards/${boardId}/releases/stage`, "POST"),
+  releaseSwitch: (token: string, boardId: string, body: { drain?: boolean } = {}) =>
+    mutate<ReleaseOpResponse>(
+      token,
+      `/api/task-boards/${boardId}/releases/switch`,
+      "POST",
+      body
+    ),
+  releases: (token: string, boardId: string) =>
+    get<{
+      releases: ReleaseDeployment[];
+      live: ReleaseDeployment | null;
+      staged: ReleaseDeployment | null;
+    }>(token, `/api/task-boards/${boardId}/releases`),
+  releaseRollback: (token: string, boardId: string, confirmRollback = false) =>
+    mutate<ReleaseOpResponse>(token, `/api/task-boards/${boardId}/releases/rollback`, "POST", {
       confirm_rollback: confirmRollback,
     }),
 };

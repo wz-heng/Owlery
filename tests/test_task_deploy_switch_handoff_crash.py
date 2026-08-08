@@ -1,12 +1,17 @@
 """Regression: process crash between journaling `handoff` and executing
 `begin_deployment_switching` (docs/plans/local-deploy.md §7.2 steps 2→3).
 
-The deployment row never left `staged` — the CAS to `switching` (§7.2 step 3)
-never ran — but the journal already has a `handoff` line naming this op's
-`to_slot`/`new_sha`. Boot reconciliation (§8) must still locate that `staged`
-row via the journal-derived `target_slot`/`target_sha` fallback and drive it
-to a terminal state; it must never finish the op while leaving the deployment
-row orphaned in `staged`.
+The rollback target's deployment row never left `superseded` — the CAS to
+`switching` (§7.2 step 3) never ran — but the journal already has a `handoff`
+line naming this op's `to_slot`/`new_sha`. Boot reconciliation (§8) must still
+locate that row via the journal-derived `target_slot`/`target_sha` fallback and
+drive it to a terminal state; it must never finish the op while leaving the
+deployment row orphaned.
+
+Reached through `deploy_rollback` — the surviving per-run coordinator entry
+point after `deploy_stage`/`deploy_switch` were removed in favor of the
+board-level release-line deploy (docs/plans/release-line-deploy.md); the crash
+window and the §8 fallback locator it exercises are identical either way.
 """
 from __future__ import annotations
 
@@ -24,7 +29,6 @@ from server.task_board.repository import TaskRepository
 from server.task_board.workspaces import prepare_workspace
 
 from tests.test_task_deploy_switch import (
-    FakeStageRunner,
     _coord,
     _init_layout,
     _init_repo,
@@ -47,6 +51,10 @@ async def store(tmp_path: Path, monkeypatch):
 
 
 async def _staged(db, repo, tmp, agent, monkeypatch):
+    """A delivery with a `superseded` deployment on slot `b` (the rollback
+    target `deploy_rollback` needs) — the handoff-crash surface now reached
+    through the surviving per-run coordinator entry point, `deploy_rollback`,
+    rather than the removed `deploy_stage`/`deploy_switch`."""
     src = tmp / "src"
     _init_repo(src)
     board = await repo.create_board(
@@ -76,22 +84,41 @@ async def _staged(db, repo, tmp, agent, monkeypatch):
     coord = _coord(db, repo)
     delivery = await coord.accept(task.id, run.id)
     layout = _init_layout(tmp / "deploy", monkeypatch)
-    delivery = await coord.deploy_stage(
-        task.id, run.id, server_root=layout.slot_path("a"), stage_runner=FakeStageRunner()
-    )
-    staged = await repo.get_staged_deployment_for_delivery(delivery.id)
-    assert staged is not None and staged.slot == "b" and staged.state == "staged"
-    return task, await repo.get_run(run.id), delivery, layout, coord, staged
+
+    # Seed the live deployment (current slot `a`) and the superseded rollback
+    # target (slot `b`) directly — `deploy_rollback` requires both to already
+    # exist; there is no coordinator verb left that produces them.
+    async with repo._transaction() as conn:
+        await conn.execute(
+            "INSERT INTO deployments (id, delivery_id, task_id, op_id, slot, sha, "
+            "source_repo, release_id, state, journal, created_at, updated_at) VALUES "
+            "('live0', ?, ?, NULL, 'a', 'oldsha0000', 'x', NULL, 'live', NULL, "
+            "'2020-01-01T00:00:00+00:00', '2020-01-01T00:00:00+00:00')",
+            (delivery.id, task.id),
+        )
+        await conn.execute(
+            "INSERT INTO deployments (id, delivery_id, task_id, op_id, slot, sha, "
+            "source_repo, release_id, state, journal, created_at, updated_at) VALUES "
+            "('sup0', ?, ?, NULL, 'b', 'targetsha01', 'x', NULL, 'superseded', NULL, "
+            "'2020-01-01T00:00:00+00:00', '2020-01-01T00:00:00+00:00')",
+            (delivery.id, task.id),
+        )
+    live = await repo.get_deployment("live0")
+    staged = await repo.get_deployment("sup0")
+    assert staged is not None and staged.slot == "b" and staged.state == "superseded"
+    return task, await repo.get_run(run.id), delivery, layout, coord, staged, live
 
 
 async def _crash_before_bind(db, repo, tmp, agent, monkeypatch):
     """Replay §7.2 steps 1-2 (snapshot + journal `handoff`) and then simulate a
     crash exactly before step 3 (`begin_deployment_switching`) ever runs — the
-    deployment row is left `staged`, still bound to the earlier `deploy_stage`
-    op id, while the journal already names this switch op's `to_slot`/`new_sha`.
+    rollback target's deployment row is left `superseded`, never bound to the
+    switch op, while the journal already names this op's `to_slot`/`new_sha`.
     """
-    task, run, delivery, layout, coord, staged = await _staged(db, repo, tmp, agent, monkeypatch)
-    pre_bind_op_id = staged.op_id  # the deploy_stage op, never a switch op
+    task, run, delivery, layout, coord, staged, live = await _staged(
+        db, repo, tmp, agent, monkeypatch
+    )
+    pre_bind_op_id = staged.op_id  # None — never bound to any switch op yet
 
     op_id = await coord._plan_and_start_switch_op(delivery, "user", None)
     op = next(o for o in await repo.list_delivery_ops(delivery.id) if o.id == op_id)
@@ -114,10 +141,10 @@ async def _crash_before_bind(db, repo, tmp, agent, monkeypatch):
     journal = switcher.Journal(str(layout.journal_path))
     journal.append(op.id, switcher.STEP_HANDOFF, handoff_detail)
 
-    # CRASH: step 3 (`begin_deployment_switching`) never runs. The deployment
-    # row is exactly as `deploy_stage` left it.
+    # CRASH: step 3 (`begin_deployment_switching`) never runs. The rollback
+    # target's deployment row is exactly as seeded — still `superseded`.
     still_staged = await repo.get_deployment(staged.id)
-    assert still_staged.state == "staged"
+    assert still_staged.state == "superseded"
     assert still_staged.op_id == pre_bind_op_id  # never bound to the switch op
 
     return task, run, delivery, layout, coord, staged, op

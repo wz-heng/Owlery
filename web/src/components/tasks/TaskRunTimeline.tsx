@@ -17,10 +17,9 @@ import { TaskDeliveryPanel } from "./TaskDeliveryPanel";
 interface TaskRunTimelineProps {
   runs: TaskRun[];
   agents: Agent[];
-  allowLocalDeploy?: boolean;
   onOpenSession?: (sessionId: string) => void;
 }
-export function TaskRunTimeline({ runs, agents, allowLocalDeploy = false, onOpenSession }: TaskRunTimelineProps) {
+export function TaskRunTimeline({ runs, agents, onOpenSession }: TaskRunTimelineProps) {
   const agentMap = new Map(agents.map((agent) => [agent.id, agent]));
   return (
     <section aria-labelledby="task-runs-title">
@@ -65,7 +64,7 @@ export function TaskRunTimeline({ runs, agents, allowLocalDeploy = false, onOpen
                 )}
               </div>
               {run.workspace_mode === "git_worktree" && run.state === "completed" && (
-                <TaskDeliveryPanel run={run} allowLocalDeploy={allowLocalDeploy} />
+                <TaskDeliveryPanel run={run} />
               )}
             </article>
           );

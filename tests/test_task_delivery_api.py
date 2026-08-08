@@ -52,14 +52,6 @@ class _Manager:
         self.calls.append(("teardown", {"task_id": task_id, "run_id": run_id, **kw}))
         return _Delivery(status="delivered")
 
-    async def deploy_stage(self, task_id, run_id, **kw):
-        self.calls.append(("deploy_stage", {"task_id": task_id, "run_id": run_id, **kw}))
-        return _Delivery(status="ready")
-
-    async def deploy_switch(self, task_id, run_id, **kw):
-        self.calls.append(("deploy_switch", {"task_id": task_id, "run_id": run_id, **kw}))
-        return _Delivery(status="ready")
-
     async def list_deployments(self):
         return [
             type("Deployment", (), {"state": "live", "to_dict": lambda self: {"id": "dep1", "state": "live"}})(),
@@ -164,24 +156,8 @@ async def test_requires_confirmation_409(client):
 
 
 @pytest.mark.asyncio
-async def test_deploy_stage_switch_and_history_routing(client, monkeypatch):
-    c, manager = client
-    r = await c.post("/api/tasks/t1/runs/r1/delivery/deploy/stage", headers=HEADERS)
-    assert r.status_code == 200
-    assert manager.calls[-1] == ("deploy_stage", {
-        "task_id": "t1", "run_id": "r1", "actor_kind": "user", "actor_agent_id": None,
-    })
-
-    r = await c.post(
-        "/api/tasks/t1/runs/r1/delivery/deploy/switch",
-        json={"drain": True, "switch_when_idle": True}, headers=HEADERS,
-    )
-    assert r.status_code == 200
-    assert manager.calls[-1] == ("deploy_switch", {
-        "task_id": "t1", "run_id": "r1", "drain": True, "switch_when_idle": True,
-        "actor_kind": "user", "actor_agent_id": None,
-    })
-
+async def test_deployments_history_routing(client):
+    c, _manager = client
     r = await c.get("/api/deployments", headers=HEADERS)
     assert r.status_code == 200
     assert r.json() == {
@@ -189,14 +165,16 @@ async def test_deploy_stage_switch_and_history_routing(client, monkeypatch):
         "live": {"id": "dep1", "state": "live"},
     }
 
-    async def agent_actor(_session_id):
-        return "agent", "a1"
 
-    monkeypatch.setattr(routes, "_delivery_actor", agent_actor)
+@pytest.mark.asyncio
+async def test_per_run_deploy_verbs_are_gone(client):
+    """The per-run deploy/stage and deploy/switch REST verbs are removed
+    outright (release-line-deploy.md §3.4) — never hidden behind a flag."""
+    c, _manager = client
+    r = await c.post("/api/tasks/t1/runs/r1/delivery/deploy/stage", headers=HEADERS)
+    assert r.status_code == 404
     r = await c.post("/api/tasks/t1/runs/r1/delivery/deploy/switch", headers=HEADERS)
-    assert r.status_code == 403
-    assert r.json()["detail"]["code"] == "deploy_switch_user_only"
-    assert manager.calls[-1][0] == "deploy_switch"
+    assert r.status_code == 404
 
 
 @pytest.mark.asyncio

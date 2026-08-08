@@ -488,20 +488,6 @@ async def remote_release_ref_tip(repo: str, remote: str, ref: str) -> str:
     return sha.lower()
 
 
-async def remote_has_commit(repo: str, remote: str, sha: str) -> bool:
-    """Verify an immutable commit is advertised by ``remote`` without trusting
-    the local object database.  A stage uses this before it creates any durable
-    deploy op, so an unpushed local commit is never a release candidate."""
-    rc, out, err = await _git("ls-remote", remote, cwd=repo)
-    if rc:
-        raise WorkspaceError(err or "unable to query the configured Git remote")
-    return any(
-        line.split(maxsplit=1)[0] == sha
-        for line in out.splitlines()
-        if line.split(maxsplit=1)
-    )
-
-
 async def push_branch(
     repo: str, remote: str, branch: str, *, force_with_lease: bool = False
 ) -> dict[str, Any]:

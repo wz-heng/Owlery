@@ -24,7 +24,6 @@ interface TaskDrawerProps {
   artifacts: TaskArtifact[];
   allTasks: Task[];
   agents: Agent[];
-  allowLocalDeploy: boolean;
   loading: boolean;
   busy: boolean;
   error: string | null;
@@ -105,7 +104,7 @@ export function TaskDrawer(props: TaskDrawerProps) {
             <Relation label="Dependents" tasks={dependents.map((item) => allTasks.find((taskItem) => taskItem.id === item.id) ?? ({ ...task, ...item, id: item.id } as Task))} onOpen={props.onOpenTask} />
           </section>
 
-          <div className="mt-8"><TaskRunTimeline runs={props.runs} agents={agents} allowLocalDeploy={props.allowLocalDeploy} onOpenSession={props.onOpenSession} /></div>
+          <div className="mt-8"><TaskRunTimeline runs={props.runs} agents={agents} onOpenSession={props.onOpenSession} /></div>
           <div className="mt-8"><Artifacts artifacts={props.artifacts} taskId={task.id} /></div>
           <div className="mt-8 pb-8"><TaskComments comments={props.comments} agents={agents} busy={props.busy} onComment={props.onComment} /></div>
         </div>
