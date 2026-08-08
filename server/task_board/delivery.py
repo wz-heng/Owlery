@@ -30,10 +30,13 @@ from .deploy_quiesce import BusySource, DeployQuiesce
 from .models import (
     DELIVERED_OP_KINDS,
     DELIVERY_RETENTIONS,
+    BoardRecord,
     DeliveryConfirmationRequired,
     DeliveryRecord,
     DeployLockedError,
     DeploymentRecord,
+    ReleaseDeploymentOpRecord,
+    ReleaseDeploymentRecord,
     RunRecord,
     TaskConflictError,
     TaskNotFoundError,
@@ -101,6 +104,30 @@ class _SwitchCtx:
     layout: "deploy.DeployLayout"
     actor_kind: str
     actor_agent_id: str | None
+    op_id: str = ""
+
+
+@dataclass(slots=True)
+class _ReleaseSwitchCtx:
+    """The release-line mirror of ``_SwitchCtx`` (release-line-deploy.md
+    §3.1): a board-level switch/rollback attempt has no per-run delivery, so
+    it threads a board and a release op instead of a delivery."""
+
+    board: BoardRecord
+    target: DeploymentRecord
+    target_state: str
+    from_slot: str
+    layout: "deploy.DeployLayout"
+    actor_kind: str
+    actor_agent_id: str | None
+    # The release row being promoted to `live` on success — `None` only for a
+    # rollback whose target predates release-line-deploy (§3.1 point 3).
+    target_release_id: str | None
+    # The release row this op is durably attached to (`release_deployment_ops.
+    # release_id`) — the staged candidate for a switch, or the CURRENTLY LIVE
+    # release for a rollback (the release being abandoned; release-line-
+    # deploy.md §3.1 point 3's rollback-op-attaches-to-the-live-release choice).
+    op_release_id: str = ""
     op_id: str = ""
 
 
@@ -1454,6 +1481,402 @@ class DeliveryCoordinator:
         return await self.repo.record_pr_reconcile(
             delivery.id, pr_number=found["number"], pr_url=found["url"], pr_state=found["state"],
         )
+
+    # --- release-line deploy (docs/plans/release-line-deploy.md §3) ------
+    #
+    # Board-level equivalents of `deploy_stage`/`deploy_switch`/`deploy_rollback`
+    # above: the source is the board's protected release branch, resolved at
+    # its configured remote, instead of a per-run delivery's attempt branch.
+    # Every mechanism below — the global deploy lock (now doubled: a release-
+    # level lock alongside the existing slot-level one), `stage_slot`, the
+    # snapshot/journal/switcher handoff, quiesce, probation — is reused
+    # byte-identical from the per-run path; only what may be staged/switched
+    # and which table records the op differ.
+
+    async def release_stage(
+        self,
+        board_id: str,
+        *,
+        actor_kind: str = "user",
+        actor_agent_id: str | None = None,
+        server_root: Path | None = None,
+        stage_runner: deploy.StageRunner | None = None,
+    ) -> tuple[ReleaseDeploymentRecord, ReleaseDeploymentOpRecord]:
+        """Resolve the board's release ref at its remote, plan a release
+        candidate, and stage it into the idle slot — one verb (§3.1 point 1).
+
+        Preconditions (board opt-in, instance fail-closed guard, a resolvable
+        release ref) refuse WITHOUT planning a release or an op — the same
+        shape as `deploy_stage`'s preconditions. From the plan onward
+        everything is durable: a bad stage step settles `failed` and releases
+        both the release-level and slot-level locks."""
+        board = await self.repo.get_board(board_id)
+        if not board.allow_local_deploy:
+            raise TaskConflictError(
+                "this board may not deploy the local instance "
+                "(enable allow_local_deploy on the board first)"
+            )
+        check = deploy.deploy_precheck(settings, server_root=server_root)
+        if not check.ok:
+            raise TaskConflictError(check.message)
+
+        remote = board.git_delivery_remote
+        remote_url = await ws.remote_url(board.working_dir, remote)
+        if remote_url is None:
+            raise TaskConflictError(
+                f"remote_source_missing: configured remote {remote!r} is unavailable"
+            )
+        try:
+            sha = await ws.remote_release_ref_tip(
+                board.working_dir, remote_url, board.deploy_release_ref
+            )
+        except ws.WorkspaceError as exc:
+            raise TaskConflictError(f"release ref could not be resolved: {exc}") from exc
+
+        async with self._admit_delivery_op():
+            release = await self.repo.plan_release_deployment(
+                board_id=board.id,
+                source_ref=board.deploy_release_ref,
+                sha=sha,
+                source_repo=remote_url,
+                actor_kind=actor_kind,
+                actor_agent_id=actor_agent_id,
+            )
+            op = await self.repo.plan_release_op(
+                release.id, kind="stage", request={"sha": sha, "source_remote": remote_url},
+                actor_kind=actor_kind, actor_agent_id=actor_agent_id,
+            )
+            await self.repo.start_release_op(release.id, op.id)
+
+        layout = deploy.DeployLayout.at(settings.resolved_deploy_root)
+        slot = layout.idle_slot()
+        try:
+            release, deployment = await self.repo.begin_release_staging(
+                release.id, slot=slot, sha=sha, source_repo=remote_url,
+            )
+        except DeployLockedError as exc:
+            op = await self.repo.finish_release_op(
+                release.id, op.id, state="failed", error=str(exc),
+            )
+            # The lock loss happened before either row entered `staging`
+            # (`begin_release_staging` is one transaction) — no born-together
+            # deployment row exists to settle alongside it.
+            release = await self.repo.fail_planned_release(release.id, error=str(exc))
+            return release, op
+
+        runner = stage_runner or deploy._default_stage_runner
+        try:
+            result = await asyncio.to_thread(
+                deploy.stage_slot,
+                layout, slot, repo_path=remote_url, sha=sha,
+                timeout=settings.deploy_stage_timeout_seconds, runner=runner,
+            )
+        except Exception as exc:  # pragma: no cover - defensive; steps return rc
+            await self.repo.mark_release_failed(
+                release.id, deployment_id=deployment.id,
+                error=f"stage pipeline crashed: {exc}",
+            )
+            op = await self.repo.finish_release_op(
+                release.id, op.id, state="failed",
+                error=f"stage pipeline crashed: {exc}",
+            )
+            release = await self.repo.get_release_deployment(release.id)
+            return release, op
+
+        if not result.ok:
+            detail = f"stage step {result.failed_step!r} failed:\n{result.output}".strip()
+            await self.repo.mark_release_failed(
+                release.id, deployment_id=deployment.id, error=detail,
+            )
+            op = await self.repo.finish_release_op(
+                release.id, op.id, state="failed", error=detail,
+            )
+            release = await self.repo.get_release_deployment(release.id)
+            return release, op
+
+        release, _ = await self.repo.mark_release_staged(
+            release.id, deployment_id=deployment.id,
+        )
+        op = await self.repo.finish_release_op(
+            release.id, op.id, state="succeeded",
+            result={"staged_sha": result.sha, "staged_slot": result.slot,
+                    "deployment_id": deployment.id},
+        )
+        return release, op
+
+    async def release_switch(
+        self,
+        board_id: str,
+        *,
+        drain: bool = False,
+        actor_kind: str = "user",
+        actor_agent_id: str | None = None,
+        server_root: Path | None = None,
+    ) -> tuple[ReleaseDeploymentRecord, ReleaseDeploymentOpRecord]:
+        """Flip the board's staged release live — the release-line mirror of
+        `deploy_switch` (§3.1 point 2). Human-only, enforced by the REST layer
+        exactly like `deploy_switch`; this coordinator method itself has no
+        actor-kind gate, matching `deploy_switch`'s own split of that
+        responsibility to the router."""
+        board = await self.repo.get_board(board_id)
+        if not board.allow_local_deploy:
+            raise TaskConflictError(
+                "this board may not deploy the local instance "
+                "(enable allow_local_deploy on the board first)"
+            )
+        check = deploy.deploy_precheck(settings, server_root=server_root)
+        if not check.ok:
+            raise TaskConflictError(check.message)
+
+        staged = await self.repo.get_staged_release(board.id)
+        if staged is None:
+            raise TaskConflictError("nothing_staged: run release_stage before switching")
+        layout = deploy.DeployLayout.at(settings.resolved_deploy_root)
+        from_slot = layout.current_slot()
+        if from_slot is None:
+            raise TaskConflictError("deploy layout has no current slot; run `owlery deploy init`")
+        deployment = await self.repo.get_deployment(staged.deployment_id) if staged.deployment_id else None
+        if deployment is None:
+            raise TaskConflictError("staged release has no deployment row to switch to")
+        if deployment.slot == from_slot:
+            raise TaskConflictError("the staged slot is already current; nothing to switch")
+        if (
+            self.deploy_quiesce is None
+            or self.broadcast_restarting is None
+            or self.request_shutdown is None
+        ):
+            raise TaskConflictError("deploy switch is unavailable on this instance")
+
+        op = await self.repo.plan_release_op(
+            staged.id, kind="switch", request={"drain": drain},
+            actor_kind=actor_kind, actor_agent_id=actor_agent_id,
+        )
+        await self.repo.start_release_op(staged.id, op.id)
+
+        ctx = _ReleaseSwitchCtx(
+            board=board, target=deployment, target_state="staged",
+            from_slot=from_slot, layout=layout,
+            actor_kind=actor_kind, actor_agent_id=actor_agent_id,
+            target_release_id=staged.id, op_release_id=staged.id, op_id=op.id,
+        )
+
+        drained = False
+        try:
+            busy = await self.deploy_quiesce.census(exclude_op_id=op.id)
+            if busy and drain:
+                await self.deploy_quiesce.pause_for_drain()
+                drained = True
+                busy = await self._drain_wait(op.id)
+            if busy:
+                raise DeploySwitchAbort("not_idle", busy=busy)
+            result = await self._perform_release_switch_handoff(ctx)
+        except DeploySwitchAbort as exc:
+            if drained:
+                await self.deploy_quiesce.resume_from_drain()
+            return await self._fail_release_switch(ctx, exc)
+        return result
+
+    async def release_rollback(
+        self,
+        board_id: str,
+        *,
+        confirm_rollback: bool,
+        actor_kind: str = "user",
+        actor_agent_id: str | None = None,
+        server_root: Path | None = None,
+    ) -> tuple[ReleaseDeploymentRecord | None, ReleaseDeploymentOpRecord]:
+        """Switch the board's live release back to its most recent superseded
+        slot — the release-line mirror of `deploy_rollback` (§3.1 point 3).
+        Slot-level, so this works even when the current live deployment
+        predates release-line-deploy (a `deployments` row with no
+        `release_id`) — provenance does not matter to a slot flip."""
+        board = await self.repo.get_board(board_id)
+        live = await self.repo.get_live_deployment()
+        if live is None:
+            raise TaskConflictError("no live deployment to roll back")
+        target = await self.repo.get_rollback_target(live.id)
+        if target is None:
+            raise TaskConflictError("no superseded deployment is available for rollback")
+        if not confirm_rollback:
+            raise DeliveryConfirmationRequired(
+                "rollback replaces the running local version; confirmation is required",
+                confirmation="confirm_rollback", action="rollback",
+            )
+        if not board.allow_local_deploy:
+            raise TaskConflictError(
+                "this board may not deploy the local instance "
+                "(enable allow_local_deploy on the board first)"
+            )
+        check = deploy.deploy_precheck(settings, server_root=server_root)
+        if not check.ok:
+            raise TaskConflictError(check.message)
+        layout = deploy.DeployLayout.at(settings.resolved_deploy_root)
+        from_slot = layout.current_slot()
+        if from_slot != live.slot:
+            raise TaskConflictError("current deploy slot no longer matches the live deployment")
+        if target.slot == from_slot:
+            raise TaskConflictError("rollback target is already current")
+        if (
+            self.deploy_quiesce is None
+            or self.broadcast_restarting is None
+            or self.request_shutdown is None
+        ):
+            raise TaskConflictError("deploy switch is unavailable on this instance")
+
+        # The rollback op is durably attached to the CURRENTLY LIVE release —
+        # the one being abandoned — since that is the release row guaranteed
+        # to exist (a `release_deployments_one_active` lock target). The
+        # rollback TARGET's release (if any) is threaded separately as
+        # `target_release_id`, which the finalizers promote to `live`.
+        live_release = await self.repo.get_release_for_deployment(live.id)
+        target_release = await self.repo.get_release_for_deployment(target.id)
+        if live_release is None:
+            raise TaskConflictError(
+                "the live deployment predates release-line-deploy and has no "
+                "release row to attach a rollback op to"
+            )
+
+        op = await self.repo.plan_release_op(
+            live_release.id, kind="rollback", request={},
+            actor_kind=actor_kind, actor_agent_id=actor_agent_id,
+        )
+        await self.repo.start_release_op(live_release.id, op.id)
+
+        ctx = _ReleaseSwitchCtx(
+            board=board, target=target, target_state="superseded",
+            from_slot=from_slot, layout=layout,
+            actor_kind=actor_kind, actor_agent_id=actor_agent_id,
+            target_release_id=target_release.id if target_release else None,
+            op_release_id=live_release.id, op_id=op.id,
+        )
+        try:
+            busy = await self.deploy_quiesce.census(exclude_op_id=op.id)
+            if busy:
+                raise DeploySwitchAbort("not_idle", busy=busy)
+            result = await self._perform_release_switch_handoff(ctx)
+        except DeploySwitchAbort as exc:
+            return await self._fail_release_switch(ctx, exc)
+        return result
+
+    async def _perform_release_switch_handoff(
+        self, ctx: _ReleaseSwitchCtx
+    ) -> tuple[ReleaseDeploymentRecord | None, ReleaseDeploymentOpRecord]:
+        """Close work admission, then execute the irreversible handoff — the
+        release-line mirror of `_perform_switch_handoff`."""
+        await self.deploy_quiesce.close_admission()
+        spawned = False
+
+        def _mark_spawned() -> None:
+            nonlocal spawned
+            spawned = True
+
+        try:
+            return await self._perform_release_switch_handoff_after_admission(
+                ctx, on_spawned=_mark_spawned
+            )
+        except BaseException:
+            if not spawned:
+                await self.deploy_quiesce.open_admission()
+            raise
+
+    async def _perform_release_switch_handoff_after_admission(
+        self, ctx: _ReleaseSwitchCtx, *, on_spawned: Callable[[], None]
+    ) -> tuple[ReleaseDeploymentRecord | None, ReleaseDeploymentOpRecord]:
+        """§7.2-equivalent handoff for a release switch/rollback: snapshot ->
+        journal `handoff` -> release+deployment `switching` + op journal_ref ->
+        spawn the detached switcher -> broadcast `server_restarting` +
+        graceful shutdown. Byte-identical sequencing to
+        `_perform_switch_handoff_after_admission`; only the DB calls at step 3
+        target the release tables instead of a delivery op."""
+        busy = await self.deploy_quiesce.census(exclude_op_id=ctx.op_id)
+        if busy:
+            raise DeploySwitchAbort("not_idle", busy=busy)
+
+        layout = ctx.layout
+        snapshot_path = await self._snapshot_db(layout, ctx.op_id)
+
+        old_sha = await self._current_sha(layout, ctx.from_slot)
+        handoff_detail = {
+            "from_slot": ctx.from_slot,
+            "to_slot": ctx.target.slot,
+            "old_sha": old_sha,
+            "new_sha": ctx.target.sha,
+            "old_pid": os.getpid(),
+            "host": self._switch_host,
+            "port": int(settings.port),
+            "db_path": self.db.path,
+            "snapshot_path": snapshot_path,
+            "serve_argv": ["serve"],
+            "serve_env": {},
+        }
+        journal = switcher.Journal(str(layout.journal_path))
+        await asyncio.to_thread(
+            journal.append, ctx.op_id, switcher.STEP_HANDOFF, handoff_detail
+        )
+
+        try:
+            # `expected_release_state` is only meaningful when `target_release_id`
+            # is set (`begin_release_switching` skips the release-row CAS
+            # entirely when it is None — a pre-release-era rollback target).
+            await self.repo.begin_release_switching(
+                release_id=ctx.target_release_id,
+                deployment_id=ctx.target.id,
+                op_id=ctx.op_id,
+                expected_release_state=ctx.target_state,
+                expected_deployment_state=ctx.target_state,
+            )
+        except DeployLockedError as exc:
+            raise DeploySwitchAbort("deploy_locked", message=str(exc)) from exc
+        op = await self.repo.record_release_switch_journal_ref(
+            ctx.op_id, journal_ref=str(layout.journal_path),
+            detail={"from_slot": ctx.from_slot, "to_slot": ctx.target.slot,
+                    "new_sha": ctx.target.sha},
+        )
+
+        # Past this line the switch is committed — no more aborts (§7.2 step 4).
+        await asyncio.to_thread(
+            self.spawn_switcher,
+            root=str(layout.root),
+            from_slot=ctx.from_slot,
+            op_id=ctx.op_id,
+            switch_timeout=float(settings.deploy_switch_timeout_seconds),
+            health_timeout=float(settings.deploy_health_timeout_seconds),
+        )
+        on_spawned()
+
+        await self.broadcast_restarting({
+            "type": "server_restarting",
+            "op_id": ctx.op_id,
+            "from_slot": ctx.from_slot,
+            "to_slot": ctx.target.slot,
+            "sha": ctx.target.sha,
+        })
+        self.request_shutdown()
+        # The op is left `running`: like the per-run switch, its terminal state
+        # is settled from the switcher's write-ahead journal, either by boot
+        # reconciliation or (the common path) this same process's probation
+        # monitor once it observes the journal go terminal (§8).
+        release = await self.repo.get_release_deployment(ctx.op_release_id)
+        return release, op
+
+    async def _fail_release_switch(
+        self, ctx: _ReleaseSwitchCtx, exc: DeploySwitchAbort
+    ) -> tuple[ReleaseDeploymentRecord | None, ReleaseDeploymentOpRecord]:
+        """Fail a release switch/rollback op that aborted pre-commit (mirrors
+        `_fail_switch`). Never touches the deployment/release rows: any
+        `switching` transition is reverted by its own abort path, and a
+        pre-flip abort never moved the staged rows."""
+        detail = (
+            f"not_idle: instance is busy — "
+            + "; ".join(f"{b.kind}:{b.detail}" for b in (exc.busy or []))
+            if exc.reason == "not_idle" and exc.busy
+            else (exc.message or exc.reason)
+        )
+        op = await self.repo.finish_release_op(
+            ctx.op_release_id, ctx.op_id, state="failed", error=detail,
+        )
+        release = await self.repo.get_release_deployment(ctx.op_release_id)
+        return release, op
 
     # --- shared tails ----------------------------------------------------
 

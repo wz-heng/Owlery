@@ -250,12 +250,16 @@ class _Repo:
     def __init__(self):
         self.runs = []
         self.ops = []
+        self.release_ops = []
 
     async def list_running_runs(self):
         return self.runs
 
     async def list_running_delivery_ops(self):
         return self.ops
+
+    async def list_running_release_ops(self):
+        return self.release_ops
 
 
 class _DB:

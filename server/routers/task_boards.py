@@ -1115,6 +1115,14 @@ class DeployRollbackRequest(BaseModel):
     confirm_rollback: bool = False
 
 
+class ReleaseSwitchRequest(BaseModel):
+    drain: bool = False
+
+
+class ReleaseRollbackRequest(BaseModel):
+    confirm_rollback: bool = False
+
+
 class WorkerDeliveryRequest(BaseModel):
     note: str | None = None
 
@@ -1314,6 +1322,95 @@ async def deployment_rollback(
         await _run(
             _get_manager().deploy_rollback(
                 deployment_id,
+                confirm_rollback=req.confirm_rollback,
+                actor_kind=actor_kind,
+                actor_agent_id=actor_agent_id,
+            )
+        )
+    )
+
+
+# ---------------------------------------------------------- release-line deploy
+
+
+def _release_op_response(pair: tuple[Any, Any]) -> dict[str, Any]:
+    release, op = pair
+    return {"release": _dict(release) if release is not None else None, "op": _dict(op)}
+
+
+@router.post("/api/task-boards/{board_id}/releases/stage")
+async def release_stage(
+    board_id: str,
+    caller_session_id: str | None = Header(default=None, alias="X-Owlery-Session-ID"),
+    _: str = Depends(verify_token),
+):
+    """Stage may be requested by a human or a trusted orchestrator agent —
+    same permission shape as the per-run `deploy/stage` verb."""
+    actor_kind, actor_agent_id = await _delivery_actor(caller_session_id)
+    return _release_op_response(
+        await _run(
+            _get_manager().release_stage(
+                board_id, actor_kind=actor_kind, actor_agent_id=actor_agent_id,
+            )
+        )
+    )
+
+
+@router.post("/api/task-boards/{board_id}/releases/switch")
+async def release_switch(
+    board_id: str,
+    req: ReleaseSwitchRequest | None = None,
+    caller_session_id: str | None = Header(default=None, alias="X-Owlery-Session-ID"),
+    _: str = Depends(verify_token),
+):
+    """A restart is deliberately human-only; agents may stage but never
+    switch — same rule as the per-run `deploy/switch` verb."""
+    actor_kind, actor_agent_id = await _delivery_actor(caller_session_id)
+    if actor_kind != "user":
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            {"code": "deploy_switch_user_only", "message": "release switch requires a human caller"},
+        )
+    req = req or ReleaseSwitchRequest()
+    return _release_op_response(
+        await _run(
+            _get_manager().release_switch(
+                board_id, drain=req.drain,
+                actor_kind=actor_kind, actor_agent_id=actor_agent_id,
+            )
+        )
+    )
+
+
+@router.get("/api/task-boards/{board_id}/releases")
+async def list_releases(board_id: str, _: str = Depends(verify_token)):
+    releases = await _run(_get_manager().list_release_deployments(board_id))
+    live = next((item for item in releases if item.state == "live"), None)
+    staged = next((item for item in releases if item.state == "staged"), None)
+    return {
+        "releases": [_dict(item) for item in releases],
+        "live": _dict(live) if live is not None else None,
+        "staged": _dict(staged) if staged is not None else None,
+    }
+
+
+@router.post("/api/task-boards/{board_id}/releases/rollback")
+async def release_rollback(
+    board_id: str,
+    req: ReleaseRollbackRequest,
+    caller_session_id: str | None = Header(default=None, alias="X-Owlery-Session-ID"),
+    _: str = Depends(verify_token),
+):
+    actor_kind, actor_agent_id = await _delivery_actor(caller_session_id)
+    if actor_kind != "user":
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            {"code": "deploy_rollback_user_only", "message": "release rollback requires a human caller"},
+        )
+    return _release_op_response(
+        await _run(
+            _get_manager().release_rollback(
+                board_id,
                 confirm_rollback=req.confirm_rollback,
                 actor_kind=actor_kind,
                 actor_agent_id=actor_agent_id,

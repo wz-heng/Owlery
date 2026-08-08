@@ -77,6 +77,20 @@ DEPLOYMENT_STATES = frozenset(
     {"staging", "staged", "switching", "live", "rolled_back", "superseded", "failed"}
 )
 
+# Release-line deploy (docs/plans/release-line-deploy.md §3). A board-level
+# release candidate's lifecycle mirrors `deployments`: `planned` → `staging` →
+# `staged`, then `switching` → `live`, with `superseded`/`rolled_back`/`failed`
+# as terminals. `release_deployments_one_active` covers `staging`/`switching`
+# the same way `deployments_one_active` covers the slot-level lock.
+RELEASE_STATES = frozenset(
+    {"planned", "staging", "staged", "switching", "live",
+     "superseded", "rolled_back", "failed"}
+)
+RELEASE_OP_KINDS = frozenset({"stage", "switch", "rollback"})
+RELEASE_OP_STATES = frozenset(
+    {"planned", "running", "succeeded", "failed", "interrupted"}
+)
+
 
 class TaskBoardError(RuntimeError):
     """Base class for stable repository errors consumed by REST and MCP."""

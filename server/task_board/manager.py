@@ -65,6 +65,11 @@ class DeployProbation:
     # ``flip_done`` journal line.  A restarted server must consume only the
     # remainder, never grant the unconfirmed switch a fresh full timeout.
     health_deadline: datetime
+    # ``task_delivery_ops`` (per-run) or ``release_deployment_ops`` (release-
+    # line, release-line-deploy.md §3.3) — which table/finalizers `op_id`
+    # belongs to. The two share the same slot-level lock, so at most one
+    # probation candidate can exist across both at any boot.
+    kind: str = "delivery"
 
 
 def _iso(value: datetime | None = None) -> str:
@@ -847,6 +852,32 @@ class TaskBoardManager:
         await self.publish_task_update(delivery.task_id)
         return delivery
 
+    # --- release-line deploy (docs/plans/release-line-deploy.md §3) ------
+
+    async def release_stage(self, board_id: str, **kwargs: Any) -> tuple[Any, Any]:
+        """Resolve the board's release ref and stage it into the idle slot."""
+        release, op = await self.delivery.release_stage(board_id, **kwargs)
+        await self.publish_board_update(board_id)
+        return release, op
+
+    async def release_switch(self, board_id: str, **kwargs: Any) -> tuple[Any, Any]:
+        """Start the explicitly user-authorized release-line switch handoff."""
+        release, op = await self.delivery.release_switch(board_id, **kwargs)
+        await self.publish_board_update(board_id)
+        return release, op
+
+    async def list_release_deployments(self, board_id: str) -> list[Any]:
+        """Return the durable release-line history for the board's Releases
+        surface."""
+        return await self.repo.list_release_deployments(board_id)
+
+    async def release_rollback(self, board_id: str, **kwargs: Any) -> tuple[Any, Any]:
+        """Run a confirmed rollback of the board's live release through the
+        ordinary release-switch path."""
+        release, op = await self.delivery.release_rollback(board_id, **kwargs)
+        await self.publish_board_update(board_id)
+        return release, op
+
     @staticmethod
     def _delivery_terminal_source(task_id: str, run_id: str) -> str:
         return f"task:{task_id}:run:{run_id}:delivery:terminal"
@@ -890,15 +921,25 @@ class TaskBoardManager:
 
         Returns a `DeployProbation` when this boot is a flipped-but-unconfirmed
         deploy candidate (§7.5): the caller must then keep producers paused and
-        run `run_deploy_probation` before starting them."""
+        run `run_deploy_probation` before starting them. A release-line switch
+        op flipped and a per-run one flipped can never both be true — the two
+        share the same slot-level `deployments_one_active` lock — so at most
+        one of the two reconcile calls below can return a probation."""
         if self.session_mgr is not None and not self.session_mgr.session_injection_dispatch_paused:
             raise RuntimeError("delivery recovery requires paused injection dispatch")
         # deploy_switch ops FIRST: a running one is not "unknown", it is journal-
         # reconciled (§8), and must be resolved before the generic interrupt
-        # sweep (which deliberately skips deploy_switch) can run.
+        # sweep (which deliberately skips deploy_switch) can run. Release-line
+        # switch/rollback ops are journal-reconciled the same way and must also
+        # resolve before any generic sweep.
         probation = await self.reconcile_deploy_switch_ops()
+        release_probation = await self.reconcile_release_switch_ops()
+        probation = probation or release_probation
         await self.repo.interrupt_running_delivery_ops(
             reason="server restarted; delivery op outcome unknown"
+        )
+        await self.repo.interrupt_running_release_stage_ops(
+            reason="server restarted; release op outcome unknown"
         )
         # A deploy_stage that died mid-pipeline leaves its `deployments` row
         # `staging`, which holds the global deploy lock; interrupting the op does
@@ -907,6 +948,12 @@ class TaskBoardManager:
         # instance, so this is DB-only and safe inside the boot barrier.
         await self.repo.fail_orphan_staging_deployments(
             reason="server restarted; deploy_stage interrupted"
+        )
+        # Same for a release stage: its release row AND its born-together
+        # `deployments` row both leave `staging` together (release-line-
+        # deploy.md §3.3).
+        await self.repo.fail_orphan_staging_releases(
+            reason="server restarted; release stage interrupted"
         )
         await self.repo.reset_preparing_deliveries()
         if self.session_mgr is None or self.db is None:
@@ -991,6 +1038,58 @@ class TaskBoardManager:
                 )
         return probation
 
+    async def reconcile_release_switch_ops(self) -> DeployProbation | None:
+        """For every release-line switch/rollback op left `running`, read the
+        SAME switcher journal and settle it per the §8 table — the
+        release-line mirror of `reconcile_deploy_switch_ops`
+        (release-line-deploy.md §3.3). Both op families share one journal
+        file (one deploy_root, one switcher) and the same slot-level lock, so
+        this is the identical algorithm keyed to a different DB table."""
+        ops = await self.repo.list_running_release_switch_ops()
+        if not ops:
+            return None
+        root = settings.resolved_deploy_root
+        if not root:
+            for op in ops:
+                await self.repo.finalize_release_interrupted(
+                    op.id, reason="deploy_root unset at boot; switch state unknown"
+                )
+            return None
+        journal = switcher.Journal(str(Path(root) / deploy.JOURNAL_NAME))
+        now = _now()
+        health_timeout = float(settings.deploy_health_timeout_seconds)
+        probation: DeployProbation | None = None
+        for op in ops:
+            entries = journal.entries(op.id)
+            if await self._apply_switch_terminal(op.id, entries, kind="release") is not None:
+                continue
+            tail = entries[-1] if entries else None
+            step = tail.get("step") if tail else None
+            flipped_at = self._journal_timestamp(tail)
+            if (
+                step == switcher.STEP_FLIP_DONE
+                and flipped_at is not None
+                and self._journal_fresh(tail, now, health_timeout)
+            ):
+                probation = DeployProbation(
+                    op_id=op.id,
+                    journal_path=str(journal.path),
+                    health_deadline=flipped_at + timedelta(seconds=health_timeout),
+                    kind="release",
+                )
+            else:
+                reason = (
+                    "stale flip_done; switcher never confirmed"
+                    if step == switcher.STEP_FLIP_DONE
+                    else "handoff recorded but switcher never confirmed"
+                )
+                target_slot, target_sha = self._handoff_target(entries)
+                await self.repo.finalize_release_interrupted(
+                    op.id, reason=reason, journal_excerpt={"tail": entries[-6:]},
+                    target_slot=target_slot, target_sha=target_sha,
+                )
+        return probation
+
     async def run_deploy_probation(
         self, probation: DeployProbation, *, on_release: Callable[[], Awaitable[None]]
     ) -> str:
@@ -1002,17 +1101,23 @@ class TaskBoardManager:
         remaining = max(0.0, (probation.health_deadline - _now()).total_seconds())
         deadline = time.monotonic() + remaining
         outcome = "timeout"
+        finalize_interrupted = (
+            self.repo.finalize_release_interrupted if probation.kind == "release"
+            else self.repo.finalize_deploy_interrupted
+        )
         try:
             while True:
                 entries = journal.entries(probation.op_id)
-                applied = await self._apply_switch_terminal(probation.op_id, entries)
+                applied = await self._apply_switch_terminal(
+                    probation.op_id, entries, kind=probation.kind
+                )
                 if applied is not None:
                     outcome = applied
                     break
                 if time.monotonic() >= deadline:
                     # Still non-terminal after the original health window → now stale.
                     target_slot, target_sha = self._handoff_target(entries)
-                    await self.repo.finalize_deploy_interrupted(
+                    await finalize_interrupted(
                         probation.op_id,
                         reason="probation timed out; switcher never confirmed",
                         target_slot=target_slot, target_sha=target_sha,
@@ -1042,11 +1147,17 @@ class TaskBoardManager:
         return (None, None)
 
     async def _apply_switch_terminal(
-        self, op_id: str, entries: list[dict[str, Any]]
+        self, op_id: str, entries: list[dict[str, Any]], *, kind: str = "delivery"
     ) -> str | None:
         """If the journal tail for `op_id` is terminal, settle the op per §8 and
         return the step name; otherwise return None. Shared by boot reconciliation
-        and the probation monitor so both apply the §8 table identically."""
+        and the probation monitor so both apply the §8 table identically.
+
+        ``kind`` selects the finalizer family: ``"delivery"`` for a per-run
+        `deploy_switch` op (`task_delivery_ops`), ``"release"`` for a
+        board-level switch/rollback op (`release_deployment_ops`,
+        release-line-deploy.md §3.3) — same journal-tail table, different
+        durable home for the verdict."""
         tail = entries[-1] if entries else None
         step = tail.get("step") if tail else None
         if step not in _SWITCH_TERMINAL_STEPS:
@@ -1054,19 +1165,39 @@ class TaskBoardManager:
         detail = (tail.get("detail") or {}) if tail else {}
         excerpt = {"tail": entries[-6:]}
         target_slot, target_sha = self._handoff_target(entries)
+        finalize_switched = (
+            self.repo.finalize_release_switched if kind == "release"
+            else self.repo.finalize_deploy_switched
+        )
+        finalize_rolled_back = (
+            self.repo.finalize_release_rolled_back if kind == "release"
+            else self.repo.finalize_deploy_rolled_back
+        )
+        finalize_rollback_incomplete = (
+            self.repo.finalize_release_rollback_incomplete if kind == "release"
+            else self.repo.finalize_deploy_rollback_incomplete
+        )
+        finalize_old_wont_die = (
+            self.repo.finalize_release_old_wont_die if kind == "release"
+            else self.repo.finalize_deploy_old_wont_die
+        )
+        finalize_interrupted = (
+            self.repo.finalize_release_interrupted if kind == "release"
+            else self.repo.finalize_deploy_interrupted
+        )
         if step == switcher.STEP_SWITCHED_OK:
-            await self.repo.finalize_deploy_switched(
+            await finalize_switched(
                 op_id, deployed_sha=str(detail.get("sha", "")),
                 deployed_slot=str(detail.get("slot", "")), journal_excerpt=excerpt,
             )
         elif step == switcher.STEP_ROLLED_BACK:
-            await self.repo.finalize_deploy_rolled_back(
+            await finalize_rolled_back(
                 op_id, reason=str(detail.get("reason", "health_failed")),
                 journal_excerpt=excerpt,
                 target_slot=target_slot, target_sha=target_sha,
             )
         elif step == switcher.STEP_ROLLBACK_INCOMPLETE:
-            await self.repo.finalize_deploy_rollback_incomplete(
+            await finalize_rollback_incomplete(
                 op_id,
                 reason=(
                     f"rollback_incomplete at {detail.get('stage', '?')} "
@@ -1076,12 +1207,12 @@ class TaskBoardManager:
                 target_slot=target_slot, target_sha=target_sha,
             )
         elif step == switcher.STEP_OLD_WONT_DIE:
-            await self.repo.finalize_deploy_old_wont_die(
+            await finalize_old_wont_die(
                 op_id, journal_excerpt=excerpt,
                 target_slot=target_slot, target_sha=target_sha,
             )
         else:  # STEP_SWITCH_ERROR — a bad/missing handoff; the flip never happened.
-            await self.repo.finalize_deploy_interrupted(
+            await finalize_interrupted(
                 op_id, reason=f"switch_error: {detail.get('reason', '?')}",
                 journal_excerpt=excerpt,
                 target_slot=target_slot, target_sha=target_sha,

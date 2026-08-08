@@ -119,6 +119,14 @@ class DeployQuiesce:
                 continue
             busy.append(BusySource("delivery_op", f"{op.kind}:{op.id}"))
 
+        # A release-line op is running (release-line-deploy.md §3.3), same
+        # reasoning as delivery ops above — the per-release one-running index
+        # only covers ITS OWN release; the census covers every other one.
+        for op in await self._repo.list_running_release_ops():
+            if exclude_op_id is not None and op.id == exclude_op_id:
+                continue
+            busy.append(BusySource("release_op", f"{op.kind}:{op.id}"))
+
         # A bg task subprocess is live (authoritative within this process).
         running_bg = len(getattr(self._bg, "_running", {}) or {}) if self._bg else 0
         if running_bg:

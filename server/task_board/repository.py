@@ -31,6 +31,8 @@ from .models import (
     DELIVERY_RETENTIONS,
     DELIVERY_STATUSES,
     DEPLOYMENT_STATES,
+    RELEASE_OP_KINDS,
+    RELEASE_STATES,
     SWITCH_OWNED_REASON_KINDS,
     WORKSPACE_MODES,
     ArtifactRecord,
@@ -2383,6 +2385,28 @@ class TaskRepository:
             raise TaskNotFoundError(f"delivery op {op_id!r} not found")
         return row
 
+    async def _release_row(
+        self, conn: aiosqlite.Connection, release_id: str
+    ) -> aiosqlite.Row:
+        row = await self._fetchone(
+            conn, "SELECT * FROM release_deployments WHERE id = ?", (release_id,)
+        )
+        if row is None:
+            raise TaskNotFoundError(f"release deployment {release_id!r} not found")
+        return row
+
+    async def _release_op_row(
+        self, conn: aiosqlite.Connection, op_id: str, release_id: str
+    ) -> aiosqlite.Row:
+        row = await self._fetchone(
+            conn,
+            "SELECT * FROM release_deployment_ops WHERE id = ? AND release_id = ?",
+            (op_id, release_id),
+        )
+        if row is None:
+            raise TaskNotFoundError(f"release op {op_id!r} not found")
+        return row
+
     async def _delivery_event(
         self,
         conn: aiosqlite.Connection,
@@ -3144,11 +3168,26 @@ class TaskRepository:
         The caller must resolve ``source_ref`` at the configured remote first.
         This method never accepts a moving ref in place of ``sha``; the stored
         SHA is what subsequent stage/switch operations use.
+
+        Re-staging after new commits land is a NEW release row (release-line-
+        deploy.md §3.1): any prior release for this board still ``planned``/
+        ``staged`` (never switched live) becomes ``superseded`` in the same
+        transaction — it describes a candidate this new plan replaces, exactly
+        like ``begin_deployment_staging`` supersedes a stale ``staged``
+        deployment row for the same slot. A ``staging``/``switching``/``live``
+        release, or one already terminal, is untouched — in particular,
+        superseding an actively ``staging`` row here would silently orphan
+        the release-level lock its own stage pipeline still holds.
         """
         stamp = _now_iso()
         day = datetime.now(timezone.utc).strftime("%Y%m%d")
         async with self._transaction() as conn:
             await self._board_row(conn, board_id)
+            await conn.execute(
+                "UPDATE release_deployments SET state='superseded', updated_at=? "
+                "WHERE board_id=? AND state IN ('planned','staged')",
+                (stamp, board_id),
+            )
             row = await self._fetchone(
                 conn,
                 "SELECT COUNT(*) AS n FROM release_deployments "
@@ -3186,13 +3225,13 @@ class TaskRepository:
         actor_kind: str,
         actor_agent_id: str | None,
     ) -> ReleaseDeploymentOpRecord:
-        if kind not in {"stage", "switch", "rollback"}:
+        if kind not in RELEASE_OP_KINDS:
             raise TaskValidationError("invalid release operation")
+        if actor_kind not in ACTOR_KINDS:
+            raise TaskValidationError("invalid release actor kind")
         stamp = _now_iso()
         async with self._transaction() as conn:
-            await self._fetchone(
-                conn, "SELECT id FROM release_deployments WHERE id=?", (release_id,)
-            )
+            await self._release_row(conn, release_id)
             ident = _short_id()
             await conn.execute(
                 "INSERT INTO release_deployment_ops "
@@ -3201,10 +3240,663 @@ class TaskRepository:
                 (ident, release_id, kind, _json_object(request), actor_kind,
                  actor_agent_id, stamp),
             )
+            row = await self._release_op_row(conn, ident, release_id)
+        return self._release_op_record(row)
+
+    async def start_release_op(
+        self, release_id: str, op_id: str
+    ) -> ReleaseDeploymentOpRecord:
+        """CAS a planned release op to ``running`` (release-line-deploy.md §3.2,
+        mirroring ``start_op``/local-deploy.md §4). The
+        ``release_deployment_ops_one_running`` partial index guarantees a single
+        in-flight op per release."""
+        stamp = _now_iso()
+        async with self._transaction() as conn:
+            op = await self._release_op_row(conn, op_id, release_id)
+            if op["state"] != "planned":
+                raise TaskConflictError("release op is not runnable")
+            try:
+                cursor = await conn.execute(
+                    "UPDATE release_deployment_ops SET state='running', started_at=? "
+                    "WHERE id=? AND state='planned'",
+                    (stamp, op_id),
+                )
+            except aiosqlite.IntegrityError as exc:
+                raise TaskConflictError(
+                    "another release op is already running"
+                ) from exc
+            if cursor.rowcount != 1:
+                raise TaskConflictError("release op lost the start CAS")
+            row = await self._release_op_row(conn, op_id, release_id)
+        return self._release_op_record(row)
+
+    async def finish_release_op(
+        self,
+        release_id: str,
+        op_id: str,
+        *,
+        state: str,
+        result: Mapping[str, Any] | None = None,
+        error: str | None = None,
+    ) -> ReleaseDeploymentOpRecord:
+        """CAS a running release op terminal (release-line-deploy.md §3.2,
+        mirroring ``finish_op``). Never touches ``release_deployments`` itself —
+        callers fold the release-row transition in the same call that settles
+        the op (``begin_release_staging``/``mark_release_*``/the switch
+        finalizers below) so op and release state never disagree."""
+        if state not in {"succeeded", "failed", "interrupted"}:
+            raise TaskValidationError("invalid release op finish state")
+        stamp = _now_iso()
+        async with self._transaction() as conn:
+            op = await self._release_op_row(conn, op_id, release_id)
+            if op["state"] != "running":
+                raise TaskConflictError("release op is not running")
+            cursor = await conn.execute(
+                "UPDATE release_deployment_ops SET state=?, result=?, error=?, "
+                "finished_at=? WHERE id=? AND state='running'",
+                (state, _json_object(result), error, stamp, op_id),
+            )
+            if cursor.rowcount != 1:
+                raise TaskConflictError("release op lost the finish CAS")
+            row = await self._release_op_row(conn, op_id, release_id)
+        return self._release_op_record(row)
+
+    async def get_live_release(self, board_id: str) -> ReleaseDeploymentRecord | None:
+        """The single ``live`` release row for a board (release-line-deploy.md
+        §3.1), or None before that board's first release switch — including
+        while its live deployment still predates release-line-deploy (a
+        pre-release ``deployments`` row with ``release_id`` NULL)."""
+        async with self._lock:
             row = await self._fetchone(
-                conn, "SELECT * FROM release_deployment_ops WHERE id=?", (ident,)
+                self.conn,
+                "SELECT * FROM release_deployments WHERE board_id=? AND state='live' LIMIT 1",
+                (board_id,),
+            )
+        return self._release_deployment_record(row) if row else None
+
+    async def get_staged_release(self, board_id: str) -> ReleaseDeploymentRecord | None:
+        """The board's current ``staged`` release candidate, if any — the
+        switch target (mirrors ``get_staged_deployment_for_delivery``)."""
+        async with self._lock:
+            row = await self._fetchone(
+                self.conn,
+                "SELECT * FROM release_deployments WHERE board_id=? AND state='staged' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (board_id,),
+            )
+        return self._release_deployment_record(row) if row else None
+
+    async def begin_release_staging(
+        self, release_id: str, *, slot: str, sha: str, source_repo: str
+    ) -> tuple[ReleaseDeploymentRecord, DeploymentRecord]:
+        """CAS a release row ``planned`` -> ``staging`` AND insert its
+        ``deployments`` staging row, atomically (release-line-deploy.md
+        §3.1/§3.2). Takes BOTH the release-level lock
+        (``release_deployments_one_active``) and the slot-level global deploy
+        lock (``deployments_one_active``, shared with the per-run path,
+        local-deploy.md §4) in one transaction — a partial lock acquisition
+        (one taken, the other contended) is never observable.
+
+        Re-staging overwrites the idle slot, so any prior ``staged`` row for
+        the SAME slot describes content about to be destroyed and becomes
+        ``superseded`` first, exactly like ``begin_deployment_staging``."""
+        stamp = _now_iso()
+        async with self._transaction() as conn:
+            try:
+                cursor = await conn.execute(
+                    "UPDATE release_deployments SET state='staging', updated_at=? "
+                    "WHERE id=? AND state='planned'",
+                    (stamp, release_id),
+                )
+            except aiosqlite.IntegrityError as exc:
+                holder = await self._fetchone(
+                    conn,
+                    "SELECT * FROM release_deployments WHERE state IN ('staging','switching') "
+                    "AND id != ? ORDER BY created_at LIMIT 1",
+                    (release_id,),
+                )
+                if holder is None:
+                    raise
+                detail = (
+                    f"another release is {holder['state']} (board {holder['board_id']}, "
+                    f"sha {holder['sha'][:12]})"
+                )
+                raise DeployLockedError(f"deploy_locked: {detail}") from exc
+            if cursor.rowcount != 1:
+                raise TaskConflictError(
+                    f"release {release_id!r} is not 'planned'; cannot stage"
+                )
+
+            await conn.execute(
+                "UPDATE deployments SET state='superseded', updated_at=? "
+                "WHERE slot=? AND state='staged'",
+                (stamp, slot),
+            )
+            dep_id = _short_id()
+            try:
+                await conn.execute(
+                    "INSERT INTO deployments (id, delivery_id, task_id, op_id, slot, "
+                    "sha, source_repo, release_id, state, journal, created_at, updated_at) "
+                    "VALUES (?, NULL, NULL, NULL, ?, ?, ?, ?, 'staging', NULL, ?, ?)",
+                    (dep_id, slot, sha, source_repo, release_id, stamp, stamp),
+                )
+            except aiosqlite.IntegrityError as exc:
+                holder = await self._fetchone(
+                    conn,
+                    "SELECT * FROM deployments WHERE state IN ('staging','switching') "
+                    "ORDER BY created_at LIMIT 1",
+                )
+                if holder is None:
+                    raise
+                detail = (
+                    f"another deploy is {holder['state']} (slot {holder['slot']}, "
+                    f"sha {holder['sha'][:12]})"
+                )
+                raise DeployLockedError(f"deploy_locked: {detail}") from exc
+
+            release_row = await self._release_row(conn, release_id)
+            dep_row = await self._fetchone(
+                conn, "SELECT * FROM deployments WHERE id=?", (dep_id,)
+            )
+        return self._release_deployment_record(release_row), self._deployment_record(dep_row)
+
+    async def _settle_release_and_deployment(
+        self,
+        release_id: str,
+        deployment_id: str,
+        release_state: str,
+        deployment_state: str,
+        *,
+        error: str | None = None,
+    ) -> tuple[ReleaseDeploymentRecord, DeploymentRecord]:
+        """Settle a release row and its born-together ``deployments`` row in one
+        transaction — the release-line mirror of ``_settle_deployment``. Both
+        rows entered ``staging`` together (``begin_release_staging``), so they
+        must leave it together too."""
+        if release_state not in RELEASE_STATES:
+            raise TaskValidationError("invalid release state")
+        if deployment_state not in DEPLOYMENT_STATES:
+            raise TaskValidationError("invalid deployment state")
+        stamp = _now_iso()
+        async with self._transaction() as conn:
+            rel_cursor = await conn.execute(
+                "UPDATE release_deployments SET state=?, deployment_id=?, error=?, "
+                "updated_at=? WHERE id=? AND state='staging'",
+                (release_state, deployment_id, error, stamp, release_id),
+            )
+            if rel_cursor.rowcount != 1:
+                raise TaskConflictError(f"release {release_id!r} is not 'staging'")
+            dep_cursor = await conn.execute(
+                "UPDATE deployments SET state=?, updated_at=? WHERE id=? AND state='staging'",
+                (deployment_state, stamp, deployment_id),
+            )
+            if dep_cursor.rowcount != 1:
+                raise TaskConflictError(f"deployment {deployment_id!r} is not 'staging'")
+            release_row = await self._release_row(conn, release_id)
+            dep_row = await self._fetchone(
+                conn, "SELECT * FROM deployments WHERE id=?", (deployment_id,)
+            )
+        return (
+            self._release_deployment_record(release_row),
+            self._deployment_record(dep_row),
+        )
+
+    async def mark_release_staged(
+        self, release_id: str, *, deployment_id: str
+    ) -> tuple[ReleaseDeploymentRecord, DeploymentRecord]:
+        """CAS a ``staging`` release row (and its deployment) to ``staged`` —
+        the settled post-stage state, releasing both locks (mirrors
+        ``mark_deployment_staged``)."""
+        return await self._settle_release_and_deployment(
+            release_id, deployment_id, "staged", "staged"
+        )
+
+    async def mark_release_failed(
+        self, release_id: str, *, deployment_id: str, error: str | None = None
+    ) -> tuple[ReleaseDeploymentRecord, DeploymentRecord]:
+        """CAS a ``staging`` release row (and its deployment) to ``failed`` — a
+        stage step failed, releasing both locks; the running instance was
+        never touched (mirrors ``mark_deployment_failed``)."""
+        return await self._settle_release_and_deployment(
+            release_id, deployment_id, "failed", "failed", error=error
+        )
+
+    async def fail_planned_release(
+        self, release_id: str, *, error: str
+    ) -> ReleaseDeploymentRecord:
+        """CAS a still-``planned`` release row to ``failed`` — used when
+        ``begin_release_staging`` itself loses the lock race (``deploy_locked``)
+        before either the release or a ``deployments`` row ever entered
+        ``staging``, so there is no born-together deployment row to settle
+        alongside it (unlike ``mark_release_failed``)."""
+        stamp = _now_iso()
+        async with self._transaction() as conn:
+            cursor = await conn.execute(
+                "UPDATE release_deployments SET state='failed', error=?, updated_at=? "
+                "WHERE id=? AND state='planned'",
+                (error, stamp, release_id),
+            )
+            if cursor.rowcount != 1:
+                raise TaskConflictError(f"release {release_id!r} is not 'planned'")
+            row = await self._release_row(conn, release_id)
+        return self._release_deployment_record(row)
+
+    async def fail_orphan_staging_releases(
+        self, *, reason: str
+    ) -> list[ReleaseDeploymentRecord]:
+        """Boot recovery for the release-level lock (release-line-deploy.md
+        §3.3, mirrors ``fail_orphan_staging_deployments``). A ``staging``
+        release row exists only between ``begin_release_staging`` and its
+        settle inside one live stage call, so any seen at boot is an orphan
+        from a stage whose process died. Its born-together ``deployments``
+        row is failed in the same sweep, releasing the slot-level lock too."""
+        stamp = _now_iso()
+        out: list[ReleaseDeploymentRecord] = []
+        async with self._transaction() as conn:
+            rows = await self._fetchall(
+                conn, "SELECT * FROM release_deployments WHERE state='staging'"
+            )
+            for row in rows:
+                await conn.execute(
+                    "UPDATE release_deployments SET state='failed', error=?, updated_at=? "
+                    "WHERE id=? AND state='staging'",
+                    (reason, stamp, row["id"]),
+                )
+                await conn.execute(
+                    "UPDATE deployments SET state='failed', updated_at=? "
+                    "WHERE release_id=? AND state='staging'",
+                    (stamp, row["id"]),
+                )
+                fresh = await self._fetchone(
+                    conn, "SELECT * FROM release_deployments WHERE id=?", (row["id"],)
+                )
+                out.append(self._release_deployment_record(fresh))
+        return out
+
+    async def interrupt_running_release_stage_ops(
+        self, *, reason: str
+    ) -> list[ReleaseDeploymentOpRecord]:
+        """Boot recovery: every running release ``stage`` op becomes
+        ``interrupted`` (mirrors ``interrupt_running_delivery_ops``).
+        ``switch``/``rollback`` ops are excluded — they are journal-
+        reconciled by ``reconcile_release_switch_ops``, which runs first."""
+        stamp = _now_iso()
+        out: list[ReleaseDeploymentOpRecord] = []
+        async with self._transaction() as conn:
+            rows = await self._fetchall(
+                conn,
+                "SELECT * FROM release_deployment_ops WHERE state='running' AND kind='stage'",
+            )
+            for op in rows:
+                detail = f"{reason} (op: {op['kind']})"
+                await conn.execute(
+                    "UPDATE release_deployment_ops SET state='interrupted', error=?, "
+                    "finished_at=? WHERE id=? AND state='running'",
+                    (detail, stamp, op["id"]),
+                )
+                row = await self._release_op_row(conn, op["id"], op["release_id"])
+                out.append(self._release_op_record(row))
+        return out
+
+    async def list_running_release_switch_ops(self) -> list[ReleaseDeploymentOpRecord]:
+        """Every ``switch``/``rollback`` release op left ``running`` in the DB —
+        the boot reconciler's worklist (mirrors
+        ``list_running_deploy_switch_ops``)."""
+        async with self._lock:
+            rows = await self._fetchall(
+                self.conn,
+                "SELECT * FROM release_deployment_ops WHERE state='running' "
+                "AND kind IN ('switch','rollback') ORDER BY created_at",
+            )
+        return [self._release_op_record(r) for r in rows]
+
+    async def list_running_release_ops(self) -> list[ReleaseDeploymentOpRecord]:
+        """Every release op left ``running`` in the DB, any kind — the quiesce
+        census worklist (release-line-deploy.md §3.3)."""
+        async with self._lock:
+            rows = await self._fetchall(
+                self.conn,
+                "SELECT * FROM release_deployment_ops WHERE state='running' "
+                "ORDER BY created_at",
+            )
+        return [self._release_op_record(r) for r in rows]
+
+    async def begin_release_switching(
+        self,
+        *,
+        release_id: str | None,
+        deployment_id: str,
+        op_id: str,
+        expected_release_state: str = "staged",
+        expected_deployment_state: str = "staged",
+    ) -> tuple[ReleaseDeploymentRecord | None, DeploymentRecord]:
+        """CAS the release row (if any) and its ``deployments`` row to
+        ``switching`` in one transaction, taking both the release-level and
+        the slot-level global deploy locks (mirrors
+        ``begin_deployment_switching``; release-line-deploy.md §3.1/§3.3).
+
+        ``release_id`` is ``None`` for a rollback whose target predates
+        release-line-deploy (a ``deployments`` row with no ``release_id``) —
+        only the slot-level lock applies then, exactly like a pre-release
+        rollback today. The normal path consumes ``staged``/``staged``; a
+        rollback consumes ``superseded``/``superseded``. Either lock's unique
+        index rejects a concurrent holder and raises ``DeployLockedError``
+        naming it; any other integrity failure is a real bug and re-raises."""
+        if expected_release_state not in {"staged", "superseded"}:
+            raise TaskValidationError("invalid release switch source state")
+        if expected_deployment_state not in {"staged", "superseded"}:
+            raise TaskValidationError("invalid deployment switch source state")
+        stamp = _now_iso()
+        async with self._transaction() as conn:
+            try:
+                dep_cursor = await conn.execute(
+                    "UPDATE deployments SET state='switching', op_id=?, updated_at=? "
+                    "WHERE id=? AND state=?",
+                    (op_id, stamp, deployment_id, expected_deployment_state),
+                )
+            except aiosqlite.IntegrityError as exc:
+                holder = await self._fetchone(
+                    conn,
+                    "SELECT * FROM deployments WHERE state IN ('staging','switching') "
+                    "AND id != ? ORDER BY created_at LIMIT 1",
+                    (deployment_id,),
+                )
+                if holder is None:
+                    raise
+                detail = (
+                    f"another deploy is {holder['state']} (slot {holder['slot']}, "
+                    f"sha {holder['sha'][:12]})"
+                )
+                raise DeployLockedError(f"deploy_locked: {detail}") from exc
+            if dep_cursor.rowcount != 1:
+                raise TaskConflictError(
+                    f"deployment {deployment_id!r} is not "
+                    f"{expected_deployment_state!r}; cannot switch"
+                )
+            release_row = None
+            if release_id is not None:
+                try:
+                    rel_cursor = await conn.execute(
+                        "UPDATE release_deployments SET state='switching', updated_at=? "
+                        "WHERE id=? AND state=?",
+                        (stamp, release_id, expected_release_state),
+                    )
+                except aiosqlite.IntegrityError as exc:
+                    holder = await self._fetchone(
+                        conn,
+                        "SELECT * FROM release_deployments WHERE state IN "
+                        "('staging','switching') AND id != ? ORDER BY created_at LIMIT 1",
+                        (release_id,),
+                    )
+                    if holder is None:
+                        raise
+                    detail = (
+                        f"another release is {holder['state']} "
+                        f"(board {holder['board_id']}, sha {holder['sha'][:12]})"
+                    )
+                    raise DeployLockedError(f"deploy_locked: {detail}") from exc
+                if rel_cursor.rowcount != 1:
+                    raise TaskConflictError(
+                        f"release {release_id!r} is not "
+                        f"{expected_release_state!r}; cannot switch"
+                    )
+                release_row = await self._release_row(conn, release_id)
+            dep_row = await self._fetchone(
+                conn, "SELECT * FROM deployments WHERE id=?", (deployment_id,)
+            )
+        return (
+            self._release_deployment_record(release_row) if release_row else None,
+            self._deployment_record(dep_row),
+        )
+
+    async def record_release_switch_journal_ref(
+        self, op_id: str, *, journal_ref: str, detail: Mapping[str, Any] | None = None
+    ) -> ReleaseDeploymentOpRecord:
+        """Persist the switcher's journal reference onto the still-running
+        release switch/rollback op (mirrors ``record_switch_journal_ref``)."""
+        result: dict[str, Any] = {}
+        if detail:
+            result.update(detail)
+        async with self._transaction() as conn:
+            row = await self._fetchone(
+                conn, "SELECT * FROM release_deployment_ops WHERE id=?", (op_id,)
+            )
+            if row is None:
+                raise TaskNotFoundError(f"release op {op_id!r} not found")
+            if row["state"] != "running":
+                raise TaskConflictError("release switch op is not running")
+            await conn.execute(
+                "UPDATE release_deployment_ops SET journal_ref=?, result=? "
+                "WHERE id=? AND state='running'",
+                (journal_ref, _json_object(result) or "{}", op_id),
+            )
+            row = await self._fetchone(
+                conn, "SELECT * FROM release_deployment_ops WHERE id=?", (op_id,)
             )
         return self._release_op_record(row)
+
+    async def _finalize_release_switch(
+        self,
+        op_id: str,
+        *,
+        op_state: str,
+        op_error: str | None,
+        op_result: Mapping[str, Any] | None,
+        deployment_state: str | None,
+        make_live: bool = False,
+        release_terminal_state: str | None = None,
+        release_error: str | None = None,
+        journal_excerpt: Mapping[str, Any] | None = None,
+        target_slot: str | None = None,
+        target_sha: str | None = None,
+    ) -> tuple[ReleaseDeploymentOpRecord, DeploymentRecord | None, ReleaseDeploymentRecord | None]:
+        """One-transaction terminal for a running release switch/rollback op —
+        the release-line mirror of ``_finalize_switch`` (release-line-deploy.md
+        §3.1/§3.3): CAS the op terminal, move the bound ``switching``
+        deployment to its final state (superseding the prior ``live`` on a
+        successful ``make_live``), settle the TARGET release row, and emit a
+        board audit event.
+
+        The target release is resolved from the ``deployments`` row's own
+        ``release_id`` — the row this specific handoff attempt is flipping to
+        — never from the op's ``release_id`` (which, for a rollback, is the
+        release being ABANDONED, not the one this attempt targets: a failed
+        rollback must revert the destination, not silently relabel the
+        still-live source). It is ``None`` for a rollback whose target
+        predates release-line-deploy (a ``deployments`` row with no
+        ``release_id`` — §3.1 point 3): the deployment row alone then carries
+        the outcome. On success the target is promoted to ``live`` and
+        whichever release was previously ``live`` (regardless of which
+        op/board) is superseded — generic, mirroring ``_finalize_switch``'s
+        "retire the prior live row FIRST"."""
+        stamp = _now_iso()
+        async with self._transaction() as conn:
+            op = await self._fetchone(
+                conn, "SELECT * FROM release_deployment_ops WHERE id=?", (op_id,)
+            )
+            if op is None:
+                raise TaskNotFoundError(f"release op {op_id!r} not found")
+            if op["state"] != "running":
+                raise TaskConflictError("release op is not running")
+            cursor = await conn.execute(
+                "UPDATE release_deployment_ops SET state=?, error=?, result=?, "
+                "finished_at=? WHERE id=? AND state='running'",
+                (op_state, op_error, _json_object(op_result), stamp, op_id),
+            )
+            if cursor.rowcount != 1:
+                raise TaskConflictError("release op lost the finish CAS")
+
+            deployment: DeploymentRecord | None = None
+            dep_row = await self._fetchone(
+                conn,
+                "SELECT * FROM deployments WHERE op_id=? ORDER BY created_at DESC LIMIT 1",
+                (op_id,),
+            )
+            if dep_row is None and target_slot is not None and target_sha is not None:
+                dep_row = await self._fetchone(
+                    conn,
+                    "SELECT * FROM deployments WHERE slot=? AND sha=? "
+                    "AND state IN ('staged', 'switching', 'superseded') "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (target_slot, target_sha),
+                )
+            target_release_id = dep_row["release_id"] if dep_row is not None else None
+            if dep_row is not None and deployment_state is not None:
+                if make_live:
+                    await conn.execute(
+                        "UPDATE deployments SET state='superseded', updated_at=? "
+                        "WHERE state='live' AND id != ?",
+                        (stamp, dep_row["id"]),
+                    )
+                await conn.execute(
+                    "UPDATE deployments SET state=?, op_id=?, "
+                    "journal=COALESCE(?, journal), updated_at=? WHERE id=?",
+                    (deployment_state, op_id, _json_object(journal_excerpt), stamp,
+                     dep_row["id"]),
+                )
+                fresh = await self._fetchone(
+                    conn, "SELECT * FROM deployments WHERE id=?", (dep_row["id"],)
+                )
+                deployment = self._deployment_record(fresh)
+
+            if make_live:
+                # Whichever release is currently live is being replaced —
+                # generic regardless of which op/board it belongs to, mirroring
+                # `_finalize_switch`'s "retire the prior live row FIRST".
+                await conn.execute(
+                    "UPDATE release_deployments SET state='superseded', updated_at=? "
+                    "WHERE state='live'",
+                    (stamp,),
+                )
+                if target_release_id is not None:
+                    await conn.execute(
+                        "UPDATE release_deployments SET state='live', updated_at=? "
+                        "WHERE id=?",
+                        (stamp, target_release_id),
+                    )
+            elif release_terminal_state is not None and target_release_id is not None:
+                fields: dict[str, Any] = {
+                    "state": release_terminal_state, "updated_at": stamp,
+                    "error": release_error,
+                }
+                sets = ", ".join(f"{k}=?" for k in fields)
+                await conn.execute(
+                    f"UPDATE release_deployments SET {sets} WHERE id=?",
+                    (*fields.values(), target_release_id),
+                )
+
+            release_row = None
+            if target_release_id is not None:
+                release_row = await self._release_row(conn, target_release_id)
+            op_row = await self._release_op_row(conn, op_id, op["release_id"])
+            board_row = await self._board_row(
+                conn, (release_row or await self._release_row(conn, op["release_id"]))["board_id"]
+            )
+            await self._board_event(
+                conn,
+                board=board_row,
+                kind="release_op_finished",
+                actor_kind="system",
+                payload={
+                    "release": (
+                        self._release_deployment_record(release_row).to_dict()
+                        if release_row else None
+                    ),
+                    "op": self._release_op_record(op_row).to_dict(),
+                },
+                now=stamp,
+            )
+        return (
+            self._release_op_record(op_row),
+            deployment,
+            self._release_deployment_record(release_row) if release_row else None,
+        )
+
+    async def finalize_release_switched(
+        self, op_id: str, *, deployed_sha: str, deployed_slot: str,
+        journal_excerpt: Mapping[str, Any] | None = None,
+    ) -> tuple[ReleaseDeploymentOpRecord, DeploymentRecord | None, ReleaseDeploymentRecord | None]:
+        """§8-equivalent ``switched_ok``: op ``succeeded``, deployment ->
+        ``live`` (prior live -> ``superseded``), release -> ``live`` (prior
+        live release -> ``superseded``). Used for both a forward switch and a
+        successful rollback — the release-level effect is identical, only the
+        op ``kind`` differs (mirrors ``finalize_deploy_switched``)."""
+        return await self._finalize_release_switch(
+            op_id, op_state="succeeded", op_error=None,
+            op_result={"deployed_sha": deployed_sha, "deployed_slot": deployed_slot},
+            deployment_state="live", make_live=True,
+            journal_excerpt=journal_excerpt,
+            target_slot=deployed_slot, target_sha=deployed_sha,
+        )
+
+    async def finalize_release_rolled_back(
+        self, op_id: str, *, reason: str,
+        journal_excerpt: Mapping[str, Any] | None = None,
+        target_slot: str | None = None, target_sha: str | None = None,
+    ) -> tuple[ReleaseDeploymentOpRecord, DeploymentRecord | None, ReleaseDeploymentRecord | None]:
+        """§8-equivalent ``rolled_back(reason)``: op ``failed``, deployment ->
+        ``rolled_back``, the TARGET release (the one this attempt tried to
+        make live) -> ``rolled_back`` (mirrors ``finalize_deploy_rolled_back``).
+        The target is ``None`` for a pre-release-era target — the deployment
+        row alone carries the outcome then."""
+        return await self._finalize_release_switch(
+            op_id, op_state="failed", op_error=reason, op_result={"reason": reason},
+            deployment_state="rolled_back",
+            release_terminal_state="rolled_back", release_error=reason,
+            journal_excerpt=journal_excerpt,
+            target_slot=target_slot, target_sha=target_sha,
+        )
+
+    async def finalize_release_rollback_incomplete(
+        self, op_id: str, *, reason: str,
+        journal_excerpt: Mapping[str, Any] | None = None,
+        target_slot: str | None = None, target_sha: str | None = None,
+    ) -> tuple[ReleaseDeploymentOpRecord, DeploymentRecord | None, ReleaseDeploymentRecord | None]:
+        """§8-equivalent ``rollback_incomplete(stage)``: never auto-repaired
+        (mirrors ``finalize_deploy_rollback_incomplete``)."""
+        return await self._finalize_release_switch(
+            op_id, op_state="failed", op_error=reason,
+            op_result={"reason": reason, "rollback": "incomplete"},
+            deployment_state="failed",
+            release_terminal_state="failed", release_error=reason,
+            journal_excerpt=journal_excerpt,
+            target_slot=target_slot, target_sha=target_sha,
+        )
+
+    async def finalize_release_old_wont_die(
+        self, op_id: str, *,
+        reason: str = "old server did not exit in time",
+        journal_excerpt: Mapping[str, Any] | None = None,
+        target_slot: str | None = None, target_sha: str | None = None,
+    ) -> tuple[ReleaseDeploymentOpRecord, DeploymentRecord | None, ReleaseDeploymentRecord | None]:
+        """§8-equivalent ``old_wont_die``: the flip never happened; deployment
+        reverts ``switching`` -> ``staged``, and the target release reverts
+        to ``staged`` (still deployable, lock released) — mirrors
+        ``finalize_deploy_old_wont_die``."""
+        return await self._finalize_release_switch(
+            op_id, op_state="failed", op_error=reason, op_result={"reason": reason},
+            deployment_state="staged",
+            release_terminal_state="staged", release_error=reason,
+            journal_excerpt=journal_excerpt,
+            target_slot=target_slot, target_sha=target_sha,
+        )
+
+    async def finalize_release_interrupted(
+        self, op_id: str, *, reason: str,
+        journal_excerpt: Mapping[str, Any] | None = None,
+        target_slot: str | None = None, target_sha: str | None = None,
+    ) -> tuple[ReleaseDeploymentOpRecord, DeploymentRecord | None, ReleaseDeploymentRecord | None]:
+        """§8-equivalent ``handoff``-only / stale non-terminal: op
+        ``interrupted``, deployment -> ``failed``, the target release ->
+        ``failed`` — never an auto-repair (mirrors
+        ``finalize_deploy_interrupted``)."""
+        return await self._finalize_release_switch(
+            op_id, op_state="interrupted", op_error=reason, op_result={"reason": reason},
+            deployment_state="failed",
+            release_terminal_state="failed", release_error=reason,
+            journal_excerpt=journal_excerpt,
+            target_slot=target_slot, target_sha=target_sha,
+        )
 
     async def get_live_deployment(self) -> DeploymentRecord | None:
         """The single ``live`` deployment row — what the instance is running
@@ -3251,15 +3943,33 @@ class TaskRepository:
             )
         return self._deployment_record(row) if row else None
 
+    async def get_release_for_deployment(
+        self, deployment_id: str
+    ) -> ReleaseDeploymentRecord | None:
+        """The release row a ``deployments`` row belongs to, or ``None`` for a
+        pre-release-era row (``release_id`` NULL — release-line-deploy.md
+        §3.1 point 3). Used to resolve a rollback target's release row."""
+        async with self._lock:
+            dep = await self._fetchone(
+                self.conn, "SELECT release_id FROM deployments WHERE id=?", (deployment_id,)
+            )
+            if dep is None or dep["release_id"] is None:
+                return None
+            row = await self._fetchone(
+                self.conn, "SELECT * FROM release_deployments WHERE id=?", (dep["release_id"],)
+            )
+        return self._release_deployment_record(row) if row else None
+
     async def begin_deployment_staging(
         self,
         *,
-        delivery_id: str,
-        task_id: str | None,
-        op_id: str | None,
+        delivery_id: str | None = None,
+        task_id: str | None = None,
+        op_id: str | None = None,
         slot: str,
         sha: str,
         source_repo: str,
+        release_id: str | None = None,
     ) -> DeploymentRecord:
         """Take the global deploy lock by inserting a ``staging`` row (§4, §5).
 
@@ -3267,7 +3977,12 @@ class TaskRepository:
         SAME slot describes content about to be destroyed and becomes
         ``superseded`` in the same transaction (§5). If another deploy already
         holds the lock the ``deployments_one_active`` unique index rejects the
-        insert and this raises ``DeployLockedError`` naming the holder."""
+        insert and this raises ``DeployLockedError`` naming the holder.
+
+        ``release_id`` is set for a release-line stage (release-line-deploy.md
+        §3.1): ``delivery_id``/``task_id`` are then NULL — the release row, not
+        a delivery, is the audit trail. A per-run stage leaves ``release_id``
+        NULL, unchanged from local-deploy.md §5."""
         stamp = _now_iso()
         async with self._transaction() as conn:
             await conn.execute(
@@ -3279,10 +3994,10 @@ class TaskRepository:
             try:
                 await conn.execute(
                     "INSERT INTO deployments (id, delivery_id, task_id, op_id, slot, "
-                    "sha, source_repo, state, journal, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'staging', NULL, ?, ?)",
+                    "sha, source_repo, release_id, state, journal, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'staging', NULL, ?, ?)",
                     (ident, delivery_id, task_id, op_id, slot, sha, source_repo,
-                     stamp, stamp),
+                     release_id, stamp, stamp),
                 )
             except aiosqlite.IntegrityError as exc:
                 holder = await self._fetchone(
