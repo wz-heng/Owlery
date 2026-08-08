@@ -3178,14 +3178,22 @@ class TaskRepository:
         release, or one already terminal, is untouched — in particular,
         superseding an actively ``staging`` row here would silently orphan
         the release-level lock its own stage pipeline still holds.
-        """
+
+        Also excluded: a ``planned`` release with a ``running`` op. Planning
+        and staging are two separate calls (``release_stage`` plans+starts the
+        op, THEN calls ``begin_release_staging``), so there is a window where
+        a release is still ``planned`` but already has committed, in-flight
+        work. Superseding it there would leave that running op permanently
+        stuck (``begin_release_staging``'s CAS would then fail against a
+        ``superseded`` row it never anticipated racing)."""
         stamp = _now_iso()
         day = datetime.now(timezone.utc).strftime("%Y%m%d")
         async with self._transaction() as conn:
             await self._board_row(conn, board_id)
             await conn.execute(
                 "UPDATE release_deployments SET state='superseded', updated_at=? "
-                "WHERE board_id=? AND state IN ('planned','staged')",
+                "WHERE board_id=? AND state IN ('planned','staged') AND id NOT IN "
+                "(SELECT release_id FROM release_deployment_ops WHERE state='running')",
                 (stamp, board_id),
             )
             row = await self._fetchone(

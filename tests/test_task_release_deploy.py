@@ -262,6 +262,109 @@ async def test_plan_release_deployment_never_supersedes_staging(store):
 
 
 @pytest.mark.asyncio
+async def test_plan_release_deployment_never_supersedes_planned_with_running_op(store):
+    """A release can be `planned` with a `running` stage op — the window
+    between `release_stage`'s plan+start and its `begin_release_staging`
+    call. A concurrent re-plan superseding it there would leave that running
+    op permanently stuck (Snape review, blocker 1)."""
+    _db, repo, _tmp, _agent = store
+    board = await repo.create_board(
+        name="B1", working_dir=str(Path.cwd()), default_workspace_mode="shared",
+    )
+    r1 = await repo.plan_release_deployment(
+        board_id=board.id, source_ref="main", sha="a" * 40,
+        source_repo="/repo", actor_kind="user", actor_agent_id=None,
+    )
+    op = await repo.plan_release_op(
+        r1.id, kind="stage", request={}, actor_kind="user", actor_agent_id=None,
+    )
+    await repo.start_release_op(r1.id, op.id)
+    assert (await repo.get_release_deployment(r1.id)).state == "planned"
+
+    r2 = await repo.plan_release_deployment(
+        board_id=board.id, source_ref="main", sha="b" * 40,
+        source_repo="/repo", actor_kind="user", actor_agent_id=None,
+    )
+    # r1 must be untouched — its running op still has somewhere to land.
+    assert (await repo.get_release_deployment(r1.id)).state == "planned"
+    assert r2.state == "planned"
+    # The in-flight stage can still complete normally.
+    r1, dep = await repo.begin_release_staging(r1.id, slot="b", sha="a" * 40, source_repo="/repo")
+    assert r1.state == "staging" and dep.state == "staging"
+
+
+@pytest.mark.asyncio
+async def test_release_stage_settles_op_when_release_lost_the_plan_cas(store, tmp_path, monkeypatch):
+    """If `begin_release_staging` loses its CAS for any reason other than the
+    global lock (e.g. the release row was superseded out from under it), the
+    running stage op must still settle `failed` — never left `running`
+    forever (Snape review, blocker 1's op-settlement half)."""
+    db, repo, tmp, _agent = store
+    board_id, _src, _sha = await _board_with_remote(repo, tmp)
+    layout = _init_layout(tmp_path / "deploy", monkeypatch)
+    coord = _coord(db, repo)
+
+    real_begin = repo.begin_release_staging
+
+    async def _begin_then_supersede(release_id, **kw):
+        # Simulate a race: something else superseded the release row between
+        # `release_stage`'s plan+start and its `begin_release_staging` call.
+        async with repo._transaction() as conn:
+            await conn.execute(
+                "UPDATE release_deployments SET state='superseded' WHERE id=?",
+                (release_id,),
+            )
+        return await real_begin(release_id, **kw)
+
+    monkeypatch.setattr(repo, "begin_release_staging", _begin_then_supersede)
+
+    release, op = await coord.release_stage(
+        board_id, server_root=layout.slot_path("a"), stage_runner=FakeStageRunner()
+    )
+    assert op.state == "failed"
+    assert release.state == "superseded"  # untouched by the best-effort fail_planned_release
+
+
+@pytest.mark.asyncio
+async def test_release_rollback_refuses_cross_board_live_release(store, tmp_path, monkeypatch):
+    """The live deployment/release are instance-wide singletons, but
+    `release_rollback(board_id)` is a board-scoped endpoint: board B must not
+    be able to roll back board A's live release (Snape review, blocker 2)."""
+    db, repo, tmp, _agent = store
+    board_a_id, _src, _sha, layout, coord, release = await _staged_release(
+        db, repo, tmp, tmp_path, monkeypatch
+    )
+    async with repo._transaction() as conn:
+        await conn.execute(
+            "INSERT INTO deployments (id, delivery_id, task_id, op_id, slot, sha, "
+            "source_repo, release_id, state, journal, created_at, updated_at) VALUES "
+            "('priorsup', NULL, NULL, NULL, 'a', 'oldsha', 'x', NULL, 'superseded', NULL, "
+            "'2020-01-01T00:00:00+00:00', '2020-01-01T00:00:00+00:00')"
+        )
+    _wire_switch(coord, FakeQuiesce([[]]))
+    await coord.release_switch(board_a_id, server_root=layout.slot_path("a"))
+    _append(layout, (await _running_switch_op(repo, release.id)), switcher.STEP_SWITCHED_OK,
+            {"slot": "b", "sha": release.sha})
+    m = _manager(db, repo)
+    await m.reconcile_release_switch_ops()
+    layout.switch_current("b")
+    assert (await repo.get_release_deployment(release.id)).board_id == board_a_id
+
+    # A second, unrelated board with its own local-deploy opt-in.
+    board_b = await repo.create_board(
+        name="B-other", working_dir=str(tmp / "src"),
+        default_workspace_mode="git_worktree", allow_local_deploy=True,
+    )
+    coord2 = _coord(db, repo)
+    _wire_switch(coord2, FakeQuiesce([[]]))
+
+    with pytest.raises(TaskConflictError, match="different board"):
+        await coord2.release_rollback(
+            board_b.id, confirm_rollback=True, server_root=layout.slot_path("b")
+        )
+
+
+@pytest.mark.asyncio
 async def test_release_op_cas_lifecycle(store):
     _db, repo, _tmp, _agent = store
     board = await repo.create_board(

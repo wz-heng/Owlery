@@ -1554,14 +1554,26 @@ class DeliveryCoordinator:
             release, deployment = await self.repo.begin_release_staging(
                 release.id, slot=slot, sha=sha, source_repo=remote_url,
             )
-        except DeployLockedError as exc:
+        except (DeployLockedError, TaskConflictError) as exc:
+            # `DeployLockedError` is the expected contention path (another
+            # deploy holds the slot- or release-level lock). A bare
+            # `TaskConflictError` here means the release CAS lost against
+            # `state='planned'` some other way; either way the op must settle
+            # rather than stay `running` forever — never leave a durable op
+            # dangling on a lock loss (release-line-deploy.md §3.2).
             op = await self.repo.finish_release_op(
                 release.id, op.id, state="failed", error=str(exc),
             )
             # The lock loss happened before either row entered `staging`
             # (`begin_release_staging` is one transaction) — no born-together
-            # deployment row exists to settle alongside it.
-            release = await self.repo.fail_planned_release(release.id, error=str(exc))
+            # deployment row exists to settle alongside it. The release row
+            # itself may no longer be `planned` (e.g. concurrently
+            # superseded), so this settle is best-effort and swallowed if it
+            # loses its own CAS — the op is already durably failed above.
+            try:
+                release = await self.repo.fail_planned_release(release.id, error=str(exc))
+            except TaskConflictError:
+                release = await self.repo.get_release_deployment(release.id)
             return release, op
 
         runner = stage_runner or deploy._default_stage_runner
@@ -1617,7 +1629,14 @@ class DeliveryCoordinator:
         `deploy_switch` (§3.1 point 2). Human-only, enforced by the REST layer
         exactly like `deploy_switch`; this coordinator method itself has no
         actor-kind gate, matching `deploy_switch`'s own split of that
-        responsibility to the router."""
+        responsibility to the router.
+
+        `switch_when_idle` (the per-run switch's in-memory-hold mode,
+        local-deploy.md §7.1) is deliberately NOT offered here: the task book
+        (release-line-deploy.md §3.1 point 2) only names `drain` for the
+        release verb's preconditions. `drain` covers the operational need
+        (wait for idle, then switch); the unbounded in-memory hold is scoped
+        out of v1 for the board-level surface, not an oversight."""
         board = await self.repo.get_board(board_id)
         if not board.allow_local_deploy:
             raise TaskConflictError(
@@ -1734,6 +1753,14 @@ class DeliveryCoordinator:
             raise TaskConflictError(
                 "the live deployment predates release-line-deploy and has no "
                 "release row to attach a rollback op to"
+            )
+        # `deployments`/`live` are instance-wide singletons, but this endpoint
+        # is board-scoped: refuse to let board B's rollback call operate on
+        # board A's live release just because B also opted into local deploy.
+        if live_release.board_id != board.id:
+            raise TaskConflictError(
+                f"the live release belongs to a different board "
+                f"({live_release.board_id!r}); roll it back from that board"
             )
 
         op = await self.repo.plan_release_op(
