@@ -1762,6 +1762,19 @@ class DeliveryCoordinator:
                 f"the live release belongs to a different board "
                 f"({live_release.board_id!r}); roll it back from that board"
             )
+        # `get_rollback_target` is slot-level and board-blind (only two slots
+        # exist, so "newest superseded on the other slot" can belong to a
+        # DIFFERENT board's release line — e.g. board B switched live after
+        # board A, superseding A's slot; a later board-A rollback would then
+        # target B's release). A `None` target release (a genuine pre-release-
+        # era deployments row, release_id NULL) is exempt — that is the
+        # documented §3.1 point 3 compatibility case, not a cross-board leak.
+        if target_release is not None and target_release.board_id != board.id:
+            raise TaskConflictError(
+                f"the rollback target belongs to a different board "
+                f"({target_release.board_id!r}); no eligible rollback target "
+                "for this board"
+            )
 
         op = await self.repo.plan_release_op(
             live_release.id, kind="rollback", request={},

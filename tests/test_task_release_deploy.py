@@ -365,6 +365,91 @@ async def test_release_rollback_refuses_cross_board_live_release(store, tmp_path
 
 
 @pytest.mark.asyncio
+async def test_release_rollback_refuses_cross_board_target(store, tmp_path, monkeypatch):
+    """`get_rollback_target` is slot-level and board-blind (only two slots
+    exist total), so "newest superseded on the other slot" can belong to a
+    DIFFERENT board's release line. Exact repro from Snape's review:
+    board A live on slot a -> board B switches live to slot b (supersedes
+    A's slot-a row) -> board A switches live back to slot a (supersedes B's
+    slot-b row) -> board A's rollback target is now board B's release, which
+    must be refused rather than silently promoted to live."""
+    db, repo, tmp, _agent = store
+    board_a_id, _src_a, _sha_a, layout, coord_a, release_a = await _staged_release(
+        db, repo, tmp, tmp_path, monkeypatch
+    )
+    m = _manager(db, repo)
+
+    # A: plan+stage+switch live onto slot b (idle_slot() picks b first).
+    _wire_switch(coord_a, FakeQuiesce([[]]))
+    await coord_a.release_switch(board_a_id, server_root=layout.slot_path("a"))
+    _append(layout, (await _running_switch_op(repo, release_a.id)), switcher.STEP_SWITCHED_OK,
+            {"slot": "b", "sha": release_a.sha})
+    await m.reconcile_release_switch_ops()
+    layout.switch_current("b")
+    assert (await repo.get_release_deployment(release_a.id)).state == "live"
+
+    # B: a second, independent board+repo, staged onto the now-idle slot a,
+    # then switched live — supersedes A's release on slot b... no, A is on
+    # slot b so B stages onto slot a and switching to it supersedes A.
+    src_b = tmp / "src_b"
+    _init_repo(src_b, branch="main")
+    bare_b = tmp / "origin_b.git"
+    _git(tmp, "init", "-q", "--bare", str(bare_b))
+    _git(src_b, "remote", "add", "origin", str(bare_b))
+    _git(src_b, "push", "origin", "main")
+    board_b = await repo.create_board(
+        name="B-other", working_dir=str(src_b), default_workspace_mode="git_worktree",
+        allow_local_deploy=True, deploy_release_ref="main",
+    )
+    coord_b = _coord(db, repo)
+    _wire_switch(coord_b, FakeQuiesce([[]]))
+    release_b, _op_b = await coord_b.release_stage(
+        board_b.id, server_root=layout.slot_path("b"), stage_runner=FakeStageRunner()
+    )
+    assert release_b.state == "staged"
+    await coord_b.release_switch(board_b.id, server_root=layout.slot_path("b"))
+    _append(layout, (await _running_switch_op(repo, release_b.id)), switcher.STEP_SWITCHED_OK,
+            {"slot": "a", "sha": release_b.sha})
+    await m.reconcile_release_switch_ops()
+    layout.switch_current("a")
+    assert (await repo.get_release_deployment(release_b.id)).state == "live"
+    assert (await repo.get_release_deployment(release_a.id)).state == "superseded"
+
+    # A: switch live back to slot b — this supersedes B's slot-a release.
+    src_a = Path((await repo.get_board(board_a_id)).working_dir)
+    _git(src_a, "commit", "--allow-empty", "-qm", "release a2")
+    _git(src_a, "push", "origin", "main")
+    coord_a2 = _coord(db, repo)
+    _wire_switch(coord_a2, FakeQuiesce([[]]))
+    release_a2, _op_a2 = await coord_a2.release_stage(
+        board_a_id, server_root=layout.slot_path("a"), stage_runner=FakeStageRunner()
+    )
+    assert release_a2.state == "staged"
+    await coord_a2.release_switch(board_a_id, server_root=layout.slot_path("a"))
+    _append(layout, (await _running_switch_op(repo, release_a2.id)), switcher.STEP_SWITCHED_OK,
+            {"slot": "b", "sha": release_a2.sha})
+    await m.reconcile_release_switch_ops()
+    layout.switch_current("b")
+    assert (await repo.get_release_deployment(release_a2.id)).state == "live"
+    assert (await repo.get_release_deployment(release_b.id)).state == "superseded"
+
+    # Board A's rollback target is now board B's release (the only superseded
+    # slot). This must be refused, not promoted to live.
+    coord_a3 = _coord(db, repo)
+    _wire_switch(coord_a3, FakeQuiesce([[]]))
+    with pytest.raises(TaskConflictError, match="different board"):
+        await coord_a3.release_rollback(
+            board_a_id, confirm_rollback=True, server_root=layout.slot_path("b")
+        )
+    # Nothing moved: B's release is still live, no rollback op was planned.
+    assert (await repo.get_release_deployment(release_b.id)).state == "superseded"
+    assert (await repo.get_release_deployment(release_a2.id)).state == "live"
+    assert [
+        o for o in await repo.list_running_release_ops()
+    ] == []
+
+
+@pytest.mark.asyncio
 async def test_release_op_cas_lifecycle(store):
     _db, repo, _tmp, _agent = store
     board = await repo.create_board(
