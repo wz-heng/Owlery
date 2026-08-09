@@ -21,6 +21,7 @@ from .deploy_quiesce import DeployQuiesce
 from .models import DeliveryRecord, RunRecord, TaskBoardError, TaskConflictError, TaskRecord
 from .prompts import render_assignment_prompt
 from .repository import TaskRepository, task_repository
+from . import workspaces as ws
 from .workspaces import (
     WorkspaceError,
     capture_artifacts,
@@ -828,14 +829,6 @@ class TaskBoardManager:
         """Return the durable local-deploy history for the operator surface."""
         return await self.repo.list_deployments()
 
-    async def deploy_rollback(
-        self, deployment_id: str, **kwargs: Any
-    ) -> DeliveryRecord:
-        """Run a confirmed rollback through the ordinary deploy-switch path."""
-        delivery = await self.delivery.deploy_rollback(deployment_id, **kwargs)
-        await self.publish_task_update(delivery.task_id)
-        return delivery
-
     # --- release-line deploy (docs/plans/release-line-deploy.md §3) ------
 
     async def release_stage(self, board_id: str, **kwargs: Any) -> tuple[Any, Any]:
@@ -854,6 +847,26 @@ class TaskBoardManager:
         """Return the durable release-line history for the board's Releases
         surface."""
         return await self.repo.list_release_deployments(board_id)
+
+    async def resolve_release_remote_tip(self, board_id: str) -> str | None:
+        """Best-effort current sha of the board's configured release branch at
+        its remote — the "remote tip" half of the Releases surface's "remote
+        tip vs live sha" display (release-line-deploy.md §3.4). Read-only and
+        never raises: a transient network/remote hiccup must not break the
+        release list itself, only leave the tip comparison blank, exactly the
+        same resolver `release_stage` uses to plan a candidate."""
+        board = await self.repo.get_board(board_id)
+        if not board.allow_local_deploy:
+            return None
+        remote_url = await ws.remote_url(board.working_dir, board.git_delivery_remote)
+        if remote_url is None:
+            return None
+        try:
+            return await ws.remote_release_ref_tip(
+                board.working_dir, remote_url, board.deploy_release_ref
+            )
+        except ws.WorkspaceError:
+            return None
 
     async def release_rollback(self, board_id: str, **kwargs: Any) -> tuple[Any, Any]:
         """Run a confirmed rollback of the board's live release through the

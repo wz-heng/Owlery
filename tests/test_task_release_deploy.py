@@ -1,24 +1,28 @@
 """Release-line deploy backend pipeline (docs/plans/release-line-deploy.md
-§3, T-A).
-
-Board-level equivalents of `deploy_stage`/`deploy_switch`/`deploy_rollback`:
-the source is the board's protected release branch, resolved at its
-configured remote, instead of a per-run delivery's attempt branch. Every
-mechanism reused from local-deploy.md — `stage_slot`, the snapshot/journal/
-switcher handoff, quiesce, probation — is exercised through the SAME fakes as
-`test_task_deploy_stage.py`/`test_task_deploy_switch.py`; only the release
-entry points and the release_deployments/release_deployment_ops tables are
-new here.
+§3): the board-level `release_stage`/`release_switch`/`release_rollback`
+that replaced every per-run/delivery-scoped deploy coordinator entry point
+(`deploy_stage`/`deploy_switch`/`deploy_rollback`, all removed — §3.4). The
+source is the board's protected release branch, resolved at its configured
+remote, instead of a per-run delivery's attempt branch. Every mechanism
+reused from local-deploy.md — `stage_slot`, the snapshot/journal/switcher
+handoff, quiesce, drain, admission, probation — is exercised here through the
+release entry points; `test_task_deploy_switch.py` now only covers the
+narrower historical-row boot-reconciliation surface that has no coordinator
+verb left to reach it.
 
 Covers: release repository ops (version sequencing, one-active lock, op CAS),
 the release coordinator (plan+stage happy path, unresolvable ref, lock held,
-stage failure settles release+lock, switch refusals and handoff, rollback
+stage failure settles release+lock, switch/rollback refusals incl. admission
+gate open/close and drain, handoff/snapshot contract incl. pruning, rollback
 incl. a pre-release-era target), boot reconciliation of release ops (every
 §8 journal-tail row), census counts a running release op. No real-model
 quota anywhere.
 """
 from __future__ import annotations
 
+import asyncio
+import os
+import sqlite3
 import subprocess
 import uuid
 from pathlib import Path
@@ -643,8 +647,12 @@ async def _staged_release(db, repo, tmp, tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_release_switch_happy_path(store, tmp_path, monkeypatch):
+    """Also covers the handoff/snapshot contract the removed per-run
+    `deploy_switch`'s `test_handoff_snapshot_journal_spawn_broadcast_shutdown`
+    exercised — `_snapshot_db`/the journal `handoff` line are shared machinery
+    now only reachable via `release_switch`/`release_rollback`."""
     db, repo, tmp, _agent = store
-    board_id, _src, sha, layout, coord, release = await _staged_release(
+    board_id, src, sha, layout, coord, release = await _staged_release(
         db, repo, tmp, tmp_path, monkeypatch
     )
     _wire_switch(coord, FakeQuiesce([[]]))
@@ -659,9 +667,40 @@ async def test_release_switch_happy_path(store, tmp_path, monkeypatch):
 
     entries = switcher.Journal(str(layout.journal_path)).entries(op.id)
     handoff = next(e for e in entries if e["step"] == switcher.STEP_HANDOFF)
-    assert handoff["detail"]["to_slot"] == "b" and handoff["detail"]["new_sha"] == sha
+    detail = handoff["detail"]
+    assert detail["from_slot"] == "a" and detail["to_slot"] == "b"
+    assert detail["new_sha"] == sha and detail["old_pid"] == os.getpid()
+    assert detail["snapshot_path"].endswith(f"{op.id}.db")
+
+    # The snapshot is a self-contained, queryable copy of the live DB (§7.4).
+    snap = Path(detail["snapshot_path"])
+    assert snap.is_file()
+    conn = sqlite3.connect(str(snap))
+    got = conn.execute("SELECT id FROM task_boards WHERE id=?", (board_id,)).fetchone()
+    conn.close()
+    assert got is not None  # committed rows survived checkpoint+copy
+
     assert coord.spawns[0]["from_slot"] == "a" and coord.spawns[0]["op_id"] == op.id
+    assert coord.broadcasts[0]["type"] == "server_restarting"
     assert coord.shutdowns == [True]
+
+
+@pytest.mark.asyncio
+async def test_release_switch_snapshot_prunes_to_keep(store, tmp_path, monkeypatch):
+    db, repo, tmp, _agent = store
+    board_id, _src, _sha, layout, coord, release = await _staged_release(
+        db, repo, tmp, tmp_path, monkeypatch
+    )
+    monkeypatch.setattr(settings, "deploy_keep_snapshots", 2)
+    # Pre-seed 3 old snapshots; pruning keeps 2 total incl. the fresh one.
+    for i in range(3):
+        (layout.snapshots_path / f"old{i}.db").write_text("x")
+    _wire_switch(coord, FakeQuiesce([[]]))
+
+    _result_release, op = await coord.release_switch(board_id, server_root=layout.slot_path("a"))
+
+    snaps = {p.name for p in layout.snapshots_path.glob("*.db")}
+    assert f"{op.id}.db" in snaps and len(snaps) == 2  # own snapshot never pruned
 
 
 @pytest.mark.asyncio
@@ -678,6 +717,70 @@ async def test_release_switch_refuses_not_idle_with_census(store, tmp_path, monk
     assert "session_turn:s1" in (op.error or "")
     assert (await repo.get_deployment(release.deployment_id)).state == "staged"
     assert coord.spawns == [] and coord.shutdowns == []
+
+
+@pytest.mark.asyncio
+async def test_release_switch_final_census_closes_admission_and_abort_reopens_it(
+    store, tmp_path, monkeypatch
+):
+    """The first census is idle, then work arrives before the handoff's final
+    census. Admission must be closed before that second census and reopened
+    once this still-live server refuses the switch — ported from the removed
+    per-run `deploy_switch`'s equivalent test, since `_perform_release_switch_
+    handoff` shares the exact same admission-close/reopen contract as the
+    removed `_perform_switch_handoff` did."""
+    db, repo, tmp, _agent = store
+    board_id, _src, _sha, layout, coord, release = await _staged_release(
+        db, repo, tmp, tmp_path, monkeypatch
+    )
+    q = FakeQuiesce([[], [BusySource("session_turn", "raced")]])
+    _wire_switch(coord, q)
+
+    _result_release, op = await coord.release_switch(board_id, server_root=layout.slot_path("a"))
+
+    assert op.state == "failed"
+    assert q.admission_closes == 1 and q.admission_opens == 1
+    assert (await repo.get_deployment(release.deployment_id)).state == "staged"
+
+
+@pytest.mark.asyncio
+async def test_release_switch_pre_spawn_cancellation_reopens_admission(store, tmp_path, monkeypatch):
+    db, repo, tmp, _agent = store
+    board_id, _src, _sha, layout, coord, _release = await _staged_release(
+        db, repo, tmp, tmp_path, monkeypatch
+    )
+    q = FakeQuiesce([[]])
+    _wire_switch(coord, q)
+
+    async def _cancel_snapshot(*args, **kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(coord, "_snapshot_db", _cancel_snapshot)
+    with pytest.raises(asyncio.CancelledError):
+        await coord.release_switch(board_id, server_root=layout.slot_path("a"))
+
+    assert q.admission_closes == 1 and q.admission_opens == 1
+    assert coord.spawns == []
+
+
+@pytest.mark.asyncio
+async def test_release_switch_post_spawn_exception_keeps_admission_closed(store, tmp_path, monkeypatch):
+    db, repo, tmp, _agent = store
+    board_id, _src, _sha, layout, coord, _release = await _staged_release(
+        db, repo, tmp, tmp_path, monkeypatch
+    )
+    q = FakeQuiesce([[]])
+    _wire_switch(coord, q)
+
+    async def _broadcast_failure(message):
+        raise RuntimeError("broadcast unavailable after spawn")
+
+    coord.broadcast_restarting = _broadcast_failure
+    with pytest.raises(RuntimeError, match="broadcast unavailable"):
+        await coord.release_switch(board_id, server_root=layout.slot_path("a"))
+
+    assert len(coord.spawns) == 1
+    assert q.admission_closes == 1 and q.admission_opens == 0
 
 
 @pytest.mark.asyncio
@@ -751,6 +854,43 @@ async def test_release_switch_requires_bound_quiesce(store, tmp_path, monkeypatc
 
 
 # --------------------------------------------- coordinator: rollback
+
+
+@pytest.mark.asyncio
+async def test_release_rollback_refuses_no_live_deployment(store, tmp_path, monkeypatch):
+    db, repo, tmp, _agent = store
+    board_id, _src, _sha = await _board_with_remote(repo, tmp)
+    coord = _coord(db, repo)
+
+    with pytest.raises(TaskConflictError, match="no live deployment to roll back"):
+        await coord.release_rollback(board_id, confirm_rollback=True)
+
+
+@pytest.mark.asyncio
+async def test_release_rollback_refuses_no_superseded_target(store, tmp_path, monkeypatch):
+    """`release_rollback` refuses when the live deployment has no superseded
+    slot to roll back to — the release-line mirror of the removed per-run
+    `deploy_rollback`'s `nothing_staged`-equivalent refusal (§3.1 point 3)."""
+    db, repo, tmp, _agent = store
+    board_id, _src, _sha, layout, coord, release = await _staged_release(
+        db, repo, tmp, tmp_path, monkeypatch
+    )
+    _wire_switch(coord, FakeQuiesce([[]]))
+    await coord.release_switch(board_id, server_root=layout.slot_path("a"))
+    _append(layout, (await _running_switch_op(repo, release.id)), switcher.STEP_SWITCHED_OK,
+            {"slot": "b", "sha": release.sha})
+    m = _manager(db, repo)
+    await m.reconcile_release_switch_ops()
+    layout.switch_current("b")
+    # Only slot b (the just-switched-to live slot) exists in the deployments
+    # table at this point — no superseded row anywhere for the rollback
+    # target lookup to find.
+    assert (await repo.get_release_deployment(release.id)).state == "live"
+
+    with pytest.raises(TaskConflictError, match="no superseded deployment is available"):
+        await coord.release_rollback(
+            board_id, confirm_rollback=True, server_root=layout.slot_path("b")
+        )
 
 
 @pytest.mark.asyncio

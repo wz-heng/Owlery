@@ -8,10 +8,16 @@ locate that row via the journal-derived `target_slot`/`target_sha` fallback and
 drive it to a terminal state; it must never finish the op while leaving the
 deployment row orphaned.
 
-Reached through `deploy_rollback` — the surviving per-run coordinator entry
-point after `deploy_stage`/`deploy_switch` were removed in favor of the
-board-level release-line deploy (docs/plans/release-line-deploy.md); the crash
-window and the §8 fallback locator it exercises are identical either way.
+`deploy_stage`/`deploy_switch`/`deploy_rollback` were all removed as
+coordinator entry points by the release-line-deploy cutover
+(docs/plans/release-line-deploy.md §3.4) — nothing user-facing creates a
+`task_delivery_ops` row of kind `deploy_switch` anymore. But the boot-
+reconciliation machinery for that historical kind must still correctly settle
+a row an upgrading instance finds left `running` from before the cutover, so
+this file plants the op directly via repository calls (mirroring exactly what
+the old `deploy_rollback` did to the DB) rather than through any coordinator
+verb — see `tests/test_task_deploy_switch.py`'s `_handed_off` docstring for
+the same reasoning.
 """
 from __future__ import annotations
 
@@ -120,8 +126,15 @@ async def _crash_before_bind(db, repo, tmp, agent, monkeypatch):
     )
     pre_bind_op_id = staged.op_id  # None — never bound to any switch op yet
 
-    op_id = await coord._plan_and_start_switch_op(delivery, "user", None)
-    op = next(o for o in await repo.list_delivery_ops(delivery.id) if o.id == op_id)
+    op = await repo.plan_op(
+        delivery.id, kind="deploy_switch",
+        source_key=f"task:{task.id}:run:{run.id}:delivery:deploy_switch",
+        request={"drain": False}, actor_kind="user", actor_agent_id=None,
+    )
+    await repo.start_op(
+        delivery.id, op.id, advance_delivering=False,
+        allowed_statuses=frozenset({"ready", "delivered", "blocked", "conflicted"}),
+    )
 
     # Step 1 (§7.2): checkpoint + snapshot.
     busy, _, _ = await db.wal_checkpoint_truncate()

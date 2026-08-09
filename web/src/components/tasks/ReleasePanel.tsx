@@ -66,6 +66,7 @@ interface ReleasePanelProps {
  * board has opted into local deploy — mirrors the per-run panel it replaces. */
 export function ReleasePanel({ board }: ReleasePanelProps) {
   const releases = useTaskStore((state) => state.releases[board.id]) ?? [];
+  const remoteTip = useTaskStore((state) => state.releaseRemoteTip[board.id]);
   const mutating = useTaskStore((state) => state.mutating);
   const error = useTaskStore((state) => state.error);
   const confirmation = useTaskStore((state) => state.releaseConfirmation);
@@ -82,6 +83,7 @@ export function ReleasePanel({ board }: ReleasePanelProps) {
   );
   const busy = mutating;
   const activeConfirmation = confirmation && confirmation.boardId === board.id ? confirmation : null;
+  const tipAheadOfLive = remoteTip != null && remoteTip !== live?.sha;
 
   return (
     <section className="mx-4 mb-2 rounded-xl border border-ink-300 bg-ink-50 p-3 md:mx-6" aria-label="Releases">
@@ -91,6 +93,15 @@ export function ReleasePanel({ board }: ReleasePanelProps) {
         </span>
         <span className="inline-flex items-center gap-1 rounded-full bg-ink-200 px-2 py-0.5 text-[10px] font-semibold uppercase text-muted-foreground">
           <IconGitBranch size={11} /> {board.deploy_release_ref}
+        </span>
+        <span
+          className={cn(
+            "rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase",
+            tipAheadOfLive ? DELIVERY_TONE_PILL.attention : "bg-ink-200 text-muted-foreground"
+          )}
+          title="The remote's current tip for the configured release branch"
+        >
+          Remote tip {shortSha(remoteTip)}
         </span>
         {live ? (
           <span className={cn("rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase", DELIVERY_TONE_PILL.success)}>
@@ -103,6 +114,9 @@ export function ReleasePanel({ board }: ReleasePanelProps) {
           <span className={cn("rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase", DELIVERY_TONE_PILL.attention)}>
             Staged {staged.version} · {shortSha(staged.sha)}
           </span>
+        )}
+        {tipAheadOfLive && !staged && (
+          <span className="text-[11px] text-attention">New commits available to stage.</span>
         )}
       </header>
 

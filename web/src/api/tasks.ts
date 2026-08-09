@@ -230,30 +230,6 @@ export interface TaskDelivery {
   updated_at: string;
 }
 
-export type DeploymentState =
-  | "staging"
-  | "staged"
-  | "switching"
-  | "live"
-  | "rolled_back"
-  | "superseded"
-  | "failed";
-
-export interface Deployment {
-  id: string;
-  delivery_id: string | null;
-  task_id: string | null;
-  op_id: string | null;
-  slot: string;
-  sha: string;
-  source_repo: string;
-  release_id: string | null;
-  state: DeploymentState;
-  journal: Record<string, unknown> | null;
-  created_at: string;
-  updated_at: string;
-}
-
 export type ReleaseDeploymentState =
   | "planned"
   | "staging"
@@ -619,12 +595,6 @@ export const taskApi = {
       retention: body.retention,
       confirmations: body.confirmations ?? {},
     }),
-  deployments: (token: string) =>
-    get<{ deployments: Deployment[]; live: Deployment | null }>(token, "/api/deployments"),
-  rollbackDeployment: (token: string, deploymentId: string, confirmRollback = false) =>
-    mutate<TaskDelivery>(token, `/api/deployments/${deploymentId}/rollback`, "POST", {
-      confirm_rollback: confirmRollback,
-    }),
   releaseStage: (token: string, boardId: string) =>
     mutate<ReleaseOpResponse>(token, `/api/task-boards/${boardId}/releases/stage`, "POST"),
   releaseSwitch: (token: string, boardId: string, body: { drain?: boolean } = {}) =>
@@ -639,6 +609,7 @@ export const taskApi = {
       releases: ReleaseDeployment[];
       live: ReleaseDeployment | null;
       staged: ReleaseDeployment | null;
+      remote_tip: string | null;
     }>(token, `/api/task-boards/${boardId}/releases`),
   releaseRollback: (token: string, boardId: string, confirmRollback = false) =>
     mutate<ReleaseOpResponse>(token, `/api/task-boards/${boardId}/releases/rollback`, "POST", {

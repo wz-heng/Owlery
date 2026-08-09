@@ -1106,10 +1106,6 @@ class DeliveryTeardownRequest(BaseModel):
     confirmations: dict[str, bool] = Field(default_factory=dict)
 
 
-class DeployRollbackRequest(BaseModel):
-    confirm_rollback: bool = False
-
-
 class ReleaseSwitchRequest(BaseModel):
     drain: bool = False
 
@@ -1252,31 +1248,6 @@ async def list_deployments(_: str = Depends(verify_token)):
     }
 
 
-@router.post("/api/deployments/{deployment_id}/rollback")
-async def deployment_rollback(
-    deployment_id: str,
-    req: DeployRollbackRequest,
-    caller_session_id: str | None = Header(default=None, alias="X-Owlery-Session-ID"),
-    _: str = Depends(verify_token),
-):
-    actor_kind, actor_agent_id = await _delivery_actor(caller_session_id)
-    if actor_kind != "user":
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            {"code": "deploy_rollback_user_only", "message": "deploy rollback requires a human caller"},
-        )
-    return _dict(
-        await _run(
-            _get_manager().deploy_rollback(
-                deployment_id,
-                confirm_rollback=req.confirm_rollback,
-                actor_kind=actor_kind,
-                actor_agent_id=actor_agent_id,
-            )
-        )
-    )
-
-
 # ---------------------------------------------------------- release-line deploy
 
 
@@ -1332,12 +1303,14 @@ async def release_switch(
 @router.get("/api/task-boards/{board_id}/releases")
 async def list_releases(board_id: str, _: str = Depends(verify_token)):
     releases = await _run(_get_manager().list_release_deployments(board_id))
+    remote_tip = await _run(_get_manager().resolve_release_remote_tip(board_id))
     live = next((item for item in releases if item.state == "live"), None)
     staged = next((item for item in releases if item.state == "staged"), None)
     return {
         "releases": [_dict(item) for item in releases],
         "live": _dict(live) if live is not None else None,
         "staged": _dict(staged) if staged is not None else None,
+        "remote_tip": remote_tip,
     }
 
 

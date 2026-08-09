@@ -29,7 +29,6 @@ class _Manager:
     def __init__(self):
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.raise_confirm = False
-        self.raise_rollback_confirm = False
 
     async def publish_task_update(self, task_id):
         pass
@@ -57,16 +56,6 @@ class _Manager:
             type("Deployment", (), {"state": "live", "to_dict": lambda self: {"id": "dep1", "state": "live"}})(),
             type("Deployment", (), {"state": "superseded", "to_dict": lambda self: {"id": "dep0", "state": "superseded"}})(),
         ]
-
-    async def deploy_rollback(self, deployment_id, **kw):
-        self.calls.append(("deploy_rollback", {"deployment_id": deployment_id, **kw}))
-        if self.raise_rollback_confirm:
-            raise DeliveryConfirmationRequired(
-                "rollback needs confirmation",
-                confirmation="confirm_rollback", action="rollback",
-                current=_Delivery(status="delivered"),
-            )
-        return _Delivery(status="ready")
 
     async def request_delivery(self, task_id, run_id, session_id, **kw):
         self.calls.append(("worker_request", {"task_id": task_id, "run_id": run_id,
@@ -168,41 +157,17 @@ async def test_deployments_history_routing(client):
 
 @pytest.mark.asyncio
 async def test_per_run_deploy_verbs_are_gone(client):
-    """The per-run deploy/stage and deploy/switch REST verbs are removed
-    outright (release-line-deploy.md §3.4) — never hidden behind a flag."""
+    """The per-run deploy/stage, deploy/switch, and deployment-rollback REST
+    verbs are removed outright (release-line-deploy.md §3.4) — never hidden
+    behind a flag. `GET /api/deployments` itself survives (slot-level truth,
+    now carrying `release_id`) — only the mutating per-run verbs are gone."""
     c, _manager = client
     r = await c.post("/api/tasks/t1/runs/r1/delivery/deploy/stage", headers=HEADERS)
     assert r.status_code == 404
     r = await c.post("/api/tasks/t1/runs/r1/delivery/deploy/switch", headers=HEADERS)
     assert r.status_code == 404
-
-
-@pytest.mark.asyncio
-async def test_rollback_requires_confirmation_and_is_human_only(client, monkeypatch):
-    c, manager = client
-    manager.raise_rollback_confirm = True
-    r = await c.post("/api/deployments/dep1/rollback", json={}, headers=HEADERS)
-    assert r.status_code == 409
-    detail = r.json()["detail"]
-    assert detail["confirmation"] == "confirm_rollback" and detail["action"] == "rollback"
-
-    manager.raise_rollback_confirm = False
-    r = await c.post(
-        "/api/deployments/dep1/rollback", json={"confirm_rollback": True}, headers=HEADERS
-    )
-    assert r.status_code == 200
-    assert manager.calls[-1] == ("deploy_rollback", {
-        "deployment_id": "dep1", "confirm_rollback": True,
-        "actor_kind": "user", "actor_agent_id": None,
-    })
-
-    async def agent_actor(_session_id):
-        return "agent", "a1"
-
-    monkeypatch.setattr(routes, "_delivery_actor", agent_actor)
     r = await c.post("/api/deployments/dep1/rollback", json={"confirm_rollback": True}, headers=HEADERS)
-    assert r.status_code == 403
-    assert r.json()["detail"]["code"] == "deploy_rollback_user_only"
+    assert r.status_code == 404
 
 
 @pytest.mark.asyncio

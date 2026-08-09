@@ -87,26 +87,10 @@ class DeploySwitchAbort(Exception):
 
 
 @dataclass(slots=True)
-class _SwitchCtx:
-    """Everything one switch attempt threads from precondition to handoff."""
-
-    task: TaskRecord
-    run: RunRecord
-    delivery: DeliveryRecord
-    target: DeploymentRecord
-    target_state: str
-    from_slot: str
-    layout: "deploy.DeployLayout"
-    actor_kind: str
-    actor_agent_id: str | None
-    op_id: str = ""
-
-
-@dataclass(slots=True)
 class _ReleaseSwitchCtx:
-    """The release-line mirror of ``_SwitchCtx`` (release-line-deploy.md
-    §3.1): a board-level switch/rollback attempt has no per-run delivery, so
-    it threads a board and a release op instead of a delivery."""
+    """Everything one release switch/rollback attempt threads from
+    precondition to handoff — a board-level attempt has no per-run delivery,
+    so it threads a board and a release op instead of a delivery."""
 
     board: BoardRecord
     target: DeploymentRecord
@@ -664,110 +648,6 @@ class DeliveryCoordinator:
             final = await self._fail(delivery.id, op_id, "op_failed", str(exc), actor_kind, actor_agent_id)
         return await self._published(task, final)
 
-    # --- deploy_rollback (docs/plans/local-deploy.md §7.1/§7.2) -----
-
-    async def deploy_rollback(
-        self,
-        deployment_id: str,
-        *,
-        confirm_rollback: bool,
-        actor_kind: str = "user",
-        actor_agent_id: str | None = None,
-        server_root: Path | None = None,
-    ) -> DeliveryRecord:
-        """Switch the live process back to its most recent superseded slot.
-
-        This is deliberately a normal, fresh ``deploy_switch`` operation: it
-        follows the exact handoff, quiesce, snapshot, and health-verification
-        path as a forward release.  The one extra guard is typed confirmation,
-        because it intentionally discards the currently running version.
-        """
-        live = await self.repo.get_deployment(deployment_id)
-        if live.state != "live":
-            raise TaskConflictError("only the current live deployment can be rolled back")
-        target = await self.repo.get_rollback_target(live.id)
-        if target is None or target.delivery_id is None:
-            raise TaskConflictError("no superseded deployment is available for rollback")
-        delivery = await self.repo.get_delivery(target.delivery_id)
-        if not confirm_rollback:
-            raise DeliveryConfirmationRequired(
-                "rollback replaces the running local version; confirmation is required",
-                confirmation="confirm_rollback",
-                action="rollback",
-                current=delivery,
-            )
-        task, run, board = await self._load(delivery.task_id, delivery.run_id)
-        if not board.allow_local_deploy:
-            raise TaskConflictError(
-                "this board may not deploy the local instance "
-                "(enable allow_local_deploy on the board first)", current=delivery,
-            )
-        check = deploy.deploy_precheck(settings, server_root=server_root)
-        if not check.ok:
-            raise TaskConflictError(check.message, current=delivery)
-        if delivery.status not in _SWITCH_START_STATES:
-            raise TaskConflictError("delivery is not in a state that accepts a deploy", current=delivery)
-        layout = deploy.DeployLayout.at(settings.resolved_deploy_root)
-        from_slot = layout.current_slot()
-        if from_slot != live.slot:
-            raise TaskConflictError("current deploy slot no longer matches the live deployment", current=delivery)
-        if target.slot == from_slot:
-            raise TaskConflictError("rollback target is already current", current=delivery)
-        if (
-            self.deploy_quiesce is None
-            or self.broadcast_restarting is None
-            or self.request_shutdown is None
-        ):
-            raise TaskConflictError("deploy switch is unavailable on this instance", current=delivery)
-
-        ctx = _SwitchCtx(
-            task=task,
-            run=run,
-            delivery=delivery,
-            target=target,
-            target_state="superseded",
-            from_slot=from_slot,
-            layout=layout,
-            actor_kind=actor_kind,
-            actor_agent_id=actor_agent_id,
-        )
-        op_id = await self._plan_and_start_switch_op(delivery, actor_kind, actor_agent_id)
-        ctx.op_id = op_id
-        try:
-            busy = await self.deploy_quiesce.census(exclude_op_id=op_id)
-            if busy:
-                raise DeploySwitchAbort("not_idle", busy=busy)
-            result = await self._perform_switch_handoff(ctx)
-        except DeploySwitchAbort as exc:
-            final = await self._fail_switch(
-                delivery.id, op_id, exc, actor_kind, actor_agent_id
-            )
-            return await self._published(task, final)
-        return await self._published(task, result)
-
-    async def _plan_switch_op(self, delivery, actor_kind, actor_agent_id):
-        ops = await self.repo.list_delivery_ops(delivery.id)
-        n = sum(1 for o in ops if o.kind == "deploy_switch")
-        suffix = "" if n == 0 else f":retry:{n}"
-        source_key = (
-            f"task:{delivery.task_id}:run:{delivery.run_id}:delivery:deploy_switch{suffix}"
-        )
-        return await self.repo.plan_op(
-            delivery.id, kind="deploy_switch", source_key=source_key,
-            request={"drain": False}, actor_kind=actor_kind, actor_agent_id=actor_agent_id,
-        )
-
-    async def _plan_and_start_switch_op(self, delivery, actor_kind, actor_agent_id):
-        op = await self._plan_switch_op(delivery, actor_kind, actor_agent_id)
-        # advance_delivering=False: a deploy is orthogonal to the git-delivery
-        # status (its lifecycle lives in `deployments`, §6). A successful switch
-        # keeps the delivery settled; a failed one blocks it — so the status is
-        # never moved to `delivering`, which would also be unrecoverable at boot.
-        await self.repo.start_op(
-            delivery.id, op.id, advance_delivering=False,
-            allowed_statuses=_SWITCH_START_STATES,
-        )
-        return op.id
 
     async def _drain_wait(self, op_id: str) -> list[BusySource]:
         """Poll the census until idle or `deploy_quiesce_timeout_seconds` elapses
@@ -779,115 +659,6 @@ class DeliveryCoordinator:
                 return []
             await asyncio.sleep(self._drain_poll_interval)
         return await self.deploy_quiesce.census(exclude_op_id=op_id)
-
-    async def _perform_switch_handoff(self, ctx: _SwitchCtx) -> DeliveryRecord:
-        """Close work admission, then execute the irreversible handoff.
-
-        Closing is deliberately adjacent to the final census in the helper: a
-        successful spawn keeps it closed until this process exits, while every
-        exception before that spawn reopens it before the caller settles the
-        aborted op.
-        """
-        await self.deploy_quiesce.close_admission()
-        spawned = False
-
-        def _mark_spawned() -> None:
-            nonlocal spawned
-            spawned = True
-
-        try:
-            return await self._perform_switch_handoff_after_admission(
-                ctx, on_spawned=_mark_spawned
-            )
-        except BaseException:
-            # `spawn_switcher` returning is the point of no return.  A later
-            # broadcast/shutdown/read error cannot safely reopen the old process:
-            # the detached switcher may already flip or restart it.  Conversely
-            # cancellation before spawn is still an abort and must release work.
-            if not spawned:
-                await self.deploy_quiesce.open_admission()
-            raise
-
-    async def _perform_switch_handoff_after_admission(
-        self, ctx: _SwitchCtx, *, on_spawned: Callable[[], None]
-    ) -> DeliveryRecord:
-        """§7.2 handoff, five steps, each committed before the next: snapshot →
-        journal `handoff` → deployment `switching` + op journal_ref → spawn the
-        detached switcher → broadcast `server_restarting` + graceful shutdown.
-
-        Ordering is the at-most-once contract: the snapshot and the journal
-        `handoff` line exist before the flip is possible, so a crash anywhere here
-        boot-reconciles from the journal (§8) — never a silent double-switch."""
-        # Re-verify idle immediately before the point of no return (§7.2). The
-        # census could have gone busy between the gate and here.
-        busy = await self.deploy_quiesce.census(exclude_op_id=ctx.op_id)
-        if busy:
-            raise DeploySwitchAbort("not_idle", busy=busy)
-
-        layout = ctx.layout
-        # 1. Checkpoint + snapshot the DB (§7.2 step 1, §7.4).
-        snapshot_path = await self._snapshot_db(layout, ctx.op_id)
-
-        # 2. Journal the handoff contract BEFORE any DB flip (§7.2 step 2). Every
-        # field the detached switcher needs to flip, restart, health-check, and
-        # roll back — resolved once, here, from the live process it replaces.
-        old_sha = await self._current_sha(layout, ctx.from_slot)
-        handoff_detail = {
-            "from_slot": ctx.from_slot,
-            "to_slot": ctx.target.slot,
-            "old_sha": old_sha,
-            "new_sha": ctx.target.sha,
-            "old_pid": os.getpid(),
-            "host": self._switch_host,
-            "port": int(settings.port),
-            "db_path": self.db.path,
-            "snapshot_path": snapshot_path,
-            "serve_argv": ["serve"],
-            "serve_env": {},
-        }
-        journal = switcher.Journal(str(layout.journal_path))
-        await asyncio.to_thread(
-            journal.append, ctx.op_id, switcher.STEP_HANDOFF, handoff_detail
-        )
-
-        # 3. The handoff CAS: take the deployment `switching` (global lock) and
-        # pin the op's journal_ref, both durable before we spawn (§7.2 step 3).
-        try:
-            await self.repo.begin_deployment_switching(
-                deployment_id=ctx.target.id, op_id=ctx.op_id,
-                expected_state=ctx.target_state,
-            )
-        except DeployLockedError as exc:
-            raise DeploySwitchAbort("deploy_locked", message=str(exc)) from exc
-        await self.repo.record_switch_journal_ref(
-            ctx.op_id, journal_ref=str(layout.journal_path),
-            detail={"from_slot": ctx.from_slot, "to_slot": ctx.target.slot,
-                    "new_sha": ctx.target.sha},
-        )
-
-        # 4. Spawn the switcher fully detached from the OLD slot's trusted code
-        # (§7.2 step 4). Past this line the switch is committed — no more aborts.
-        await asyncio.to_thread(
-            self.spawn_switcher,
-            root=str(layout.root),
-            from_slot=ctx.from_slot,
-            op_id=ctx.op_id,
-            switch_timeout=float(settings.deploy_switch_timeout_seconds),
-            health_timeout=float(settings.deploy_health_timeout_seconds),
-        )
-        on_spawned()
-
-        # 5. Broadcast the restart banner, then initiate the normal graceful
-        # shutdown (§7.2 step 5). The switcher waits for this process to exit.
-        await self.broadcast_restarting({
-            "type": "server_restarting",
-            "op_id": ctx.op_id,
-            "from_slot": ctx.from_slot,
-            "to_slot": ctx.target.slot,
-            "sha": ctx.target.sha,
-        })
-        self.request_shutdown()
-        return await self.repo.get_delivery(ctx.delivery.id)
 
     async def _snapshot_db(self, layout: "deploy.DeployLayout", op_id: str) -> str:
         """Checkpoint the WAL (TRUNCATE) and copy the DB to `snapshots/<op_id>.db`
@@ -935,33 +706,6 @@ class DeliveryCoordinator:
             "rev-parse", "HEAD", cwd=str(layout.slot_path(from_slot))
         )
         return out.strip() if rc == 0 and out else ""
-
-    async def _fail_switch(
-        self, delivery_id, op_id, exc: DeploySwitchAbort, actor_kind, actor_agent_id
-    ) -> DeliveryRecord:
-        """Fail a switch op that aborted pre-commit, mapping the abort reason to a
-        durable delivery reason (§7.1/§12). Never touches the deployment: any
-        `switching` transition is reverted by its own abort path, and a pre-flip
-        abort never moved the staged row."""
-        reason_map = {
-            "not_idle": "not_idle",
-            "deploy_locked": "deploy_locked",
-            "snapshot_failed": "op_failed",
-        }
-        reason_kind = reason_map.get(exc.reason, "op_failed")
-        if exc.reason == "not_idle" and exc.busy:
-            census = "; ".join(f"{b.kind}:{b.detail}" for b in exc.busy)
-            detail = f"not_idle: instance is busy — {census}"
-            result: dict[str, Any] | None = {"busy": [b.to_dict() for b in exc.busy]}
-        else:
-            detail = exc.message or exc.reason
-            result = None
-        final, _ = await self.repo.finish_op(
-            delivery_id, op_id, state="failed", error=detail,
-            delivery_status="blocked", reason_kind=reason_kind, reason_detail=detail,
-            result=result, actor_kind=actor_kind, actor_agent_id=actor_agent_id,
-        )
-        return final
 
     # --- teardown --------------------------------------------------------
 

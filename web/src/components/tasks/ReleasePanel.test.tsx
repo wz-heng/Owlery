@@ -52,6 +52,21 @@ function release(overrides: Partial<ReleaseDeployment> = {}): ReleaseDeployment 
   };
 }
 
+function releasesResponse(overrides: {
+  releases?: ReleaseDeployment[];
+  live?: ReleaseDeployment | null;
+  staged?: ReleaseDeployment | null;
+  remote_tip?: string | null;
+} = {}) {
+  return {
+    releases: [],
+    live: null,
+    staged: null,
+    remote_tip: null,
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   resetTaskStore();
   vi.restoreAllMocks();
@@ -62,11 +77,9 @@ afterEach(cleanup);
 
 describe("ReleasePanel", () => {
   it("shows the configured release branch and loads history on mount", async () => {
-    const list = vi.spyOn(taskApi, "releases").mockResolvedValue({
-      releases: [release()],
-      live: release(),
-      staged: null,
-    });
+    const list = vi.spyOn(taskApi, "releases").mockResolvedValue(
+      releasesResponse({ releases: [release()], live: release(), remote_tip: release().sha })
+    );
 
     render(<ReleasePanel board={board()} />);
 
@@ -75,14 +88,54 @@ describe("ReleasePanel", () => {
     await waitFor(() =>
       expect(screen.getByText(/Live r20260809\.01/)).toBeInTheDocument()
     );
+    // remote tip == live sha here, so no "new commits available" affordance.
+    await waitFor(() => expect(screen.getByText(/Remote tip/)).toBeInTheDocument());
+    expect(screen.queryByText("New commits available to stage.")).not.toBeInTheDocument();
+  });
+
+  it("flags new commits available when the remote tip is ahead of live and nothing is staged", async () => {
+    vi.spyOn(taskApi, "releases").mockResolvedValue(
+      releasesResponse({
+        releases: [release()], live: release(), remote_tip: "b".repeat(40),
+      })
+    );
+
+    render(<ReleasePanel board={board()} />);
+
+    await waitFor(() =>
+      expect(screen.getByText("New commits available to stage.")).toBeInTheDocument()
+    );
+  });
+
+  it("surfaces the busy census when a release action is refused as not idle", async () => {
+    vi.spyOn(taskApi, "releases").mockResolvedValue(
+      releasesResponse({ releases: [release({ state: "staged" })], staged: release({ state: "staged" }) })
+    );
+    const switchRelease = vi.spyOn(taskApi, "releaseSwitch").mockResolvedValue({
+      release: release({ state: "staged" }),
+      op: {
+        id: "op-1", release_id: "rel-1", kind: "switch", state: "failed",
+        request: {}, result: null,
+        error: "not_idle: instance is busy — session_turn:s1",
+        journal_ref: null, actor_kind: "user", actor_agent_id: null,
+        started_at: null, finished_at: null, created_at: "2026-08-09T00:00:00Z",
+      },
+    });
+
+    render(<ReleasePanel board={board()} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: /Switch/ })).toBeEnabled());
+
+    fireEvent.click(screen.getByRole("button", { name: /Switch/ }));
+    await waitFor(() => expect(switchRelease).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(screen.getByText(/not_idle: instance is busy — session_turn:s1/)).toBeInTheDocument()
+    );
   });
 
   it("disables Switch until a release is staged, enables it once staged", async () => {
-    vi.spyOn(taskApi, "releases").mockResolvedValue({
-      releases: [release({ state: "staged" })],
-      live: null,
-      staged: release({ state: "staged" }),
-    });
+    vi.spyOn(taskApi, "releases").mockResolvedValue(
+      releasesResponse({ releases: [release({ state: "staged" })], staged: release({ state: "staged" }) })
+    );
 
     render(<ReleasePanel board={board()} />);
 
@@ -91,7 +144,7 @@ describe("ReleasePanel", () => {
   });
 
   it("Switch stays disabled with no staged release", async () => {
-    vi.spyOn(taskApi, "releases").mockResolvedValue({ releases: [], live: null, staged: null });
+    vi.spyOn(taskApi, "releases").mockResolvedValue(releasesResponse());
 
     render(<ReleasePanel board={board()} />);
 
@@ -100,7 +153,7 @@ describe("ReleasePanel", () => {
   });
 
   it("Stage calls the release-stage endpoint and reloads history", async () => {
-    vi.spyOn(taskApi, "releases").mockResolvedValue({ releases: [], live: null, staged: null });
+    vi.spyOn(taskApi, "releases").mockResolvedValue(releasesResponse());
     const stage = vi.spyOn(taskApi, "releaseStage").mockResolvedValue({
       release: release({ state: "staged" }),
       op: {
@@ -119,11 +172,9 @@ describe("ReleasePanel", () => {
   });
 
   it("Rollback requires typed confirmation before resubmitting", async () => {
-    vi.spyOn(taskApi, "releases").mockResolvedValue({
-      releases: [release()],
-      live: release(),
-      staged: null,
-    });
+    vi.spyOn(taskApi, "releases").mockResolvedValue(
+      releasesResponse({ releases: [release()], live: release() })
+    );
     const rollback = vi.spyOn(taskApi, "releaseRollback").mockRejectedValueOnce(
       new TaskApiError(
         "rollback replaces the running local version; confirmation is required",
@@ -149,7 +200,7 @@ describe("ReleasePanel", () => {
   });
 
   it("Stage stays enabled without a staged release, but disabled while mutating", async () => {
-    vi.spyOn(taskApi, "releases").mockResolvedValue({ releases: [], live: null, staged: null });
+    vi.spyOn(taskApi, "releases").mockResolvedValue(releasesResponse());
     render(<ReleasePanel board={board()} />);
     await waitFor(() => expect(screen.getByRole("button", { name: "Stage" })).toBeEnabled());
 

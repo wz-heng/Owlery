@@ -1,31 +1,40 @@
-"""`deploy_rollback` op, quiesce gate, boot reconciliation, and probation
-(docs/plans/local-deploy.md §7/§8, step 4 of §17).
+"""§8 boot-reconciliation, probation, and switch-owned-blocker-fold coverage
+for the historical `deploy_switch` op kind (docs/plans/local-deploy.md §7/§8,
+step 4 of §17).
 
-`deploy_rollback` is the one per-run coordinator entry point that survived the
-release-line-deploy cutover (docs/plans/release-line-deploy.md §3.4) — the
+The release-line-deploy cutover (docs/plans/release-line-deploy.md §3.4)
+removed EVERY per-run/delivery-scoped coordinator deploy entry point —
+`deploy_stage`, `deploy_switch`, and `deploy_rollback` alike — in favor of the
 board-level `release_stage`/`release_switch`/`release_rollback` (tested in
-`test_task_release_deploy.py`) replaced `deploy_stage`/`deploy_switch`, but a
-per-run deployment can still be rolled back to its prior slot. `deploy_rollback`
-drives the exact same handoff machinery (`_SwitchCtx`, `_perform_switch_handoff`,
-`_snapshot_db`, quiesce census/drain/admission) as the removed `deploy_switch`
-did, so this file exercises that shared machinery through `deploy_rollback`.
+`test_task_release_deploy.py`, which now also owns the admission-gate,
+handoff/snapshot, and drain coverage this file used to carry through
+`deploy_rollback`). Nothing user-facing creates a `task_delivery_ops` row of
+kind `deploy_switch` anymore.
+
+What remains here is boot-reconciliation and delivery-status-folding
+machinery that is still real and still load-bearing: an instance upgrading
+across this cutover may find a `deploy_switch`-kind op left `running` from
+before it, and `TaskBoardManager.reconcile_deploy_switch_ops` /
+`_apply_switch_terminal`'s `kind="delivery"` dispatch / the `finalize_deploy_*`
+family / `clear_switch_owned_blocker`'s delivery-status fold must still settle
+it correctly. Since no coordinator verb exists to reach that "op running,
+deployment switching, handoff journaled" state anymore, every test below
+reaches it by planting the op directly via repository calls (see the
+`_handed_off` and `_plant_*` helpers' docstrings) rather than through a
+coordinator method.
 
 Everything runs against temp dirs and a fake instance (a dual-slot layout whose
 `.venv/bin/owlery` binaries are stubs), never a real production path (§14). The
 switcher itself is a seam here — its real-process behaviour is covered by
-`test_task_deploy_switcher.py`; these tests drive the SERVER side: the census,
-the drain gate, the handoff (snapshot + journal + detached spawn + broadcast +
-shutdown), the §8 boot-reconciliation table, and probation.
+`test_task_deploy_switcher.py`.
 
 The §14 switch/boot bullets covered:
 - quiesce census, each busy source individually;
-- drain pause/resume (and the honest `not_idle` refusal on timeout);
-- snapshot checkpoint + copy (a self-contained, queryable snapshot);
-- handoff journal contract;
-- detachment: the spawned switcher owns its process group + session;
 - every §8 journal-tail row;
 - probation holds until the journal goes terminal (or the window elapses);
-- stale journal → interrupted.
+- stale journal → interrupted;
+- a green explicit retry clears a switch-owned blocker, never a real git
+  conflict or a different deploy's lock contention.
 """
 from __future__ import annotations
 
@@ -115,12 +124,13 @@ def _init_layout(root: Path, monkeypatch, *, seed_idle: bool = True) -> DeployLa
 
 async def _staged(db, repo, tmp, agent, monkeypatch, *, sha="targetsha01"):
     """A delivery with a `live` deployment on the current slot `a` and a
-    `superseded` deployment on slot `b` — the rollback target `deploy_rollback`
-    needs (the surviving per-run coordinator entry point after `deploy_stage`/
-    `deploy_switch` were removed for the board-level release-line deploy,
-    release-line-deploy.md §3.4). `staged` here names the rollback TARGET row
-    (kept for minimal diff against the pre-cutover fixture name), reachable via
-    `coord.deploy_rollback(live.id, confirm_rollback=True, ...)`.
+    `superseded` deployment on slot `b` — the pair the removed `deploy_rollback`
+    coordinator method used to require (release-line-deploy.md §3.4 removed
+    it, along with `deploy_stage`/`deploy_switch`, in favor of the board-level
+    release-line deploy). `staged` here names the slot-`b` row (kept for
+    minimal diff against the pre-cutover fixture name) — tests below reach a
+    "switch in flight" state on this pair via direct repository calls (see
+    `_handed_off`'s docstring), never a coordinator verb.
     Returns (board, task, run, delivery, layout, coord, staged_target, live)."""
     src = tmp / "src"
     _init_repo(src)
@@ -393,151 +403,6 @@ async def test_pause_resume_for_drain_hits_every_primitive():
     assert "inj_resume" in events and "sched_resume" in events
 
 
-# --------------------------------------------------- C. coordinator gate
-
-
-@pytest.mark.asyncio
-async def test_switch_refuses_not_idle_with_census(store, monkeypatch):
-    db, repo, tmp, agent = store
-    _, task, run, delivery, layout, coord, staged, live = await _staged(db, repo, tmp, agent, monkeypatch)
-    _wire_switch(coord, FakeQuiesce([[BusySource("session_turn", "s1")]]))
-
-    d = await coord.deploy_rollback(
-        live.id, confirm_rollback=True, server_root=layout.slot_path("a")
-    )
-
-    assert d.status == "blocked" and d.reason_kind == "not_idle"
-    assert "session_turn:s1" in (d.reason_detail or "")
-    op = next(o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch")
-    assert op.state == "failed" and op.external is True
-    # The rollback target is untouched — a busy refusal never flips anything.
-    assert (await repo.get_deployment(staged.id)).state == "superseded"
-    assert coord.spawns == [] and coord.shutdowns == []
-
-
-@pytest.mark.asyncio
-async def test_final_census_closes_admission_and_abort_reopens_it(store, monkeypatch):
-    db, repo, tmp, agent = store
-    _, task, run, delivery, layout, coord, staged, live = await _staged(db, repo, tmp, agent, monkeypatch)
-    # The first census is idle, then work arrives before the handoff's final
-    # census. Admission must be closed before that second census and reopened
-    # once this still-live server refuses the switch.
-    q = FakeQuiesce([[], [BusySource("session_turn", "raced")]])
-    _wire_switch(coord, q)
-
-    d = await coord.deploy_rollback(
-        live.id, confirm_rollback=True, server_root=layout.slot_path("a")
-    )
-
-    assert d.status == "blocked" and d.reason_kind == "not_idle"
-    assert q.admission_closes == 1 and q.admission_opens == 1
-    assert (await repo.get_deployment(staged.id)).state == "superseded"
-
-
-@pytest.mark.asyncio
-async def test_pre_spawn_cancellation_reopens_admission(store, monkeypatch):
-    db, repo, tmp, agent = store
-    _, task, run, delivery, layout, coord, staged, live = await _staged(db, repo, tmp, agent, monkeypatch)
-    q = FakeQuiesce([[]])
-    _wire_switch(coord, q)
-
-    async def _cancel_snapshot(*args, **kwargs):
-        raise asyncio.CancelledError()
-
-    monkeypatch.setattr(coord, "_snapshot_db", _cancel_snapshot)
-    with pytest.raises(asyncio.CancelledError):
-        await coord.deploy_rollback(
-            live.id, confirm_rollback=True, server_root=layout.slot_path("a")
-        )
-
-    assert q.admission_closes == 1 and q.admission_opens == 1
-    assert coord.spawns == []
-
-
-@pytest.mark.asyncio
-async def test_post_spawn_exception_keeps_admission_closed(store, monkeypatch):
-    db, repo, tmp, agent = store
-    _, task, run, delivery, layout, coord, staged, live = await _staged(db, repo, tmp, agent, monkeypatch)
-    q = FakeQuiesce([[]])
-    _wire_switch(coord, q)
-
-    async def _broadcast_failure(message):
-        raise RuntimeError("broadcast unavailable after spawn")
-
-    coord.broadcast_restarting = _broadcast_failure
-    with pytest.raises(RuntimeError, match="broadcast unavailable"):
-        await coord.deploy_rollback(
-            live.id, confirm_rollback=True, server_root=layout.slot_path("a")
-        )
-
-    assert len(coord.spawns) == 1
-    assert q.admission_closes == 1 and q.admission_opens == 0
-
-
-# ---------------------------------------------- E. handoff + snapshot
-
-
-@pytest.mark.asyncio
-async def test_handoff_snapshot_journal_spawn_broadcast_shutdown(store, monkeypatch):
-    db, repo, tmp, agent = store
-    _, task, run, delivery, layout, coord, staged, live = await _staged(db, repo, tmp, agent, monkeypatch)
-    q = FakeQuiesce([[]])
-    _wire_switch(coord, q)
-
-    await coord.deploy_rollback(
-        live.id, confirm_rollback=True, server_root=layout.slot_path("a")
-    )
-
-    op = next(o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch")
-    # The op stays RUNNING through handoff — the switcher/probation finalizes it.
-    assert op.state == "running"
-    assert op.result and op.result.get("journal_ref") == str(layout.journal_path)
-    # Deployment took the global lock as `switching`, bound to this op.
-    dep = await repo.get_deployment(staged.id)
-    assert dep.state == "switching" and dep.op_id == op.id
-
-    # The handoff journal line carries the full switch contract (§7.2 step 2).
-    entries = switcher.Journal(str(layout.journal_path)).entries(op.id)
-    handoff = next(e for e in entries if e["step"] == switcher.STEP_HANDOFF)
-    d = handoff["detail"]
-    assert d["from_slot"] == "a" and d["to_slot"] == "b"
-    assert d["new_sha"] == staged.sha and d["old_pid"] == os.getpid()
-    assert d["snapshot_path"].endswith(f"{op.id}.db")
-
-    # The snapshot is a self-contained, queryable copy of the live DB (§7.4).
-    snap = Path(d["snapshot_path"])
-    assert snap.is_file()
-    conn = sqlite3.connect(str(snap))
-    got = conn.execute("SELECT id FROM tasks WHERE id=?", (task.id,)).fetchone()
-    conn.close()
-    assert got is not None  # committed rows survived checkpoint+copy
-
-    # The detached switcher was spawned from the OLD slot; restart is under way.
-    assert coord.spawns[0]["from_slot"] == "a" and coord.spawns[0]["op_id"] == op.id
-    assert coord.broadcasts[0]["type"] == "server_restarting"
-    assert q.admission_closes == 1 and q.admission_opens == 0
-    assert coord.shutdowns == [True]
-
-
-@pytest.mark.asyncio
-async def test_snapshot_prunes_to_keep(store, monkeypatch):
-    db, repo, tmp, agent = store
-    _, task, run, delivery, layout, coord, staged, live = await _staged(db, repo, tmp, agent, monkeypatch)
-    monkeypatch.setattr(settings, "deploy_keep_snapshots", 2)
-    # Pre-seed 3 old snapshots; pruning keeps 2 total incl. the fresh one.
-    for i in range(3):
-        (layout.snapshots_path / f"old{i}.db").write_text("x")
-    _wire_switch(coord, FakeQuiesce([[]]))
-
-    await coord.deploy_rollback(
-        live.id, confirm_rollback=True, server_root=layout.slot_path("a")
-    )
-
-    op = next(o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch")
-    snaps = {p.name for p in layout.snapshots_path.glob("*.db")}
-    assert f"{op.id}.db" in snaps and len(snaps) == 2  # own snapshot never pruned
-
-
 # ------------------------------------------------- F. detachment (pgid/sid)
 
 
@@ -586,19 +451,69 @@ async def test_spawn_switcher_is_fully_detached(tmp_path, monkeypatch):
 
 
 async def _handed_off(db, repo, tmp, agent, monkeypatch):
-    """Drive a full handoff via `deploy_rollback`, then return
-    (manager, coord, op, staged, layout, ids, live) with the op `running`, the
-    deployment `switching`, and a `handoff` journal tail — the state every §8
-    boot row starts from. `live` is the fixture's own live deployment (slot
-    `a`) being rolled back away from — still `live` at this point, since the
-    supersede only happens at finalize time (§8)."""
-    _, task, run, delivery, layout, coord, staged, live = await _staged(db, repo, tmp, agent, monkeypatch)
-    _wire_switch(coord, FakeQuiesce([[]]))
-    await coord.deploy_rollback(
-        live.id, confirm_rollback=True, server_root=layout.slot_path("a")
+    """Reach "op running (kind=deploy_switch), deployment switching, handoff
+    journaled" — the state every §8 boot row starts from — via DIRECT
+    repository calls, never a coordinator switch verb.
+
+    `deploy_stage`/`deploy_switch`/`deploy_rollback` were all removed as
+    coordinator entry points by the release-line-deploy cutover
+    (release-line-deploy.md §3.4); nothing user-facing creates a
+    `task_delivery_ops` row of kind `deploy_switch` anymore. But the boot-
+    reconciliation machinery for that historical kind
+    (`TaskBoardManager.reconcile_deploy_switch_ops`, the `finalize_deploy_*`
+    family, `_finalize_switch`'s `clear_switch_owned_blocker` delivery-status
+    fold) must still correctly settle any such row an upgrading instance finds
+    left `running` from before this cutover — so it is exercised here by
+    planting the op directly, mirroring exactly what the old
+    `deploy_rollback`/`_perform_switch_handoff_after_admission` pair did to
+    the DB (plan → start → `begin_deployment_switching` → journal `handoff` →
+    `record_switch_journal_ref`), just without the coordinator or a running
+    switcher.
+
+    Returns (manager, op, staged, layout, ids, live) with the op `running`,
+    the deployment `switching`, and a `handoff` journal tail. `live` is the
+    fixture's own live deployment (slot `a`); `staged` is the switch target
+    (slot `b`)."""
+    _, task, run, delivery, layout, _coord, staged, live = await _staged(db, repo, tmp, agent, monkeypatch)
+
+    op = await repo.plan_op(
+        delivery.id, kind="deploy_switch",
+        source_key=f"task:{task.id}:run:{run.id}:delivery:deploy_switch",
+        request={"drain": False}, actor_kind="user", actor_agent_id=None,
     )
-    op = next(o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch")
-    return _manager(db, repo), coord, op, staged, layout, (task, run, delivery), live
+    await repo.start_op(
+        delivery.id, op.id, advance_delivering=False,
+        allowed_statuses=frozenset({"ready", "delivered", "blocked", "conflicted"}),
+    )
+
+    # §7.2 step 1: checkpoint + snapshot BEFORE the switching CAS (step 3) —
+    # same ordering `_perform_switch_handoff_after_admission` used, and the
+    # trap `test_reconcile_after_real_snapshot_restore` below depends on: the
+    # snapshot must predate the deployment row's `switching`/op_id binding.
+    layout.snapshots_path.mkdir(exist_ok=True)
+    snapshot_path = layout.snapshots_path / f"{op.id}.db"
+    busy, _, _ = await db.wal_checkpoint_truncate()
+    assert busy == 0
+    shutil.copyfile(db.path, str(snapshot_path))
+
+    journal = switcher.Journal(str(layout.journal_path))
+    journal.append(op.id, switcher.STEP_HANDOFF, {
+        "from_slot": "a", "to_slot": staged.slot,
+        "old_sha": live.sha, "new_sha": staged.sha,
+        "old_pid": os.getpid(), "host": "127.0.0.1", "port": 8765,
+        "db_path": db.path, "snapshot_path": str(snapshot_path),
+        "serve_argv": ["serve"], "serve_env": {},
+    })
+
+    # §7.2 step 3: the handoff CAS, after the snapshot.
+    await repo.begin_deployment_switching(
+        deployment_id=staged.id, op_id=op.id, expected_state="superseded",
+    )
+    op = await repo.record_switch_journal_ref(
+        op.id, journal_ref=str(layout.journal_path),
+        detail={"from_slot": "a", "to_slot": staged.slot, "new_sha": staged.sha},
+    )
+    return _manager(db, repo), op, staged, layout, (task, run, delivery), live
 
 
 def _append(layout, op_id, step, detail):
@@ -614,7 +529,7 @@ async def test_reconcile_switched_ok(store, monkeypatch):
     onto an idle slot with no live deployment yet) is the entry point under
     test."""
     db, repo, tmp, agent = store
-    m, coord, op, staged, layout, (task, run, delivery), live = await _handed_off(db, repo, tmp, agent, monkeypatch)
+    m, op, staged, layout, (task, run, delivery), live = await _handed_off(db, repo, tmp, agent, monkeypatch)
     _append(layout, op.id, switcher.STEP_SWITCHED_OK, {"slot": "b", "sha": staged.sha, "pid": 9})
 
     assert await m.reconcile_deploy_switch_ops() is None  # terminal, no probation
@@ -628,15 +543,24 @@ async def test_reconcile_switched_ok(store, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_confirmed_rollback_reuses_the_switch_handoff(store, monkeypatch):
-    """A later rollback is a fresh deploy_switch targeting the superseded slot,
-    with the same snapshot/journal/quiesce handoff — never a direct symlink
-    flip. `_handed_off` already drives the FIRST rollback (fixture's `live`,
-    slot a -> fixture's `staged` target, slot b); once that is reconciled, the
-    now-superseded former-`live` row (slot a) becomes the target for a SECOND,
-    genuine rollback attempt — no manually seeded row needed."""
+async def test_second_switch_reuses_the_handoff_on_the_same_lineage(store, monkeypatch):
+    """A later switch on the SAME deployment lineage is a fresh `deploy_switch`
+    op targeting the newly-superseded slot, with the same snapshot/journal
+    handoff — never a direct symlink flip. `_handed_off` already drives the
+    FIRST switch (fixture's `live`, slot a -> fixture's `staged` target, slot
+    b); once that is reconciled, the now-superseded former-`live` row (slot a)
+    becomes the target for a SECOND op, planted the same direct-repository way
+    as `_handed_off` (no coordinator verb exists to drive this anymore — see
+    `_handed_off`'s docstring).
+
+    The coordinator-level `confirm_rollback` precondition this test used to
+    also exercise (`deploy_rollback` raising `DeliveryConfirmationRequired`)
+    is gone along with the coordinator method itself and cannot be
+    reconstructed by planting ops directly; `test_task_release_deploy.py`'s
+    `test_release_rollback_confirmation_required` covers that precondition on
+    the surviving release-line path instead."""
     db, repo, tmp, agent = store
-    m, coord, op, staged, layout, (task, run, delivery), live = await _handed_off(
+    m, op, staged, layout, (task, run, delivery), live = await _handed_off(
         db, repo, tmp, agent, monkeypatch
     )
     _append(layout, op.id, switcher.STEP_SWITCHED_OK, {"slot": "b", "sha": staged.sha})
@@ -645,23 +569,37 @@ async def test_confirmed_rollback_reuses_the_switch_handoff(store, monkeypatch):
     assert (await repo.get_deployment(staged.id)).state == "live"
     assert (await repo.get_deployment(live.id)).state == "superseded"
 
-    with pytest.raises(DeliveryConfirmationRequired) as refused:
-        await coord.deploy_rollback(
-            staged.id, confirm_rollback=False, server_root=layout.slot_path("b")
-        )
-    assert refused.value.confirmation == "confirm_rollback"
-
-    await coord.deploy_rollback(
-        staged.id, confirm_rollback=True, server_root=layout.slot_path("b")
+    op2 = await repo.plan_op(
+        delivery.id, kind="deploy_switch",
+        source_key=f"task:{task.id}:run:{run.id}:delivery:deploy_switch:retry:1",
+        request={"drain": False}, actor_kind="user", actor_agent_id=None,
     )
+    await repo.start_op(
+        delivery.id, op2.id, advance_delivering=False,
+        allowed_statuses=frozenset({"ready", "delivered", "blocked", "conflicted"}),
+    )
+    snapshot_path2 = layout.snapshots_path / f"{op2.id}.db"
+    busy, _, _ = await db.wal_checkpoint_truncate()
+    assert busy == 0
+    shutil.copyfile(db.path, str(snapshot_path2))
+    journal = switcher.Journal(str(layout.journal_path))
+    journal.append(op2.id, switcher.STEP_HANDOFF, {
+        "from_slot": "b", "to_slot": "a", "old_sha": staged.sha, "new_sha": live.sha,
+        "old_pid": os.getpid(), "host": "127.0.0.1", "port": 8765,
+        "db_path": db.path, "snapshot_path": str(snapshot_path2),
+        "serve_argv": ["serve"], "serve_env": {},
+    })
+    await repo.begin_deployment_switching(
+        deployment_id=live.id, op_id=op2.id, expected_state="superseded",
+    )
+    op2 = await repo.record_switch_journal_ref(
+        op2.id, journal_ref=str(layout.journal_path),
+        detail={"from_slot": "b", "to_slot": "a", "new_sha": live.sha},
+    )
+
     target = await repo.get_deployment(live.id)
     assert target.state == "switching"
-    rollback_op = [
-        item for item in await repo.list_delivery_ops(delivery.id)
-        if item.kind == "deploy_switch" and item.id != op.id
-    ]
-    assert len(rollback_op) == 1 and rollback_op[0].state == "running"
-    entries = switcher.Journal(str(layout.journal_path)).entries(rollback_op[0].id)
+    entries = switcher.Journal(str(layout.journal_path)).entries(op2.id)
     tail = entries[-1]
     assert tail["detail"]["to_slot"] == "a" and tail["detail"]["new_sha"] == live.sha
 
@@ -674,7 +612,7 @@ async def test_confirmed_rollback_reuses_the_switch_handoff(store, monkeypatch):
             (live.id,),
         )
     await repo.finalize_deploy_rolled_back(
-        rollback_op[0].id,
+        op2.id,
         reason="health_timeout",
         target_slot="a",
         target_sha=live.sha,
@@ -685,7 +623,7 @@ async def test_confirmed_rollback_reuses_the_switch_handoff(store, monkeypatch):
 @pytest.mark.asyncio
 async def test_reconcile_rolled_back(store, monkeypatch):
     db, repo, tmp, agent = store
-    m, coord, op, staged, layout, (task, run, delivery), live = await _handed_off(db, repo, tmp, agent, monkeypatch)
+    m, op, staged, layout, (task, run, delivery), live = await _handed_off(db, repo, tmp, agent, monkeypatch)
     _append(layout, op.id, switcher.STEP_ROLLED_BACK, {"reason": "health_timeout"})
 
     await m.reconcile_deploy_switch_ops()
@@ -700,7 +638,7 @@ async def test_reconcile_rolled_back(store, monkeypatch):
 @pytest.mark.asyncio
 async def test_reconcile_rollback_incomplete(store, monkeypatch):
     db, repo, tmp, agent = store
-    m, coord, op, staged, layout, (task, run, delivery), live = await _handed_off(db, repo, tmp, agent, monkeypatch)
+    m, op, staged, layout, (task, run, delivery), live = await _handed_off(db, repo, tmp, agent, monkeypatch)
     _append(layout, op.id, switcher.STEP_ROLLBACK_INCOMPLETE,
             {"stage": "port_not_freed", "reason": "health_timeout"})
 
@@ -716,7 +654,7 @@ async def test_reconcile_rollback_incomplete(store, monkeypatch):
 @pytest.mark.asyncio
 async def test_reconcile_old_wont_die_reverts_to_staged(store, monkeypatch):
     db, repo, tmp, agent = store
-    m, coord, op, staged, layout, (task, run, delivery), live = await _handed_off(db, repo, tmp, agent, monkeypatch)
+    m, op, staged, layout, (task, run, delivery), live = await _handed_off(db, repo, tmp, agent, monkeypatch)
     _append(layout, op.id, switcher.STEP_OLD_WONT_DIE, {"old_pid": 1, "port": 8000})
 
     await m.reconcile_deploy_switch_ops()
@@ -733,7 +671,7 @@ async def test_reconcile_old_wont_die_reverts_to_staged(store, monkeypatch):
 @pytest.mark.asyncio
 async def test_reconcile_handoff_only_is_interrupted(store, monkeypatch):
     db, repo, tmp, agent = store
-    m, coord, op, staged, layout, (task, run, delivery), live = await _handed_off(db, repo, tmp, agent, monkeypatch)
+    m, op, staged, layout, (task, run, delivery), live = await _handed_off(db, repo, tmp, agent, monkeypatch)
     # No switcher line beyond `handoff`.
     assert await m.reconcile_deploy_switch_ops() is None
 
@@ -747,7 +685,7 @@ async def test_reconcile_handoff_only_is_interrupted(store, monkeypatch):
 @pytest.mark.asyncio
 async def test_reconcile_stale_flip_done_is_interrupted(store, monkeypatch):
     db, repo, tmp, agent = store
-    m, coord, op, staged, layout, (task, run, delivery), live = await _handed_off(db, repo, tmp, agent, monkeypatch)
+    m, op, staged, layout, (task, run, delivery), live = await _handed_off(db, repo, tmp, agent, monkeypatch)
     monkeypatch.setattr(settings, "deploy_health_timeout_seconds", 60)
     old_ts = (datetime.now(timezone.utc) - timedelta(seconds=9999)).isoformat()
     with open(layout.journal_path, "a") as f:
@@ -773,7 +711,7 @@ async def test_reconcile_after_real_snapshot_restore(store, monkeypatch):
     file/connection — not a scripted journal fixture — so it exercises the
     actual on-disk sequence, not just the reconciler's journal-reading half."""
     db, repo, tmp, agent = store
-    m, coord, op, staged, layout, (task, run, delivery), live = await _handed_off(
+    m, op, staged, layout, (task, run, delivery), live = await _handed_off(
         db, repo, tmp, agent, monkeypatch
     )
 
@@ -839,7 +777,7 @@ async def test_reconcile_after_real_snapshot_restore(store, monkeypatch):
 @pytest.mark.asyncio
 async def test_fresh_flip_done_enters_probation(store, monkeypatch):
     db, repo, tmp, agent = store
-    m, coord, op, staged, layout, (task, run, delivery), live = await _handed_off(db, repo, tmp, agent, monkeypatch)
+    m, op, staged, layout, (task, run, delivery), live = await _handed_off(db, repo, tmp, agent, monkeypatch)
     _append(layout, op.id, switcher.STEP_FLIP_DONE, {"from_slot": "a", "to_slot": "b"})
 
     probation = await m.reconcile_deploy_switch_ops()
@@ -853,7 +791,7 @@ async def test_fresh_flip_done_enters_probation(store, monkeypatch):
 @pytest.mark.asyncio
 async def test_probation_uses_remaining_window_from_flip_done(store, monkeypatch):
     db, repo, tmp, agent = store
-    m, coord, op, staged, layout, (task, run, delivery), live = await _handed_off(db, repo, tmp, agent, monkeypatch)
+    m, op, staged, layout, (task, run, delivery), live = await _handed_off(db, repo, tmp, agent, monkeypatch)
     monkeypatch.setattr(settings, "deploy_health_timeout_seconds", 0.06)
     flipped_at = datetime.now(timezone.utc) - timedelta(seconds=0.045)
     with open(layout.journal_path, "a") as f:
@@ -877,7 +815,7 @@ async def test_probation_uses_remaining_window_from_flip_done(store, monkeypatch
 @pytest.mark.asyncio
 async def test_probation_applies_terminal_tail_even_after_window_elapsed(store, monkeypatch):
     db, repo, tmp, agent = store
-    m, coord, op, staged, layout, (task, run, delivery), live = await _handed_off(db, repo, tmp, agent, monkeypatch)
+    m, op, staged, layout, (task, run, delivery), live = await _handed_off(db, repo, tmp, agent, monkeypatch)
     _append(layout, op.id, switcher.STEP_FLIP_DONE, {"from_slot": "a", "to_slot": "b"})
     probation = await m.reconcile_deploy_switch_ops()
     assert probation is not None
@@ -902,7 +840,7 @@ async def _release(released):
 @pytest.mark.asyncio
 async def test_probation_releases_on_switched_ok(store, monkeypatch):
     db, repo, tmp, agent = store
-    m, coord, op, staged, layout, (task, run, delivery), live = await _handed_off(db, repo, tmp, agent, monkeypatch)
+    m, op, staged, layout, (task, run, delivery), live = await _handed_off(db, repo, tmp, agent, monkeypatch)
     _append(layout, op.id, switcher.STEP_FLIP_DONE, {"from_slot": "a", "to_slot": "b"})
     probation = await m.reconcile_deploy_switch_ops()
     # The switcher confirms health.
@@ -924,7 +862,7 @@ async def test_probation_releases_on_switched_ok(store, monkeypatch):
 @pytest.mark.asyncio
 async def test_probation_times_out_to_interrupted(store, monkeypatch):
     db, repo, tmp, agent = store
-    m, coord, op, staged, layout, (task, run, delivery), live = await _handed_off(db, repo, tmp, agent, monkeypatch)
+    m, op, staged, layout, (task, run, delivery), live = await _handed_off(db, repo, tmp, agent, monkeypatch)
     monkeypatch.setattr(settings, "deploy_health_timeout_seconds", 0.05)
     _append(layout, op.id, switcher.STEP_FLIP_DONE, {"from_slot": "a", "to_slot": "b"})
     probation = await m.reconcile_deploy_switch_ops()
@@ -943,42 +881,13 @@ async def test_probation_times_out_to_interrupted(store, monkeypatch):
 
 
 # --------------------------------------------------- I. preconditions
-
-
-@pytest.mark.asyncio
-async def test_switch_requires_board_opt_in(store, monkeypatch):
-    db, repo, tmp, agent = store
-    board, task, run, delivery, layout, coord, staged, live = await _staged(db, repo, tmp, agent, monkeypatch)
-    await repo.update_board(board.id, allow_local_deploy=False)
-    _wire_switch(coord, FakeQuiesce([[]]))
-
-    with pytest.raises(TaskConflictError):
-        await coord.deploy_rollback(
-            live.id, confirm_rollback=True, server_root=layout.slot_path("a")
-        )
-    # No op planned; nothing flipped.
-    assert not [o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch"]
-    assert (await repo.get_deployment(staged.id)).state == "superseded"
-
-
-@pytest.mark.asyncio
-async def test_switch_requires_a_staged_slot(store, monkeypatch):
-    """`deploy_rollback` refuses when no superseded slot is available to roll
-    back to — the rollback mirror of the removed `deploy_switch`'s
-    `nothing_staged` refusal."""
-    db, repo, tmp, agent = store
-    _, task, run, delivery, layout, coord, staged, live = await _staged(db, repo, tmp, agent, monkeypatch)
-    # Promote the rollback target out of `superseded` so nothing is left to
-    # roll back to.
-    async with repo._transaction() as conn:
-        await conn.execute("UPDATE deployments SET state='failed' WHERE id=?", (staged.id,))
-    _wire_switch(coord, FakeQuiesce([[]]))
-
-    with pytest.raises(TaskConflictError, match="no superseded deployment is available"):
-        await coord.deploy_rollback(
-            live.id, confirm_rollback=True, server_root=layout.slot_path("a")
-        )
-    assert not [o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch"]
+#
+# (removed: both `allow_local_deploy` opt-in and "nothing to switch to"
+# refusals were tested here via the now-removed `coord.deploy_rollback`.
+# Both preconditions are duplicated on the surviving release-line path —
+# `test_task_release_deploy.py`'s `test_release_stage_refuses_without_opt_in`
+# and `test_release_switch_nothing_staged_refuses` — so this section is a
+# pure duplicate once the per-run coordinator method it drove is gone.)
 
 
 # ------------------------------------- J. successful retry clears a switch-
@@ -1060,27 +969,87 @@ async def _staged_then_conflicted(db, repo, tmp, agent, monkeypatch):
     return task, run, delivery, layout, coord, staged, live
 
 
+async def _plant_failed_switch_op(
+    repo, delivery, *, task, run, reason_kind, reason_detail, suffix="",
+):
+    """Plant a planned->running->failed(blocked) `deploy_switch` op directly —
+    the same durable shape `_fail_switch` (removed along with the coordinator
+    method that was its only caller) used to leave behind, reached here
+    without any coordinator verb. See `_handed_off`'s docstring for why this
+    direct-repository-call approach is now the only way to exercise this
+    generic boot/retry machinery."""
+    op = await repo.plan_op(
+        delivery.id, kind="deploy_switch",
+        source_key=f"task:{task.id}:run:{run.id}:delivery:deploy_switch{suffix}",
+        request={"drain": False}, actor_kind="user", actor_agent_id=None,
+    )
+    await repo.start_op(
+        delivery.id, op.id, advance_delivering=False,
+        allowed_statuses=frozenset({"ready", "delivered", "blocked", "conflicted"}),
+    )
+    final, _ = await repo.finish_op(
+        delivery.id, op.id, state="failed", error=reason_detail,
+        delivery_status="blocked", reason_kind=reason_kind, reason_detail=reason_detail,
+        actor_kind="user", actor_agent_id=None,
+    )
+    return op, final
+
+
+async def _plant_running_switch_op(repo, layout, db, delivery, target, *, task, run, suffix):
+    """Plant a second (retry) `deploy_switch` op through to `running` +
+    `switching`-bound + handoff-journaled — the state a retry reaches right
+    before boot reconciliation settles it. Mirrors `_handed_off`'s direct-
+    repository-call approach for the SAME `delivery`/target pair a retry
+    reuses (§4/§13.3: an explicit new op, never a tick)."""
+    op = await repo.plan_op(
+        delivery.id, kind="deploy_switch",
+        source_key=f"task:{task.id}:run:{run.id}:delivery:deploy_switch{suffix}",
+        request={"drain": False}, actor_kind="user", actor_agent_id=None,
+    )
+    await repo.start_op(
+        delivery.id, op.id, advance_delivering=False,
+        allowed_statuses=frozenset({"ready", "delivered", "blocked", "conflicted"}),
+    )
+    layout.snapshots_path.mkdir(exist_ok=True)
+    snapshot_path = layout.snapshots_path / f"{op.id}.db"
+    busy, _, _ = await db.wal_checkpoint_truncate()
+    assert busy == 0
+    shutil.copyfile(db.path, str(snapshot_path))
+    journal = switcher.Journal(str(layout.journal_path))
+    journal.append(op.id, switcher.STEP_HANDOFF, {
+        "from_slot": "a", "to_slot": target.slot, "old_sha": "oldsha0000",
+        "new_sha": target.sha, "old_pid": os.getpid(), "host": "127.0.0.1", "port": 8765,
+        "db_path": db.path, "snapshot_path": str(snapshot_path),
+        "serve_argv": ["serve"], "serve_env": {},
+    })
+    await repo.begin_deployment_switching(
+        deployment_id=target.id, op_id=op.id, expected_state="superseded",
+    )
+    op = await repo.record_switch_journal_ref(
+        op.id, journal_ref=str(layout.journal_path),
+        detail={"from_slot": "a", "to_slot": target.slot, "new_sha": target.sha},
+    )
+    return op
+
+
 @pytest.mark.asyncio
 async def test_successful_retry_clears_not_idle_blocker(store, monkeypatch):
     db, repo, tmp, agent = store
     _, task, run, delivery, layout, coord, staged, live = await _staged(db, repo, tmp, agent, monkeypatch)
-    _wire_switch(coord, FakeQuiesce([[BusySource("session_turn", "s1")]]))
 
-    d = await coord.deploy_rollback(
-        live.id, confirm_rollback=True, server_root=layout.slot_path("a")
+    _, blocked = await _plant_failed_switch_op(
+        repo, delivery, task=task, run=run,
+        reason_kind="not_idle", reason_detail="not_idle: instance is busy — session_turn:s1",
     )
-    assert d.status == "blocked" and d.reason_kind == "not_idle"
+    assert blocked.status == "blocked" and blocked.reason_kind == "not_idle"
     assert (await repo.get_deployment(staged.id)).state == "superseded"
 
     # An explicit new attempt — a fresh `:retry:1` op, never a tick (§4).
-    _wire_switch(coord, FakeQuiesce([[]]))
-    await coord.deploy_rollback(
-        live.id, confirm_rollback=True, server_root=layout.slot_path("a")
+    retry_op = await _plant_running_switch_op(
+        repo, layout, db, delivery, staged, task=task, run=run, suffix=":retry:1",
     )
     ops = [o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch"]
-    assert len(ops) == 2
-    retry_op = ops[1]
-    assert retry_op.source_key.endswith(":retry:1") and retry_op.state == "running"
+    assert len(ops) == 2 and retry_op.source_key.endswith(":retry:1")
 
     _append(layout, retry_op.id, switcher.STEP_SWITCHED_OK, {"slot": "b", "sha": staged.sha})
     m = _manager(db, repo)
@@ -1102,20 +1071,14 @@ async def test_successful_retry_after_push_lands_delivered(store, monkeypatch):
     task, run, delivery, layout, coord, staged, live = await _staged_with_push(
         db, repo, tmp, agent, monkeypatch
     )
-    _wire_switch(coord, FakeQuiesce([[BusySource("session_turn", "s1")]]))
 
-    d = await coord.deploy_rollback(
-        live.id, confirm_rollback=True, server_root=layout.slot_path("a")
+    await _plant_failed_switch_op(
+        repo, delivery, task=task, run=run,
+        reason_kind="not_idle", reason_detail="not_idle: instance is busy — session_turn:s1",
     )
-    assert d.status == "blocked" and d.reason_kind == "not_idle"
 
-    _wire_switch(coord, FakeQuiesce([[]]))
-    await coord.deploy_rollback(
-        live.id, confirm_rollback=True, server_root=layout.slot_path("a")
-    )
-    retry_op = next(
-        o for o in await repo.list_delivery_ops(delivery.id)
-        if o.kind == "deploy_switch" and o.source_key.endswith(":retry:1")
+    retry_op = await _plant_running_switch_op(
+        repo, layout, db, delivery, staged, task=task, run=run, suffix=":retry:1",
     )
     _append(layout, retry_op.id, switcher.STEP_SWITCHED_OK, {"slot": "b", "sha": staged.sha})
     m = _manager(db, repo)
@@ -1135,12 +1098,10 @@ async def test_switch_success_never_clears_real_conflict(store, monkeypatch):
     task, run, delivery, layout, coord, staged, live = await _staged_then_conflicted(
         db, repo, tmp, agent, monkeypatch
     )
-    _wire_switch(coord, FakeQuiesce([[]]))
 
-    await coord.deploy_rollback(
-        live.id, confirm_rollback=True, server_root=layout.slot_path("a")
+    op = await _plant_running_switch_op(
+        repo, layout, db, delivery, staged, task=task, run=run, suffix="",
     )
-    op = next(o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch")
     _append(layout, op.id, switcher.STEP_SWITCHED_OK, {"slot": "b", "sha": staged.sha})
     m = _manager(db, repo)
     assert await m.reconcile_deploy_switch_ops() is None
@@ -1168,32 +1129,20 @@ async def test_successful_retry_after_deploy_locked_leaves_delivery_blocked(stor
     `test_switch_success_never_clears_real_conflict`."""
     db, repo, tmp, agent = store
     _, task, run, delivery, layout, coord, staged, live = await _staged(db, repo, tmp, agent, monkeypatch)
-    _wire_switch(coord, FakeQuiesce([[]]))
 
-    # Another deploy holds the global lock (a `staging` row) when this switch
-    # attempts its `begin_deployment_switching` CAS.
-    holder = await repo.begin_deployment_staging(
-        delivery_id=None, task_id="t-other", op_id=None,
-        slot="a", sha="deadbeef" * 5, source_repo=str(layout.root),
+    _, blocked = await _plant_failed_switch_op(
+        repo, delivery, task=task, run=run,
+        reason_kind="deploy_locked", reason_detail="deploy_locked: another deploy holds the lock",
     )
-
-    d = await coord.deploy_rollback(
-        live.id, confirm_rollback=True, server_root=layout.slot_path("a")
-    )
-    assert d.status == "blocked" and d.reason_kind == "deploy_locked"
+    assert blocked.status == "blocked" and blocked.reason_kind == "deploy_locked"
     assert (await repo.get_deployment(staged.id)).state == "superseded"  # never flipped
 
-    # Release the holder — the global lock is free again.
-    await repo.mark_deployment_failed(holder.id)
-
     # An explicit new attempt — a fresh `:retry:1` op, never a tick (§4).
-    await coord.deploy_rollback(
-        live.id, confirm_rollback=True, server_root=layout.slot_path("a")
+    retry_op = await _plant_running_switch_op(
+        repo, layout, db, delivery, staged, task=task, run=run, suffix=":retry:1",
     )
     ops = [o for o in await repo.list_delivery_ops(delivery.id) if o.kind == "deploy_switch"]
-    assert len(ops) == 2
-    retry_op = ops[1]
-    assert retry_op.source_key.endswith(":retry:1") and retry_op.state == "running"
+    assert len(ops) == 2 and retry_op.source_key.endswith(":retry:1")
 
     _append(layout, retry_op.id, switcher.STEP_SWITCHED_OK, {"slot": "b", "sha": staged.sha})
     m = _manager(db, repo)

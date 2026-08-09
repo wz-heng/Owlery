@@ -132,6 +132,7 @@ interface TaskState {
   deliveryOps: Record<string, TaskDeliveryOp[]>;
   deliveryConfirmation: DeliveryConfirmation | null;
   releases: Record<string, ReleaseDeployment[]>;
+  releaseRemoteTip: Record<string, string | null>;
   releaseConfirmation: ReleaseConfirmation | null;
   dispatcher: Record<string, DispatcherStatus>;
   lastEventSeq: Record<string, number>;
@@ -297,7 +298,10 @@ type TaskGet = () => TaskState;
  * decode, mirroring `runDeliveryCall`. A release op response carries only the
  * one release row it touched, so success also reloads the board's full
  * history — the UI needs the whole list (staged/live/superseded), not a
- * single row. */
+ * single row. A busy-census refusal (e.g. "nothing running" not idle) does
+ * NOT raise — the coordinator settles the op `failed` with the census in
+ * `op.error` and returns 200 — so that must be surfaced explicitly here,
+ * never silently swallowed by a lone `loadReleases` refresh. */
 async function runReleaseCall(
   set: DeliverySet,
   get: TaskGet,
@@ -307,8 +311,12 @@ async function runReleaseCall(
 ): Promise<boolean> {
   set({ mutating: true, error: null });
   try {
-    await call();
+    const { op } = await call();
     await get().loadReleases(boardId);
+    if (op.state === "failed") {
+      set({ error: op.error ?? `release ${action} failed` });
+      return false;
+    }
     return true;
   } catch (error) {
     if (
@@ -350,6 +358,7 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   deliveryOps: {},
   deliveryConfirmation: null,
   releases: {},
+  releaseRemoteTip: {},
   releaseConfirmation: null,
   dispatcher: {},
   lastEventSeq: {},
@@ -541,7 +550,12 @@ export const useTaskStore = create<TaskState>((set, get) => ({
       const events = await taskApi.boardEvents(token, boardId, lastEventSeq[boardId] ?? 0);
       for (const event of events) get().applyTaskEvent(boardId, event.task_id, event);
       if (events.some((event) => event.task_id === null)) {
-        await get().loadBoards(true);
+        // A board-level event: board settings, dispatcher, AND release-line
+        // deploy ops all publish through here (publish_board_update), so the
+        // Releases panel must catch up the same way boards/tasks do — never
+        // stall on a stale history after another client's stage/switch or a
+        // WS-reconnect replay.
+        await Promise.all([get().loadBoards(true), get().loadReleases(boardId)]);
       }
       if (events.some((event) => !(event.payload.task && typeof event.payload.task === "object"))) {
         await get().loadTasks(boardId);
@@ -740,7 +754,10 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     if (!token) return;
     try {
       const result = await taskApi.releases(token, boardId);
-      set((state) => ({ releases: { ...state.releases, [boardId]: result.releases } }));
+      set((state) => ({
+        releases: { ...state.releases, [boardId]: result.releases },
+        releaseRemoteTip: { ...state.releaseRemoteTip, [boardId]: result.remote_tip },
+      }));
     } catch (error) {
       set({ error: message(error) });
     }
@@ -775,6 +792,7 @@ export function resetTaskStore(): void {
     deliveryOps: {},
     deliveryConfirmation: null,
     releases: {},
+    releaseRemoteTip: {},
     releaseConfirmation: null,
     dispatcher: {},
     lastEventSeq: {},
