@@ -57,10 +57,12 @@ async def store(tmp_path: Path, monkeypatch):
 
 
 async def _staged(db, repo, tmp, agent, monkeypatch):
-    """A delivery with a `superseded` deployment on slot `b` (the rollback
-    target `deploy_rollback` needs) — the handoff-crash surface now reached
-    through the surviving per-run coordinator entry point, `deploy_rollback`,
-    rather than the removed `deploy_stage`/`deploy_switch`."""
+    """A delivery with a `superseded` deployment on slot `b` — the pair the
+    removed `deploy_rollback` coordinator method used to require. Every
+    per-run coordinator deploy entry point (`deploy_stage`/`deploy_switch`/
+    `deploy_rollback`) is gone (release-line-deploy.md §3.4); the handoff-crash
+    surface is reached below via direct repository calls instead (see the
+    module docstring)."""
     src = tmp / "src"
     _init_repo(src)
     board = await repo.create_board(
