@@ -500,6 +500,10 @@ test.describe("Credentials Panel", () => {
     expect(res.ok()).toBeTruthy();
 
     await login(page);
+    // Credentials lives inside the collapsed "Integrations" disclosure group
+    // (sidebar-hierarchy.md §3); open it before interacting.
+    await page.locator(".integrations-header").click();
+    await expect(page.locator(".integrations-panel")).toBeVisible();
 
     await expect(page.locator(".credential-title")).toHaveText("Harness");
 
@@ -543,6 +547,8 @@ test.describe("Credentials Panel", () => {
     });
 
     await login(page);
+    await page.locator(".integrations-header").click();
+    await expect(page.locator(".integrations-panel")).toBeVisible();
     // Click the "+" button in the Harness section header, then pick Claude
     // Code in the backend chooser.
     await page
@@ -616,6 +622,8 @@ test.describe("Credentials Panel", () => {
     });
 
     await login(page);
+    await page.locator(".integrations-header").click();
+    await expect(page.locator(".integrations-panel")).toBeVisible();
     await page
       .locator(".credential-section .btn-credential-add")
       .first()

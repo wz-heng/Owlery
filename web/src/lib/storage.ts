@@ -5,6 +5,7 @@
 
 export const TOKEN_KEY = "owlery_token";
 export const SHOW_DELEGATIONS_KEY = "owlery_show_delegations";
+export const INTEGRATIONS_EXPANDED_KEY = "owlery_integrations_expanded";
 
 const LEGACY_KEYS: Record<string, string> = {
   [TOKEN_KEY]: "octopus_token",
