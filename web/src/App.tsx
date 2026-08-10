@@ -6,9 +6,7 @@ import { AgentSettings } from "./components/AgentSettings";
 import { ArchivedSessionsDialog } from "./components/ArchivedSessionsDialog";
 import { UsageDialog } from "./components/UsageDialog";
 import { ChatView } from "./components/ChatView";
-import { ApplicationList } from "./components/ApplicationList";
-import { ConnectorList } from "./components/ConnectorList";
-import { CredentialList } from "./components/CredentialList";
+import { IntegrationsSection } from "./components/IntegrationsSection";
 // SessionList is rendered inside AgentList (nested under the active agent),
 // not as its own sidebar section — sessions belong to an agent.
 import { FileViewerDialog } from "./components/FileViewerDialog";
@@ -213,13 +211,15 @@ function AuthenticatedApp({
             <IconClipboardList size={17} />
             <span>Task Board</span>
           </button>
-          {/* Everything below Agents is infrastructure, not the daily path —
-           * a hairline sets it apart so the eye lands on Agents first. */}
+          {/* Schedules is a hot, glanceable work surface — same rail weight
+           * as Task Board, not an infra row (sidebar-hierarchy.md §2-3). */}
+          <ScheduleList onOpen={() => setSchedulesOpen(true)} />
+          {/* Connectors/Credentials are cold, configure-once integrations —
+           * a hairline sets them apart, and they collapse into one
+           * disclosure group so the rail doesn't grow with every new
+           * integration kind (sidebar-hierarchy.md §3-4). */}
           <div className="mt-2 pt-2 border-t border-sidebar-border/60 flex flex-col gap-0.5">
-            <ScheduleList onOpen={() => setSchedulesOpen(true)} />
-            <ApplicationList onAdd={() => {}} />
-            <ConnectorList />
-            <CredentialList />
+            <IntegrationsSection />
           </div>
         </nav>
 

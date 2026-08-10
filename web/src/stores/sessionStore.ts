@@ -1,6 +1,7 @@
 import { create } from "zustand";
 
 import {
+  INTEGRATIONS_EXPANDED_KEY,
   SHOW_DELEGATIONS_KEY,
   TOKEN_KEY,
   readStored,
@@ -237,6 +238,12 @@ interface SessionStore {
   // across reloads.
   showDelegations: boolean;
   setShowDelegations: (v: boolean) => void;
+
+  // Sidebar "Integrations" disclosure group (Connectors/Credentials).
+  // Collapsed by default; persists once the user opens or closes it
+  // (docs/plans/sidebar-hierarchy.md §4).
+  integrationsExpanded: boolean;
+  setIntegrationsExpanded: (v: boolean) => void;
 
   // Native deep-research jobs, keyed by sessionId → list (native-deep-research.md
   // §7). The ResearchCard renders live phase/progress; the final report arrives
@@ -566,5 +573,12 @@ export const useSessionStore = create<SessionStore>((set) => ({
     if (v) localStorage.setItem(SHOW_DELEGATIONS_KEY, "true");
     else localStorage.removeItem(SHOW_DELEGATIONS_KEY);
     set({ showDelegations: v });
+  },
+
+  integrationsExpanded: readStored(INTEGRATIONS_EXPANDED_KEY) === "true",
+  setIntegrationsExpanded: (v) => {
+    if (v) localStorage.setItem(INTEGRATIONS_EXPANDED_KEY, "true");
+    else localStorage.removeItem(INTEGRATIONS_EXPANDED_KEY);
+    set({ integrationsExpanded: v });
   },
 }));

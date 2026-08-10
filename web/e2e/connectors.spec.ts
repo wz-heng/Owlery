@@ -38,6 +38,10 @@ test.afterEach(async ({ request }) => {
 test.describe("Connectors", () => {
   test.beforeEach(async ({ page }) => {
     await login(page);
+    // Connectors/Credentials live inside the collapsed "Integrations"
+    // disclosure group (sidebar-hierarchy.md §3); open it once per test.
+    await page.locator(".integrations-header").click();
+    await expect(page.locator(".integrations-panel")).toBeVisible();
   });
 
   test("the sidebar has a Connectors section", async ({ page }) => {
