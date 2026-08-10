@@ -1025,6 +1025,13 @@ class DeliveryCoordinator:
             raise TaskConflictError("staged release has no deployment row to switch to")
         if deployment.slot == from_slot:
             raise TaskConflictError("the staged slot is already current; nothing to switch")
+        # Refuse to flip into a slot that cannot see its runtime config. This is
+        # the one class of fault a rollback cannot undo — the rollback restarts
+        # the old server through the same spawn path, so it fails identically
+        # and the deploy ends with nothing serving (local-deploy.md §3.2).
+        env_problem = deploy.slot_env_problem(layout, deployment.slot)
+        if env_problem:
+            raise TaskConflictError(env_problem)
         if (
             self.deploy_quiesce is None
             or self.broadcast_restarting is None
