@@ -91,24 +91,36 @@ describe("IntegrationsSection", () => {
     expect(screen.queryByRole("region", { name: "Integrations" })).toBeNull();
   });
 
-  it("persists the expanded state to localStorage and across remounts", async () => {
-    const { unmount } = render(<IntegrationsSection />);
+  it("persists the expanded state to localStorage across a click", async () => {
+    await act(async () => {
+      render(<IntegrationsSection />);
+    });
     const header = screen.getByRole("button", { name: /Integrations/i });
 
     await act(async () => {
       fireEvent.click(header);
     });
     expect(localStorage.getItem(INTEGRATIONS_EXPANDED_KEY)).toBe("true");
+  });
 
-    unmount();
-    cleanup();
+  it("reads the persisted flag from localStorage on a fresh module load (reload)", async () => {
+    // The store's `integrationsExpanded` field seeds itself from
+    // `readStored()` at module init (sessionStore.ts), same as
+    // `showDelegations`. Simulate an actual page reload — not just a
+    // remount — by seeding localStorage and re-importing the store module
+    // fresh, so this exercises that init path rather than assuming it.
+    localStorage.setItem(INTEGRATIONS_EXPANDED_KEY, "true");
+    vi.resetModules();
+    const { useSessionStore: freshStore } = await import("../stores/sessionStore");
+    const { IntegrationsSection: FreshIntegrationsSection } = await import(
+      "./IntegrationsSection"
+    );
+    freshStore.setState({ token: "tok" });
 
-    // A fresh mount reads the persisted flag straight from the store, which
-    // itself seeds from localStorage at module init — simulate a reload by
-    // re-running the store's persisted read directly.
-    useSessionStore.setState({ integrationsExpanded: true });
+    expect(freshStore.getState().integrationsExpanded).toBe(true);
+
     await act(async () => {
-      render(<IntegrationsSection />);
+      render(<FreshIntegrationsSection />);
     });
     expect(
       screen.getByRole("button", { name: /Integrations/i })

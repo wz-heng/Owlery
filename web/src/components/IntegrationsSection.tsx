@@ -1,10 +1,7 @@
-import { useEffect } from "react";
 import { IconChevronRight, IconPlugConnected } from "@tabler/icons-react";
 import { ConnectorList } from "./ConnectorList";
 import { CredentialList } from "./CredentialList";
 import { useSessionStore } from "../stores/sessionStore";
-
-const CREDENTIALS_API = `${window.location.origin}/api/credentials`;
 
 /** Sidebar "Integrations" disclosure group — the cold, configure-once
  * counterpart to the hot rail items above the hairline
@@ -17,27 +14,17 @@ const CREDENTIALS_API = `${window.location.origin}/api/credentials`;
  * matters at a glance: whether anything is configured at all
  * (sidebar-hierarchy.md §4).
  *
- * `credentials` is fetched here unconditionally (not gated on `expanded`)
- * because other UI reads it regardless of this group's collapse state — the
- * new-session credential selector (SessionList) and per-backend credential
- * options (AgentSettings). Connector installations get the same treatment
- * already, fetched globally by AgentList. */
+ * This component is purely presentational — it reads `connectorInstallations`
+ * / `credentials` from the store but doesn't fetch either. Both lists are
+ * global (read by SessionList's credential selector and AgentSettings too,
+ * regardless of this group's collapse state) and are fetched once by
+ * AgentList, the sidebar's single orchestrator for that kind of load. */
 export function IntegrationsSection() {
-  const token = useSessionStore((s) => s.token);
   const expanded = useSessionStore((s) => s.integrationsExpanded);
   const setExpanded = useSessionStore((s) => s.setIntegrationsExpanded);
   const connectorCount = useSessionStore((s) => s.connectorInstallations.length);
   const credentialCount = useSessionStore((s) => s.credentials.length);
-  const setCredentials = useSessionStore((s) => s.setCredentials);
   const total = connectorCount + credentialCount;
-
-  useEffect(() => {
-    if (!token) return;
-    fetch(CREDENTIALS_API, { headers: { Authorization: `Bearer ${token}` } })
-      .then((r) => (r.ok ? r.json() : null))
-      .then((creds) => creds && setCredentials(creds))
-      .catch(() => {});
-  }, [token, setCredentials]);
 
   return (
     <div className="integrations-section shrink-0">
