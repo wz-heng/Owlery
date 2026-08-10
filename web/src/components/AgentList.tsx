@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { IconChevronRight, IconPlus } from "@tabler/icons-react";
 import { fetchInstallations } from "../api/connectors";
+import { fetchCredentials } from "../api/credentials";
 import { useSessionStore, type Agent, type SessionInfo } from "../stores/sessionStore";
 import { SessionList } from "./SessionList";
 import { AgentSeal } from "./ui/seal";
@@ -29,6 +30,7 @@ export function AgentList({
   const setConnectorInstallations = useSessionStore(
     (s) => s.setConnectorInstallations
   );
+  const setCredentials = useSessionStore((s) => s.setCredentials);
 
   // Which agents are unfolded (showing their sessions). Multiple may be open;
   // folding keeps the sidebar from filling with sessions when there are many
@@ -80,6 +82,15 @@ export function AgentList({
     // each agent's per-connector toggles.
     fetchInstallations(token)
       .then(setConnectorInstallations)
+      .catch(() => {});
+    // Credentials are likewise global — the sidebar's Integrations group
+    // (collapsed by default), the new-session credential selector
+    // (SessionList), and AgentSettings' per-backend options all read this
+    // one store slice regardless of what's mounted. CredentialList itself
+    // only writes back after mutations (create/reauth/delete), so this is
+    // the single source for the initial load.
+    fetchCredentials(token)
+      .then(setCredentials)
       .catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);

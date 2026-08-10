@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   IconCheck,
   IconCopy,
@@ -94,21 +94,11 @@ export function CredentialList() {
     Authorization: `Bearer ${token}`,
   };
 
-  const fetchCredentials = useCallback(async () => {
-    try {
-      const res = await fetch(API, { headers });
-      if (res.ok) {
-        const items: CredentialInfo[] = await res.json();
-        setCredentials(items);
-      }
-    } catch {
-      // ignore
-    }
-  }, [token, setCredentials]);
-
-  useEffect(() => {
-    fetchCredentials();
-  }, [fetchCredentials]);
+  // The initial global list is fetched once by AgentList (the sidebar's
+  // orchestrator for cross-cutting data — SessionList's credential selector
+  // and AgentSettings read `credentials` too, regardless of whether this
+  // component is even mounted). This component only writes back after its
+  // own mutations, below.
 
   // Replace an existing credential (re-auth) or append a new one, off the
   // freshest store state — works for both fresh sign-in and in-place re-auth.
