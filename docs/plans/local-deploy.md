@@ -90,8 +90,9 @@ integration path and is unaffected. Prerequisites for deploy are only:
 ```text
 <deploy_root>/
   current -> a            # symlink; the ONLY path anything runs through
-  a/                      # full checkout: .git, .venv, web/dist, ...
+  a/                      # full checkout: .git, .venv, web/dist, .env -> ../.env
   b/                      # full checkout: idle slot, staged here
+  .env                    # canonical runtime config (§3.2); slots link to it
   journal.jsonl           # append-only switcher journal (§8)
   snapshots/              # pre-switch SQLite snapshots (§7.4)
 ```
@@ -99,7 +100,7 @@ integration path and is unaffected. Prerequisites for deploy are only:
 - Each slot is a complete, self-sufficient installation: its own git clone,
   its own `.venv` created **at its final path** (venvs are not relocatable —
   building in place is what makes the flip atomic and skew-free), its own
-  built `web/dist`.
+  built `web/dist`, and its own link to the runtime config (§3.2).
 - The running process resolves everything through its own slot directory
   (`__file__`-relative, as `server/main.py` already does for `dist`), so a
   symlink flip never changes what the *old* process serves — the flip is
@@ -131,6 +132,42 @@ exact command to fix, no op and no delivery mutation — §12) — Owlery never
 guesses a layout and never deploys an instance it could not restart correctly.
 `settings.debug` (uvicorn reload) also refuses: a reloading dev server must
 not be production-switched.
+
+### 3.2 Runtime config: the deploy root owns `.env`
+
+A slot cannot obtain its settings from anywhere it would naturally look:
+
+- **Not from its own checkout.** `.env` is gitignored, so the clone that
+  creates a slot never brings one.
+- **Not from the environment.** pydantic reads `.env` into `Settings` but does
+  **not** export to `os.environ`, so the switcher's "same env" handoff (§7.3
+  step 3) propagates nothing that a `.env` supplied — `os.environ` never had
+  it. Only genuinely exported variables survive that hop.
+
+So the deploy root holds the canonical `<root>/.env`, and every slot carries a
+relative `.env -> ../.env` link. `deploy init` seeds the file once from the
+checkout being migrated (never overwriting an existing one — the live
+instance's config outranks any checkout's) and links both slots; `deploy_stage`
+re-links after every checkout, since a fresh clone starts without one.
+
+Configuring purely by exported environment variables remains valid and needs
+no `.env` at all; what is enforced is the *resolved* result, not the file.
+
+**Why this is guarded twice.** A slot with no config does not fail loudly — it
+starts, serves, and answers `/health` `200`. But `db_path` defaults to a
+*relative* `owlery.db`, so it silently opens an empty database beside its own
+directory instead of the live one, and `deploy_root` defaults to empty, so
+`/health` reports `sha: null` (§7.3 step 4 can never match the handoff sha).
+The switch therefore health-times-out **and the rollback fails identically** —
+it restarts the old server through the same spawn path, hits the same missing
+config, and the deploy ends `rollback_incomplete` with nothing serving. This
+is the one fault class rollback cannot undo, so it is caught before it can
+happen: `config_probe` at stage time (§5 step 6) and a `.env`-readability
+check immediately before the flip (§7.2). Both fail closed.
+
+*(Observed in production 2026-08-09: a tree whose `deploy_root`/`db_path` were
+set only in a checkout's `.env`. Every switch was guaranteed to fail, the
+rollback with it, and the server came back on an empty database.)*
 
 ## 4. Op model
 
@@ -174,7 +211,13 @@ and running tasks are not even aware of it.
    build`;
 5. sanity probe: `<slot>/.venv/bin/python -c "import server.main"` — an
    import-crash is caught at stage time, not at switch time;
-6. record a `deployments` row `state='staged'` with slot, sha, delivery/op
+6. config probe: with the slot's own interpreter and cwd, resolve `Settings`
+   and require an absolute `db_path` and a `deploy_root` equal to this tree
+   (§3.2). `.env` is linked into the slot right after step 2, since the
+   checkout carries none. A slot that fails this would boot, serve, and
+   quietly use an empty database — and could not be rolled back — so it is
+   refused here, while nothing is live;
+7. record a `deployments` row `state='staged'` with slot, sha, delivery/op
    ids, and fold `staged_sha`/`staged_slot` into the op result.
 
 Any step failing marks the op `failed` (`reason_kind='stage_failed'`, full
@@ -250,6 +293,15 @@ first, visibly and deliberately.
 
 ### 7.2 Handoff
 
+Preconditions are checked first, while the switch is still a no-op: the board
+allows local deploy, the layout guard passes (§3.1), something is staged, the
+target is not already `current`, **and the target slot can read its runtime
+config** (§3.2 — `<slot>/.env` resolves to a real file, or the deploy root is
+exported). Each refuses with a 409 that names the fix, leaving `current`
+untouched. The config check is repeated here rather than trusted from stage
+time because a slot staged by an older build, or one whose canonical `.env`
+was since deleted, is exactly the case rollback cannot rescue.
+
 Once quiesced (and re-verified immediately before handoff):
 
 1. checkpoint SQLite (`PRAGMA wal_checkpoint(TRUNCATE)`) and copy `owlery.db`
@@ -276,8 +328,12 @@ Small, sequential, journaling every step before performing it:
    `failed(old_wont_die)`; the switcher never SIGKILLs a server that is
    still finishing durable writes);
 2. flip `current` to the staged slot (atomic rename); journal `flip_done`;
-3. start `<root>/current/.venv/bin/owlery serve` detached, same argv/env
-   contract as the old process (captured in the journal at handoff);
+3. start `<root>/current/.venv/bin/owlery serve` detached with the old
+   process's argv and environment (captured in the journal at handoff).
+   Note what this does *not* carry: settings the old server read from a
+   `.env` were never in `os.environ`, so they do not propagate here — the new
+   slot re-reads them from its own `.env` link (§3.2). The env hop covers
+   exported variables only;
 4. poll `GET /health` (unauthenticated by design) until it answers with the
    new sha, up to `deploy_health_timeout_seconds`;
 5. **success**: journal `switched_ok`, exit 0;

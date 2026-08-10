@@ -7,6 +7,9 @@ clone, venv, or build — and never a real production path.
 """
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -14,13 +17,16 @@ import pytest
 from server.cli import build_parser
 from server.config import Settings
 from server.deploy import (
+    ENV_FILE,
     REASON_NOT_INITIALIZED,
     REASON_NOT_VIA_CURRENT,
     DeployError,
     DeployLayout,
+    config_probe_source,
     deploy_init,
     deploy_precheck,
     format_init_report,
+    stage_slot,
 )
 
 FAKE_SHA = "0123456789abcdef0123456789abcdef01234567"
@@ -63,10 +69,54 @@ class FakeRunner:
         raise AssertionError(f"unexpected command: {argv}")
 
 
-def _fake_source(tmp_path: Path) -> Path:
+class StageRunnerSpy:
+    """Simulates `stage_slot`'s subprocess steps by materializing what each
+    would leave on disk, and records whether the slot's `.env` was already in
+    place when the config probe ran."""
+
+    def __init__(self, *, config_probe_error: str | None = None) -> None:
+        self.config_probe_error = config_probe_error
+        self.steps: list[str] = []
+        self.env_present_at_config_probe: bool | None = None
+
+    def __call__(self, argv: list[str], cwd: Path, timeout: int) -> tuple[int, str]:
+        if argv[:2] == ["git", "clone"]:
+            dst = Path(argv[3])
+            (dst / ".git").mkdir(parents=True, exist_ok=True)
+            (dst / "web").mkdir(exist_ok=True)
+            self.steps.append("clone")
+        elif argv[:2] == ["git", "fetch"]:
+            self.steps.append("fetch")
+        elif argv[:2] == ["git", "checkout"]:
+            self.steps.append("checkout")
+        elif argv[1:3] == ["-m", "venv"]:
+            bindir = cwd / ".venv" / "bin"
+            bindir.mkdir(parents=True, exist_ok=True)
+            for exe in ("python", "pip", "owlery"):
+                (bindir / exe).touch()
+            self.steps.append("venv")
+        elif Path(argv[0]).name == "pip":
+            self.steps.append("pip")
+        elif argv[0] == "bun":
+            self.steps.append("bun")
+        elif argv[1:2] == ["-c"] and "resolved_deploy_root" in argv[2]:
+            self.steps.append("config_probe")
+            self.env_present_at_config_probe = (cwd / ENV_FILE).is_symlink()
+            if self.config_probe_error:
+                return 1, self.config_probe_error
+        elif argv[1:2] == ["-c"]:
+            self.steps.append("import_probe")
+        else:
+            raise AssertionError(f"unexpected command: {argv}")
+        return 0, "ok"
+
+
+def _fake_source(tmp_path: Path, *, env_body: str | None = None) -> Path:
     src = tmp_path / "checkout"
     (src / ".git").mkdir(parents=True)
     (src / "web").mkdir()
+    if env_body is not None:
+        (src / ENV_FILE).write_text(env_body)
     return src
 
 
@@ -249,6 +299,198 @@ def test_deploy_init_rejects_non_git_source(tmp_path: Path):
     src.mkdir()
     with pytest.raises(DeployError, match="not a git checkout"):
         deploy_init(tmp_path / "deploy", src, runner=FakeRunner())
+
+
+# --------------------------------------------------- slot runtime config (.env)
+#
+# A slot is only "self-sufficient" (§3) if it can resolve its runtime config.
+# It cannot inherit one from the environment: pydantic reads `.env` into
+# Settings WITHOUT exporting to os.environ, so the switcher's "same env"
+# handoff carries nothing a `.env` supplied. And `.env` is gitignored, so the
+# slot's own checkout never brings one. The deploy root owns the canonical
+# file and every slot links to it.
+
+
+def test_deploy_init_seeds_root_env_and_links_both_slots(tmp_path: Path):
+    src = _fake_source(tmp_path, env_body="OWLERY_DB_PATH=/abs/live.db\n")
+    root = tmp_path / "deploy"
+
+    deploy_init(root, src, runner=FakeRunner())
+
+    canonical = root / ENV_FILE
+    assert canonical.is_file()
+    assert canonical.read_text() == "OWLERY_DB_PATH=/abs/live.db\n"
+    # Secrets live here (auth token, bridge keys) — owner-only.
+    assert canonical.stat().st_mode & 0o077 == 0
+
+    layout = DeployLayout.at(root)
+    for slot in ("a", "b"):
+        link = layout.slot_path(slot) / ENV_FILE
+        assert link.is_symlink(), f"slot {slot} has no .env link"
+        # Relative, so the whole tree stays relocatable.
+        assert os.readlink(link) == f"../{ENV_FILE}"
+        assert link.read_text() == "OWLERY_DB_PATH=/abs/live.db\n"
+
+
+def test_deploy_init_never_overwrites_an_existing_root_env(tmp_path: Path):
+    src = _fake_source(tmp_path, env_body="OWLERY_DB_PATH=/from/source.db\n")
+    root = tmp_path / "deploy"
+    root.mkdir(parents=True)
+    (root / ENV_FILE).write_text("OWLERY_DB_PATH=/already/live.db\n")
+
+    deploy_init(root, src, runner=FakeRunner())
+
+    # The deploy root's config is authoritative once it exists — re-running
+    # init must never clobber the live instance's settings with a checkout's.
+    assert (root / ENV_FILE).read_text() == "OWLERY_DB_PATH=/already/live.db\n"
+
+
+def test_deploy_init_without_source_env_leaves_no_dangling_links(tmp_path: Path):
+    # Config supplied purely by exported env vars is legitimate; init must not
+    # invent a `.env`, nor leave slot links pointing at a file that isn't there.
+    src = _fake_source(tmp_path)
+    root = tmp_path / "deploy"
+
+    deploy_init(root, src, runner=FakeRunner())
+
+    assert not (root / ENV_FILE).exists()
+    layout = DeployLayout.at(root)
+    for slot in ("a", "b"):
+        assert not (layout.slot_path(slot) / ENV_FILE).is_symlink()
+
+
+# ------------------------------------------------------------- the config probe
+#
+# These run the probe for real, in a subprocess, against a temp `.env` — the
+# exact mechanism a staged slot uses. A stubbed probe could not have caught
+# the relative-db_path bug, because the bug IS the resolution.
+
+
+def _run_probe(cwd: Path, expected_root: Path) -> tuple[int, str]:
+    """Run the probe with the slot's cwd and a clean env (no ambient OWLERY_*
+    leaking in from the developer's shell)."""
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("OWLERY_", "OCTOPUS_"))
+    }
+    proc = subprocess.run(
+        [sys.executable, "-c", config_probe_source(expected_root)],
+        cwd=str(cwd), capture_output=True, text=True, env=env, timeout=120,
+    )
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+def test_config_probe_passes_on_a_correctly_configured_slot(tmp_path: Path):
+    root = tmp_path / "deploy"
+    slot = root / "a"
+    slot.mkdir(parents=True)
+    (slot / ENV_FILE).write_text(
+        f"OWLERY_DEPLOY_ROOT={root}\nOWLERY_DB_PATH={tmp_path / 'live.db'}\n"
+    )
+
+    rc, out = _run_probe(slot, root)
+
+    assert rc == 0, out
+
+
+def test_config_probe_rejects_a_relative_db_path(tmp_path: Path):
+    # The exact production failure: db_path resolves against the server's cwd,
+    # so each slot silently opens its OWN empty database instead of the live one.
+    root = tmp_path / "deploy"
+    slot = root / "a"
+    slot.mkdir(parents=True)
+    (slot / ENV_FILE).write_text(f"OWLERY_DEPLOY_ROOT={root}\nOWLERY_DB_PATH=owlery.db\n")
+
+    rc, out = _run_probe(slot, root)
+
+    assert rc != 0
+    assert "db_path" in out and "relative" in out
+
+
+def test_config_probe_rejects_an_unresolvable_deploy_root(tmp_path: Path):
+    # deploy_root unset ⇒ /health reports sha=null ⇒ the switcher can never
+    # match the handoff sha ⇒ every switch health-times-out AND its rollback
+    # (which restarts the old server the same way) fails identically.
+    root = tmp_path / "deploy"
+    slot = root / "a"
+    slot.mkdir(parents=True)
+    (slot / ENV_FILE).write_text(f"OWLERY_DB_PATH={tmp_path / 'live.db'}\n")
+
+    rc, out = _run_probe(slot, root)
+
+    assert rc != 0
+    assert "deploy_root" in out
+
+
+def test_stage_slot_links_env_then_probes_the_config(tmp_path: Path):
+    root = tmp_path / "deploy"
+    root.mkdir(parents=True)
+    (root / ENV_FILE).write_text("OWLERY_DB_PATH=/abs/live.db\n")
+    layout = DeployLayout.at(root)
+    runner = StageRunnerSpy()
+
+    result = stage_slot(
+        layout, "b", repo_path=str(tmp_path / "repo"), sha=FAKE_SHA,
+        timeout=60, runner=runner,
+    )
+
+    assert result.ok, result.output
+    # A fresh clone carries no `.env` (gitignored) — stage must supply it.
+    link = layout.slot_path("b") / ENV_FILE
+    assert link.is_symlink() and os.readlink(link) == f"../{ENV_FILE}"
+    assert link.read_text() == "OWLERY_DB_PATH=/abs/live.db\n"
+    # …and it must already be in place by the time the probe reads it.
+    assert runner.env_present_at_config_probe is True
+
+
+def test_stage_slot_fails_closed_when_the_slot_cannot_resolve_config(tmp_path: Path):
+    root = tmp_path / "deploy"
+    root.mkdir(parents=True)
+    layout = DeployLayout.at(root)
+    runner = StageRunnerSpy(config_probe_error="db_path 'owlery.db' is relative")
+
+    result = stage_slot(
+        layout, "b", repo_path=str(tmp_path / "repo"), sha=FAKE_SHA,
+        timeout=60, runner=runner,
+    )
+
+    # Fail the STAGE, so the slot is never eligible to be switched into. A slot
+    # that boots but serves an empty DB cannot be recovered by rollback.
+    assert result.ok is False
+    assert result.failed_step == "config_probe"
+    assert "relative" in result.output
+
+
+def test_stage_slot_leaves_no_dangling_env_link_without_a_root_env(tmp_path: Path):
+    root = tmp_path / "deploy"
+    root.mkdir(parents=True)
+    layout = DeployLayout.at(root)
+
+    result = stage_slot(
+        layout, "b", repo_path=str(tmp_path / "repo"), sha=FAKE_SHA,
+        timeout=60, runner=StageRunnerSpy(),
+    )
+
+    # Exported-env configuration is valid; the probe (not the link) is the
+    # arbiter, so an absent root `.env` must not leave a broken symlink behind.
+    assert result.ok, result.output
+    assert not (layout.slot_path("b") / ENV_FILE).is_symlink()
+
+
+def test_config_probe_rejects_a_slot_pointing_at_a_foreign_deploy_root(tmp_path: Path):
+    root = tmp_path / "deploy"
+    slot = root / "a"
+    slot.mkdir(parents=True)
+    (slot / ENV_FILE).write_text(
+        f"OWLERY_DEPLOY_ROOT={tmp_path / 'somewhere-else'}\n"
+        f"OWLERY_DB_PATH={tmp_path / 'live.db'}\n"
+    )
+
+    rc, out = _run_probe(slot, root)
+
+    assert rc != 0
+    assert "deploy_root" in out
 
 
 # ------------------------------------------------------------ fail-closed guard

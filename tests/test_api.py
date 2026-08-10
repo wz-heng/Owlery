@@ -32,13 +32,18 @@ async def client():
 
 
 @pytest.mark.asyncio
-async def test_health(client):
+async def test_health(client, monkeypatch):
+    # Pin the feature off rather than relying on the ambient default: once a
+    # developer actually runs `owlery deploy init`, their `.env` carries a real
+    # `deploy_root` and /health legitimately reports a sha — which says nothing
+    # about the behaviour under test.
+    monkeypatch.setattr(settings, "deploy_root", "")
     resp = await client.get("/health")
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == "ok"
-    # Local deploy disabled by default (no `deploy_root`) → fail-closed None,
-    # not a 500 (docs/plans/local-deploy.md §6/§13.2).
+    # Local deploy disabled (no `deploy_root`) → fail-closed None, not a 500
+    # (docs/plans/local-deploy.md §6/§13.2).
     assert data["sha"] is None
     assert data["slot"] is None
 

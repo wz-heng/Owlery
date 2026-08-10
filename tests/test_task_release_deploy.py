@@ -32,7 +32,7 @@ import pytest
 import server.switcher as switcher
 from server.config import settings
 from server.database import Database
-from server.deploy import DeployLayout
+from server.deploy import ENV_FILE, DeployLayout
 from server.deploy_admission import DeployAdmissionGate
 from server.task_board.delivery import DeliveryCoordinator
 from server.task_board.deploy_quiesce import BusySource, DeployQuiesce
@@ -77,10 +77,15 @@ def _init_repo(path: Path, *, branch: str = "main") -> None:
 def _init_layout(root: Path, monkeypatch, *, seed_idle: bool = True) -> DeployLayout:
     layout = DeployLayout.at(root)
     root.mkdir(parents=True, exist_ok=True)
+    # Runtime config, exactly as deploy_init/stage_slot lay it down (§3.2): the
+    # canonical file at the root, a relative link in every slot. A slot without
+    # one cannot legally be switched into.
+    (root / ENV_FILE).write_text("OWLERY_DB_PATH=/abs/live.db\n")
     for slot in ("a", "b") if seed_idle else ("a",):
         s = layout.slot_path(slot)
         (s / ".git").mkdir(parents=True)
         (s / "web").mkdir()
+        (s / ENV_FILE).symlink_to(Path("..") / ENV_FILE)
         bindir = s / ".venv" / "bin"
         bindir.mkdir(parents=True)
         for exe in ("python", "pip", "owlery"):
@@ -851,6 +856,48 @@ async def test_release_switch_requires_bound_quiesce(store, tmp_path, monkeypatc
     )
     with pytest.raises(TaskConflictError, match="unavailable on this instance"):
         await coord.release_switch(board_id, server_root=layout.slot_path("a"))
+
+
+@pytest.mark.asyncio
+async def test_release_switch_refuses_a_slot_with_no_runtime_config(
+    store, tmp_path, monkeypatch
+):
+    """A slot with no `.env` boots on defaults — an empty database of its own
+    and `sha: null` at /health. The switch must refuse BEFORE the point of no
+    return: the rollback restarts the old server through the identical spawn
+    path, so it fails identically and the deploy ends with nothing serving
+    (local-deploy.md §3.2)."""
+    db, repo, tmp, _agent = store
+    board_id, _src, _sha, layout, coord, _release = await _staged_release(
+        db, repo, tmp, tmp_path, monkeypatch
+    )
+    _wire_switch(coord, FakeQuiesce([[]]))
+    (layout.slot_path("b") / ENV_FILE).unlink()
+
+    with pytest.raises(TaskConflictError, match="has no readable"):
+        await coord.release_switch(board_id, server_root=layout.slot_path("a"))
+
+    # And the refusal must leave the live slot exactly where it was.
+    assert layout.current_slot() == "a"
+
+
+@pytest.mark.asyncio
+async def test_release_switch_refuses_a_slot_whose_env_link_dangles(
+    store, tmp_path, monkeypatch
+):
+    """The link surviving is not enough — the file it points at must exist. A
+    dangling link is what a deleted canonical `.env` leaves behind."""
+    db, repo, tmp, _agent = store
+    board_id, _src, _sha, layout, coord, _release = await _staged_release(
+        db, repo, tmp, tmp_path, monkeypatch
+    )
+    _wire_switch(coord, FakeQuiesce([[]]))
+    (layout.root / ENV_FILE).unlink()
+
+    with pytest.raises(TaskConflictError, match="no runtime config found"):
+        await coord.release_switch(board_id, server_root=layout.slot_path("a"))
+
+    assert layout.current_slot() == "a"
 
 
 # --------------------------------------------- coordinator: rollback

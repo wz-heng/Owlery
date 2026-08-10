@@ -28,6 +28,21 @@ SLOTS: tuple[str, str] = ("a", "b")
 JOURNAL_NAME = "journal.jsonl"
 SNAPSHOTS_DIR = "snapshots"
 
+# Runtime config (§3.2). The deploy root owns the canonical `.env`; each slot
+# carries a relative symlink to it. Both halves are load-bearing:
+#
+#   * The slot cannot inherit config from the environment. pydantic reads
+#     `.env` into Settings but never exports to os.environ, so the switcher's
+#     "same env" handoff (§7.3 step 3) carries nothing a `.env` supplied.
+#   * The slot cannot get one from its own checkout either — `.env` is
+#     gitignored, so a slot is created without any runtime config at all.
+#
+# Without this, a slot silently falls back to every default: `db_path` is
+# relative, so the server opens an empty DB next to its cwd instead of the
+# live one, and `deploy_root` is empty, so /health reports sha=null and every
+# switch health-times-out with a rollback that fails the exact same way.
+ENV_FILE = ".env"
+
 # reason_kind values this module can emit (the fail-closed subset of §9). The
 # switch-layer reasons (not_idle, health_failed, old_wont_die) arrive with §17
 # step 4.
@@ -203,6 +218,121 @@ def _build_slot(slot_dir: Path, runner: CommandRunner) -> None:
     runner(["bun", "run", "build"], slot_dir / "web")
 
 
+def _seed_root_env(src_checkout: Path, root: Path) -> None:
+    """Give the deploy root its canonical `.env`, copied once from the checkout
+    being migrated (§3.2).
+
+    Never overwrites: once the root has a `.env` it is the live instance's
+    authoritative config, and a later `deploy init` re-run must not clobber it
+    with whatever a checkout happens to carry. A checkout with no `.env`
+    (config supplied by exported env vars instead) seeds nothing — that is a
+    valid setup, and `config_probe` is what actually decides whether a slot can
+    resolve its settings."""
+    src, dst = src_checkout / ENV_FILE, root / ENV_FILE
+    if dst.exists() or not src.is_file():
+        return
+    shutil.copy2(src, dst)
+    dst.chmod(0o600)  # auth token + bridge secrets
+
+
+def _link_slot_env(root: Path, slot_dir: Path) -> None:
+    """Point `<slot>/.env` at the deploy root's canonical file.
+
+    Relative (`../.env`) so the tree stays relocatable, and re-created on every
+    stage because `git clone` into a fresh slot dir starts with no `.env` at
+    all. Idempotent and self-healing: an existing link/file is replaced. A root
+    with no `.env` leaves no link rather than a dangling one."""
+    src = root / ENV_FILE
+    dst = slot_dir / ENV_FILE
+    if not src.is_file():
+        return
+    if dst.is_symlink() or dst.exists():
+        dst.unlink()
+    dst.symlink_to(Path("..") / ENV_FILE)
+
+
+def config_probe_source(expected_root: Path | str) -> str:
+    """Python source for the stage-time config probe (§5.6).
+
+    Runs inside the staged slot, with the slot's own interpreter and cwd —
+    the same way `owlery serve` will run there — and fails the stage if the
+    settings that slot would boot with are unusable. It deliberately re-derives
+    them rather than trusting `.env` to exist: a slot configured by exported
+    env vars is equally valid, and only the resolved values matter.
+
+    The two checks are precisely the two ways a slot can look healthy and still
+    destroy a deploy (both observed in production, 2026-08-09):
+
+      * a relative `db_path` resolves against the server's cwd, so the slot
+        opens an empty database of its own instead of the live one;
+      * an unset/foreign `deploy_root` makes /health report `sha: null`, which
+        the switcher can never match against the handoff sha — so the switch
+        health-times-out and the rollback, restarting the old server through
+        the identical path, fails the identical way (`rollback_incomplete`).
+    """
+    return (
+        "import os, sys\n"
+        "from server.config import settings\n"
+        f"expected = {str(expected_root)!r}\n"
+        "root, db = settings.resolved_deploy_root, settings.db_path\n"
+        "bad = []\n"
+        "if not root:\n"
+        "    bad.append('deploy_root is unset, so this slot would report "
+        "sha=null at /health and fail every switch health check')\n"
+        "elif os.path.realpath(root) != os.path.realpath(expected):\n"
+        "    bad.append(f'deploy_root {root!r} is not this deploy tree "
+        "({expected!r})')\n"
+        "if not os.path.isabs(db):\n"
+        "    bad.append(f'db_path {db!r} is relative, so this slot would open "
+        "its own empty database instead of the live one')\n"
+        "if bad:\n"
+        "    sys.stderr.write('; '.join(bad) + chr(10))\n"
+        "    sys.exit(1)\n"
+    )
+
+
+def slot_env_problem(layout: "DeployLayout", slot: str) -> str | None:
+    """Fail-closed pre-flip guard: the slot about to go live must be able to see
+    runtime config. Returns None if it can, else a user-facing reason.
+
+    Deliberately a filesystem check rather than a re-run of the stage probe.
+    This executes on the switch path, immediately before the point of no
+    return, and must not depend on spawning the target slot's interpreter.
+    `stage_slot` already ran the full probe; what can still have changed
+    between stage and switch is the config itself — a `.env` deleted, or a slot
+    staged by a build that predates §3.2 and so never had one linked.
+
+    It is worth guarding this cheaply because the failure is not recoverable:
+    the rollback restarts the OLD server through the identical spawn path, so
+    a config fault fails the rollback in exactly the same way it failed the
+    switch, and the deploy ends in `rollback_incomplete` with nothing serving.
+
+    Config supplied by exported env vars needs no `.env` at all, so an
+    environment that already carries the deploy root is equally acceptable."""
+    if os.environ.get("OWLERY_DEPLOY_ROOT") or os.environ.get("OCTOPUS_DEPLOY_ROOT"):
+        return None
+    slot_env = layout.slot_path(slot) / ENV_FILE
+    canonical = layout.root / ENV_FILE
+    # is_file() follows symlinks, so a dangling link fails here too.
+    if slot_env.is_file():
+        return None
+    consequence = (
+        "it would boot with default settings — opening an empty database "
+        "beside its own directory instead of the live one, and reporting "
+        "sha=null at /health so the switch could never pass its health check"
+    )
+    if canonical.is_file():
+        return (
+            f"slot {slot} has no readable {ENV_FILE} (expected a link to "
+            f"{canonical}); {consequence}. Re-stage the slot, or run "
+            "`owlery deploy init` to relink it."
+        )
+    return (
+        f"no runtime config found: neither {slot_env} nor {canonical} exists, "
+        f"and OWLERY_DEPLOY_ROOT is not exported; {consequence}."
+    )
+
+
 def _remove_slot(slot_dir: Path) -> None:
     """Remove leftover slot debris (dir, file, or symlink). Only ever called on
     a slot with no valid `current` pointing at it, so it never deletes a live
@@ -237,10 +367,16 @@ def deploy_init(
     # Ancillary dirs/files are cheap and safe to ensure on every run.
     layout.snapshots_path.mkdir(exist_ok=True)
     layout.journal_path.touch(exist_ok=True)
+    _seed_root_env(src, layout.root)
 
     existing = layout.current_slot()
     if existing is not None and layout.slot_path(existing).exists():
-        # Already initialized. Do not touch the live slot; just report.
+        # Already initialized. Do not touch the live slot's CODE; re-linking
+        # `.env` is config-only, idempotent, and self-heals a tree initialized
+        # before slots carried one (§3.2).
+        for slot in SLOTS:
+            if layout.slot_path(slot).is_dir():
+                _link_slot_env(layout.root, layout.slot_path(slot))
         commit = _git_head(layout.slot_path(existing), runner)
         return _result(layout, existing, commit, already=True)
 
@@ -255,9 +391,11 @@ def deploy_init(
     for slot in (live, idle):
         _remove_slot(layout.slot_path(slot))
     _clone_slot(src, layout.slot_path(live), commit, runner)
+    _link_slot_env(layout.root, layout.slot_path(live))
     _build_slot(layout.slot_path(live), runner)
     # Idle slot is cloned but not built — the first deploy_stage builds it (§3.1).
     _clone_slot(src, layout.slot_path(idle), commit, runner)
+    _link_slot_env(layout.root, layout.slot_path(idle))
     layout.switch_current(live)
     return _result(layout, live, commit, already=False)
 
@@ -287,9 +425,14 @@ def format_init_report(result: InitResult) -> str:
         f"{head}\n"
         f"  root:    {result.root}\n"
         f"  live:    slot {result.live_slot} @ {result.commit[:12]}\n"
-        f"  current: {result.root / CURRENT_LINK} -> {result.live_slot}\n\n"
-        "Point the server at this tree and start it via `current`:\n"
-        f"  export {result.env_hint}\n"
+        f"  current: {result.root / CURRENT_LINK} -> {result.live_slot}\n"
+        f"  config:  {result.root / ENV_FILE} (linked into every slot)\n\n"
+        "Runtime settings come from that file — edit it there, not in a\n"
+        "checkout: each slot carries only a link to it, and a slot that cannot\n"
+        "read it is refused at stage and switch time. If you configure by\n"
+        "environment instead, export it:\n"
+        f"  export {result.env_hint}\n\n"
+        "Start the server via `current`:\n"
         f"  {result.start_command}\n\n"
         "Update your launchd plist / shell alias to that command once; the\n"
         "symlink flip keeps it correct across every future deploy. The original\n"
@@ -445,7 +588,15 @@ def stage_slot(
          what keeps the flip skew-free, §3/§5.3);
       4. ``bun install`` + ``bun run build`` in the slot's ``web`` (§5.4);
       5. ``python -c "import server.main"`` — an import crash is caught here, at
-         stage time, not at switch time (§5.5).
+         stage time, not at switch time (§5.5);
+      6. ``config_probe`` — the slot must resolve usable runtime settings with
+         its own interpreter and cwd (§5.6). A slot that cannot is worse than
+         one that fails to build: it starts, answers /health, and quietly
+         serves an empty database, and the switch that flips into it cannot be
+         rolled back (§3.2).
+
+    `.env` is linked into the slot right after the checkout, since a fresh git
+    clone never carries one.
     """
     slot_dir = layout.slot_path(slot)
 
@@ -481,9 +632,18 @@ def stage_slot(
     steps.append(("bun_install", ["bun", "install"], web_dir))
     steps.append(("build", ["bun", "run", "build"], web_dir))
     steps.append(("import_probe", [str(venv_python), "-c", "import server.main"], slot_dir))
+    steps.append(
+        ("config_probe", [str(venv_python), "-c", config_probe_source(layout.root)], slot_dir)
+    )
 
     for name, argv, cwd in steps:
         rc, out = runner(argv, cwd, timeout)
         if rc != 0:
             return StageResult(ok=False, slot=slot, sha=sha, failed_step=name, output=out)
+        if name == "checkout":
+            # The clone/checkout above just materialized this slot from git, and
+            # `.env` is gitignored — so the slot has no runtime config until we
+            # link it (§3.2). Must happen before `config_probe` reads it, and
+            # before anything else boots code in here.
+            _link_slot_env(layout.root, slot_dir)
     return StageResult(ok=True, slot=slot, sha=sha)
