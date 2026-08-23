@@ -115,7 +115,12 @@ export function filterTasks(
     if (filters.assignee && task.assignee_agent_id !== filters.assignee) return false;
     if (filters.mine && (!activeAgentId || task.assignee_agent_id !== activeAgentId)) return false;
     if (filters.priority !== null && task.priority !== filters.priority) return false;
-    if (needle && !`${task.title}\n${task.body}`.toLocaleLowerCase().includes(needle)) {
+    if (
+      needle &&
+      !`${task.title}\n${task.body ?? task.body_excerpt ?? ""}`
+        .toLocaleLowerCase()
+        .includes(needle)
+    ) {
       return false;
     }
     return true;

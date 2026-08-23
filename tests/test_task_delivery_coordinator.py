@@ -690,6 +690,117 @@ async def test_supersession_survives_worktree_and_branch_teardown(store):
 
 
 @pytest.mark.asyncio
+async def test_supersession_reverts_to_null_when_target_branch_deleted(store):
+    """The false-revert bug T-C caught: deleting the CONVERGING party's
+    (the target's) branch must not leave a stale collapse in place just
+    because the commit object hasn't been garbage-collected yet. Unlike
+    ``test_supersession_survives_worktree_and_branch_teardown`` — which
+    deletes the SUPERSEDED delivery's own branch and expects the pointer to
+    survive — this deletes the TARGET's branch with no other live ref
+    (main/release) reaching its head, so the pointer must snap back to null.
+    """
+    db, repo, tmp, agent = store
+    src = tmp / "src"
+    _init_repo(src)
+    base_head = _rev(src, "main")
+    board = await repo.create_board(
+        name="TargetTeardown", working_dir=str(src), default_workspace_mode="git_worktree"
+    )
+    coord = _coord(db, repo, FakeConnectors({}))
+
+    _git(src, "checkout", "-b", "attemptA")
+    (src / "a.txt").write_text("a\n")
+    _git(src, "add", ".")
+    _git(src, "commit", "-qm", "A")
+    head_a = _rev(src)
+
+    _git(src, "checkout", "-b", "attemptB")
+    (src / "b.txt").write_text("b\n")
+    _git(src, "add", ".")
+    _git(src, "commit", "-qm", "B")
+    head_b = _rev(src)
+    _git(src, "checkout", "main")
+
+    task_a, run_a = await _task_and_completed_run(repo, board, agent, tmp / "wt-a")
+    await _accept_with_head(
+        repo, task_a, run_a, repository=str(src), attempt_branch="attemptA",
+        base_ref="main", base_head=base_head, attempt_head=head_a,
+    )
+    await coord.recompute_supersession(task_a.id, run_a.id)
+
+    task_b, run_b = await _task_and_completed_run(repo, board, agent, tmp / "wt-b")
+    await _accept_with_head(
+        repo, task_b, run_b, repository=str(src), attempt_branch="attemptB",
+        base_ref="main", base_head=base_head, attempt_head=head_b,
+    )
+    d_b = await coord.recompute_supersession(task_b.id, run_b.id)
+    d_a = await repo.get_delivery_by_run(run_a.id)
+    assert d_a.superseded_by_delivery_id == d_b.id
+
+    # Delete the TARGET's (B's) branch — never merged into main/release, and
+    # never pushed anywhere else, so no live ref reaches head_b anymore. The
+    # commit object is still present (no gc ran), so a naive ancestor-only
+    # check would keep reporting A as collapsed into B.
+    _git(src, "branch", "-D", "attemptB")
+
+    reconciled = await coord.recompute_supersession(task_a.id, run_a.id)
+    assert reconciled.superseded_by_delivery_id is None
+
+
+@pytest.mark.asyncio
+async def test_supersession_survives_target_branch_deleted_after_merge_to_release_ref(store):
+    """A deleted target branch is not automatically a false collapse: if the
+    target's head was merged into the board's release ref (main, by default —
+    task-board-overhaul.md §3.1) before its branch was cleaned up, that head
+    is still live and the collapse must hold."""
+    db, repo, tmp, agent = store
+    src = tmp / "src"
+    _init_repo(src)
+    base_head = _rev(src, "main")
+    board = await repo.create_board(
+        name="ReleaseRef", working_dir=str(src), default_workspace_mode="git_worktree"
+    )
+    coord = _coord(db, repo, FakeConnectors({}))
+
+    _git(src, "checkout", "-b", "attemptA")
+    (src / "a.txt").write_text("a\n")
+    _git(src, "add", ".")
+    _git(src, "commit", "-qm", "A")
+    head_a = _rev(src)
+
+    _git(src, "checkout", "-b", "attemptB")
+    (src / "b.txt").write_text("b\n")
+    _git(src, "add", ".")
+    _git(src, "commit", "-qm", "B")
+    head_b = _rev(src)
+    _git(src, "checkout", "main")
+
+    task_a, run_a = await _task_and_completed_run(repo, board, agent, tmp / "wt-a")
+    await _accept_with_head(
+        repo, task_a, run_a, repository=str(src), attempt_branch="attemptA",
+        base_ref="main", base_head=base_head, attempt_head=head_a,
+    )
+    await coord.recompute_supersession(task_a.id, run_a.id)
+
+    task_b, run_b = await _task_and_completed_run(repo, board, agent, tmp / "wt-b")
+    await _accept_with_head(
+        repo, task_b, run_b, repository=str(src), attempt_branch="attemptB",
+        base_ref="main", base_head=base_head, attempt_head=head_b,
+    )
+    d_b = await coord.recompute_supersession(task_b.id, run_b.id)
+    d_a = await repo.get_delivery_by_run(run_a.id)
+    assert d_a.superseded_by_delivery_id == d_b.id
+
+    # Merge B into main (fast-forward), then delete B's branch — the standard
+    # accept-and-clean-up flow. head_b is now reachable only via "main".
+    _git(src, "merge", "--ff-only", "attemptB")
+    _git(src, "branch", "-D", "attemptB")
+
+    reconciled = await coord.recompute_supersession(task_a.id, run_a.id)
+    assert reconciled.superseded_by_delivery_id == d_b.id
+
+
+@pytest.mark.asyncio
 async def test_supersession_reverts_to_null_when_ancestry_breaks(store):
     """If the superseding branch's history is rewritten so it no longer
     contains the collapsed delivery's commit, the next reconcile must snap

@@ -1346,26 +1346,45 @@ class DeliveryCoordinator:
             await self._on_task_touched(touched_task_id)
         return updated
 
+    async def _target_head_is_live(
+        self, repo_path: str, board: BoardRecord, target: DeliveryRecord
+    ) -> bool:
+        """A supersede TARGET must still be reachable through a live ref, not
+        merely an unreachable commit object git hasn't garbage-collected yet
+        (``merge-base --is-ancestor`` stays true for a deleted branch's tip
+        until gc runs). Live means either the target's own attempt branch
+        still resolves to its recorded head, or that head is contained in the
+        board's release ref (main/release — task-board-overhaul.md §3.1)."""
+        if await ws.resolve_ref(repo_path, target.attempt_branch) == target.attempt_head:
+            return True
+        release_tip = await ws.resolve_ref(repo_path, board.deploy_release_ref)
+        if release_tip is None:
+            return False
+        return await ws.is_ancestor(repo_path, target.attempt_head, release_tip)
+
     async def _recompute_supersession(
         self, task: TaskRecord, delivery: DeliveryRecord
     ) -> DeliveryRecord:
         """Idempotently derive ``superseded_by_delivery_id`` from git ancestor
         facts (§3.1): delivery A is superseded by delivery B iff both belong to
-        the same board and repository and A's head is a STRICT ancestor of B's
-        head (``git merge-base --is-ancestor``). Comparisons use the shared
-        ``repository`` path (never the run's worktree), so the judgment still
-        works after the worktree is torn down as long as the commit stays
-        reachable in that repo — through the attempt branch itself, or through
-        whatever branch it was folded into.
+        the same board and repository, A's head is a STRICT ancestor of B's
+        head (``git merge-base --is-ancestor``), and B's head is still LIVE
+        (``_target_head_is_live``). Comparisons use the shared ``repository``
+        path (never the run's worktree), so the judgment still works after the
+        worktree is torn down as long as the commit stays reachable in that
+        repo — through the attempt branch itself, or through whatever branch
+        it was folded into.
 
         Runs after every delivery settle point (``_published``), covering both
         halves of the rule: a delivery reaching ``ready`` collapses whichever
         still-open ancestors it now contains, and any settle re-verifies this
         delivery's own recorded pointer, snapping it back to null if the git
         fact it recorded no longer holds (history rewrite, or the branch that
-        carried it deleted with no surviving ref). The field only ever moves
-        null -> some id or back to null — never directly between two ids — so
-        a collapsed card's target link is stable until it is genuinely gone.
+        carried the TARGET deleted with no surviving live ref — an
+        unreachable dangling commit does not count as surviving). The field
+        only ever moves null -> some id or back to null — never directly
+        between two ids — so a collapsed card's target link is stable until
+        it is genuinely gone.
 
         Dirty deliveries are exempt from ever being marked superseded (their
         uncommitted changes are not contained in anyone's history) but a dirty
@@ -1378,6 +1397,7 @@ class DeliveryCoordinator:
             task.board_id, delivery.repository, exclude_delivery_id=delivery.id
         )
         repo_path = delivery.repository
+        board = await self.repo.get_board(task.board_id)
 
         if delivery.dirty:
             if delivery.superseded_by_delivery_id is not None:
@@ -1396,6 +1416,7 @@ class DeliveryCoordinator:
                     and await ws.is_ancestor(
                         repo_path, delivery.attempt_head, target.attempt_head
                     )
+                    and await self._target_head_is_live(repo_path, board, target)
                 )
                 if not still_valid:
                     delivery = await self._apply_superseded_by(
@@ -1407,7 +1428,7 @@ class DeliveryCoordinator:
                         continue
                     if await ws.is_ancestor(
                         repo_path, delivery.attempt_head, sib.attempt_head
-                    ):
+                    ) and await self._target_head_is_live(repo_path, board, sib):
                         delivery = await self._apply_superseded_by(
                             task.id, delivery.id, None, sib.id
                         )
@@ -1415,14 +1436,16 @@ class DeliveryCoordinator:
 
         # Propagate forward: this delivery may itself contain still-open
         # siblings, regardless of its own dirty state (a dirty tip's committed
-        # history is a real ancestor fact for anyone it contains).
-        for sib in siblings:
-            if sib.dirty or sib.superseded_by_delivery_id is not None:
-                continue
-            if sib.attempt_head == delivery.attempt_head:
-                continue
-            if await ws.is_ancestor(repo_path, sib.attempt_head, delivery.attempt_head):
-                await self._apply_superseded_by(sib.task_id, sib.id, None, delivery.id)
+        # history is a real ancestor fact for anyone it contains) — provided
+        # this delivery is itself still a live target.
+        if await self._target_head_is_live(repo_path, board, delivery):
+            for sib in siblings:
+                if sib.dirty or sib.superseded_by_delivery_id is not None:
+                    continue
+                if sib.attempt_head == delivery.attempt_head:
+                    continue
+                if await ws.is_ancestor(repo_path, sib.attempt_head, delivery.attempt_head):
+                    await self._apply_superseded_by(sib.task_id, sib.id, None, delivery.id)
 
         return delivery
 

@@ -262,6 +262,16 @@ describe("taskStore event replay and filters", () => {
     expect(filterTasks(rows, { text: "durable", assignee: "", priority: 2, includeArchived: false, mine: true }, "agent-1").map((row) => row.id)).toEqual(["task-1"]);
     expect(filterTasks(rows, { text: "", assignee: "", priority: null, includeArchived: true, mine: false }, null)).toHaveLength(3);
   });
+
+  it("falls back to body_excerpt when a list-summary task has no full body", () => {
+    // List endpoints return summaries: `body` is unset and `body_excerpt`
+    // carries the truncated text (taskStore.ts filterTasks). The text filter
+    // must still match on that excerpt.
+    const summary = task({ id: "task-4", title: "Untitled", body: undefined, body_excerpt: "mentions coordination layer" });
+    const filters = { text: "coordination layer", assignee: "", priority: null, includeArchived: false, mine: false };
+    expect(filterTasks([summary], filters, null).map((row) => row.id)).toEqual(["task-4"]);
+    expect(filterTasks([summary], { ...filters, text: "no match here" }, null)).toHaveLength(0);
+  });
 });
 
 describe("taskStore git delivery", () => {
