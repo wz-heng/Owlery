@@ -216,6 +216,23 @@ export function ChatView({
     }
   }, [activeSessionId, activeSession?.fork_prefilled_prompt]);
 
+  // Prefilled chat input from the Memory page's "纠错" button
+  // (memory-ui.md §3): a fresh session's composer opens with the
+  // correction-prompt template already typed, one-shot-by-ref same as the
+  // fork prefill above so it never re-fires or clobbers the user's edits.
+  const composerDrafts = useSessionStore((s) => s.composerDrafts);
+  const clearComposerDraft = useSessionStore((s) => s.clearComposerDraft);
+  const draftAppliedForRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!activeSessionId) return;
+    const draft = composerDrafts[activeSessionId];
+    if (draft !== undefined && draftAppliedForRef.current !== activeSessionId) {
+      draftAppliedForRef.current = activeSessionId;
+      setInput(draft);
+      clearComposerDraft(activeSessionId);
+    }
+  }, [activeSessionId, composerDrafts, clearComposerDraft]);
+
   const isRunning = activeSession?.status === "running";
 
   const isWaitingForResponse = useMemo(() => {

@@ -194,6 +194,17 @@ interface SessionStore {
   setPendingFork: (sessionId: string, label: string | null) => void;
   clearPendingFork: (sessionId: string) => void;
 
+  // One-shot chat-composer prefill, keyed by session id. Set by the Memory
+  // page's "纠错" (correction) button when it creates a fresh delegation
+  // session, so ChatView can open with the correction prompt template
+  // already typed in — no new backend mechanism (memory-ui.md §3). ChatView
+  // consumes-and-clears its session's entry the first time it sees it, the
+  // same one-shot-by-ref pattern as `fork_prefilled_prompt`. Tab-scoped, not
+  // persisted.
+  composerDrafts: Record<string, string>;
+  setComposerDraft: (sessionId: string, text: string) => void;
+  clearComposerDraft: (sessionId: string) => void;
+
   // Active AskUserQuestion prompts waiting for the user's answer.
   pendingQuestions: Record<string, PendingQuestion[]>;
   setPendingQuestions: (sessionId: string, qs: PendingQuestion[]) => void;
@@ -472,6 +483,19 @@ export const useSessionStore = create<SessionStore>((set) => ({
       const next = { ...s.pendingForks };
       delete next[sessionId];
       return { pendingForks: next };
+    }),
+
+  composerDrafts: {},
+  setComposerDraft: (sessionId, text) =>
+    set((s) => ({
+      composerDrafts: { ...s.composerDrafts, [sessionId]: text },
+    })),
+  clearComposerDraft: (sessionId) =>
+    set((s) => {
+      if (!(sessionId in s.composerDrafts)) return s;
+      const next = { ...s.composerDrafts };
+      delete next[sessionId];
+      return { composerDrafts: next };
     }),
 
   pendingQuestions: {},

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { IconClipboardList, IconLoader2, IconMenu2 } from "@tabler/icons-react";
+import { IconBrain, IconClipboardList, IconLoader2, IconMenu2 } from "@tabler/icons-react";
 import { AccountDropdown } from "./components/AccountDropdown";
 import { AgentList } from "./components/AgentList";
 import { AgentSettings } from "./components/AgentSettings";
@@ -10,6 +10,7 @@ import { IntegrationsSection } from "./components/IntegrationsSection";
 // SessionList is rendered inside AgentList (nested under the active agent),
 // not as its own sidebar section — sessions belong to an agent.
 import { FileViewerDialog } from "./components/FileViewerDialog";
+import { MemoryPage } from "./components/MemoryPage";
 import { OwleryLogo } from "./components/OwleryLogo";
 import { ScheduleList } from "./components/ScheduleList";
 import { SchedulesDialog } from "./components/SchedulesDialog";
@@ -120,7 +121,7 @@ function AuthenticatedApp({
   const [schedulesOpen, setSchedulesOpen] = useState(false);
   const [archivedOpen, setArchivedOpen] = useState(false);
   const [usageOpen, setUsageOpen] = useState(false);
-  const [mainSurface, setMainSurface] = useState<"chat" | "tasks">("chat");
+  const [mainSurface, setMainSurface] = useState<"chat" | "tasks" | "memory">("chat");
   const setActiveSessionId = useSessionStore((s) => s.setActiveSessionId);
 
   const signOut = () => {
@@ -211,6 +212,24 @@ function AuthenticatedApp({
             <IconClipboardList size={17} />
             <span>Task Board</span>
           </button>
+          {/* Memory is a top-level main surface too, same rail weight as
+           * Task Board and Schedules — it's not a cold configure-once
+           * integration (memory-ui.md §设计要点 2, sidebar-hierarchy.md §2-3). */}
+          <button
+            type="button"
+            className={`mt-1 flex h-9 w-full items-center gap-2 rounded-lg px-3 text-left text-sm transition-colors ${
+              mainSurface === "memory"
+                ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                : "text-sidebar-foreground/75 hover:bg-sidebar-accent/70 hover:text-sidebar-foreground"
+            }`}
+            onClick={() => {
+              setMainSurface("memory");
+              setSidebarOpen(false);
+            }}
+          >
+            <IconBrain size={17} />
+            <span>Memory</span>
+          </button>
           {/* Schedules is a hot, glanceable work surface — same rail weight
            * as Task Board, not an infra row (sidebar-hierarchy.md §2-3). */}
           <ScheduleList onOpen={() => setSchedulesOpen(true)} />
@@ -241,6 +260,14 @@ function AuthenticatedApp({
             token={token}
             agents={agents}
             activeAgentId={activeAgentId}
+            onOpenSession={(sessionId) => {
+              setActiveSessionId(sessionId);
+              setMainSurface("chat");
+            }}
+            onToggleSidebar={() => setSidebarOpen(!sidebarOpen)}
+          />
+        ) : mainSurface === "memory" ? (
+          <MemoryPage
             onOpenSession={(sessionId) => {
               setActiveSessionId(sessionId);
               setMainSurface("chat");
