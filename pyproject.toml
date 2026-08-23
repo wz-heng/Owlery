@@ -20,6 +20,10 @@ dependencies = [
     # Feishu bridge (docs/plans/feishu-bridge.md). Pinned: the SDK's lifecycle
     # + strict-security surface is what we depend on; a float could swap it.
     "lark-channel-sdk==1.2.0",
+    # Agent memory frontmatter parsing (docs/plans/memory-ui.md). Already
+    # pulled in transitively by uvicorn[standard]; pinned explicitly since
+    # server/routers/memory.py imports it directly.
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]

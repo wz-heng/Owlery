@@ -29,7 +29,7 @@ from .legacy_rename import migrate_legacy_state, rewrite_legacy_paths
 from .notifiers import notifier_manager
 from .agent_manager import AgentManager
 from .connector_manager import ConnectorManager
-from .routers import agents, attachments, bg_tasks as bg_tasks_router, budgets as budgets_router, connectors, credentials, delegations as delegations_router, files, notifiers, questions, research as research_router, schedules, sessions, task_boards as task_boards_router, usage as usage_router, ws
+from .routers import agents, attachments, bg_tasks as bg_tasks_router, budgets as budgets_router, connectors, credentials, delegations as delegations_router, files, memory as memory_router, notifiers, questions, research as research_router, schedules, sessions, task_boards as task_boards_router, usage as usage_router, ws
 from .parked_turns import ParkedTurnRunner
 from .scheduler import ScheduleRunner
 from .session_manager import session_manager
@@ -310,6 +310,7 @@ app.include_router(research_router.router)
 app.include_router(task_boards_router.router)
 app.include_router(questions.router)
 app.include_router(schedules.router)
+app.include_router(memory_router.router)
 app.include_router(usage_router.router)
 app.include_router(budgets_router.router)
 app.include_router(credentials.router)
