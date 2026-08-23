@@ -1155,22 +1155,56 @@ async def _delivery_chain_entry(delivery) -> dict[str, Any]:
     }
 
 
+async def _resolve_supersede_tip(delivery):
+    """Follow ``superseded_by_delivery_id`` to the ULTIMATE tip, not just the
+    one-hop pointer — a chain A→B→C only ever updates one link per recompute
+    (server/task_board/delivery.py's propagation skips a sibling that already
+    points somewhere), so A's stored pointer can lag behind B's own collapse
+    into C. A visited-set guards against a cycle that should never occur from
+    git ancestry, but must never hang the request if it somehow did."""
+    seen = {delivery.id}
+    current = delivery
+    while current.superseded_by_delivery_id and current.superseded_by_delivery_id not in seen:
+        seen.add(current.superseded_by_delivery_id)
+        current = await task_repository.get_delivery(current.superseded_by_delivery_id)
+    return current if current.id != delivery.id else None
+
+
+async def _resolve_all_superseded(delivery_id: str) -> list[Any]:
+    """Every delivery that transitively collapses into ``delivery_id`` — the
+    full set a chain's true tip must offer for batch teardown, not just its
+    direct predecessor (same one-hop-per-recompute reason as above)."""
+    collected: list[Any] = []
+    frontier = [delivery_id]
+    seen = {delivery_id}
+    while frontier:
+        next_frontier: list[str] = []
+        for current_id in frontier:
+            for row in await task_repository.list_superseded_by(current_id):
+                if row.id in seen:
+                    continue
+                seen.add(row.id)
+                collected.append(row)
+                next_frontier.append(row.id)
+        frontier = next_frontier
+    return collected
+
+
 @router.get("/api/tasks/{task_id}/runs/{run_id}/delivery/chain")
 async def get_delivery_chain(task_id: str, run_id: str, _: str = Depends(verify_token)):
     """Supersede-chain context for the delivery panel (task-board-overhaul.md
-    §3.1): ``target`` is who collapsed this delivery (null for a tip);
-    ``superseded`` is who this delivery has itself collapsed, the candidate
-    set for the tip panel's batch-teardown affordance."""
+    §3.1): ``target`` is the ULTIMATE tip that has collapsed this delivery,
+    possibly transitively (null if this delivery already is the tip);
+    ``superseded`` is everything this delivery transitively contains — the
+    candidate set for the tip panel's batch-teardown affordance. Both walk
+    the full chain rather than one hop, so an intermediate delivery that has
+    itself since been collapsed never strands its own predecessors."""
     delivery = await _delivery_for(task_id, run_id)
 
     async def _load():
-        target = None
-        if delivery.superseded_by_delivery_id:
-            target_delivery = await task_repository.get_delivery(
-                delivery.superseded_by_delivery_id
-            )
-            target = await _delivery_chain_entry(target_delivery)
-        superseded_rows = await task_repository.list_superseded_by(delivery.id)
+        tip = await _resolve_supersede_tip(delivery)
+        target = await _delivery_chain_entry(tip) if tip is not None else None
+        superseded_rows = await _resolve_all_superseded(delivery.id)
         superseded = [await _delivery_chain_entry(row) for row in superseded_rows]
         return {"target": target, "superseded": superseded}
 

@@ -102,6 +102,28 @@ describe("ReleasePanel", () => {
     expect(screen.queryByText("New commits available to stage.")).not.toBeInTheDocument();
   });
 
+  it("still shows Live and enables Rollback when the live release has aged off the first history page", async () => {
+    // Regression (Snape review): live/staged must come from the dedicated
+    // server-resolved fields, never derived from `releases.find(...)` over
+    // just the first page — here the live row (r-live, 11 releases back)
+    // isn't among the 10 newer terminal rows the page actually returns.
+    const olderLive = release({ id: "r-live", version: "r-live", state: "live" });
+    const newerPage = Array.from({ length: 10 }, (_, i) =>
+      release({ id: `r-newer-${i}`, version: `r-newer-${i}`, state: "failed" })
+    );
+    vi.spyOn(taskApi, "releases").mockResolvedValue(
+      releasesResponse({ releases: newerPage, live: olderLive, total: 11 })
+    );
+
+    render(<ReleasePanel board={board()} />);
+
+    await waitFor(() => expect(screen.getByText(/Live r-live/)).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Rollback" })).toBeInTheDocument();
+    // The fetched history page itself is unaffected by the live/staged fix —
+    // it still shows the 10 newer (non-live) rows the page actually returned.
+    expect(screen.getByText("r-newer-0")).toBeInTheDocument();
+  });
+
   it("flags new commits available when the remote tip is ahead of live and nothing is staged", async () => {
     vi.spyOn(taskApi, "releases").mockResolvedValue(
       releasesResponse({

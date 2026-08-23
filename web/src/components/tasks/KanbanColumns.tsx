@@ -131,7 +131,7 @@ export function KanbanColumns({ tasks, agents, onOpenTask, onMoveTask }: KanbanC
                     }
                   }}
                 >
-                  <IconArchive size={13} /> Archive {archivableInView.length} delivered
+                  <IconArchive size={13} /> Archive {archivableInView.length} finished
                 </button>
               )}
             </div>

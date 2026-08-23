@@ -142,6 +142,11 @@ interface TaskState {
   deliveryChains: Record<string, DeliveryChain>;
   releases: Record<string, ReleaseDeployment[]>;
   releasesTotal: Record<string, number>;
+  /** The board's current live/staged rows, resolved server-side independent
+   * of `releases`' page window (Snape review: deriving these from the first
+   * page via `.find()` goes stale the moment either row ages off page 1). */
+  releaseLive: Record<string, ReleaseDeployment | null>;
+  releaseStaged: Record<string, ReleaseDeployment | null>;
   releaseRemoteTip: Record<string, string | null>;
   releaseConfirmation: ReleaseConfirmation | null;
   /** Releases panel collapse state (task-board-overhaul.md §3.2), persisted
@@ -317,6 +322,37 @@ async function runDeliveryCall(
   }
 }
 
+/** REST's max page size (`le=1000` in `server/routers/task_boards.py`),
+ * matching `get_tree`'s existing precedent for a single-page fetch. */
+const TASK_PAGE_LIMIT = 1000;
+
+/** Exhaustively page a board's task list (task-board-overhaul.md §3.4/§6
+ * acceptance #4): a fixed single-page fetch — even at REST's max limit —
+ * silently truncates the Kanban/Tree's active columns once a board crosses
+ * that count (Snape review). Loops on the server's authoritative `total`
+ * until every item is collected, so no board size ever drops tasks from the
+ * default view; the Done column's OWN 15-card cap is a separate client-side
+ * render window over this fully-loaded set, not a fetch cap. */
+async function fetchAllTasks(
+  token: string,
+  boardId: string,
+  filters: Omit<TaskListFilters, "limit" | "offset">
+): Promise<Task[]> {
+  const items: Task[] = [];
+  let total = Infinity;
+  while (items.length < total) {
+    const page = await taskApi.listTasks(token, boardId, {
+      ...filters,
+      limit: TASK_PAGE_LIMIT,
+      offset: items.length,
+    });
+    total = page.total;
+    if (page.items.length === 0) break; // guards a stalled/inconsistent total
+    items.push(...page.items);
+  }
+  return items;
+}
+
 type TaskGet = () => TaskState;
 
 /** Shared reconcile for the release mutations: mutating/finally + confirmation
@@ -385,6 +421,8 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   deliveryChains: {},
   releases: {},
   releasesTotal: {},
+  releaseLive: {},
+  releaseStaged: {},
   releaseRemoteTip: {},
   releaseConfirmation: null,
   releasesExpanded: readStored(RELEASES_EXPANDED_KEY) === "true",
@@ -517,17 +555,11 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     const { token } = get();
     set({ loadingTasks: true, error: null });
     try {
-      const [page, dispatcher] = await Promise.all([
-        // The REST default page (200) is well under a board's realistic
-        // lifetime task count; request the server's max page instead so the
-        // Kanban/Tree view never silently truncates active columns — the
-        // Done column's own collapse (task-board-overhaul.md §3.4) is a
-        // client-side render cap over this fully-loaded set, not a fetch cap.
-        taskApi.listTasks(token, boardId, { include_archived: true, limit: 1000 }),
+      const [tasks, dispatcher] = await Promise.all([
+        fetchAllTasks(token, boardId, { include_archived: true }),
         taskApi.dispatcher(token, boardId),
       ]);
       if (get().selectedBoardId !== boardId) return;
-      const tasks = page.items;
       set({
         tasksById: Object.fromEntries(tasks.map((task) => [task.id, task])),
         taskOrder: tasks.map((task) => task.id),
@@ -544,9 +576,8 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     const { token } = get();
     set({ loadingTasks: true, error: null });
     try {
-      const filters: TaskListFilters = { include_archived: true, limit: 1000 };
-      const page = await taskApi.listTasks(token, boardId, filters);
-      if (get().selectedBoardId === boardId) get().setTaskSnapshot(page.items);
+      const tasks = await fetchAllTasks(token, boardId, { include_archived: true });
+      if (get().selectedBoardId === boardId) get().setTaskSnapshot(tasks);
     } catch (error) {
       set({ error: message(error) });
     } finally {
@@ -811,8 +842,11 @@ export const useTaskStore = create<TaskState>((set, get) => ({
         }
       }
     } finally {
-      // Refresh even on a partial run: entries torn down before the stop
-      // must drop out of the candidate list immediately.
+      // `superseded_by_delivery_id` is a permanent git fact — a successful
+      // teardown does NOT remove an entry from `chain.superseded` (only a
+      // history rewrite that breaks the ancestry would). Refresh anyway so
+      // any OTHER change the teardown made (op ledger, retention) is current
+      // the next time this panel reads the chain.
       await get().loadDeliveryChain(taskId, runId);
     }
     return allOk;
@@ -826,6 +860,8 @@ export const useTaskStore = create<TaskState>((set, get) => ({
       set((state) => ({
         releases: { ...state.releases, [boardId]: result.releases },
         releasesTotal: { ...state.releasesTotal, [boardId]: result.total },
+        releaseLive: { ...state.releaseLive, [boardId]: result.live },
+        releaseStaged: { ...state.releaseStaged, [boardId]: result.staged },
         releaseRemoteTip: { ...state.releaseRemoteTip, [boardId]: result.remote_tip },
       }));
     } catch (error) {
@@ -845,6 +881,8 @@ export const useTaskStore = create<TaskState>((set, get) => ({
       set((state) => ({
         releases: { ...state.releases, [boardId]: [...current, ...result.releases] },
         releasesTotal: { ...state.releasesTotal, [boardId]: result.total },
+        releaseLive: { ...state.releaseLive, [boardId]: result.live },
+        releaseStaged: { ...state.releaseStaged, [boardId]: result.staged },
         releaseRemoteTip: { ...state.releaseRemoteTip, [boardId]: result.remote_tip },
       }));
     } catch (error) {
@@ -888,6 +926,8 @@ export function resetTaskStore(): void {
     deliveryChains: {},
     releases: {},
     releasesTotal: {},
+    releaseLive: {},
+    releaseStaged: {},
     releaseRemoteTip: {},
     releaseConfirmation: null,
     dispatcher: {},

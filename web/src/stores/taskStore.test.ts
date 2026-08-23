@@ -341,6 +341,42 @@ describe("taskStore git delivery", () => {
   });
 });
 
+describe("taskStore exhaustive task-list pagination", () => {
+  it("loadTasks pages past the server's max page size instead of silently truncating (Snape review)", async () => {
+    useTaskStore.setState({ token: "tok", selectedBoardId: "board-1" });
+    const list = vi.spyOn(taskApi, "listTasks");
+    // 1000 is REST's max `limit`; a board with >1000 tasks must still load
+    // in full via a second page, not drop the overflow.
+    const page1 = Array.from({ length: 1000 }, (_, i) => task({ id: `t${i}` }));
+    const page2 = [task({ id: "t1000" })];
+    list.mockResolvedValueOnce({ items: page1, total: 1001, limit: 1000, offset: 0 });
+    list.mockResolvedValueOnce({ items: page2, total: 1001, limit: 1000, offset: 1000 });
+
+    await useTaskStore.getState().loadTasks("board-1");
+
+    expect(list).toHaveBeenNthCalledWith(1, "tok", "board-1", {
+      include_archived: true, limit: 1000, offset: 0,
+    });
+    expect(list).toHaveBeenNthCalledWith(2, "tok", "board-1", {
+      include_archived: true, limit: 1000, offset: 1000,
+    });
+    expect(useTaskStore.getState().taskOrder).toHaveLength(1001);
+    expect(useTaskStore.getState().tasksById["t1000"]).toBeTruthy();
+  });
+
+  it("stops after one page when everything already fit", async () => {
+    useTaskStore.setState({ token: "tok", selectedBoardId: "board-1" });
+    const list = vi.spyOn(taskApi, "listTasks").mockResolvedValue({
+      items: [task({ id: "t1" })], total: 1, limit: 1000, offset: 0,
+    });
+
+    await useTaskStore.getState().loadTasks("board-1");
+
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(useTaskStore.getState().taskOrder).toEqual(["t1"]);
+  });
+});
+
 describe("taskStore supersede chain", () => {
   it("loadDeliveryChain stores the chain keyed by run_id", async () => {
     useTaskStore.setState({ token: "tok" });
@@ -429,6 +465,23 @@ describe("taskStore releases pagination and collapse", () => {
     await useTaskStore.getState().loadMoreReleases("board-1");
     expect(list).toHaveBeenLastCalledWith("tok", "board-1", { limit: 10, offset: 1 });
     expect(useTaskStore.getState().releases["board-1"].map((r) => r.id)).toEqual(["r1", "r2"]);
+  });
+
+  it("stores live/staged independently of the page window (Snape review)", async () => {
+    useTaskStore.setState({ token: "tok" });
+    const liveRow = release({ id: "r-live", state: "live" });
+    const stagedRow = release({ id: "r-staged", state: "staged" });
+    vi.spyOn(taskApi, "releases").mockResolvedValueOnce({
+      // Neither live nor staged is in the fetched page — both aged off.
+      releases: [{ ...release(), id: "r-newer", state: "failed" }],
+      total: 3, limit: 10, offset: 0, live: liveRow, staged: stagedRow, remote_tip: null,
+    });
+
+    await useTaskStore.getState().loadReleases("board-1");
+
+    expect(useTaskStore.getState().releaseLive["board-1"]?.id).toBe("r-live");
+    expect(useTaskStore.getState().releaseStaged["board-1"]?.id).toBe("r-staged");
+    expect(useTaskStore.getState().releases["board-1"].map((r) => r.id)).toEqual(["r-newer"]);
   });
 
   it("setReleasesExpanded flips state and persists to localStorage", () => {

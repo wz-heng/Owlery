@@ -458,6 +458,25 @@ async def test_list_tasks_page_omits_body_and_paginates(real_client):
     assert ids_1.isdisjoint(ids_2)
 
 
+async def _extra_delivery(repo, board, agent_id, root, *, suffix, title="Deliver 2"):
+    """A second (or third...) ready+accepted delivery on the SAME board, for
+    supersede-chain tests — mirrors `_accepted_task_with_delivery` but reuses
+    the given board instead of planning a new one (board names are unique)."""
+    task = await repo.create_task(
+        board_id=board.id, title=title, status="todo", assignee_agent_id=agent_id
+    )
+    run = await repo.claim_ready(
+        task.id, workspace_mode="git_worktree", workspace_path=str(root / f"wt-{suffix}")
+    )
+    await repo.complete_run(task.id, run.id, summary="done")
+    delivery = await repo.create_delivery(
+        run.id, repository="/repo", attempt_branch=f"owlery/{suffix}", base_ref="main", base_head="a"
+    )
+    await repo.start_accept(delivery.id)
+    await repo.record_baseline(delivery.id, status="ready", dirty=False, commits_ahead=2)
+    return task, await repo.get_delivery_by_run(run.id)
+
+
 @pytest.mark.asyncio
 async def test_delivery_chain_endpoint_reports_target_and_superseded(real_client):
     """GET .../delivery/chain feeds the panel's collapse UI (task-board-
@@ -466,22 +485,8 @@ async def test_delivery_chain_endpoint_reports_target_and_superseded(real_client
     for its batch-teardown affordance."""
     c, repo, root, agent_id = real_client
     board, task_a = await _accepted_task_with_delivery(repo, root, agent_id)
-    # A second delivery on the SAME board/repository — supersession is only
-    # ever judged within one board+repository (task-board-overhaul.md §3.1).
-    task_b = await repo.create_task(
-        board_id=board.id, title="Deliver 2", status="todo", assignee_agent_id=agent_id
-    )
-    run_b = await repo.claim_ready(
-        task_b.id, workspace_mode="git_worktree", workspace_path=str(root / "wt-2")
-    )
-    await repo.complete_run(task_b.id, run_b.id, summary="done")
-    delivery_b_created = await repo.create_delivery(
-        run_b.id, repository="/repo", attempt_branch="owlery/y", base_ref="main", base_head="a"
-    )
-    await repo.start_accept(delivery_b_created.id)
-    await repo.record_baseline(delivery_b_created.id, status="ready", dirty=False, commits_ahead=2)
+    task_b, delivery_b = await _extra_delivery(repo, board, agent_id, root, suffix="y")
     delivery_a = await repo.get_delivery_by_run((await repo.list_runs(task_a.id))[0].id)
-    delivery_b = await repo.get_delivery_by_run(run_b.id)
     await repo.set_superseded_by(delivery_a.id, delivery_b.id, expected_current=None)
 
     tip = await c.get(
@@ -501,6 +506,45 @@ async def test_delivery_chain_endpoint_reports_target_and_superseded(real_client
     assert collapsed_body["superseded"] == []
     assert collapsed_body["target"]["task_id"] == task_b.id
     assert collapsed_body["target"]["delivery_id"] == delivery_b.id
+
+
+@pytest.mark.asyncio
+async def test_delivery_chain_endpoint_resolves_transitive_chain(real_client):
+    """A→B→C: each recompute only ever updates ONE link (delivery.py's
+    propagation skips a sibling that already points somewhere), so A's stored
+    pointer still says B even after B itself gets collapsed into C. The
+    `/delivery/chain` endpoint must resolve past that one-hop staleness:
+    every node's `target` is the ultimate tip C, and C's `superseded` must
+    include BOTH A and B — otherwise C's batch-teardown never reaches A, and
+    A's collapsed panel points at a delivery (B) that is itself collapsed
+    (Snape review, task-board-overhaul.md §3.1)."""
+    c, repo, root, agent_id = real_client
+    board, task_a = await _accepted_task_with_delivery(repo, root, agent_id)
+    task_b, delivery_b = await _extra_delivery(repo, board, agent_id, root, suffix="y", title="Deliver 2")
+    task_c, delivery_c = await _extra_delivery(repo, board, agent_id, root, suffix="z", title="Deliver 3")
+    delivery_a = await repo.get_delivery_by_run((await repo.list_runs(task_a.id))[0].id)
+    # A points to B, B points to C — B's own pointer is NOT retargeted to C.
+    await repo.set_superseded_by(delivery_a.id, delivery_b.id, expected_current=None)
+    await repo.set_superseded_by(delivery_b.id, delivery_c.id, expected_current=None)
+
+    chain_a = (await c.get(
+        f"/api/tasks/{task_a.id}/runs/{delivery_a.run_id}/delivery/chain", headers=HEADERS
+    )).json()
+    assert chain_a["target"]["task_id"] == task_c.id
+    assert chain_a["target"]["delivery_id"] == delivery_c.id
+    assert chain_a["superseded"] == []
+
+    chain_b = (await c.get(
+        f"/api/tasks/{task_b.id}/runs/{delivery_b.run_id}/delivery/chain", headers=HEADERS
+    )).json()
+    assert chain_b["target"]["task_id"] == task_c.id
+    assert [item["task_id"] for item in chain_b["superseded"]] == [task_a.id]
+
+    chain_c = (await c.get(
+        f"/api/tasks/{task_c.id}/runs/{delivery_c.run_id}/delivery/chain", headers=HEADERS
+    )).json()
+    assert chain_c["target"] is None
+    assert {item["task_id"] for item in chain_c["superseded"]} == {task_a.id, task_b.id}
 
 
 @pytest.mark.asyncio

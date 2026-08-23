@@ -82,7 +82,7 @@ describe("KanbanColumns", () => {
     expect(screen.queryByRole("button", { name: /Show.*more/ })).not.toBeInTheDocument();
   });
 
-  it("offers a batch archive for delivered done tasks in view, and skips still-active deliveries", async () => {
+  it("offers a batch archive for delivered done tasks in view, and skips still-active or failed deliveries", async () => {
     const archive = vi.spyOn(taskApi, "archiveTask").mockImplementation(
       async (_token, taskId) => task(taskId, "done", taskId, { archived: true })
     );
@@ -100,17 +100,27 @@ describe("KanbanColumns", () => {
           pr_number: null, pr_state: null, merge_strategy: null, reason_kind: null,
         },
       }),
+      // A terminal-but-unhappy delivery status must NOT be swept into a
+      // batch archive labeled "finished" — it still needs a human's eyes
+      // (Snape review: failed/blocked/conflicted aren't "delivered").
+      task("problem", "done", "Failed delivery", {
+        delivery: {
+          status: "failed", dirty: false, commits_ahead: 0, pushed_ref: null,
+          pr_number: null, pr_state: null, merge_strategy: null, reason_kind: "op_failed",
+        },
+      }),
     ];
     render(
       <KanbanColumns tasks={tasks} agents={[]} onOpenTask={vi.fn()} onMoveTask={vi.fn().mockResolvedValue(true)} />
     );
 
-    const archiveButton = screen.getByRole("button", { name: /Archive 2 delivered/ });
+    const archiveButton = screen.getByRole("button", { name: /Archive 2 finished/ });
     fireEvent.click(archiveButton);
 
     await vi.waitFor(() => expect(archive).toHaveBeenCalledTimes(2));
     expect(archive).toHaveBeenCalledWith("token", "plain", true);
     expect(archive).toHaveBeenCalledWith("token", "shipped", true);
     expect(archive).not.toHaveBeenCalledWith("token", "mid-flight", true);
+    expect(archive).not.toHaveBeenCalledWith("token", "problem", true);
   });
 });

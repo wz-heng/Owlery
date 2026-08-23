@@ -69,6 +69,11 @@ interface ReleasePanelProps {
 export function ReleasePanel({ board }: ReleasePanelProps) {
   const releases = useTaskStore((state) => state.releases[board.id]) ?? [];
   const releasesTotal = useTaskStore((state) => state.releasesTotal[board.id] ?? 0);
+  // Resolved server-side independent of the `releases` page window (Snape
+  // review) — must NOT be derived via `releases.find(...)`, which goes stale
+  // the moment either row ages off the first page.
+  const live = useTaskStore((state) => state.releaseLive[board.id]) ?? null;
+  const staged = useTaskStore((state) => state.releaseStaged[board.id]) ?? null;
   const remoteTip = useTaskStore((state) => state.releaseRemoteTip[board.id]);
   const expanded = useTaskStore((state) => state.releasesExpanded);
   const mutating = useTaskStore((state) => state.mutating);
@@ -81,10 +86,11 @@ export function ReleasePanel({ board }: ReleasePanelProps) {
     void useTaskStore.getState().loadReleases(board.id);
   }, [board.id]);
 
-  const live = releases.find((release) => release.state === "live");
-  const staged = releases.find((release) => release.state === "staged");
   // Releases are always fetched most-recent-first (§3.2); the current
-  // in-flight row, if any, otherwise the latest terminal one.
+  // in-flight row, if any, otherwise the latest terminal one. In-flight ops
+  // are always the newest row when they exist, so the first page always has
+  // them — only the terminal-fallback here would ever miss live/staged, and
+  // that's exactly what the dedicated `live`/`staged` state above covers.
   const history = releases;
   const current = history.find((release) => release.state === "staging" || release.state === "switching") ?? history[0] ?? null;
   const busy = mutating;

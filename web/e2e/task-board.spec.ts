@@ -373,7 +373,7 @@ test.describe("Task Board", () => {
       await expect(releases.getByRole("button", { name: "Stage" })).not.toBeVisible();
 
       const done = page.getByRole("region", { name: "Done tasks" });
-      const archiveButton = done.getByRole("button", { name: /Archive \d+ delivered/ });
+      const archiveButton = done.getByRole("button", { name: /Archive \d+ finished/ });
       await expect(archiveButton).toBeVisible();
       await archiveButton.click();
       await expect(done.getByRole("button", { name: `Open task ${title}` })).toHaveCount(0);
