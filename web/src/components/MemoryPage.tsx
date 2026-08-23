@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   IconAlertTriangle,
   IconMenu2,
@@ -38,8 +38,6 @@ export function MemoryPage({ onOpenSession, onToggleSidebar }: MemoryPageProps) 
   const token = useSessionStore((s) => s.token);
   const agents = useSessionStore((s) => s.agents);
   const activeAgentId = useSessionStore((s) => s.activeAgentId);
-  const sessions = useSessionStore((s) => s.sessions);
-  const setSessions = useSessionStore((s) => s.setSessions);
   const setActiveAgentId = useSessionStore((s) => s.setActiveAgentId);
   const setActiveSessionId = useSessionStore((s) => s.setActiveSessionId);
   const setComposerDraft = useSessionStore((s) => s.setComposerDraft);
@@ -78,6 +76,19 @@ export function MemoryPage({ onOpenSession, onToggleSidebar }: MemoryPageProps) 
   useEffect(() => {
     if (!token || !selectedAgentId) return;
     let cancelled = false;
+    // Drop the previous agent's data immediately (not just on success): a
+    // failed fetch must never leave stale list/graph/file data attributed
+    // to the *new* `selectedAgentId` sitting around — `currentFile` derives
+    // from `listData`, and "纠错" POSTs to whatever `selectedAgentId` is, so
+    // a stale pairing would file a correction for the wrong agent/file
+    // (Snape review). Note this intentionally does NOT touch `selectedFile`
+    // — that's the caller's job: `selectAgent` clears it (switch → default
+    // to the index), `jumpToHit` sets it to the search hit's file, and
+    // either way it must survive this effect re-running so the hit's file
+    // is still what gets applied once the new agent's list arrives.
+    setListData(null);
+    setGraphData(null);
+    setFileContent(null);
     setListLoading(true);
     setListError(null);
     Promise.all([
@@ -88,7 +99,6 @@ export function MemoryPage({ onOpenSession, onToggleSidebar }: MemoryPageProps) 
         if (cancelled) return;
         setListData(list);
         setGraphData(graph);
-        setSelectedFile(null);
       })
       .catch(() => {
         if (!cancelled) setListError("Failed to load this agent's memory.");
@@ -149,20 +159,28 @@ export function MemoryPage({ onOpenSession, onToggleSidebar }: MemoryPageProps) 
     setSearchResults(null);
   }, []);
 
+  // Guards against a slow earlier search's response landing after a faster
+  // later one and clobbering it — only the most recently *issued* request's
+  // result is ever applied (Snape review).
+  const searchRequestRef = useRef(0);
   const runSearch = useCallback(async () => {
     const q = searchInput.trim();
     if (!q || !token) {
+      searchRequestRef.current += 1;
       setSearchResults(null);
       return;
     }
+    const requestId = ++searchRequestRef.current;
     setSearching(true);
     try {
       const res = await memoryApi.search(token, q);
+      if (searchRequestRef.current !== requestId) return;
       setSearchResults(res.hits);
     } catch {
+      if (searchRequestRef.current !== requestId) return;
       setSearchResults([]);
     } finally {
-      setSearching(false);
+      if (searchRequestRef.current === requestId) setSearching(false);
     }
   }, [token, searchInput]);
 
@@ -201,7 +219,13 @@ export function MemoryPage({ onOpenSession, onToggleSidebar }: MemoryPageProps) 
       );
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const session = (await res.json()) as SessionInfo;
-      setSessions([...sessions, session]);
+      // Read the current list at the moment the POST resolves, not a
+      // closed-over value from render time — otherwise a session added by
+      // WS/another tab while this POST was in flight would be dropped
+      // (CLAUDE.md: use getState() in callbacks that mutate the store; also
+      // Snape review).
+      const store = useSessionStore.getState();
+      store.setSessions([...store.sessions, session]);
       setComposerDraft(session.id, buildCorrectionPrompt(currentFile.file));
       setActiveAgentId(selectedAgentId);
       setActiveSessionId(session.id);
@@ -215,8 +239,6 @@ export function MemoryPage({ onOpenSession, onToggleSidebar }: MemoryPageProps) 
     token,
     selectedAgentId,
     currentFile,
-    sessions,
-    setSessions,
     setComposerDraft,
     setActiveAgentId,
     setActiveSessionId,

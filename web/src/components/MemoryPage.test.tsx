@@ -28,7 +28,14 @@ const listByAgent: Record<string, unknown> = {
   "agent-2": {
     agent_id: "agent-2",
     index: null,
-    files: [{ file: "solo.md", name: "Solo", description: null, type: "project" }],
+    // "other.md" sorts/lists first on purpose: a regression of the
+    // selectedFile-gets-clobbered bug (Snape review) would fall back to
+    // `files[0]` here and show the WRONG file, catching it instead of
+    // coincidentally passing the way a single-file fixture would.
+    files: [
+      { file: "other.md", name: "Other", description: null, type: "project" },
+      { file: "solo.md", name: "Solo", description: null, type: "project" },
+    ],
   },
 };
 
@@ -50,6 +57,7 @@ const fileContent: Record<string, Record<string, string>> = {
     "note-b.md": "Note B body",
   },
   "agent-2": {
+    "other.md": "Other body",
     "solo.md": "Solo body",
   },
 };
@@ -106,6 +114,9 @@ beforeEach(() => {
     const listMatch = url.match(/\/api\/memory\/([^/?]+)$/);
     if (listMatch) {
       const agentId = decodeURIComponent(listMatch[1]);
+      if (agentId === "agent-3") {
+        return new Response("boom", { status: 500 });
+      }
       return jsonResponse(
         listByAgent[agentId] ?? { agent_id: agentId, index: null, files: [] }
       );
@@ -154,12 +165,13 @@ describe("MemoryPage", () => {
       fireEvent.click(screen.getByText("Snape"));
     });
 
-    // "Solo" legitimately appears twice once loaded — the file-list row and
-    // (since it's the only file) the reading-view header — so scope to the
-    // list row's button role rather than a plain (ambiguous) text query.
-    await screen.findByRole("button", { name: "Solo" });
+    // Switching agent via the switcher (as opposed to jumping to a specific
+    // search hit) resets to that agent's default file — the first one, since
+    // agent-2 has no MEMORY.md index.
+    await screen.findByRole("button", { name: "Other" });
+    expect(screen.getByRole("button", { name: "Solo" })).toBeTruthy();
     expect(screen.queryByText("Note A")).toBeNull();
-    await screen.findByText("Solo body");
+    await screen.findByText("Other body");
   });
 
   it("filters the file list by the active type chips", async () => {
@@ -194,8 +206,82 @@ describe("MemoryPage", () => {
       fireEvent.click(hit.closest("button")!);
     });
 
+    // Must land on the hit's exact file, not agent-2's default/first file
+    // (a regression here previously fell back to "other.md" — Snape review).
     await screen.findByText("Solo body");
+    expect(screen.queryByText("Other body")).toBeNull();
     expect(screen.queryByPlaceholderText("Search all agents' memory")).toHaveValue("");
+  });
+
+  it("clears stale data and hides the correct button when switching to an agent whose fetch fails", async () => {
+    useSessionStore.setState({
+      agents: [...agents, { id: "agent-3", name: "Voldemort" } as Agent],
+    });
+    await act(async () => {
+      render(<MemoryPage />);
+    });
+    await screen.findByRole("heading", { name: "Index" });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Voldemort"));
+    });
+
+    // Stale agent-1 content must not linger once we've switched away, even
+    // though agent-3's fetch is about to fail.
+    await waitFor(() =>
+      expect(screen.queryByRole("heading", { name: "Index" })).toBeNull()
+    );
+    expect(screen.queryByText("Note A")).toBeNull();
+    // With nothing loaded for agent-3, there's nothing to file a correction
+    // against — the button must not render (it would otherwise silently
+    // file a correction naming a stale agent-1 file against agent-3).
+    expect(screen.queryByText("纠错")).toBeNull();
+  });
+
+  it("only applies the most recently issued search's results (a slow earlier response can't clobber a faster later one)", async () => {
+    await act(async () => {
+      render(<MemoryPage />);
+    });
+    await screen.findByText("Note A");
+
+    let resolveSlow!: (r: Response) => void;
+    const slow = new Promise<Response>((resolve) => {
+      resolveSlow = resolve;
+    });
+    // The next two `fetch` calls this test triggers are exactly the two
+    // search submits below — queue their responses in issue order.
+    fetchMock.mockImplementationOnce(async () => slow);
+    fetchMock.mockImplementationOnce(async () =>
+      jsonResponse({
+        query: "fast",
+        hits: [
+          { agent_id: "agent-2", file: "solo.md", name: "Solo", type: "project", snippet: "fast hit" },
+        ],
+      })
+    );
+
+    const searchBox = screen.getByPlaceholderText("Search all agents' memory");
+    const form = searchBox.closest("form")!;
+
+    fireEvent.change(searchBox, { target: { value: "slow" } });
+    await act(async () => {
+      fireEvent.submit(form);
+    });
+
+    fireEvent.change(searchBox, { target: { value: "fast" } });
+    await act(async () => {
+      fireEvent.submit(form);
+    });
+
+    await screen.findByText("fast hit");
+
+    // The slow (earlier-issued) response finally lands — it must be a no-op.
+    await act(async () => {
+      resolveSlow(jsonResponse({ query: "slow", hits: [] }));
+      await slow;
+    });
+
+    expect(screen.getByText("fast hit")).toBeTruthy();
   });
 
   it("starts a correction session and primes the composer draft, without writing to the memory file", async () => {

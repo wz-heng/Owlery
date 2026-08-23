@@ -1,4 +1,3 @@
-import { useMemo } from "react";
 import { IconMessageExclamation, IconRefresh } from "@tabler/icons-react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -7,17 +6,72 @@ import rehypeHighlight from "rehype-highlight";
 import type { MemoryFileMeta, MemoryGraphNode } from "../../api/memory";
 import { resolveWikilink } from "./memoryPresentation";
 
-const WIKILINK_RE = /\[\[([^\]\[]+)\]\]/g;
 const WIKILINK_HREF_PREFIX = "#wikilink:";
 
-/** `[[name]]` -> a real markdown link the renderer below intercepts. Kept as
- * a source-text rewrite (not a remark plugin) so the transform stays a
- * one-line, unit-testable pure step instead of a mini-AST visitor. */
-function wikilinksToMarkdownLinks(text: string): string {
-  return text.replace(
-    WIKILINK_RE,
-    (_match, name: string) => `[${name.trim()}](${WIKILINK_HREF_PREFIX}${encodeURIComponent(name.trim())})`
-  );
+// Minimal structural mdast shape — just enough to walk `children` and read
+// `type`/`value`. Avoids pulling in `@types/mdast` (transitive, not a direct
+// dependency) for what's otherwise a two-field read.
+interface MdNode {
+  type: string;
+  value?: string;
+  children?: MdNode[];
+  [key: string]: unknown;
+}
+
+const WIKILINK_SKIP_TYPES = new Set(["code", "inlineCode", "link", "linkReference"]);
+
+/** `[[name]]` inside a plain text run -> text + link mdast nodes, so the `a`
+ * renderer below can intercept them. Splitting on the parsed AST (rather
+ * than regex-replacing the raw markdown source before parsing) means a
+ * `[[literal]]` inside a fenced/inline code block or an existing markdown
+ * link's label is left untouched — those aren't text nodes / are explicitly
+ * skipped, so the rewrite can never corrupt code or double-wrap a link
+ * (Snape review: the source-string version did both). */
+function splitWikilinkText(value: string): MdNode[] {
+  const re = /\[\[([^\]\[]+)\]\]/g;
+  const nodes: MdNode[] = [];
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(value))) {
+    if (match.index > lastIndex) {
+      nodes.push({ type: "text", value: value.slice(lastIndex, match.index) });
+    }
+    const name = match[1].trim();
+    nodes.push({
+      type: "link",
+      url: `${WIKILINK_HREF_PREFIX}${encodeURIComponent(name)}`,
+      children: [{ type: "text", value: name }],
+    });
+    lastIndex = match.index + match[0].length;
+  }
+  if (nodes.length === 0) return [{ type: "text", value }];
+  if (lastIndex < value.length) {
+    nodes.push({ type: "text", value: value.slice(lastIndex) });
+  }
+  return nodes;
+}
+
+function transformWikilinkChildren(children: MdNode[]): MdNode[] {
+  const result: MdNode[] = [];
+  for (const child of children) {
+    if (child.type === "text" && typeof child.value === "string") {
+      result.push(...splitWikilinkText(child.value));
+      continue;
+    }
+    if (!WIKILINK_SKIP_TYPES.has(child.type) && Array.isArray(child.children)) {
+      child.children = transformWikilinkChildren(child.children);
+    }
+    result.push(child);
+  }
+  return result;
+}
+
+function remarkWikilinks() {
+  return (tree: MdNode) => {
+    if (Array.isArray(tree.children)) {
+      tree.children = transformWikilinkChildren(tree.children);
+    }
+  };
 }
 
 interface MemoryReadingViewProps {
@@ -45,11 +99,6 @@ export function MemoryReadingView({
   onCorrect,
   correcting,
 }: MemoryReadingViewProps) {
-  const transformed = useMemo(
-    () => (content ? wikilinksToMarkdownLinks(content) : ""),
-    [content]
-  );
-
   if (!file) {
     return (
       <div className="flex h-full items-center justify-center p-8 text-sm text-muted-foreground">
@@ -90,7 +139,7 @@ export function MemoryReadingView({
         ) : (
           <div className="markdown text-sm leading-relaxed">
             <Markdown
-              remarkPlugins={[remarkGfm]}
+              remarkPlugins={[remarkGfm, remarkWikilinks]}
               rehypePlugins={[[rehypeHighlight, { ignoreMissing: true }]]}
               components={{
                 a: ({ href, children }) => {
@@ -132,7 +181,7 @@ export function MemoryReadingView({
                 },
               }}
             >
-              {transformed}
+              {content ?? ""}
             </Markdown>
           </div>
         )}

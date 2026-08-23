@@ -115,6 +115,55 @@ describe("MemoryReadingView", () => {
     expect(el.tagName).not.toBe("A");
   });
 
+  it("leaves a [[literal]] inside a fenced code block untouched (not turned into a link)", () => {
+    render(
+      <MemoryReadingView
+        file={file}
+        content={"```\nconst x = [[project-notes]];\n```"}
+        loading={false}
+        graphNodes={nodes}
+        onNavigateLink={vi.fn()}
+        onCorrect={vi.fn()}
+      />
+    );
+    expect(screen.getByText(/\[\[project-notes\]\]/)).toBeTruthy();
+    expect(screen.queryByRole("link", { name: "project-notes" })).toBeNull();
+  });
+
+  it("leaves a [[literal]] inside inline code untouched", () => {
+    render(
+      <MemoryReadingView
+        file={file}
+        content={"Use `[[project-notes]]` as the syntax."}
+        loading={false}
+        graphNodes={nodes}
+        onNavigateLink={vi.fn()}
+        onCorrect={vi.fn()}
+      />
+    );
+    expect(screen.getByText("[[project-notes]]").tagName).toBe("CODE");
+  });
+
+  it("does not double-wrap a [[wikilink]]-shaped string inside an existing markdown link's label", () => {
+    const onNavigateLink = vi.fn();
+    render(
+      <MemoryReadingView
+        file={file}
+        content={"[see [[project-notes]] here](https://example.com)"}
+        loading={false}
+        graphNodes={nodes}
+        onNavigateLink={onNavigateLink}
+        onCorrect={vi.fn()}
+      />
+    );
+    // The whole thing is one ordinary external link — clicking it must NOT
+    // fire the wikilink navigation callback.
+    const outer = screen.getByRole("link", { name: /project-notes/ });
+    expect(outer).toHaveAttribute("href", "https://example.com");
+    fireEvent.click(outer);
+    expect(onNavigateLink).not.toHaveBeenCalled();
+  });
+
   it("calls onCorrect when the 纠错 button is clicked", () => {
     const onCorrect = vi.fn();
     render(
