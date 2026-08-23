@@ -1325,9 +1325,23 @@ class DeliveryCoordinator:
     # --- supersede derivation (docs/plans/task-board-overhaul.md §3.1) --
 
     async def _apply_superseded_by(
-        self, touched_task_id: str, delivery_id: str, target_id: str | None
+        self,
+        touched_task_id: str,
+        delivery_id: str,
+        expected_current: str | None,
+        target_id: str | None,
     ) -> DeliveryRecord:
-        updated = await self.repo.set_superseded_by(delivery_id, target_id)
+        """CAS the pointer from ``expected_current`` (what this recompute pass
+        observed) to ``target_id``. A lost CAS means a concurrent recompute
+        already moved it since we read it — that write is authoritative, so
+        drop ours rather than clobber it; the next settle point re-derives
+        from the now-current state, so nothing is lost, only deferred."""
+        try:
+            updated = await self.repo.set_superseded_by(
+                delivery_id, target_id, expected_current=expected_current
+            )
+        except TaskConflictError:
+            return await self.repo.get_delivery(delivery_id)
         if self._on_task_touched is not None:
             await self._on_task_touched(touched_task_id)
         return updated
@@ -1368,7 +1382,7 @@ class DeliveryCoordinator:
         if delivery.dirty:
             if delivery.superseded_by_delivery_id is not None:
                 delivery = await self._apply_superseded_by(
-                    task.id, delivery.id, None
+                    task.id, delivery.id, delivery.superseded_by_delivery_id, None
                 )
         else:
             if delivery.superseded_by_delivery_id is not None:
@@ -1385,7 +1399,7 @@ class DeliveryCoordinator:
                 )
                 if not still_valid:
                     delivery = await self._apply_superseded_by(
-                        task.id, delivery.id, None
+                        task.id, delivery.id, delivery.superseded_by_delivery_id, None
                     )
             if delivery.superseded_by_delivery_id is None:
                 for sib in sorted(siblings, key=lambda s: (s.created_at, s.id)):
@@ -1395,7 +1409,7 @@ class DeliveryCoordinator:
                         repo_path, delivery.attempt_head, sib.attempt_head
                     ):
                         delivery = await self._apply_superseded_by(
-                            task.id, delivery.id, sib.id
+                            task.id, delivery.id, None, sib.id
                         )
                         break
 
@@ -1408,7 +1422,7 @@ class DeliveryCoordinator:
             if sib.attempt_head == delivery.attempt_head:
                 continue
             if await ws.is_ancestor(repo_path, sib.attempt_head, delivery.attempt_head):
-                await self._apply_superseded_by(sib.task_id, sib.id, delivery.id)
+                await self._apply_superseded_by(sib.task_id, sib.id, None, delivery.id)
 
         return delivery
 

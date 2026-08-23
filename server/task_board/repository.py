@@ -2615,23 +2615,47 @@ class TaskRepository:
         delivery_id: str,
         target_delivery_id: str | None,
         *,
+        expected_current: str | None,
         actor_kind: str = "system",
         actor_agent_id: str | None = None,
     ) -> DeliveryRecord:
-        """CAS the derived collapse pointer (task-board-overhaul.md §3.1). Not
-        part of the delivery status machine — no status precondition beyond the
-        row existing. A no-op write (pointer already at the requested value)
-        skips the event so idempotent recomputes stay quiet."""
+        """CAS the derived collapse pointer (task-board-overhaul.md §3.1) from
+        ``expected_current`` to ``target_delivery_id``. Not part of the
+        delivery status machine — no status precondition beyond the row
+        existing — but IS a real compare-and-swap: the caller's decision to
+        write was made against a specific prior value (read outside this
+        transaction, while running the git ancestry checks), and two
+        concurrent recomputes can otherwise both observe the same stale
+        ``NULL`` and race to point the same delivery at two different
+        targets, silently violating the "null -> id, or back to null, never
+        id -> id directly" invariant the field promises. Raises
+        ``TaskConflictError`` if the row moved since the caller read it — the
+        caller treats that as "another recompute already handled this" and
+        drops it; the next settle point re-derives from scratch. A no-op
+        write (pointer already at the requested value) skips the event so
+        idempotent recomputes stay quiet."""
         stamp = _now_iso()
         async with self._transaction() as conn:
             row = await self._delivery_row(conn, delivery_id)
-            if (row["superseded_by_delivery_id"] or None) == target_delivery_id:
+            current = row["superseded_by_delivery_id"] or None
+            if current == target_delivery_id:
                 return self._delivery_record(row)
-            await conn.execute(
+            if current != expected_current:
+                raise TaskConflictError(
+                    "superseded_by lost the CAS", current=self._delivery_record(row)
+                )
+            cursor = await conn.execute(
                 "UPDATE task_deliveries SET superseded_by_delivery_id = ?, "
-                "updated_at = ? WHERE id = ?",
-                (target_delivery_id, stamp, delivery_id),
+                "updated_at = ? WHERE id = ? AND superseded_by_delivery_id IS ?",
+                (target_delivery_id, stamp, delivery_id, expected_current),
             )
+            if cursor.rowcount != 1:
+                raise TaskConflictError(
+                    "superseded_by lost the CAS",
+                    current=self._delivery_record(
+                        await self._delivery_row(conn, delivery_id)
+                    ),
+                )
             row = await self._delivery_row(conn, delivery_id)
             await self._delivery_event(
                 conn,
