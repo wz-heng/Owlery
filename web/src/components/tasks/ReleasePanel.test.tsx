@@ -54,12 +54,17 @@ function release(overrides: Partial<ReleaseDeployment> = {}): ReleaseDeployment 
 
 function releasesResponse(overrides: {
   releases?: ReleaseDeployment[];
+  total?: number;
   live?: ReleaseDeployment | null;
   staged?: ReleaseDeployment | null;
   remote_tip?: string | null;
 } = {}) {
+  const releases = overrides.releases ?? [];
   return {
-    releases: [],
+    releases,
+    total: overrides.total ?? releases.length,
+    limit: 10,
+    offset: 0,
     live: null,
     staged: null,
     remote_tip: null,
@@ -70,7 +75,9 @@ function releasesResponse(overrides: {
 beforeEach(() => {
   resetTaskStore();
   vi.restoreAllMocks();
-  useTaskStore.setState({ token: "token" });
+  // Releases default collapsed (task-board-overhaul.md §3.2); most tests
+  // below exercise the expanded action/history surface.
+  useTaskStore.setState({ token: "token", releasesExpanded: true });
 });
 
 afterEach(cleanup);
@@ -83,7 +90,9 @@ describe("ReleasePanel", () => {
 
     render(<ReleasePanel board={board()} />);
 
-    await waitFor(() => expect(list).toHaveBeenCalledWith("token", "board-1"));
+    await waitFor(() =>
+      expect(list).toHaveBeenCalledWith("token", "board-1", { limit: 10, offset: 0 })
+    );
     expect(screen.getByText("main")).toBeInTheDocument();
     await waitFor(() =>
       expect(screen.getByText(/Live r20260809\.01/)).toBeInTheDocument()
@@ -206,5 +215,60 @@ describe("ReleasePanel", () => {
 
     useTaskStore.setState({ mutating: true });
     await waitFor(() => expect(screen.getByRole("button", { name: "Stage" })).toBeDisabled());
+  });
+
+  it("defaults to collapsed: only the current row shows, no action buttons or full history", async () => {
+    useTaskStore.setState({ releasesExpanded: false });
+    vi.spyOn(taskApi, "releases").mockResolvedValue(
+      releasesResponse({ releases: [release()], live: release(), total: 1 })
+    );
+
+    render(<ReleasePanel board={board()} />);
+
+    await waitFor(() => expect(screen.getByText("r20260809.01")).toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: "Stage" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Switch/ })).not.toBeInTheDocument();
+    expect(screen.queryByText(/History/)).not.toBeInTheDocument();
+  });
+
+  it("expands on toggle to reveal actions and history, and collapses back", async () => {
+    useTaskStore.setState({ releasesExpanded: false });
+    vi.spyOn(taskApi, "releases").mockResolvedValue(
+      releasesResponse({ releases: [release()], live: release(), total: 1 })
+    );
+
+    render(<ReleasePanel board={board()} />);
+    await waitFor(() => expect(screen.getByText("r20260809.01")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: /Releases/ }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Stage" })).toBeInTheDocument());
+    expect(screen.getByText(/History/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Releases/ }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Stage" })).not.toBeInTheDocument());
+  });
+
+  it("shows a load-more control when more history exists, and appends the next page", async () => {
+    const list = vi.spyOn(taskApi, "releases");
+    list.mockResolvedValueOnce(
+      releasesResponse({ releases: [release({ id: "rel-1", version: "r1" })], total: 3 })
+    );
+    render(<ReleasePanel board={board()} />);
+    await waitFor(() => expect(screen.getByText("r1")).toBeInTheDocument());
+    expect(screen.getByText(/History/)).toHaveTextContent("3");
+    expect(screen.getByRole("button", { name: /Load more \(2 older\)/ })).toBeInTheDocument();
+
+    list.mockResolvedValueOnce(
+      releasesResponse({
+        releases: [release({ id: "rel-2", version: "r2" }), release({ id: "rel-3", version: "r3" })],
+        total: 3,
+      })
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Load more/ }));
+
+    await waitFor(() => expect(list).toHaveBeenCalledWith("token", "board-1", { limit: 10, offset: 1 }));
+    await waitFor(() => expect(screen.getByText("r2")).toBeInTheDocument());
+    expect(screen.getByText("r3")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Load more/ })).not.toBeInTheDocument();
   });
 });

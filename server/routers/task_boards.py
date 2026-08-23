@@ -1145,6 +1145,38 @@ async def get_delivery(task_id: str, run_id: str, _: str = Depends(verify_token)
     return {"delivery": delivery.to_dict(), "ops": [o.to_dict() for o in ops]}
 
 
+async def _delivery_chain_entry(delivery) -> dict[str, Any]:
+    task = await task_repository.get_task(delivery.task_id)
+    return {
+        "delivery_id": delivery.id,
+        "task_id": task.id,
+        "task_title": task.title,
+        "run_id": delivery.run_id,
+    }
+
+
+@router.get("/api/tasks/{task_id}/runs/{run_id}/delivery/chain")
+async def get_delivery_chain(task_id: str, run_id: str, _: str = Depends(verify_token)):
+    """Supersede-chain context for the delivery panel (task-board-overhaul.md
+    §3.1): ``target`` is who collapsed this delivery (null for a tip);
+    ``superseded`` is who this delivery has itself collapsed, the candidate
+    set for the tip panel's batch-teardown affordance."""
+    delivery = await _delivery_for(task_id, run_id)
+
+    async def _load():
+        target = None
+        if delivery.superseded_by_delivery_id:
+            target_delivery = await task_repository.get_delivery(
+                delivery.superseded_by_delivery_id
+            )
+            target = await _delivery_chain_entry(target_delivery)
+        superseded_rows = await task_repository.list_superseded_by(delivery.id)
+        superseded = [await _delivery_chain_entry(row) for row in superseded_rows]
+        return {"target": target, "superseded": superseded}
+
+    return await _run(_load())
+
+
 @router.get("/api/tasks/{task_id}/runs/{run_id}/delivery/ops")
 async def list_delivery_ops(task_id: str, run_id: str, _: str = Depends(verify_token)):
     delivery = await _delivery_for(task_id, run_id)
@@ -1306,13 +1338,22 @@ async def release_switch(
 
 
 @router.get("/api/task-boards/{board_id}/releases")
-async def list_releases(board_id: str, _: str = Depends(verify_token)):
-    releases = await _run(_get_manager().list_release_deployments(board_id))
+async def list_releases(
+    board_id: str,
+    limit: int = Query(10, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    _: str = Depends(verify_token),
+):
+    releases, total = await _run(
+        _get_manager().list_release_deployments(board_id, limit=limit, offset=offset)
+    )
+    live, staged = await _run(_get_manager().get_current_release_deployments(board_id))
     remote_tip = await _run(_get_manager().resolve_release_remote_tip(board_id))
-    live = next((item for item in releases if item.state == "live"), None)
-    staged = next((item for item in releases if item.state == "staged"), None)
     return {
         "releases": [_dict(item) for item in releases],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
         "live": _dict(live) if live is not None else None,
         "staged": _dict(staged) if staged is not None else None,
         "remote_tip": remote_tip,

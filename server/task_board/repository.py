@@ -2610,6 +2610,18 @@ class TaskRepository:
             )
         return [self._delivery_record(r) for r in rows]
 
+    async def list_superseded_by(self, delivery_id: str) -> list[DeliveryRecord]:
+        """Deliveries this one has collapsed (task-board-overhaul.md §3.1):
+        the reverse of ``superseded_by_delivery_id`` — used to build the tip
+        panel's batch-teardown affordance."""
+        async with self._lock:
+            rows = await self._fetchall(
+                self.conn,
+                "SELECT * FROM task_deliveries WHERE superseded_by_delivery_id = ?",
+                (delivery_id,),
+            )
+        return [self._delivery_record(r) for r in rows]
+
     async def set_superseded_by(
         self,
         delivery_id: str,
@@ -3319,16 +3331,25 @@ class TaskRepository:
         return ReleaseDeploymentRecord(**dict(row))
 
     async def list_release_deployments(
-        self, board_id: str
-    ) -> list[ReleaseDeploymentRecord]:
+        self, board_id: str, *, limit: int = 10, offset: int = 0
+    ) -> tuple[list[ReleaseDeploymentRecord], int]:
+        """Paginated release history, most recent first (task-board-overhaul.md
+        §3.2): the Releases panel's default view needs only the current row,
+        so the full history must never load unbounded just to render it."""
         async with self._lock:
             rows = await self._fetchall(
                 self.conn,
                 "SELECT * FROM release_deployments WHERE board_id=? "
-                "ORDER BY created_at DESC, id DESC",
+                "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                (board_id, limit, offset),
+            )
+            total_row = await self._fetchone(
+                self.conn,
+                "SELECT COUNT(*) AS n FROM release_deployments WHERE board_id=?",
                 (board_id,),
             )
-        return [self._release_deployment_record(row) for row in rows]
+        total = int(total_row["n"]) if total_row else 0
+        return [self._release_deployment_record(row) for row in rows], total
 
     async def get_release_deployment(self, release_id: str) -> ReleaseDeploymentRecord:
         async with self._lock:

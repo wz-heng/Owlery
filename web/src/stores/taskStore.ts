@@ -5,6 +5,7 @@ import {
   TaskApiError,
   type CreateBoardInput,
   type CreateTaskInput,
+  type DeliveryChain,
   type DispatcherStatus,
   type MergeStrategy,
   type ReleaseDeployment,
@@ -23,6 +24,11 @@ import {
   type UpdateBoardInput,
   type UpdateTaskInput,
 } from "../api/tasks";
+import { RELEASES_EXPANDED_KEY, readStored } from "../lib/storage";
+
+/** History page size for the Releases panel's expanded view
+ * (task-board-overhaul.md §3.2). */
+const RELEASES_PAGE_SIZE = 10;
 
 export type DeliveryActionKind =
   | "accept"
@@ -131,9 +137,16 @@ interface TaskState {
   deliveries: Record<string, TaskDelivery>;
   deliveryOps: Record<string, TaskDeliveryOp[]>;
   deliveryConfirmation: DeliveryConfirmation | null;
+  /** Keyed by run_id, mirroring `deliveries` — the supersede-chain context
+   * for that run's delivery panel (task-board-overhaul.md §3.1). */
+  deliveryChains: Record<string, DeliveryChain>;
   releases: Record<string, ReleaseDeployment[]>;
+  releasesTotal: Record<string, number>;
   releaseRemoteTip: Record<string, string | null>;
   releaseConfirmation: ReleaseConfirmation | null;
+  /** Releases panel collapse state (task-board-overhaul.md §3.2), persisted
+   * via `readStored` like `integrationsExpanded`. */
+  releasesExpanded: boolean;
   dispatcher: Record<string, DispatcherStatus>;
   lastEventSeq: Record<string, number>;
   filters: TaskFilters;
@@ -197,8 +210,20 @@ interface TaskState {
     options?: { retention?: string; confirmations?: Record<string, boolean> }
   ): Promise<boolean>;
   clearDeliveryConfirmation(): void;
+  loadDeliveryChain(taskId: string, runId: string): Promise<void>;
+  /** Tear down every delivery this run's tip has collapsed, one at a time,
+   * reusing the existing single-delivery teardown op — no new batch op
+   * (task-board-overhaul.md §3.1). Stops at the first failure so a partial
+   * batch surfaces the same `error` state a single failed teardown would. */
+  teardownSuperseded(
+    taskId: string,
+    runId: string,
+    options?: { retention?: string }
+  ): Promise<boolean>;
 
   loadReleases(boardId: string): Promise<void>;
+  loadMoreReleases(boardId: string): Promise<void>;
+  setReleasesExpanded(expanded: boolean): void;
   stageRelease(boardId: string): Promise<boolean>;
   switchRelease(boardId: string, drain?: boolean): Promise<boolean>;
   rollbackRelease(boardId: string, confirm?: boolean): Promise<boolean>;
@@ -357,9 +382,12 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   deliveries: {},
   deliveryOps: {},
   deliveryConfirmation: null,
+  deliveryChains: {},
   releases: {},
+  releasesTotal: {},
   releaseRemoteTip: {},
   releaseConfirmation: null,
+  releasesExpanded: readStored(RELEASES_EXPANDED_KEY) === "true",
   dispatcher: {},
   lastEventSeq: {},
   filters: EMPTY_FILTERS,
@@ -490,7 +518,12 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     set({ loadingTasks: true, error: null });
     try {
       const [page, dispatcher] = await Promise.all([
-        taskApi.listTasks(token, boardId, { include_archived: true }),
+        // The REST default page (200) is well under a board's realistic
+        // lifetime task count; request the server's max page instead so the
+        // Kanban/Tree view never silently truncates active columns — the
+        // Done column's own collapse (task-board-overhaul.md §3.4) is a
+        // client-side render cap over this fully-loaded set, not a fetch cap.
+        taskApi.listTasks(token, boardId, { include_archived: true, limit: 1000 }),
         taskApi.dispatcher(token, boardId),
       ]);
       if (get().selectedBoardId !== boardId) return;
@@ -511,7 +544,7 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     const { token } = get();
     set({ loadingTasks: true, error: null });
     try {
-      const filters: TaskListFilters = { include_archived: true };
+      const filters: TaskListFilters = { include_archived: true, limit: 1000 };
       const page = await taskApi.listTasks(token, boardId, filters);
       if (get().selectedBoardId === boardId) get().setTaskSnapshot(page.items);
     } catch (error) {
@@ -749,19 +782,79 @@ export const useTaskStore = create<TaskState>((set, get) => ({
       })
     ),
   clearDeliveryConfirmation: () => set({ deliveryConfirmation: null }),
+  loadDeliveryChain: async (taskId, runId) => {
+    const { token } = get();
+    if (!token) return;
+    try {
+      const chain = await taskApi.deliveryChain(token, taskId, runId);
+      set((state) => ({ deliveryChains: { ...state.deliveryChains, [runId]: chain } }));
+    } catch (error) {
+      if (error instanceof TaskApiError && error.status === 404) return;
+      set({ error: message(error) });
+    }
+  },
+  teardownSuperseded: async (taskId, runId, options = {}) => {
+    const chain = get().deliveryChains[runId];
+    if (!chain || chain.superseded.length === 0) return true;
+    let allOk = true;
+    try {
+      for (const entry of chain.superseded) {
+        const ok = await get().teardownDelivery(entry.task_id, entry.run_id, options);
+        if (!ok) {
+          // A single entry needing a typed confirmation (e.g. deleting an
+          // unmerged branch) stops the walk there rather than skipping it —
+          // the pending confirmation is the same dialog a solo teardown
+          // would show; re-running the batch after resolving it picks up
+          // where this left off.
+          allOk = false;
+          break;
+        }
+      }
+    } finally {
+      // Refresh even on a partial run: entries torn down before the stop
+      // must drop out of the candidate list immediately.
+      await get().loadDeliveryChain(taskId, runId);
+    }
+    return allOk;
+  },
 
   loadReleases: async (boardId) => {
     const { token } = get();
     if (!token) return;
     try {
-      const result = await taskApi.releases(token, boardId);
+      const result = await taskApi.releases(token, boardId, { limit: RELEASES_PAGE_SIZE, offset: 0 });
       set((state) => ({
         releases: { ...state.releases, [boardId]: result.releases },
+        releasesTotal: { ...state.releasesTotal, [boardId]: result.total },
         releaseRemoteTip: { ...state.releaseRemoteTip, [boardId]: result.remote_tip },
       }));
     } catch (error) {
       set({ error: message(error) });
     }
+  },
+  loadMoreReleases: async (boardId) => {
+    const { token } = get();
+    if (!token) return;
+    const current = get().releases[boardId] ?? [];
+    try {
+      const result = await taskApi.releases(token, boardId, {
+        limit: RELEASES_PAGE_SIZE,
+        offset: current.length,
+      });
+      if (get().token !== token) return;
+      set((state) => ({
+        releases: { ...state.releases, [boardId]: [...current, ...result.releases] },
+        releasesTotal: { ...state.releasesTotal, [boardId]: result.total },
+        releaseRemoteTip: { ...state.releaseRemoteTip, [boardId]: result.remote_tip },
+      }));
+    } catch (error) {
+      set({ error: message(error) });
+    }
+  },
+  setReleasesExpanded: (expanded) => {
+    if (expanded) localStorage.setItem(RELEASES_EXPANDED_KEY, "true");
+    else localStorage.removeItem(RELEASES_EXPANDED_KEY);
+    set({ releasesExpanded: expanded });
   },
   stageRelease: (boardId) =>
     runReleaseCall(set, get, boardId, "stage", () => taskApi.releaseStage(get().token, boardId)),
@@ -792,7 +885,9 @@ export function resetTaskStore(): void {
     deliveries: {},
     deliveryOps: {},
     deliveryConfirmation: null,
+    deliveryChains: {},
     releases: {},
+    releasesTotal: {},
     releaseRemoteTip: {},
     releaseConfirmation: null,
     dispatcher: {},

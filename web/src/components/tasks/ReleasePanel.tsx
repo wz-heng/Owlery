@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import {
   IconAlertTriangle,
+  IconChevronDown,
+  IconChevronRight,
   IconGitBranch,
   IconHistory,
   IconRocket,
@@ -66,11 +68,14 @@ interface ReleasePanelProps {
  * board has opted into local deploy — mirrors the per-run panel it replaces. */
 export function ReleasePanel({ board }: ReleasePanelProps) {
   const releases = useTaskStore((state) => state.releases[board.id]) ?? [];
+  const releasesTotal = useTaskStore((state) => state.releasesTotal[board.id] ?? 0);
   const remoteTip = useTaskStore((state) => state.releaseRemoteTip[board.id]);
+  const expanded = useTaskStore((state) => state.releasesExpanded);
   const mutating = useTaskStore((state) => state.mutating);
   const error = useTaskStore((state) => state.error);
   const confirmation = useTaskStore((state) => state.releaseConfirmation);
   const store = useTaskStore.getState();
+  const [loadingMore, setLoadingMore] = useState(false);
 
   useEffect(() => {
     void useTaskStore.getState().loadReleases(board.id);
@@ -78,19 +83,27 @@ export function ReleasePanel({ board }: ReleasePanelProps) {
 
   const live = releases.find((release) => release.state === "live");
   const staged = releases.find((release) => release.state === "staged");
-  const history = [...releases].sort(
-    (a, b) => Date.parse(b.created_at) - Date.parse(a.created_at)
-  );
+  // Releases are always fetched most-recent-first (§3.2); the current
+  // in-flight row, if any, otherwise the latest terminal one.
+  const history = releases;
+  const current = history.find((release) => release.state === "staging" || release.state === "switching") ?? history[0] ?? null;
   const busy = mutating;
   const activeConfirmation = confirmation && confirmation.boardId === board.id ? confirmation : null;
   const tipAheadOfLive = remoteTip != null && remoteTip !== live?.sha;
+  const hasMore = releases.length < releasesTotal;
 
   return (
     <section className="mx-4 mb-2 rounded-xl border border-ink-300 bg-ink-50 p-3 md:mx-6" aria-label="Releases">
       <header className="flex flex-wrap items-center gap-2">
-        <span className="inline-flex items-center gap-1.5 text-sm font-semibold">
+        <button
+          type="button"
+          className="inline-flex items-center gap-1.5 text-sm font-semibold hover:text-primary-700"
+          onClick={() => store.setReleasesExpanded(!expanded)}
+          aria-expanded={expanded}
+        >
+          {expanded ? <IconChevronDown size={15} /> : <IconChevronRight size={15} />}
           <IconRocket size={15} /> Releases
-        </span>
+        </button>
         <span className="inline-flex items-center gap-1 rounded-full bg-ink-200 px-2 py-0.5 text-[10px] font-semibold uppercase text-muted-foreground">
           <IconGitBranch size={11} /> {board.deploy_release_ref}
         </span>
@@ -127,59 +140,90 @@ export function ReleasePanel({ board }: ReleasePanelProps) {
         </p>
       )}
 
-      <div className="mt-2 flex flex-wrap gap-2">
-        <ReleaseActionButton
-          label="Stage"
-          icon={<IconGitBranch size={14} />}
-          disabled={busy || !board.allow_local_deploy}
-          onClick={() => void store.stageRelease(board.id)}
-        />
-        <ReleaseActionButton
-          label="Switch"
-          icon={<IconRocket size={14} />}
-          disabled={busy || !staged}
-          destructive
-          onClick={() => void store.switchRelease(board.id)}
-        />
-        {live && (
-          <ReleaseActionButton
-            label="Rollback"
-            icon={<IconAlertTriangle size={14} />}
-            disabled={busy}
-            destructive
-            onClick={() => void store.rollbackRelease(board.id)}
-          />
-        )}
-      </div>
-
-      {history.length > 0 && (
-        <div className="mt-3">
-          <p className="mb-1.5 flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-            <IconHistory size={12} /> History <span className="font-normal">{history.length}</span>
-          </p>
-          <ul className="space-y-1">
-            {history.slice(0, 8).map((release) => (
-              <li
-                key={release.id}
-                className="flex flex-wrap items-center gap-2 rounded-lg border border-ink-200 bg-card px-2.5 py-1.5 text-xs"
-              >
-                <span className="font-mono font-medium text-ink-800">{release.version}</span>
-                <span className="font-mono text-muted-foreground">{shortSha(release.sha)}</span>
-                <span className={cn("rounded-full px-1.5 py-0.5 text-[9px] font-semibold uppercase", DELIVERY_TONE_PILL[releaseTone(release.state)])}>
-                  {release.state}
-                </span>
-                {release.error && (
-                  <span className="text-destructive" title={release.error}>{release.error}</span>
-                )}
-                <span className="ml-auto text-[10px] text-muted-foreground">{formatDate(release.updated_at)}</span>
-              </li>
-            ))}
-          </ul>
+      {!expanded && current && (
+        <div className="mt-2">
+          <ReleaseRow release={current} />
         </div>
+      )}
+
+      {expanded && (
+        <>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <ReleaseActionButton
+              label="Stage"
+              icon={<IconGitBranch size={14} />}
+              disabled={busy || !board.allow_local_deploy}
+              onClick={() => void store.stageRelease(board.id)}
+            />
+            <ReleaseActionButton
+              label="Switch"
+              icon={<IconRocket size={14} />}
+              disabled={busy || !staged}
+              destructive
+              onClick={() => void store.switchRelease(board.id)}
+            />
+            {live && (
+              <ReleaseActionButton
+                label="Rollback"
+                icon={<IconAlertTriangle size={14} />}
+                disabled={busy}
+                destructive
+                onClick={() => void store.rollbackRelease(board.id)}
+              />
+            )}
+          </div>
+
+          {history.length > 0 && (
+            <div className="mt-3">
+              <p className="mb-1.5 flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                <IconHistory size={12} /> History <span className="font-normal">{releasesTotal}</span>
+              </p>
+              <ul className="space-y-1">
+                {history.map((release) => (
+                  <ReleaseRow key={release.id} release={release} asListItem />
+                ))}
+              </ul>
+              {hasMore && (
+                <button
+                  type="button"
+                  className="mt-2 h-7 w-full rounded-lg border border-ink-300 text-[11px] font-medium text-ink-700 hover:bg-ink-200 disabled:opacity-50"
+                  disabled={loadingMore}
+                  onClick={async () => {
+                    setLoadingMore(true);
+                    try {
+                      await store.loadMoreReleases(board.id);
+                    } finally {
+                      setLoadingMore(false);
+                    }
+                  }}
+                >
+                  {loadingMore ? "Loading…" : `Load more (${releasesTotal - releases.length} older)`}
+                </button>
+              )}
+            </div>
+          )}
+        </>
       )}
 
       {activeConfirmation && <ReleaseConfirmationDialog confirmation={activeConfirmation} />}
     </section>
+  );
+}
+
+function ReleaseRow({ release, asListItem = false }: { release: ReleaseDeployment; asListItem?: boolean }) {
+  const Tag = asListItem ? "li" : "div";
+  return (
+    <Tag className="flex flex-wrap items-center gap-2 rounded-lg border border-ink-200 bg-card px-2.5 py-1.5 text-xs">
+      <span className="font-mono font-medium text-ink-800">{release.version}</span>
+      <span className="font-mono text-muted-foreground">{shortSha(release.sha)}</span>
+      <span className={cn("rounded-full px-1.5 py-0.5 text-[9px] font-semibold uppercase", DELIVERY_TONE_PILL[releaseTone(release.state)])}>
+        {release.state}
+      </span>
+      {release.error && (
+        <span className="text-destructive" title={release.error}>{release.error}</span>
+      )}
+      <span className="ml-auto text-[10px] text-muted-foreground">{formatDate(release.updated_at)}</span>
+    </Tag>
   );
 }
 

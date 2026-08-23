@@ -47,6 +47,7 @@ export function TaskTree({ tasks, agents, onOpenTask }: TaskTreeProps) {
     const isCollapsed = collapsed.has(task.id);
     const agent = task.assignee_agent_id ? agentMap.get(task.assignee_agent_id) : undefined;
     const delivery = deliveryChip(task);
+    const dependencyCount = task.dependency_count ?? task.dependencies?.length ?? 0;
     return (
       <div key={task.id}>
         <div
@@ -90,13 +91,27 @@ export function TaskTree({ tasks, agents, onOpenTask }: TaskTreeProps) {
               <span className="italic">Unassigned</span>
             )}
           </div>
-          <div className="flex items-center gap-3 text-[11px] text-muted-foreground">
-            <span className="inline-flex items-center gap-1" title="Tree children">
+          <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+            <span className="inline-flex items-center gap-1" title="Tree children (decomposition — task-board.md §3.3)">
               <IconHierarchy size={13} /> {descendants.length}
             </span>
-            <span className="inline-flex items-center gap-1" title="Execution dependencies">
-              <IconGitBranch size={13} /> {task.dependency_count ?? task.dependencies?.length ?? 0}
-            </span>
+            {dependencyCount > 0 && (
+              // A visually distinct pill (not a plain count, like "Tree
+              // children") so a dependency edge is never mistaken for tree
+              // nesting (task-board-overhaul.md §3.3): parent_task_id is the
+              // skeleton, dependencies are ordering, drawn differently.
+              <button
+                type="button"
+                className="inline-flex items-center gap-1 rounded-full bg-attention-surface px-1.5 py-0.5 font-semibold text-attention hover:brightness-95"
+                title="Execution dependencies (must finish first) — open to see which"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onOpenTask(task.id);
+                }}
+              >
+                <IconGitBranch size={13} /> {dependencyCount}
+              </button>
+            )}
             {delivery && (
               <span
                 data-testid="task-delivery-chip"
@@ -122,7 +137,14 @@ export function TaskTree({ tasks, agents, onOpenTask }: TaskTreeProps) {
         <div className="grid grid-cols-[minmax(18rem,1fr)_7rem_10rem_9rem] border-b border-ink-300 bg-ink-100 px-3 py-2 text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
           <span>Task tree</span><span>Status</span><span>Assignee</span><span>Links</span>
         </div>
-        {roots.map((task) => row(task, 0))}
+        {roots.map((task, index) => (
+          // One root = one battle (task-board-overhaul.md §3.3): a zebra tint
+          // per root group makes each root's whole flat subtree read as one
+          // cluster at a glance, distinct from the next root's.
+          <div key={task.id} className={index % 2 === 1 ? "bg-ink-50/60" : undefined}>
+            {row(task, 0)}
+          </div>
+        ))}
         {roots.length === 0 && (
           <div className="p-10 text-center font-serif text-sm text-muted-foreground">No tasks match these filters.</div>
         )}

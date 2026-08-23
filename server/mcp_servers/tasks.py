@@ -201,6 +201,16 @@ def create_task(
     worker-supplied ``board_id`` is ignored by the server. Normal sessions must
     name a board.
 
+    ``parent_id`` and ``dependencies`` mean different things and are not
+    interchangeable. ``parent_id`` is decomposition only: "this task is part
+    of that goal." One battle = one root task; every sub-task it spawns
+    (including fix rounds, review rounds, and final acceptance) should be a
+    flat child of that SAME root — never nested under the previous round's
+    task. ``dependencies`` is execution order only: "this task cannot start
+    until those are done." Creating a child does not implicitly make it a
+    dependency of anything, and a dependency link does not imply shared
+    ancestry — set both explicitly when a task needs both.
+
     Pass ``model`` to route the task's worker session onto a specific model
     (e.g. a cheaper model for a mechanical sub-task). It must be compatible
     with the assignee agent's backend, or the create is rejected.

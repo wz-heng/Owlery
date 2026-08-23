@@ -126,6 +126,20 @@ export function deliveryChip(
   }
 }
 
+const TERMINAL_DELIVERY_STATUSES: DeliveryStatus[] = ["delivered", "failed", "blocked", "conflicted"];
+
+/** Whether a `done` task is safe to offer the Done column's batch "archive"
+ * entry (task-board-overhaul.md §3.4): nothing about it is still mid-flight.
+ * A task with no delivery (non-git-worktree run, or never accepted) has
+ * nothing left to track; one with a delivery is eligible once that delivery
+ * reached a terminal status — `preparing`/`ready`/`delivering` still have an
+ * actionable panel a bulk archive must not bury. */
+export function isArchivableDoneTask(task: Pick<Task, "status" | "archived" | "delivery">): boolean {
+  if (task.status !== "done" || task.archived) return false;
+  if (!task.delivery) return true;
+  return TERMINAL_DELIVERY_STATUSES.includes(task.delivery.status);
+}
+
 export function relativeTime(value: string | null | undefined): string {
   if (!value) return "—";
   const delta = Date.now() - new Date(value).getTime();

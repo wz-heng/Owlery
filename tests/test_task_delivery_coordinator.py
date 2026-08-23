@@ -521,6 +521,11 @@ async def test_supersession_direct_chain(store):
     assert d_a.superseded_by_delivery_id == d_b.id
     assert d_b.superseded_by_delivery_id is None
 
+    # The reverse lookup the delivery panel's batch-teardown affordance uses
+    # (task-board-overhaul.md §3.1): B's own record of who it collapsed.
+    assert [d.id for d in await repo.list_superseded_by(d_b.id)] == [d_a.id]
+    assert await repo.list_superseded_by(d_a.id) == []
+
 
 @pytest.mark.asyncio
 async def test_supersession_diamond_neither_branch_supersedes_the_other(store):

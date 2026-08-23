@@ -459,6 +459,51 @@ async def test_list_tasks_page_omits_body_and_paginates(real_client):
 
 
 @pytest.mark.asyncio
+async def test_delivery_chain_endpoint_reports_target_and_superseded(real_client):
+    """GET .../delivery/chain feeds the panel's collapse UI (task-board-
+    overhaul.md §3.1): a superseded delivery reports its target task/title
+    for the "collapsed by task X" link, and the tip reports the reverse list
+    for its batch-teardown affordance."""
+    c, repo, root, agent_id = real_client
+    board, task_a = await _accepted_task_with_delivery(repo, root, agent_id)
+    # A second delivery on the SAME board/repository — supersession is only
+    # ever judged within one board+repository (task-board-overhaul.md §3.1).
+    task_b = await repo.create_task(
+        board_id=board.id, title="Deliver 2", status="todo", assignee_agent_id=agent_id
+    )
+    run_b = await repo.claim_ready(
+        task_b.id, workspace_mode="git_worktree", workspace_path=str(root / "wt-2")
+    )
+    await repo.complete_run(task_b.id, run_b.id, summary="done")
+    delivery_b_created = await repo.create_delivery(
+        run_b.id, repository="/repo", attempt_branch="owlery/y", base_ref="main", base_head="a"
+    )
+    await repo.start_accept(delivery_b_created.id)
+    await repo.record_baseline(delivery_b_created.id, status="ready", dirty=False, commits_ahead=2)
+    delivery_a = await repo.get_delivery_by_run((await repo.list_runs(task_a.id))[0].id)
+    delivery_b = await repo.get_delivery_by_run(run_b.id)
+    await repo.set_superseded_by(delivery_a.id, delivery_b.id, expected_current=None)
+
+    tip = await c.get(
+        f"/api/tasks/{task_b.id}/runs/{delivery_b.run_id}/delivery/chain", headers=HEADERS
+    )
+    assert tip.status_code == 200
+    tip_body = tip.json()
+    assert tip_body["target"] is None
+    assert [item["task_id"] for item in tip_body["superseded"]] == [task_a.id]
+    assert tip_body["superseded"][0]["task_title"] == "Deliver"
+
+    collapsed = await c.get(
+        f"/api/tasks/{task_a.id}/runs/{delivery_a.run_id}/delivery/chain", headers=HEADERS
+    )
+    assert collapsed.status_code == 200
+    collapsed_body = collapsed.json()
+    assert collapsed_body["superseded"] == []
+    assert collapsed_body["target"]["task_id"] == task_b.id
+    assert collapsed_body["target"]["delivery_id"] == delivery_b.id
+
+
+@pytest.mark.asyncio
 async def test_enriched_accepts_task_record_or_mapping(monkeypatch):
     """The manager's block / running-cancel exits hand _enriched an already
     serialized task dict, not a TaskRecord; it must accept both — through the

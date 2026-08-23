@@ -950,4 +950,30 @@ async def test_release_plan_records_human_version_and_immutable_sha(task_store):
     assert release.source_ref == "main"
     assert release.sha == "a" * 40
     assert release.state == "planned"
-    assert [item.id for item in await repo.list_release_deployments(board.id)] == [release.id]
+    items, total = await repo.list_release_deployments(board.id)
+    assert [item.id for item in items] == [release.id]
+    assert total == 1
+
+
+@pytest.mark.asyncio
+async def test_list_release_deployments_paginates_most_recent_first(task_store):
+    """Releases panel default view (task-board-overhaul.md §3.2): history must
+    page with a stable most-recent-first order and an accurate total,
+    independent of the page size requested."""
+    _db, repo, root, _agent = task_store
+    board = await _board(repo, root)
+    releases = [
+        await repo.plan_release_deployment(
+            board_id=board.id, source_ref="main", sha=f"{i:040d}",
+            source_repo="/repo", actor_kind="user", actor_agent_id=None,
+        )
+        for i in range(3)
+    ]
+
+    page1, total1 = await repo.list_release_deployments(board.id, limit=2, offset=0)
+    assert [item.id for item in page1] == [releases[2].id, releases[1].id]
+    assert total1 == 3
+
+    page2, total2 = await repo.list_release_deployments(board.id, limit=2, offset=2)
+    assert [item.id for item in page2] == [releases[0].id]
+    assert total2 == 3
