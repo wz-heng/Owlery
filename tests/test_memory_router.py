@@ -107,6 +107,27 @@ async def test_list_requires_auth(client, agents_root):
     assert r.status_code in (401, 403)
 
 
+@pytest.mark.asyncio
+async def test_list_skips_symlink_escaping_memory_dir(client, agents_root):
+    """An agent's harness can write inside its own memory dir; a symlink
+    planted there pointing outside must not be followed by the directory
+    scan shared by list/search/graph — same containment the file-read
+    endpoint already enforces."""
+    outside = agents_root.parent / "outside"
+    outside.mkdir()
+    (outside / "secret.md").write_text("TOP SECRET OUTSIDE FILE")
+
+    mem_dir = agents_root / "a1" / "memory"
+    mem_dir.mkdir(parents=True)
+    _write_fact(mem_dir, "real.md", name="real", description="d", type_="project")
+    (mem_dir / "escape.md").symlink_to(outside / "secret.md")
+
+    r = await client.get("/api/memory/a1", headers=HEADERS)
+    assert r.status_code == 200, r.text
+    files = {f["file"] for f in r.json()["files"]}
+    assert files == {"real.md"}
+
+
 # ---------------------------------------------------------------- file ----
 
 
@@ -219,6 +240,21 @@ async def test_search_no_matches_returns_empty_hits(client, agents_root):
 
 
 @pytest.mark.asyncio
+async def test_search_does_not_follow_symlink_outside_memory_dir(client, agents_root):
+    outside = agents_root.parent / "outside"
+    outside.mkdir()
+    (outside / "secret.md").write_text("TOP SECRET NEEDLE")
+
+    mem_dir = agents_root / "a1" / "memory"
+    mem_dir.mkdir(parents=True)
+    (mem_dir / "escape.md").symlink_to(outside / "secret.md")
+
+    r = await client.get("/api/memory/search", params={"q": "NEEDLE"}, headers=HEADERS)
+    assert r.status_code == 200, r.text
+    assert r.json()["hits"] == []
+
+
+@pytest.mark.asyncio
 async def test_search_missing_agents_dir_returns_empty(client, tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "agents_dir", str(tmp_path / "does-not-exist"))
     r = await client.get("/api/memory/search", params={"q": "anything"}, headers=HEADERS)
@@ -271,6 +307,23 @@ async def test_graph_empty_agent_returns_empty_graph(client, agents_root):
     r = await client.get("/api/memory/nope/graph", headers=HEADERS)
     assert r.status_code == 200
     assert r.json() == {"agent_id": "nope", "nodes": [], "edges": []}
+
+
+@pytest.mark.asyncio
+async def test_graph_does_not_follow_symlink_outside_memory_dir(client, agents_root):
+    outside = agents_root.parent / "outside"
+    outside.mkdir()
+    (outside / "secret.md").write_text("---\nname: leaked\n---\n\nTOP SECRET")
+
+    mem_dir = agents_root / "a1" / "memory"
+    mem_dir.mkdir(parents=True)
+    (mem_dir / "escape.md").symlink_to(outside / "secret.md")
+
+    r = await client.get("/api/memory/a1/graph", headers=HEADERS)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["nodes"] == []
+    assert body["edges"] == []
 
 
 @pytest.mark.asyncio

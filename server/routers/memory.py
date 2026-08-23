@@ -96,17 +96,32 @@ def _require_safe_segment(value: str, field: str) -> None:
 
 def _safe_agent_memory_dir(agent_id: str) -> Path:
     """`agent_memory_dir(agent_id)`, rejecting any `agent_id` that would let
-    the join escape `<agents_dir>/<agent_id>/memory` (path-traversal guard —
-    the sole security-relevant helper in this router)."""
+    the join escape `<agents_dir>/<agent_id>/memory` (path-traversal guard)."""
     _require_safe_segment(agent_id, "agent_id")
     return agent_memory_dir(agent_id)
 
 
 def _list_memory_md_files(agent_id: str) -> list[Path]:
+    """`.md` files directly under the agent's memory dir. Also closes the
+    symlink-escape gap: an agent's harness has file-write tools inside its
+    own memory dir, so a malicious/compromised agent could plant a symlink
+    to an arbitrary host file there — `p.is_file()` alone follows it. Each
+    candidate is resolved and re-checked against the resolved memory dir
+    before being returned, same containment check `read_memory_file` already
+    does for the single-file endpoint."""
     mem_dir = _safe_agent_memory_dir(agent_id)
     if not mem_dir.is_dir():
         return []
-    return sorted(p for p in mem_dir.iterdir() if p.is_file() and p.suffix == ".md")
+    resolved_root = mem_dir.resolve()
+    files = []
+    for p in mem_dir.iterdir():
+        if p.suffix != ".md" or not p.is_file():
+            continue
+        resolved = p.resolve()
+        if resolved != resolved_root and resolved_root not in resolved.parents:
+            continue
+        files.append(p)
+    return sorted(files, key=lambda p: p.name)
 
 
 def _parse_frontmatter(text: str) -> dict:
