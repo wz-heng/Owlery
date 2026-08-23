@@ -801,6 +801,59 @@ async def test_supersession_survives_target_branch_deleted_after_merge_to_releas
 
 
 @pytest.mark.asyncio
+async def test_supersession_forward_propagation_skips_non_live_target(store):
+    """The forward-propagation pass (delivery.py's own settle collapsing
+    still-open siblings it contains) must gate on ITS OWN liveness too, not
+    just the reverse-lookup paths: if the delivery being recomputed has
+    already lost its only live ref before its first settle, it must not
+    collapse A into it (Snape's T-E review)."""
+    db, repo, tmp, agent = store
+    src = tmp / "src"
+    _init_repo(src)
+    base_head = _rev(src, "main")
+    board = await repo.create_board(
+        name="ForwardGate", working_dir=str(src), default_workspace_mode="git_worktree"
+    )
+    coord = _coord(db, repo, FakeConnectors({}))
+
+    _git(src, "checkout", "-b", "attemptA")
+    (src / "a.txt").write_text("a\n")
+    _git(src, "add", ".")
+    _git(src, "commit", "-qm", "A")
+    head_a = _rev(src)
+
+    _git(src, "checkout", "-b", "attemptB")
+    (src / "b.txt").write_text("b\n")
+    _git(src, "add", ".")
+    _git(src, "commit", "-qm", "B")
+    head_b = _rev(src)
+    _git(src, "checkout", "main")
+
+    task_a, run_a = await _task_and_completed_run(repo, board, agent, tmp / "wt-a")
+    await _accept_with_head(
+        repo, task_a, run_a, repository=str(src), attempt_branch="attemptA",
+        base_ref="main", base_head=base_head, attempt_head=head_a,
+    )
+    await coord.recompute_supersession(task_a.id, run_a.id)
+
+    task_b, run_b = await _task_and_completed_run(repo, board, agent, tmp / "wt-b")
+    await _accept_with_head(
+        repo, task_b, run_b, repository=str(src), attempt_branch="attemptB",
+        base_ref="main", base_head=base_head, attempt_head=head_b,
+    )
+
+    # B's branch is gone — never merged to main — before its first settle
+    # ever runs. head_b is still a strict ancestor-containing commit of
+    # nothing relevant here, but head_a IS an ancestor of head_b, so a naive
+    # forward-propagation pass would collapse A into B regardless.
+    _git(src, "branch", "-D", "attemptB")
+
+    await coord.recompute_supersession(task_b.id, run_b.id)
+    d_a = await repo.get_delivery_by_run(run_a.id)
+    assert d_a.superseded_by_delivery_id is None
+
+
+@pytest.mark.asyncio
 async def test_supersession_reverts_to_null_when_ancestry_breaks(store):
     """If the superseding branch's history is rewritten so it no longer
     contains the collapsed delivery's commit, the next reconcile must snap
