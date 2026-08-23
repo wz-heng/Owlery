@@ -54,6 +54,7 @@ def test_list_tasks_uses_trusted_session_and_no_proxy(monkeypatch):
         "board_id": "b1",
         "status": "ready",
         "limit": 12,
+        "offset": 0,
     }
     assert captured["headers"]["Authorization"] == "Bearer secret"
     assert captured["headers"]["X-Owlery-Session-ID"] == "session-1"

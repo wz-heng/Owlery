@@ -71,9 +71,9 @@ export function TaskCard({ task, agent, onOpen, draggable = true }: TaskCardProp
         )}
       </div>
 
-      {task.body && (
+      {(task.body || task.body_excerpt) && (
         <p className="mt-1.5 line-clamp-2 pl-1 text-xs leading-4 text-muted-foreground">
-          {task.body}
+          {task.body || task.body_excerpt}
         </p>
       )}
 

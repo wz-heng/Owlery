@@ -59,6 +59,11 @@ _DELIVERY_TERMINAL_STATUSES = frozenset(
     {"delivered", "conflicted", "blocked", "failed"}
 )
 
+# List-page payload cap (task-board-overhaul.md §3.5): a list item never
+# carries the full `body` — only this many leading characters, plus the
+# card-facing enrichment. Full text is always a `show`/single-task fetch.
+TASK_BODY_EXCERPT_CHARS = 200
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -879,7 +884,7 @@ class TaskRepository:
         return TaskRecord.from_row(row) if row else None
 
     @staticmethod
-    def _list_tasks_sql(
+    def _task_filter_clauses(
         *,
         board_id: str | None,
         status: str | None,
@@ -887,10 +892,7 @@ class TaskRepository:
         parent_task_id: str | None,
         root_only: bool,
         include_archived: bool,
-        limit: int,
-    ) -> tuple[str, list[Any]]:
-        if limit < 1 or limit > 1000:
-            raise TaskValidationError("limit must be between 1 and 1000")
+    ) -> tuple[list[str], list[Any]]:
         clauses: list[str] = []
         args: list[Any] = []
         if board_id is not None:
@@ -909,11 +911,63 @@ class TaskRepository:
             clauses.append("parent_task_id IS NULL")
         if not include_archived:
             clauses.append("archived = 0")
+        return clauses, args
+
+    @classmethod
+    def _list_tasks_sql(
+        cls,
+        *,
+        board_id: str | None,
+        status: str | None,
+        assignee_agent_id: str | None,
+        parent_task_id: str | None,
+        root_only: bool,
+        include_archived: bool,
+        limit: int,
+        offset: int = 0,
+    ) -> tuple[str, list[Any]]:
+        if limit < 1 or limit > 1000:
+            raise TaskValidationError("limit must be between 1 and 1000")
+        if offset < 0:
+            raise TaskValidationError("offset must not be negative")
+        clauses, args = cls._task_filter_clauses(
+            board_id=board_id,
+            status=status,
+            assignee_agent_id=assignee_agent_id,
+            parent_task_id=parent_task_id,
+            root_only=root_only,
+            include_archived=include_archived,
+        )
         sql = "SELECT * FROM tasks"
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY priority DESC, created_at, id LIMIT ?"
+        sql += " ORDER BY priority DESC, created_at, id LIMIT ? OFFSET ?"
         args.append(limit)
+        args.append(offset)
+        return sql, args
+
+    @classmethod
+    def _count_tasks_sql(
+        cls,
+        *,
+        board_id: str | None,
+        status: str | None,
+        assignee_agent_id: str | None,
+        parent_task_id: str | None,
+        root_only: bool,
+        include_archived: bool,
+    ) -> tuple[str, list[Any]]:
+        clauses, args = cls._task_filter_clauses(
+            board_id=board_id,
+            status=status,
+            assignee_agent_id=assignee_agent_id,
+            parent_task_id=parent_task_id,
+            root_only=root_only,
+            include_archived=include_archived,
+        )
+        sql = "SELECT COUNT(*) AS n FROM tasks"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
         return sql, args
 
     async def list_tasks(
@@ -1045,6 +1099,62 @@ class TaskRepository:
                 self.conn, [record.id for record in records]
             )
         return [{**record.to_dict(), **enrichment[record.id]} for record in records]
+
+    async def list_tasks_summary_page(
+        self,
+        *,
+        board_id: str | None = None,
+        status: str | None = None,
+        assignee_agent_id: str | None = None,
+        parent_task_id: str | None = None,
+        root_only: bool = False,
+        include_archived: bool = False,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Paginated, summary-shaped page for MCP ``list`` / REST ``GET
+        /api/tasks`` (task-board-overhaul.md §3.5).
+
+        Same card-facing shape as ``list_tasks_enriched`` (enrichment fields
+        included, so cards render identically) except the full ``body`` is
+        replaced by ``body_excerpt`` — a list page must never balloon just
+        because a handful of tasks carry a huge spec doc pasted into their
+        body. Full text is always a ``show``/single-task fetch. Returns
+        ``(items, total)`` so callers can page to exhaustion.
+        """
+        sql, args = self._list_tasks_sql(
+            board_id=board_id,
+            status=status,
+            assignee_agent_id=assignee_agent_id,
+            parent_task_id=parent_task_id,
+            root_only=root_only,
+            include_archived=include_archived,
+            limit=limit,
+            offset=offset,
+        )
+        count_sql, count_args = self._count_tasks_sql(
+            board_id=board_id,
+            status=status,
+            assignee_agent_id=assignee_agent_id,
+            parent_task_id=parent_task_id,
+            root_only=root_only,
+            include_archived=include_archived,
+        )
+        async with self._lock:
+            rows = await self._fetchall(self.conn, sql, args)
+            records = [TaskRecord.from_row(row) for row in rows]
+            enrichment = await self._enrichment_for(
+                self.conn, [record.id for record in records]
+            )
+            total_row = await self._fetchone(self.conn, count_sql, count_args)
+        total = int(total_row["n"]) if total_row else 0
+        items: list[dict[str, Any]] = []
+        for record in records:
+            data = record.to_dict()
+            body = data.pop("body")
+            data["body_excerpt"] = body[:TASK_BODY_EXCERPT_CHARS]
+            items.append({**data, **enrichment[record.id]})
+        return items, total
 
     async def enrich_task(self, task_id: str) -> dict[str, Any]:
         """A single task's dict with the same derived fields the list exits add."""
@@ -2482,6 +2592,58 @@ class TaskRepository:
                 (delivery_id,),
             )
         return [self._delivery_op_record(r) for r in rows]
+
+    async def list_delivery_siblings(
+        self, board_id: str, repository: str, *, exclude_delivery_id: str
+    ) -> list[DeliveryRecord]:
+        """Deliveries eligible for supersede comparison against
+        ``exclude_delivery_id`` (task-board-overhaul.md §3.1): same board, same
+        repository, a captured head. The comparison itself (git ancestry) is
+        the coordinator's job, off this lock — this is a pure DB read."""
+        async with self._lock:
+            rows = await self._fetchall(
+                self.conn,
+                "SELECT d.* FROM task_deliveries d JOIN tasks t ON t.id = d.task_id "
+                "WHERE t.board_id = ? AND d.repository = ? AND d.id != ? "
+                "AND d.attempt_head IS NOT NULL",
+                (board_id, repository, exclude_delivery_id),
+            )
+        return [self._delivery_record(r) for r in rows]
+
+    async def set_superseded_by(
+        self,
+        delivery_id: str,
+        target_delivery_id: str | None,
+        *,
+        actor_kind: str = "system",
+        actor_agent_id: str | None = None,
+    ) -> DeliveryRecord:
+        """CAS the derived collapse pointer (task-board-overhaul.md §3.1). Not
+        part of the delivery status machine — no status precondition beyond the
+        row existing. A no-op write (pointer already at the requested value)
+        skips the event so idempotent recomputes stay quiet."""
+        stamp = _now_iso()
+        async with self._transaction() as conn:
+            row = await self._delivery_row(conn, delivery_id)
+            if (row["superseded_by_delivery_id"] or None) == target_delivery_id:
+                return self._delivery_record(row)
+            await conn.execute(
+                "UPDATE task_deliveries SET superseded_by_delivery_id = ?, "
+                "updated_at = ? WHERE id = ?",
+                (target_delivery_id, stamp, delivery_id),
+            )
+            row = await self._delivery_row(conn, delivery_id)
+            await self._delivery_event(
+                conn,
+                delivery_row=row,
+                kind="delivery_superseded"
+                if target_delivery_id
+                else "delivery_supersede_cleared",
+                actor_kind=actor_kind,
+                actor_agent_id=actor_agent_id,
+                now=stamp,
+            )
+        return self._delivery_record(row)
 
     async def record_delivery_retention(
         self,

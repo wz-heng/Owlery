@@ -658,6 +658,11 @@ CREATE TABLE IF NOT EXISTS task_deliveries (
     reason_detail TEXT,
     deployed_sha TEXT,                     -- sha a successful deploy_switch made live (local-deploy.md §8)
     deployed_slot TEXT,                    -- slot ('a'/'b') that sha runs in
+    -- Derived collapse pointer (task-board-overhaul.md §3.1): set when this
+    -- delivery's head is a strict git ancestor of another delivery's head on
+    -- the same board/repository. Recomputed from git facts, never itself part
+    -- of the `status` machine above.
+    superseded_by_delivery_id TEXT REFERENCES task_deliveries(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (run_id)
@@ -942,6 +947,30 @@ class Database:
                 if "duplicate column" not in str(exc).lower():
                     logger.error("delivery migration failed: %s (%s)", ddl, exc)
                     raise
+
+        # Task Board rectification (docs/plans/task-board-overhaul.md §3.1): the
+        # derived supersede-collapse pointer. New DBs get it from _SCHEMA; this
+        # catch-up covers deliveries created before the feature landed. The
+        # index is created here (not in _SCHEMA) since an old DB's CREATE TABLE
+        # IF NOT EXISTS is a no-op — the column only exists after this ALTER.
+        superseded_ddl = (
+            "ALTER TABLE task_deliveries ADD COLUMN "
+            "superseded_by_delivery_id TEXT "
+            "REFERENCES task_deliveries(id) ON DELETE SET NULL"
+        )
+        try:
+            await self._conn.execute(superseded_ddl)
+        except aiosqlite.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                logger.error("delivery migration failed: %s (%s)", superseded_ddl, exc)
+                raise
+        try:
+            await self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS task_deliveries_superseded_by "
+                "ON task_deliveries(superseded_by_delivery_id)"
+            )
+        except Exception:
+            logger.exception("task_deliveries_superseded_by index migration failed")
 
         await self._migrate_delivery_op_kinds()
 

@@ -71,7 +71,11 @@ export interface Task {
   board_id: string;
   parent_task_id: string | null;
   title: string;
-  body: string;
+  // A list-page item (`taskApi.listTasks`) never carries the full body — only
+  // `body_excerpt` (first ~200 chars). `TaskDetail` (single-task fetch) sets
+  // `body` to the full text and leaves `body_excerpt` unset.
+  body?: string;
+  body_excerpt?: string;
   status: TaskStatus;
   assignee_agent_id: string | null;
   priority: number;
@@ -323,6 +327,16 @@ export interface TaskListFilters {
   priority?: number;
 }
 
+/** The paginated envelope `GET /api/task-boards/{id}/tasks` returns
+ * (task-board-overhaul.md §3.5): items are summaries (`body_excerpt`, not
+ * `body`); `total` is the full matching count regardless of `limit`. */
+export interface TaskListPage {
+  items: Task[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
 export interface CreateBoardInput {
   name: string;
   description?: string;
@@ -500,7 +514,7 @@ export const taskApi = {
   boardEvents: (token: string, boardId: string, afterSeq = 0) =>
     get<TaskEvent[]>(token, `/api/task-boards/${boardId}/events${query({ after_seq: afterSeq })}`),
   listTasks: (token: string, boardId: string, filters: TaskListFilters = {}) =>
-    get<Task[]>(token, `/api/task-boards/${boardId}/tasks${query(filters)}`),
+    get<TaskListPage>(token, `/api/task-boards/${boardId}/tasks${query(filters)}`),
   createTask: (token: string, boardId: string, input: CreateTaskInput) =>
     mutate<Task>(token, `/api/task-boards/${boardId}/tasks`, "POST", input),
   tree: (token: string, boardId: string) =>

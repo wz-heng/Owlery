@@ -173,6 +173,11 @@ class DeliveryCoordinator:
         self.db: Any = None
         self.connectors: ConnectorManager | None = None
         self._notify_terminal: NotifyTerminal | None = None
+        # Fired with a task id whenever supersede recompute (§3.1) changes a
+        # DIFFERENT task's delivery row, so the caller can push a WS refresh
+        # for that card too — the acting task already gets one from the
+        # manager's own post-op `publish_task_update`.
+        self._on_task_touched: Callable[[str], Awaitable[None]] | None = None
         # Test seams for the hosting-platform layer — no real network in tests.
         self.create_pr = _github_create_pr
         self.find_pr = _github_find_pr
@@ -198,10 +203,12 @@ class DeliveryCoordinator:
         connectors: ConnectorManager | None = None,
         notify_terminal: NotifyTerminal | None = None,
         repo: TaskRepository | None = None,
+        on_task_touched: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self.db = db
         self.connectors = connectors or ConnectorManager(db)
         self._notify_terminal = notify_terminal
+        self._on_task_touched = on_task_touched
         if repo is not None:
             self.repo = repo
 
@@ -350,8 +357,17 @@ class DeliveryCoordinator:
         result = await self._capture_baseline(
             task, run, board, delivery.id, actor_kind, actor_agent_id
         )
-        await self._fire_terminal(task, result)
-        return result
+        return await self._published(task, result)
+
+    async def recompute_supersession(self, task_id: str, run_id: str) -> DeliveryRecord:
+        """Public reconcile entry (task-board-overhaul.md §3.1): re-derive this
+        delivery's supersede pointer from current git ancestor facts without
+        performing any other status transition. Every settle path in this
+        module already triggers the same computation via ``_published``; this
+        is for an explicit out-of-band recheck (and is what tests drive)."""
+        task, _run, _board = await self._load(task_id, run_id)
+        delivery = await self._delivery_for(run_id)
+        return await self._recompute_supersession(task, delivery)
 
     async def _verify_base(self, delivery: DeliveryRecord, base_ref: str) -> str:
         """Verify an operator-named base for a legacy run; return the base_head."""
@@ -1302,7 +1318,98 @@ class DeliveryCoordinator:
         return final
 
     async def _published(self, task: TaskRecord, delivery: DeliveryRecord) -> DeliveryRecord:
+        delivery = await self._recompute_supersession(task, delivery)
         await self._fire_terminal(task, delivery)
+        return delivery
+
+    # --- supersede derivation (docs/plans/task-board-overhaul.md §3.1) --
+
+    async def _apply_superseded_by(
+        self, touched_task_id: str, delivery_id: str, target_id: str | None
+    ) -> DeliveryRecord:
+        updated = await self.repo.set_superseded_by(delivery_id, target_id)
+        if self._on_task_touched is not None:
+            await self._on_task_touched(touched_task_id)
+        return updated
+
+    async def _recompute_supersession(
+        self, task: TaskRecord, delivery: DeliveryRecord
+    ) -> DeliveryRecord:
+        """Idempotently derive ``superseded_by_delivery_id`` from git ancestor
+        facts (§3.1): delivery A is superseded by delivery B iff both belong to
+        the same board and repository and A's head is a STRICT ancestor of B's
+        head (``git merge-base --is-ancestor``). Comparisons use the shared
+        ``repository`` path (never the run's worktree), so the judgment still
+        works after the worktree is torn down as long as the commit stays
+        reachable in that repo — through the attempt branch itself, or through
+        whatever branch it was folded into.
+
+        Runs after every delivery settle point (``_published``), covering both
+        halves of the rule: a delivery reaching ``ready`` collapses whichever
+        still-open ancestors it now contains, and any settle re-verifies this
+        delivery's own recorded pointer, snapping it back to null if the git
+        fact it recorded no longer holds (history rewrite, or the branch that
+        carried it deleted with no surviving ref). The field only ever moves
+        null -> some id or back to null — never directly between two ids — so
+        a collapsed card's target link is stable until it is genuinely gone.
+
+        Dirty deliveries are exempt from ever being marked superseded (their
+        uncommitted changes are not contained in anyone's history) but a dirty
+        delivery may still be a valid supersede TARGET for others, since its
+        own committed history is unaffected by its current dirty state.
+        """
+        if not delivery.attempt_head:
+            return delivery
+        siblings = await self.repo.list_delivery_siblings(
+            task.board_id, delivery.repository, exclude_delivery_id=delivery.id
+        )
+        repo_path = delivery.repository
+
+        if delivery.dirty:
+            if delivery.superseded_by_delivery_id is not None:
+                delivery = await self._apply_superseded_by(
+                    task.id, delivery.id, None
+                )
+        else:
+            if delivery.superseded_by_delivery_id is not None:
+                target = next(
+                    (s for s in siblings if s.id == delivery.superseded_by_delivery_id),
+                    None,
+                )
+                still_valid = (
+                    target is not None
+                    and target.attempt_head != delivery.attempt_head
+                    and await ws.is_ancestor(
+                        repo_path, delivery.attempt_head, target.attempt_head
+                    )
+                )
+                if not still_valid:
+                    delivery = await self._apply_superseded_by(
+                        task.id, delivery.id, None
+                    )
+            if delivery.superseded_by_delivery_id is None:
+                for sib in sorted(siblings, key=lambda s: (s.created_at, s.id)):
+                    if sib.attempt_head == delivery.attempt_head:
+                        continue
+                    if await ws.is_ancestor(
+                        repo_path, delivery.attempt_head, sib.attempt_head
+                    ):
+                        delivery = await self._apply_superseded_by(
+                            task.id, delivery.id, sib.id
+                        )
+                        break
+
+        # Propagate forward: this delivery may itself contain still-open
+        # siblings, regardless of its own dirty state (a dirty tip's committed
+        # history is a real ancestor fact for anyone it contains).
+        for sib in siblings:
+            if sib.dirty or sib.superseded_by_delivery_id is not None:
+                continue
+            if sib.attempt_head == delivery.attempt_head:
+                continue
+            if await ws.is_ancestor(repo_path, sib.attempt_head, delivery.attempt_head):
+                await self._apply_superseded_by(sib.task_id, sib.id, delivery.id)
+
         return delivery
 
 

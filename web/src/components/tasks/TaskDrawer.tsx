@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   IconArchive,
   IconCalendar,
@@ -41,13 +41,27 @@ interface TaskDrawerProps {
 
 export function TaskDrawer(props: TaskDrawerProps) {
   const { task, detail, agents, allTasks } = props;
+  // A board-list card only carries `body_excerpt` (task-board-overhaul.md
+  // §3.5); the full text lands separately via `detail` once it loads. Fall
+  // back through detail -> full body -> excerpt so the field is never
+  // outright empty, then upgrade to the full text below without clobbering
+  // an in-progress edit.
+  const fallbackBody = task.body ?? task.body_excerpt ?? "";
   const [title, setTitle] = useState(task.title);
-  const [body, setBody] = useState(task.body);
+  const [body, setBody] = useState(detail?.body ?? fallbackBody);
   const [priority, setPriority] = useState(task.priority);
   const [assignee, setAssignee] = useState(task.assignee_agent_id ?? "");
   const [scheduledAt, setScheduledAt] = useState(task.scheduled_at ? task.scheduled_at.slice(0, 16) : "");
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode | "">(task.workspace_mode ?? "");
   const [dependency, setDependency] = useState("");
+
+  useEffect(() => {
+    if (detail?.body !== undefined) {
+      const fullBody = detail.body;
+      setBody((current) => (current === fallbackBody ? fullBody : current));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detail?.body]);
 
   const dependencies = useMemo(
     () => detail?.dependencies ?? task.dependencies ?? [],
@@ -59,7 +73,8 @@ export function TaskDrawer(props: TaskDrawerProps) {
     () => allTasks.filter((item) => item.id !== task.id && item.board_id === task.board_id && !dependencies.some((dep) => dep.id === item.id)),
     [allTasks, dependencies, task.board_id, task.id]
   );
-  const dirty = title !== task.title || body !== task.body || priority !== task.priority || assignee !== (task.assignee_agent_id ?? "") || scheduledAt !== (task.scheduled_at ? task.scheduled_at.slice(0, 16) : "") || workspaceMode !== (task.workspace_mode ?? "");
+  const bodyBaseline = detail?.body ?? fallbackBody;
+  const dirty = title !== task.title || body !== bodyBaseline || priority !== task.priority || assignee !== (task.assignee_agent_id ?? "") || scheduledAt !== (task.scheduled_at ? task.scheduled_at.slice(0, 16) : "") || workspaceMode !== (task.workspace_mode ?? "");
 
   return (
     <div className="fixed inset-0 z-40 bg-ink-950/25 backdrop-blur-[1px]" onMouseDown={(event) => { if (event.target === event.currentTarget) props.onClose(); }}>

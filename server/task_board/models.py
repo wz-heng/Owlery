@@ -304,6 +304,11 @@ class DeliveryRecord(Record):
     # way `pushed_ref`/`pr_number` fold a git op's external effect.
     deployed_sha: str | None
     deployed_slot: str | None
+    # Derived collapse pointer (docs/plans/task-board-overhaul.md §3.1): set
+    # when this delivery's head is a strict git ancestor of another delivery's
+    # head on the same board/repository. Never part of the status machine —
+    # recomputed from git facts, never written by a delivery op.
+    superseded_by_delivery_id: str | None
     created_at: str
     updated_at: str
 

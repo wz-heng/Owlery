@@ -349,7 +349,11 @@ async def test_list_tree_and_detail_expose_identical_enrichment(real_client):
 
     listed = await c.get(f"/api/tasks?board_id={board.id}", headers=HEADERS)
     assert listed.status_code == 200
-    card = next(t for t in listed.json() if t["id"] == task.id)
+    listed_body = listed.json()
+    assert listed_body["total"] >= 1
+    card = next(t for t in listed_body["items"] if t["id"] == task.id)
+    assert "body" not in card
+    assert "body_excerpt" in card
 
     tree = await c.get(f"/api/task-boards/{board.id}/tree", headers=HEADERS)
     assert tree.status_code == 200
@@ -409,6 +413,49 @@ async def test_stale_patch_conflict_current_is_enriched(real_client):
     assert _ENRICHMENT_KEYS <= set(current)
     assert current["delivery"]["status"] == "ready"
     assert current["latest_run_state"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_page_omits_body_and_paginates(real_client):
+    """GET /api/tasks must never carry a task's full body — a page-sized
+    excerpt plus a total count instead (task-board-overhaul.md §3.5); full
+    text is always a `show`/single-task fetch."""
+    c, repo, root, agent_id = real_client
+    board = await repo.create_board(
+        name="Big", working_dir=str(root), default_workspace_mode="shared"
+    )
+    huge_body = "y" * 200_000
+    for n in range(3):
+        await repo.create_task(
+            board_id=board.id, title=f"T{n}", status="todo",
+            assignee_agent_id=agent_id, body=huge_body,
+        )
+
+    listed = await c.get(f"/api/tasks?board_id={board.id}", headers=HEADERS)
+    assert listed.status_code == 200
+    payload = listed.json()
+    assert payload["total"] == 3
+    assert payload["limit"] == 200
+    assert payload["offset"] == 0
+    assert len(payload["items"]) == 3
+    for item in payload["items"]:
+        assert "body" not in item
+        assert item["body_excerpt"] == huge_body[:200]
+    # The whole page stays well under the ~19-char-per-task*10^5 blowup a full
+    # body would cause — a hard ceiling that would catch a body regression.
+    assert len(listed.content) < 20_000
+
+    page1 = await c.get(
+        f"/api/tasks?board_id={board.id}&limit=2&offset=0", headers=HEADERS
+    )
+    page2 = await c.get(
+        f"/api/tasks?board_id={board.id}&limit=2&offset=2", headers=HEADERS
+    )
+    assert page1.json()["total"] == page2.json()["total"] == 3
+    ids_1 = {item["id"] for item in page1.json()["items"]}
+    ids_2 = {item["id"] for item in page2.json()["items"]}
+    assert len(ids_1) == 2 and len(ids_2) == 1
+    assert ids_1.isdisjoint(ids_2)
 
 
 @pytest.mark.asyncio

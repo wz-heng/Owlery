@@ -421,3 +421,327 @@ async def test_merge_conflict_reports_conflicted(store):
     await coord.accept(task.id, run.id)
     d = await coord.deliver_op(task.id, run.id, kind="merge", merge_strategy="fast_forward_only")
     assert d.status == "conflicted" and d.reason_kind == "conflict"
+
+
+# --------------------------------------------------------------------------- #
+# Supersede derivation (docs/plans/task-board-overhaul.md §3.1). These build
+# delivery rows directly (bypassing the worktree-driven accept flow, which
+# isn't what's under test) against a real shared git repo, so the coordinator's
+# `git merge-base --is-ancestor` judgment runs against real history.
+# --------------------------------------------------------------------------- #
+
+
+def _rev(cwd, ref="HEAD") -> str:
+    return subprocess.run(
+        ["git", "rev-parse", ref], cwd=str(cwd), check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+async def _task_and_completed_run(repo, board, agent, workspace_path):
+    task = await repo.create_task(
+        board_id=board.id, title=f"Task {uuid.uuid4().hex[:6]}", status="todo",
+        assignee_agent_id=agent,
+    )
+    run = await repo.claim_ready(
+        task.id, workspace_mode="git_worktree", workspace_path=str(workspace_path)
+    )
+    await repo.complete_run(task.id, run.id, summary="did the work")
+    return task, await repo.get_run(run.id)
+
+
+async def _accept_with_head(
+    repo,
+    task,
+    run,
+    *,
+    repository,
+    attempt_branch,
+    base_ref,
+    base_head,
+    attempt_head,
+    dirty=False,
+    commits_ahead=1,
+):
+    delivery = await repo.create_delivery(
+        run.id,
+        repository=repository,
+        attempt_branch=attempt_branch,
+        base_ref=base_ref,
+        base_head=base_head,
+    )
+    await repo.start_accept(delivery.id)
+    return await repo.record_baseline(
+        delivery.id,
+        status="ready",
+        attempt_head=attempt_head,
+        dirty=dirty,
+        commits_ahead=commits_ahead,
+    )
+
+
+@pytest.mark.asyncio
+async def test_supersession_direct_chain(store):
+    db, repo, tmp, agent = store
+    src = tmp / "src"
+    _init_repo(src)
+    base_head = _rev(src, "main")
+    board = await repo.create_board(
+        name="Chain", working_dir=str(src), default_workspace_mode="git_worktree"
+    )
+    coord = _coord(db, repo, FakeConnectors({}))
+
+    _git(src, "checkout", "-b", "attemptA")
+    (src / "a.txt").write_text("a\n")
+    _git(src, "add", ".")
+    _git(src, "commit", "-qm", "A")
+    head_a = _rev(src)
+
+    _git(src, "checkout", "-b", "attemptB")
+    (src / "b.txt").write_text("b\n")
+    _git(src, "add", ".")
+    _git(src, "commit", "-qm", "B")
+    head_b = _rev(src)
+    _git(src, "checkout", "main")
+
+    task_a, run_a = await _task_and_completed_run(repo, board, agent, tmp / "wt-a")
+    await _accept_with_head(
+        repo, task_a, run_a, repository=str(src), attempt_branch="attemptA",
+        base_ref="main", base_head=base_head, attempt_head=head_a,
+    )
+    await coord.recompute_supersession(task_a.id, run_a.id)
+
+    task_b, run_b = await _task_and_completed_run(repo, board, agent, tmp / "wt-b")
+    await _accept_with_head(
+        repo, task_b, run_b, repository=str(src), attempt_branch="attemptB",
+        base_ref="main", base_head=base_head, attempt_head=head_b,
+    )
+    d_b = await coord.recompute_supersession(task_b.id, run_b.id)
+
+    d_a = await repo.get_delivery_by_run(run_a.id)
+    assert d_a.superseded_by_delivery_id == d_b.id
+    assert d_b.superseded_by_delivery_id is None
+
+
+@pytest.mark.asyncio
+async def test_supersession_diamond_neither_branch_supersedes_the_other(store):
+    db, repo, tmp, agent = store
+    src = tmp / "src"
+    _init_repo(src)
+    base_head = _rev(src, "main")
+    board = await repo.create_board(
+        name="Diamond", working_dir=str(src), default_workspace_mode="git_worktree"
+    )
+    coord = _coord(db, repo, FakeConnectors({}))
+
+    _git(src, "checkout", "-b", "attemptA")
+    (src / "a.txt").write_text("a\n")
+    _git(src, "add", ".")
+    _git(src, "commit", "-qm", "A")
+    head_a = _rev(src)
+
+    _git(src, "checkout", "-b", "attemptB", "attemptA")
+    (src / "b.txt").write_text("b\n")
+    _git(src, "add", ".")
+    _git(src, "commit", "-qm", "B")
+    head_b = _rev(src)
+
+    _git(src, "checkout", "-b", "attemptC", "attemptA")
+    (src / "c.txt").write_text("c\n")
+    _git(src, "add", ".")
+    _git(src, "commit", "-qm", "C")
+    head_c = _rev(src)
+    _git(src, "checkout", "main")
+
+    task_a, run_a = await _task_and_completed_run(repo, board, agent, tmp / "wt-a")
+    await _accept_with_head(
+        repo, task_a, run_a, repository=str(src), attempt_branch="attemptA",
+        base_ref="main", base_head=base_head, attempt_head=head_a,
+    )
+    await coord.recompute_supersession(task_a.id, run_a.id)
+
+    task_b, run_b = await _task_and_completed_run(repo, board, agent, tmp / "wt-b")
+    d_b = await _accept_with_head(
+        repo, task_b, run_b, repository=str(src), attempt_branch="attemptB",
+        base_ref="main", base_head=base_head, attempt_head=head_b,
+    )
+    await coord.recompute_supersession(task_b.id, run_b.id)
+
+    task_c, run_c = await _task_and_completed_run(repo, board, agent, tmp / "wt-c")
+    d_c = await _accept_with_head(
+        repo, task_c, run_c, repository=str(src), attempt_branch="attemptC",
+        base_ref="main", base_head=base_head, attempt_head=head_c,
+    )
+    await coord.recompute_supersession(task_c.id, run_c.id)
+
+    d_a = await repo.get_delivery_by_run(run_a.id)
+    d_b = await repo.get_delivery_by_run(run_b.id)
+    d_c = await repo.get_delivery_by_run(run_c.id)
+    # A is contained in both B and C; the first to settle wins its pointer.
+    assert d_a.superseded_by_delivery_id == d_b.id
+    # B and C are independent branches — neither collapses the other.
+    assert d_b.superseded_by_delivery_id is None
+    assert d_c.superseded_by_delivery_id is None
+
+
+@pytest.mark.asyncio
+async def test_supersession_dirty_delivery_never_marked_superseded(store):
+    db, repo, tmp, agent = store
+    src = tmp / "src"
+    _init_repo(src)
+    base_head = _rev(src, "main")
+    board = await repo.create_board(
+        name="Dirty", working_dir=str(src), default_workspace_mode="git_worktree"
+    )
+    coord = _coord(db, repo, FakeConnectors({}))
+
+    _git(src, "checkout", "-b", "attemptA")
+    (src / "a.txt").write_text("a\n")
+    _git(src, "add", ".")
+    _git(src, "commit", "-qm", "A")
+    head_a = _rev(src)
+
+    _git(src, "checkout", "-b", "attemptB")
+    (src / "b.txt").write_text("b\n")
+    _git(src, "add", ".")
+    _git(src, "commit", "-qm", "B")
+    head_b = _rev(src)
+    _git(src, "checkout", "main")
+
+    task_a, run_a = await _task_and_completed_run(repo, board, agent, tmp / "wt-a")
+    await _accept_with_head(
+        repo, task_a, run_a, repository=str(src), attempt_branch="attemptA",
+        base_ref="main", base_head=base_head, attempt_head=head_a, dirty=True,
+    )
+    await coord.recompute_supersession(task_a.id, run_a.id)
+
+    task_b, run_b = await _task_and_completed_run(repo, board, agent, tmp / "wt-b")
+    await _accept_with_head(
+        repo, task_b, run_b, repository=str(src), attempt_branch="attemptB",
+        base_ref="main", base_head=base_head, attempt_head=head_b,
+    )
+    await coord.recompute_supersession(task_b.id, run_b.id)
+
+    # A's committed head really is an ancestor of B, but A is dirty — its
+    # uncommitted work is not contained in B's history, so it must never
+    # collapse behind an Accept-only card.
+    d_a = await repo.get_delivery_by_run(run_a.id)
+    assert d_a.superseded_by_delivery_id is None
+
+
+@pytest.mark.asyncio
+async def test_supersession_survives_worktree_and_branch_teardown(store):
+    """The judgment compares against the shared repository, not the run's
+    worktree, so it keeps working after the worktree is removed — and even
+    after the superseded delivery's OWN branch ref is deleted, since its
+    commit stays reachable through the branch that contains it."""
+    db, repo, tmp, agent = store
+    src = tmp / "src"
+    _init_repo(src)
+    base_head = _rev(src, "main")
+    board = await repo.create_board(
+        name="Teardown", working_dir=str(src), default_workspace_mode="git_worktree"
+    )
+    coord = _coord(db, repo, FakeConnectors({}))
+
+    _git(src, "checkout", "-b", "attemptA")
+    (src / "a.txt").write_text("a\n")
+    _git(src, "add", ".")
+    _git(src, "commit", "-qm", "A")
+    head_a = _rev(src)
+
+    _git(src, "checkout", "-b", "attemptB")
+    (src / "b.txt").write_text("b\n")
+    _git(src, "add", ".")
+    _git(src, "commit", "-qm", "B")
+    head_b = _rev(src)
+    _git(src, "checkout", "main")
+
+    wt_a = tmp / "wt-a"
+    task_a, run_a = await _task_and_completed_run(repo, board, agent, wt_a)
+    await _accept_with_head(
+        repo, task_a, run_a, repository=str(src), attempt_branch="attemptA",
+        base_ref="main", base_head=base_head, attempt_head=head_a,
+    )
+    await coord.recompute_supersession(task_a.id, run_a.id)
+
+    task_b, run_b = await _task_and_completed_run(repo, board, agent, tmp / "wt-b")
+    await _accept_with_head(
+        repo, task_b, run_b, repository=str(src), attempt_branch="attemptB",
+        base_ref="main", base_head=base_head, attempt_head=head_b,
+    )
+    d_b = await coord.recompute_supersession(task_b.id, run_b.id)
+    d_a = await repo.get_delivery_by_run(run_a.id)
+    assert d_a.superseded_by_delivery_id == d_b.id
+
+    # Simulate a completed teardown of the superseded delivery: its worktree
+    # directory never exists (this test never created one — matching a real
+    # `worktree_remove` outcome) and its own branch ref has been deleted
+    # (retention policy remove_all after a successful collapse).
+    assert not wt_a.exists()
+    _git(src, "branch", "-D", "attemptA")
+
+    reconciled = await coord.recompute_supersession(task_a.id, run_a.id)
+    assert reconciled.superseded_by_delivery_id == d_b.id
+
+
+@pytest.mark.asyncio
+async def test_supersession_reverts_to_null_when_ancestry_breaks(store):
+    """If the superseding branch's history is rewritten so it no longer
+    contains the collapsed delivery's commit, the next reconcile must snap
+    the stale pointer back to null rather than leave a dangling collapse."""
+    db, repo, tmp, agent = store
+    src = tmp / "src"
+    _init_repo(src)
+    base_head = _rev(src, "main")
+    board = await repo.create_board(
+        name="Rewrite", working_dir=str(src), default_workspace_mode="git_worktree"
+    )
+    coord = _coord(db, repo, FakeConnectors({}))
+
+    _git(src, "checkout", "-b", "attemptA")
+    (src / "a.txt").write_text("a\n")
+    _git(src, "add", ".")
+    _git(src, "commit", "-qm", "A")
+    head_a = _rev(src)
+
+    _git(src, "checkout", "-b", "attemptB")
+    (src / "b.txt").write_text("b\n")
+    _git(src, "add", ".")
+    _git(src, "commit", "-qm", "B")
+    head_b = _rev(src)
+    _git(src, "checkout", "main")
+
+    task_a, run_a = await _task_and_completed_run(repo, board, agent, tmp / "wt-a")
+    await _accept_with_head(
+        repo, task_a, run_a, repository=str(src), attempt_branch="attemptA",
+        base_ref="main", base_head=base_head, attempt_head=head_a,
+    )
+    await coord.recompute_supersession(task_a.id, run_a.id)
+
+    task_b, run_b = await _task_and_completed_run(repo, board, agent, tmp / "wt-b")
+    delivery_b = await _accept_with_head(
+        repo, task_b, run_b, repository=str(src), attempt_branch="attemptB",
+        base_ref="main", base_head=base_head, attempt_head=head_b,
+    )
+    await coord.recompute_supersession(task_b.id, run_b.id)
+    d_a = await repo.get_delivery_by_run(run_a.id)
+    assert d_a.superseded_by_delivery_id is not None
+
+    # Rewrite attemptB's history so it no longer descends from attemptA's tip.
+    _git(src, "checkout", "attemptB")
+    _git(src, "reset", "--hard", "main")
+    (src / "rewritten.txt").write_text("rewritten\n")
+    _git(src, "add", ".")
+    _git(src, "commit", "-qm", "rewritten")
+    new_head_b = _rev(src)
+    _git(src, "checkout", "main")
+    assert new_head_b != head_b
+
+    await repo.start_accept(delivery_b.id)
+    await repo.record_baseline(
+        delivery_b.id, status="ready", attempt_head=new_head_b,
+        dirty=False, commits_ahead=1,
+    )
+    await coord.recompute_supersession(task_b.id, run_b.id)
+    reconciled_a = await coord.recompute_supersession(task_a.id, run_a.id)
+    assert reconciled_a.superseded_by_delivery_id is None

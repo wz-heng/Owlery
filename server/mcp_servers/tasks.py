@@ -132,8 +132,17 @@ def list_tasks(
     assignee: str | None = None,
     parent_id: str | None = None,
     limit: int = 50,
+    offset: int = 0,
 ) -> str:
-    """List durable tasks. Filters are optional; limit is capped server-side."""
+    """List durable tasks. Filters are optional; limit is capped server-side.
+
+    Returns a page: ``{items, total, limit, offset}``. Each item is a summary
+    — id/title/status/assignee/parent/board/timestamps/archived plus
+    ``body_excerpt`` (first ~200 chars) — never the full ``body``, so a page
+    stays small even when a task's body holds a long spec. Read `total` to
+    know how many pages remain and pass a larger ``offset`` to page through;
+    fetch a specific task's full body with `show`.
+    """
     error = _orchestrator_only("list")
     if error:
         return error
@@ -145,6 +154,7 @@ def list_tasks(
             "assignee": assignee,
             "parent_id": parent_id,
             "limit": limit,
+            "offset": offset,
         }.items()
         if value is not None
     }

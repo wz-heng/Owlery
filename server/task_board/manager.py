@@ -117,6 +117,7 @@ class TaskBoardManager:
             connectors=ConnectorManager(db),
             notify_terminal=self._notify_delivery_terminal,
             repo=self.repo,
+            on_task_touched=self.publish_task_update,
         )
         session_mgr.on_broadcast(self.BROADCAST_KEY, self._on_broadcast)
 

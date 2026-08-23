@@ -489,11 +489,12 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     const { token } = get();
     set({ loadingTasks: true, error: null });
     try {
-      const [tasks, dispatcher] = await Promise.all([
+      const [page, dispatcher] = await Promise.all([
         taskApi.listTasks(token, boardId, { include_archived: true }),
         taskApi.dispatcher(token, boardId),
       ]);
       if (get().selectedBoardId !== boardId) return;
+      const tasks = page.items;
       set({
         tasksById: Object.fromEntries(tasks.map((task) => [task.id, task])),
         taskOrder: tasks.map((task) => task.id),
@@ -511,8 +512,8 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     set({ loadingTasks: true, error: null });
     try {
       const filters: TaskListFilters = { include_archived: true };
-      const tasks = await taskApi.listTasks(token, boardId, filters);
-      if (get().selectedBoardId === boardId) get().setTaskSnapshot(tasks);
+      const page = await taskApi.listTasks(token, boardId, filters);
+      if (get().selectedBoardId === boardId) get().setTaskSnapshot(page.items);
     } catch (error) {
       set({ error: message(error) });
     } finally {

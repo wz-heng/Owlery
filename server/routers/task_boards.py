@@ -498,19 +498,22 @@ async def list_all_tasks(
     parent_id: str | None = None,
     include_archived: bool = False,
     limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
     _: str = Depends(verify_token),
 ):
     assignee_id = await _resolve_agent(assignee, None) if assignee else None
-    return await _run(
-        task_repository.list_tasks_enriched(
+    items, total = await _run(
+        task_repository.list_tasks_summary_page(
             board_id=board_id,
             status=status_filter,
             assignee_agent_id=assignee_id,
             parent_task_id=parent_id,
             include_archived=include_archived,
             limit=limit,
+            offset=offset,
         )
     )
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
 
 
 @router.get("/api/task-boards/{board_id}/tasks")
@@ -521,10 +524,12 @@ async def list_board_tasks(
     parent_id: str | None = None,
     include_archived: bool = False,
     limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
     _: str = Depends(verify_token),
 ):
     return await list_all_tasks(
-        board_id, status_filter, assignee, parent_id, include_archived, limit, _
+        board_id, status_filter, assignee, parent_id, include_archived,
+        limit, offset, _,
     )
 
 
