@@ -192,6 +192,23 @@ const DELIVERY_GOAL_ACCEPTING_STATUSES: DeliveryStatus[] = [
   "conflicted",
 ];
 
+/** Statuses the backend's `teardown()` gate accepts —
+ * `server/task_board/delivery.py` `_TEARDOWN_START_STATES`. Unlike the goal
+ * ops above, teardown is also allowed from `ready` (discard an accepted-but-
+ * untouched delivery) and from `failed` (the only way out of it) — it's
+ * disallowed only while an op is actively in flight (`pending`, `preparing`,
+ * `delivering`). Snape review — this previously excluded `ready`, which the
+ * backend has always accepted, so the button was disabled with a misleading
+ * "must reach a terminal state" tooltip for a delivery that hadn't failed at
+ * all. */
+const DELIVERY_TEARDOWN_ACCEPTING_STATUSES: DeliveryStatus[] = [
+  "ready",
+  "delivered",
+  "blocked",
+  "conflicted",
+  "failed",
+];
+
 /** Single source of truth for whether each delivery action button is
  * clickable and, if not, why — shared by the enable/disable logic and the
  * tooltip text so the two can never drift apart. `delivery` is `null` before
@@ -235,14 +252,10 @@ export function deliveryButtonState(
       if (status === "delivered")
         return { enabled: false, reason: "Already delivered — merge on the platform" };
       return { enabled: true, reason: null };
-    case "teardown": {
-      const terminal = (
-        ["delivered", "failed", "blocked", "conflicted"] as DeliveryStatus[]
-      ).includes(status);
-      return terminal
+    case "teardown":
+      return DELIVERY_TEARDOWN_ACCEPTING_STATUSES.includes(status)
         ? { enabled: true, reason: null }
-        : { enabled: false, reason: "Delivery must reach a terminal state before teardown" };
-    }
+        : { enabled: false, reason: "An operation is still in progress — wait for it to finish before tearing down" };
   }
 }
 

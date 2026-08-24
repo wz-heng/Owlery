@@ -337,10 +337,18 @@ describe("deliveryButtonState", () => {
     }
   });
 
-  it("teardown requires a terminal status", () => {
-    expect(deliveryButtonState("teardown", d({ status: "ready" })).reason).toMatch(/terminal state/i);
-    for (const status of ["delivered", "failed", "blocked", "conflicted"] as DeliveryStatus[]) {
+  it("teardown is available from ready/delivered/blocked/conflicted/failed, only blocked while an op is in flight", () => {
+    // Backend `_TEARDOWN_START_STATES` (server/task_board/delivery.py)
+    // includes `ready` — discarding an accepted-but-untouched delivery is a
+    // valid teardown, not just cleanup after a terminal outcome (Snape
+    // review — this previously excluded `ready` with a misleading "must
+    // reach a terminal state" tooltip).
+    for (const status of ["ready", "delivered", "failed", "blocked", "conflicted"] as DeliveryStatus[]) {
       expect(deliveryButtonState("teardown", d({ status }))).toEqual({ enabled: true, reason: null });
+    }
+    for (const status of ["pending", "preparing", "delivering"] as DeliveryStatus[]) {
+      expect(deliveryButtonState("teardown", d({ status })).enabled).toBe(false);
+      expect(deliveryButtonState("teardown", d({ status })).reason).toMatch(/in progress/i);
     }
   });
 });

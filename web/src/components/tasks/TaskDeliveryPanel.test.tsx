@@ -140,7 +140,10 @@ describe("TaskDeliveryPanel", () => {
     expect(screen.getByRole("button", { name: "Push" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Open PR" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Merge" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Teardown" })).toBeDisabled();
+    // Teardown accepts `ready` too, not just a terminal outcome — discarding
+    // an accepted-but-untouched delivery is a legal teardown (backend
+    // `_TEARDOWN_START_STATES`, server/task_board/delivery.py).
+    expect(screen.getByRole("button", { name: "Teardown" })).toBeEnabled();
     expect(screen.getByText("push")).toBeInTheDocument();
     expect(screen.getByText("succeeded")).toBeInTheDocument();
     expect(screen.getByText(/ref: refs\/heads\/owlery\/task-1-run-1/)).toBeInTheDocument();
@@ -150,13 +153,15 @@ describe("TaskDeliveryPanel", () => {
     seed(delivery());
     render(<TaskDeliveryPanel run={run} />);
 
-    for (const label of ["Accept", "Commit", "Open PR", "Merge", "Teardown"]) {
+    for (const label of ["Accept", "Commit", "Open PR", "Merge"]) {
       const button = screen.getByRole("button", { name: label });
       expect(button).toBeDisabled();
       expect(button.getAttribute("title")).toBeTruthy();
     }
-    // Push is enabled in this fixture — no explanatory tooltip needed.
+    // Push and Teardown are both enabled in this `ready` fixture — no
+    // explanatory tooltip needed for either.
     expect(screen.getByRole("button", { name: "Push" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Teardown" })).toBeEnabled();
   });
 
   it("explains a pre-existing PR by name on the disabled Open PR button", () => {
