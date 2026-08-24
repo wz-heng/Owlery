@@ -81,17 +81,26 @@ export function TaskDrawer(props: TaskDrawerProps) {
   // run — mirrors the server's three rejections exactly, so the tooltip
   // never claims something the backend would actually accept.
   const isTerminal = task.status === "done" || task.status === "cancelled";
+  // `props.runs` defaults to `[]` before `loadTaskDetail` resolves, which is
+  // indistinguishable from "genuinely has no runs" — enabling Close during
+  // that window would let a previously-run container pass the client check
+  // and still 409 against the server's run-history rejection (Snape review).
+  // `detail` lands in the same store write as `runs` (taskStore.ts
+  // `loadTaskDetail`), so its presence is a race-free "runs are current" signal.
+  const runsLoaded = detail !== undefined;
   const hasRunHistory = props.runs.length > 0;
   const openChildren = children.filter((child) => child.status !== "done" && child.status !== "cancelled");
-  const closeDisabledReason = isTerminal
-    ? "Task is already terminal"
-    : task.current_run_id != null
-      ? "A running task cannot be closed"
-      : hasRunHistory
-        ? "Has run history — close through the worker completion protocol instead"
-        : openChildren.length > 0
-          ? `${openChildren.length} child task${openChildren.length === 1 ? "" : "s"} not yet terminal`
-          : null;
+  const closeDisabledReason = !runsLoaded
+    ? "Loading task history…"
+    : isTerminal
+      ? "Task is already terminal"
+      : task.current_run_id != null
+        ? "A running task cannot be closed"
+        : hasRunHistory
+          ? "Has run history — close through the worker completion protocol instead"
+          : openChildren.length > 0
+            ? `${openChildren.length} child task${openChildren.length === 1 ? "" : "s"} not yet terminal`
+            : null;
   const dependencyCandidates = useMemo(
     () => allTasks.filter((item) => item.id !== task.id && item.board_id === task.board_id && !dependencies.some((dep) => dep.id === item.id)),
     [allTasks, dependencies, task.board_id, task.id]
@@ -120,12 +129,12 @@ export function TaskDrawer(props: TaskDrawerProps) {
 
         <div className="min-h-0 flex-1 overflow-y-auto px-4 py-5 sm:px-6">
           <section className="grid gap-3 sm:grid-cols-2">
-            <label className="sm:col-span-2"><span className="task-label">Title</span><input className="task-input" value={title} disabled={task.status === "done"} onChange={(event) => setTitle(event.target.value)} /></label>
-            <label className="sm:col-span-2"><span className="task-label">Description{!bodyReady && " (loading full text…)"}</span><textarea className="task-input min-h-28 resize-y py-2" value={body} disabled={task.status === "done" || !bodyReady} onChange={(event) => setBody(event.target.value)} /></label>
-            <label><span className="task-label">Assignee</span><select className="task-input" value={assignee} disabled={task.status === "running" || task.status === "done"} onChange={(event) => setAssignee(event.target.value)}><option value="">Unassigned</option>{agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select></label>
-            <label><span className="task-label">Priority</span><select className="task-input" value={priority} disabled={task.status === "done"} onChange={(event) => setPriority(Number(event.target.value))}>{[3, 2, 1, 0].map((p) => <option key={p} value={p}>P{p}</option>)}</select></label>
-            <label><span className="task-label">Schedule</span><span className="relative block"><IconCalendar size={15} className="absolute left-2.5 top-2.5 text-muted-foreground" /><input type="datetime-local" className="task-input pl-8" value={scheduledAt} disabled={task.status === "done"} onChange={(event) => setScheduledAt(event.target.value)} /></span></label>
-            <label><span className="task-label">Workspace</span><select className="task-input" value={workspaceMode} disabled={task.status === "running" || task.status === "done"} onChange={(event) => setWorkspaceMode(event.target.value as WorkspaceMode | "")}><option value="">Board default</option><option value="shared">Shared</option><option value="copy">Copy</option><option value="git_worktree">Git worktree</option></select></label>
+            <label className="sm:col-span-2"><span className="task-label">Title</span><input className="task-input" value={title} disabled={isTerminal} onChange={(event) => setTitle(event.target.value)} /></label>
+            <label className="sm:col-span-2"><span className="task-label">Description{!bodyReady && " (loading full text…)"}</span><textarea className="task-input min-h-28 resize-y py-2" value={body} disabled={isTerminal || !bodyReady} onChange={(event) => setBody(event.target.value)} /></label>
+            <label><span className="task-label">Assignee</span><select className="task-input" value={assignee} disabled={task.status === "running" || isTerminal} onChange={(event) => setAssignee(event.target.value)}><option value="">Unassigned</option>{agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select></label>
+            <label><span className="task-label">Priority</span><select className="task-input" value={priority} disabled={isTerminal} onChange={(event) => setPriority(Number(event.target.value))}>{[3, 2, 1, 0].map((p) => <option key={p} value={p}>P{p}</option>)}</select></label>
+            <label><span className="task-label">Schedule</span><span className="relative block"><IconCalendar size={15} className="absolute left-2.5 top-2.5 text-muted-foreground" /><input type="datetime-local" className="task-input pl-8" value={scheduledAt} disabled={isTerminal} onChange={(event) => setScheduledAt(event.target.value)} /></span></label>
+            <label><span className="task-label">Workspace</span><select className="task-input" value={workspaceMode} disabled={task.status === "running" || isTerminal} onChange={(event) => setWorkspaceMode(event.target.value as WorkspaceMode | "")}><option value="">Board default</option><option value="shared">Shared</option><option value="copy">Copy</option><option value="git_worktree">Git worktree</option></select></label>
           </section>
 
           {task.status === "blocked" && <div className="mt-4 rounded-xl border border-destructive/30 bg-destructive-surface p-3"><p className="text-xs font-semibold uppercase tracking-wide text-destructive">Blocked · {task.blocked_kind}</p><p className="mt-1 whitespace-pre-wrap text-sm text-ink-800">{task.blocked_reason ?? "No reason recorded."}</p></div>}
@@ -158,7 +167,7 @@ export function TaskDrawer(props: TaskDrawerProps) {
               </button>
             )}
             <button type="button" className="ml-auto inline-flex h-8 items-center gap-1.5 rounded-lg px-3 text-xs text-muted-foreground hover:bg-ink-200" onClick={() => props.onArchive(!task.archived)}><IconArchive size={14} /> {task.archived ? "Unarchive" : "Archive"}</button>
-            {dirty && task.status !== "done" && <button type="button" className="h-8 rounded-lg bg-primary-700 px-3 text-xs font-semibold text-white disabled:opacity-50" disabled={props.busy || !title.trim() || !bodyReady} title={!bodyReady ? "Waiting for the full task text to load" : undefined} onClick={() => void props.onSave({ title: title.trim(), body, priority, assignee_agent_id: assignee || null, scheduled_at: scheduledAt ? new Date(scheduledAt).toISOString() : null, workspace_mode: workspaceMode || null })}>Save changes</button>}
+            {dirty && !isTerminal && <button type="button" className="h-8 rounded-lg bg-primary-700 px-3 text-xs font-semibold text-white disabled:opacity-50" disabled={props.busy || !title.trim() || !bodyReady} title={!bodyReady ? "Waiting for the full task text to load" : undefined} onClick={() => void props.onSave({ title: title.trim(), body, priority, assignee_agent_id: assignee || null, scheduled_at: scheduledAt ? new Date(scheduledAt).toISOString() : null, workspace_mode: workspaceMode || null })}>Save changes</button>}
             {closing && (
               <form
                 className="flex w-full flex-col gap-2 rounded-lg border border-ink-300 bg-card p-2.5"

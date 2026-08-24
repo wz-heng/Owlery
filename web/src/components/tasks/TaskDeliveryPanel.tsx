@@ -343,6 +343,7 @@ export function TaskDeliveryPanel({ run, onOpenTask }: TaskDeliveryPanelProps) {
             label="Teardown all collapsed"
             icon={<IconTrashX size={14} />}
             disabled={busy || teardownAllBusy}
+            title={busy ? BUSY_REASON : teardownAllBusy ? "Batch teardown already running" : undefined}
             destructive
             onClick={async () => {
               setTeardownAllBusy(true);

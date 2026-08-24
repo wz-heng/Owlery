@@ -310,6 +310,25 @@ describe("TaskDeliveryPanel supersede collapse", () => {
     );
   });
 
+  it("gives the batch-teardown entry a tooltip when disabled while another action is in flight", () => {
+    vi.spyOn(taskApi, "deliveryChain").mockResolvedValue(chain());
+    seedChain(
+      delivery({ status: "delivered" }),
+      chain({
+        superseded: [
+          { delivery_id: "delivery-9", task_id: "task-9", task_title: "Deliver A", run_id: "run-9" },
+        ],
+      })
+    );
+    useTaskStore.setState({ token: "token", mutating: true });
+
+    render(<TaskDeliveryPanel run={run} />);
+
+    const teardownAll = screen.getByRole("button", { name: "Teardown all collapsed" });
+    expect(teardownAll).toBeDisabled();
+    expect(teardownAll.getAttribute("title")).toBeTruthy();
+  });
+
   it("renders no batch-teardown entry when nothing has been collapsed", () => {
     vi.spyOn(taskApi, "deliveryChain").mockResolvedValue(chain());
     seedChain(delivery({ status: "delivered" }), chain());

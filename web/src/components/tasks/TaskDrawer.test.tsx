@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { Task } from "../../api/tasks";
+import type { Task, TaskDetail } from "../../api/tasks";
 import { TaskDrawer } from "./TaskDrawer";
 
 function task(overrides: Partial<Task> = {}): Task {
@@ -32,6 +32,15 @@ function task(overrides: Partial<Task> = {}): Task {
     archived_at: null,
     ...overrides,
   };
+}
+
+// `detail` landing (vs. staying `undefined`) is the store's race-free signal
+// that `runs` has been fetched for this task at least once — see the
+// `runsLoaded` comment in TaskDrawer.tsx. Tests exercising the Close button's
+// run-history-dependent branches must supply this, or they'd only be
+// exercising the "still loading" branch.
+function taskDetail(t: Task, children: Task[] = []): TaskDetail {
+  return { ...t, dependencies: [], dependents: [], children };
 }
 
 function baseProps(overrides: Partial<Parameters<typeof TaskDrawer>[0]> = {}) {
@@ -103,7 +112,16 @@ describe("TaskDrawer close", () => {
     const root = task({ id: "root", status: "triage" });
     const child = task({ id: "child", parent_task_id: "root", status: "done" });
     const onCloseTask = vi.fn().mockResolvedValue(true);
-    render(<TaskDrawer {...baseProps({ task: root, allTasks: [root, child], onCloseTask })} />);
+    render(
+      <TaskDrawer
+        {...baseProps({
+          task: root,
+          allTasks: [root, child],
+          detail: taskDetail(root, [child]),
+          onCloseTask,
+        })}
+      />
+    );
 
     const closeButton = screen.getByRole("button", { name: "Close" });
     expect(closeButton).toBeEnabled();
@@ -115,10 +133,25 @@ describe("TaskDrawer close", () => {
     await vi.waitFor(() => expect(onCloseTask).toHaveBeenCalledWith("Battle won."));
   });
 
+  it("disables Close with a loading reason before task detail (and thus run history) has loaded — even if children look terminal and runs looks empty", () => {
+    // The exact race Snape's review caught: `runs` defaults to `[]` before
+    // `loadTaskDetail` resolves, indistinguishable from "genuinely no runs"
+    // unless something else (here, `detail` being undefined) says so.
+    const root = task({ id: "root", status: "triage" });
+    const child = task({ id: "child", parent_task_id: "root", status: "done" });
+    render(<TaskDrawer {...baseProps({ task: root, allTasks: [root, child], detail: undefined, runs: [] })} />);
+
+    const closeButton = screen.getByRole("button", { name: "Close" });
+    expect(closeButton).toBeDisabled();
+    expect(closeButton.getAttribute("title")).toMatch(/loading/i);
+  });
+
   it("disables Close with a reason when a child is still open", () => {
     const root = task({ id: "root", status: "triage" });
     const child = task({ id: "child", parent_task_id: "root", status: "todo" });
-    render(<TaskDrawer {...baseProps({ task: root, allTasks: [root, child] })} />);
+    render(
+      <TaskDrawer {...baseProps({ task: root, allTasks: [root, child], detail: taskDetail(root, [child]) })} />
+    );
 
     const closeButton = screen.getByRole("button", { name: "Close" });
     expect(closeButton).toBeDisabled();
@@ -133,6 +166,7 @@ describe("TaskDrawer close", () => {
         {...baseProps({
           task: root,
           allTasks: [root, child],
+          detail: taskDetail(root, [child]),
           runs: [
             {
               id: "run-1",
@@ -160,5 +194,24 @@ describe("TaskDrawer close", () => {
     const closeButton = screen.getByRole("button", { name: "Close" });
     expect(closeButton).toBeDisabled();
     expect(closeButton.getAttribute("title")).toMatch(/worker completion protocol/i);
+  });
+});
+
+describe("TaskDrawer terminal immutability", () => {
+  it("disables every editable field for a cancelled task, same as done", () => {
+    render(<TaskDrawer {...baseProps({ task: task({ status: "cancelled" }) })} />);
+    expect(screen.getByLabelText("Title")).toBeDisabled();
+    expect(screen.getByLabelText("Assignee")).toBeDisabled();
+    expect(screen.getByLabelText("Priority")).toBeDisabled();
+    expect(screen.getByLabelText("Workspace")).toBeDisabled();
+  });
+
+  it("never shows Save changes for a cancelled task even if its local title state becomes dirty", () => {
+    // fireEvent bypasses the DOM's own "disabled inputs don't fire events"
+    // restriction, so this exercises the `!isTerminal` guard on the Save
+    // button directly rather than relying on `dirty` never becoming true.
+    render(<TaskDrawer {...baseProps({ task: task({ status: "cancelled" }) })} />);
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Edited anyway" } });
+    expect(screen.queryByRole("button", { name: "Save changes" })).not.toBeInTheDocument();
   });
 });
