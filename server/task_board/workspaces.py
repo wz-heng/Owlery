@@ -390,6 +390,18 @@ async def is_ancestor(repo: str, ancestor: str, descendant: str) -> bool:
     return rc == 0
 
 
+async def resolve_ref(repo: str, ref: str) -> str | None:
+    """The commit SHA ``ref`` currently resolves to in ``repo``, or None if it
+    does not exist — e.g. a branch that has been deleted. Distinct from
+    ``rev_exists``: that checks whether a *commit object* is still present
+    (which stays true for a deleted branch's tip until git gc runs), this
+    checks whether a *ref* still points at it."""
+    rc, out, _ = await _git(
+        "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", cwd=repo
+    )
+    return out if rc == 0 and out else None
+
+
 async def count_commits_ahead(repo: str, base: str, head: str) -> int:
     rc, out, err = await _git("rev-list", "--count", f"{base}..{head}", cwd=repo)
     if rc:

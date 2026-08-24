@@ -25,6 +25,11 @@ Rules:
    already have occurred; inspect durable evidence and ask for a new attempt.
 7. Child tasks and dependency links must stay on this board. Repository limits
    on tree depth, per-run fan-out, and open task count are authoritative.
+8. `parent_id` means decomposition ("part of this goal"), never sequencing.
+   One battle = one root task; fix rounds, review rounds, and final
+   acceptance are all flat children of that SAME root, not nested under the
+   previous round's task. Only `task_dependencies` (the `dependencies` param)
+   expresses "must finish before" — set it explicitly where order matters.
 """
 
 

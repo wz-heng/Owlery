@@ -29,6 +29,11 @@ interface TaskCardProps {
 
 export function TaskCard({ task, agent, onOpen, draggable = true }: TaskCardProps) {
   const delivery = deliveryChip(task);
+  // `updated_at` is the closest durable proxy for "time since blocked" —
+  // there is no dedicated `blocked_at` column, so any later edit (a
+  // comment, a priority change) also resets this age. Acceptable: it still
+  // reads as "how long has this sat untouched," which is the staleness
+  // signal task-board-overhaul.md §3.4 asks for.
   const ageSource =
     task.status === "running"
       ? task.latest_heartbeat_at ?? task.updated_at
@@ -71,9 +76,9 @@ export function TaskCard({ task, agent, onOpen, draggable = true }: TaskCardProp
         )}
       </div>
 
-      {task.body && (
+      {(task.body || task.body_excerpt) && (
         <p className="mt-1.5 line-clamp-2 pl-1 text-xs leading-4 text-muted-foreground">
-          {task.body}
+          {task.body || task.body_excerpt}
         </p>
       )}
 
@@ -129,12 +134,14 @@ export function TaskCard({ task, agent, onOpen, draggable = true }: TaskCardProp
           </span>
         )}
         {task.status === "blocked" && (
-          <span className="inline-flex min-w-0 items-center gap-0.5 text-destructive">
+          <span className="inline-flex min-w-0 items-center gap-0.5 text-destructive" title={`Blocked ${relativeTime(task.updated_at)}`}>
             <IconAlertTriangle size={12} />
-            <span className="truncate">{task.blocked_kind ?? "blocked"}</span>
+            <span className="truncate">
+              {task.blocked_kind ?? "blocked"} · {relativeTime(task.updated_at)}
+            </span>
           </span>
         )}
-        {ageSource && (
+        {ageSource && task.status !== "blocked" && (
           <span className="ml-auto inline-flex items-center gap-0.5">
             <IconMessage size={12} /> {relativeTime(ageSource)}
           </span>

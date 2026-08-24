@@ -126,6 +126,19 @@ export function deliveryChip(
   }
 }
 
+/** Whether a `done` task is safe to offer the Done column's batch "archive"
+ * entry (task-board-overhaul.md §3.4). A task with no delivery (non-git-
+ * worktree run, or never accepted) has nothing left to track. A task WITH a
+ * delivery is eligible only once that delivery actually reached `delivered`
+ * — `failed`/`blocked`/`conflicted` are terminal in the state-machine sense
+ * but still need a human's eyes; batching them under "Archive N delivered"
+ * would hide a real problem, not close out a finished one (Snape review). */
+export function isArchivableDoneTask(task: Pick<Task, "status" | "archived" | "delivery">): boolean {
+  if (task.status !== "done" || task.archived) return false;
+  if (!task.delivery) return true;
+  return task.delivery.status === "delivered";
+}
+
 export function relativeTime(value: string | null | undefined): string {
   if (!value) return "—";
   const delta = Date.now() - new Date(value).getTime();

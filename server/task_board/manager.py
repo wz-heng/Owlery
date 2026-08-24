@@ -117,6 +117,7 @@ class TaskBoardManager:
             connectors=ConnectorManager(db),
             notify_terminal=self._notify_delivery_terminal,
             repo=self.repo,
+            on_task_touched=self.publish_task_update,
         )
         session_mgr.on_broadcast(self.BROADCAST_KEY, self._on_broadcast)
 
@@ -843,10 +844,21 @@ class TaskBoardManager:
         await self.publish_board_update(board_id)
         return release, op
 
-    async def list_release_deployments(self, board_id: str) -> list[Any]:
-        """Return the durable release-line history for the board's Releases
-        surface."""
-        return await self.repo.list_release_deployments(board_id)
+    async def list_release_deployments(
+        self, board_id: str, *, limit: int = 10, offset: int = 0
+    ) -> tuple[list[Any], int]:
+        """Return a page of the durable release-line history for the board's
+        Releases surface (task-board-overhaul.md §3.2), plus the total count
+        for "load more" pagination."""
+        return await self.repo.list_release_deployments(board_id, limit=limit, offset=offset)
+
+    async def get_current_release_deployments(self, board_id: str) -> tuple[Any, Any]:
+        """The board's current live/staged rows, independent of history
+        pagination — reuses the same lookups the coordinator uses to plan a
+        stage/switch, so the header summary is never a page-window artifact."""
+        live = await self.repo.get_live_release(board_id)
+        staged = await self.repo.get_staged_release(board_id)
+        return live, staged
 
     async def resolve_release_remote_tip(self, board_id: str) -> str | None:
         """Best-effort current sha of the board's configured release branch at

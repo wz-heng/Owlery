@@ -377,3 +377,24 @@ async def test_delivery_recovery_records_missing_origin_once(task_runtime):
     assert await db.get_session_injection_by_source(
         f"task:{task.id}:run:{delivery.run_id}:delivery:terminal"
     ) is None
+
+
+@pytest.mark.asyncio
+async def test_list_release_deployments_and_current_release_pass_through(task_runtime):
+    """The Releases panel (task-board-overhaul.md §3.2) needs a paginated
+    history page AND the current live/staged rows independent of that page
+    window — both manager entry points must reach the repository unchanged."""
+    db, repo, sessions, manager, root = task_runtime
+    board = await repo.create_board(name="Releases", working_dir=str(root))
+    planned = await repo.plan_release_deployment(
+        board_id=board.id, source_ref="main", sha="a" * 40,
+        source_repo=str(root), actor_kind="user", actor_agent_id=None,
+    )
+
+    items, total = await manager.list_release_deployments(board.id, limit=1, offset=0)
+    assert total == 1
+    assert [item.id for item in items] == [planned.id]
+
+    live, staged = await manager.get_current_release_deployments(board.id)
+    assert live is None
+    assert staged is None

@@ -778,6 +778,63 @@ async def test_enrichment_shape_identical_across_exits(task_store):
     # The enrichment values agree exactly across all three exits.
     for key in _ENRICHMENT_KEYS:
         assert from_list[key] == single[key] == from_tree[key], key
+
+
+# --------------------------------------------------------------------------- #
+# List summary + pagination (task-board-overhaul.md §3.5)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_summary_page_excerpts_body_and_omits_full_text(task_store):
+    _db, repo, root, agent = task_store
+    board = await _board(repo, root)
+    huge_body = "x" * 5000
+    task = await _task(repo, board.id, agent, body=huge_body)
+    items, total = await repo.list_tasks_summary_page(board_id=board.id)
+    assert total == 1
+    [item] = items
+    assert item["id"] == task.id
+    assert "body" not in item
+    assert item["body_excerpt"] == huge_body[:200]
+    assert len(item["body_excerpt"]) == 200
+    # The card-facing enrichment survives alongside the excerpt.
+    assert _ENRICHMENT_KEYS <= set(item)
+
+
+@pytest.mark.asyncio
+async def test_summary_page_short_body_excerpt_is_unclipped(task_store):
+    _db, repo, root, agent = task_store
+    board = await _board(repo, root)
+    await _task(repo, board.id, agent, body="short")
+    [item], _total = await repo.list_tasks_summary_page(board_id=board.id)
+    assert item["body_excerpt"] == "short"
+
+
+@pytest.mark.asyncio
+async def test_summary_page_paginates_with_stable_total(task_store):
+    _db, repo, root, agent = task_store
+    board = await _board(repo, root)
+    created = [
+        await _task(repo, board.id, agent, title=f"Task {n}") for n in range(5)
+    ]
+    page1, total1 = await repo.list_tasks_summary_page(board_id=board.id, limit=2, offset=0)
+    page2, total2 = await repo.list_tasks_summary_page(board_id=board.id, limit=2, offset=2)
+    page3, total3 = await repo.list_tasks_summary_page(board_id=board.id, limit=2, offset=4)
+    assert total1 == total2 == total3 == len(created)
+    assert len(page1) == 2 and len(page2) == 2 and len(page3) == 1
+    seen_ids = {item["id"] for item in (*page1, *page2, *page3)}
+    assert seen_ids == {task.id for task in created}
+
+
+@pytest.mark.asyncio
+async def test_summary_page_rejects_negative_offset(task_store):
+    _db, repo, root, _agent = task_store
+    board = await _board(repo, root)
+    with pytest.raises(TaskValidationError):
+        await repo.list_tasks_summary_page(board_id=board.id, offset=-1)
+
+
 # --------------------------------------------------------------------------- #
 # Model routing (budget-model-routing.md §4.2)
 # --------------------------------------------------------------------------- #
@@ -893,4 +950,30 @@ async def test_release_plan_records_human_version_and_immutable_sha(task_store):
     assert release.source_ref == "main"
     assert release.sha == "a" * 40
     assert release.state == "planned"
-    assert [item.id for item in await repo.list_release_deployments(board.id)] == [release.id]
+    items, total = await repo.list_release_deployments(board.id)
+    assert [item.id for item in items] == [release.id]
+    assert total == 1
+
+
+@pytest.mark.asyncio
+async def test_list_release_deployments_paginates_most_recent_first(task_store):
+    """Releases panel default view (task-board-overhaul.md §3.2): history must
+    page with a stable most-recent-first order and an accurate total,
+    independent of the page size requested."""
+    _db, repo, root, _agent = task_store
+    board = await _board(repo, root)
+    releases = [
+        await repo.plan_release_deployment(
+            board_id=board.id, source_ref="main", sha=f"{i:040d}",
+            source_repo="/repo", actor_kind="user", actor_agent_id=None,
+        )
+        for i in range(3)
+    ]
+
+    page1, total1 = await repo.list_release_deployments(board.id, limit=2, offset=0)
+    assert [item.id for item in page1] == [releases[2].id, releases[1].id]
+    assert total1 == 3
+
+    page2, total2 = await repo.list_release_deployments(board.id, limit=2, offset=2)
+    assert [item.id for item in page2] == [releases[0].id]
+    assert total2 == 3

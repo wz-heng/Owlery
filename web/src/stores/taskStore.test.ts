@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   taskApi,
   TaskApiError,
+  type ReleaseDeployment,
   type Task,
   type TaskDelivery,
   type TaskDeliveryOp,
@@ -45,6 +46,7 @@ function delivery(overrides: Partial<TaskDelivery> = {}): TaskDelivery {
     task_id: "task-1",
     run_id: "run-1",
     status: "ready",
+    superseded_by_delivery_id: null,
     repository: "/repo",
     base_ref: "main",
     base_head: "aaaaaaaaaaaa",
@@ -91,9 +93,29 @@ function op(overrides: Partial<TaskDeliveryOp> = {}): TaskDeliveryOp {
   };
 }
 
+function release(overrides: Partial<ReleaseDeployment> = {}): ReleaseDeployment {
+  return {
+    id: "rel-1",
+    board_id: "board-1",
+    version: "r20260809.01",
+    source_ref: "main",
+    sha: "a".repeat(40),
+    source_repo: "/repo",
+    deployment_id: null,
+    state: "planned",
+    actor_kind: "user",
+    actor_agent_id: null,
+    error: null,
+    created_at: "2026-08-09T00:00:00Z",
+    updated_at: "2026-08-09T00:00:00Z",
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   resetTaskStore();
   vi.restoreAllMocks();
+  localStorage.clear();
 });
 describe("taskStore transitions", () => {
   it("maps only legal drag shortcuts to guarded lifecycle operations", () => {
@@ -240,6 +262,16 @@ describe("taskStore event replay and filters", () => {
     expect(filterTasks(rows, { text: "durable", assignee: "", priority: 2, includeArchived: false, mine: true }, "agent-1").map((row) => row.id)).toEqual(["task-1"]);
     expect(filterTasks(rows, { text: "", assignee: "", priority: null, includeArchived: true, mine: false }, null)).toHaveLength(3);
   });
+
+  it("falls back to body_excerpt when a list-summary task has no full body", () => {
+    // List endpoints return summaries: `body` is unset and `body_excerpt`
+    // carries the truncated text (taskStore.ts filterTasks). The text filter
+    // must still match on that excerpt.
+    const summary = task({ id: "task-4", title: "Untitled", body: undefined, body_excerpt: "mentions coordination layer" });
+    const filters = { text: "coordination layer", assignee: "", priority: null, includeArchived: false, mine: false };
+    expect(filterTasks([summary], filters, null).map((row) => row.id)).toEqual(["task-4"]);
+    expect(filterTasks([summary], { ...filters, text: "no match here" }, null)).toHaveLength(0);
+  });
 });
 
 describe("taskStore git delivery", () => {
@@ -316,5 +348,159 @@ describe("taskStore git delivery", () => {
     const ok = await useTaskStore.getState().deliveryAction("task-1", "run-1", "commit");
     expect(ok).toBe(true);
     expect(useTaskStore.getState().deliveries["run-1"].commits_ahead).toBe(3);
+  });
+});
+
+describe("taskStore exhaustive task-list pagination", () => {
+  it("loadTasks pages past the server's max page size instead of silently truncating (Snape review)", async () => {
+    useTaskStore.setState({ token: "tok", selectedBoardId: "board-1" });
+    const list = vi.spyOn(taskApi, "listTasks");
+    // 1000 is REST's max `limit`; a board with >1000 tasks must still load
+    // in full via a second page, not drop the overflow.
+    const page1 = Array.from({ length: 1000 }, (_, i) => task({ id: `t${i}` }));
+    const page2 = [task({ id: "t1000" })];
+    list.mockResolvedValueOnce({ items: page1, total: 1001, limit: 1000, offset: 0 });
+    list.mockResolvedValueOnce({ items: page2, total: 1001, limit: 1000, offset: 1000 });
+
+    await useTaskStore.getState().loadTasks("board-1");
+
+    expect(list).toHaveBeenNthCalledWith(1, "tok", "board-1", {
+      include_archived: true, limit: 1000, offset: 0,
+    });
+    expect(list).toHaveBeenNthCalledWith(2, "tok", "board-1", {
+      include_archived: true, limit: 1000, offset: 1000,
+    });
+    expect(useTaskStore.getState().taskOrder).toHaveLength(1001);
+    expect(useTaskStore.getState().tasksById["t1000"]).toBeTruthy();
+  });
+
+  it("stops after one page when everything already fit", async () => {
+    useTaskStore.setState({ token: "tok", selectedBoardId: "board-1" });
+    const list = vi.spyOn(taskApi, "listTasks").mockResolvedValue({
+      items: [task({ id: "t1" })], total: 1, limit: 1000, offset: 0,
+    });
+
+    await useTaskStore.getState().loadTasks("board-1");
+
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(useTaskStore.getState().taskOrder).toEqual(["t1"]);
+  });
+});
+
+describe("taskStore supersede chain", () => {
+  it("loadDeliveryChain stores the chain keyed by run_id", async () => {
+    useTaskStore.setState({ token: "tok" });
+    vi.spyOn(taskApi, "deliveryChain").mockResolvedValue({
+      target: null,
+      superseded: [{ delivery_id: "del-2", task_id: "task-2", task_title: "B", run_id: "run-2" }],
+    });
+
+    await useTaskStore.getState().loadDeliveryChain("task-1", "run-1");
+
+    expect(useTaskStore.getState().deliveryChains["run-1"]?.superseded).toHaveLength(1);
+  });
+
+  it("teardownSuperseded tears down every collapsed entry and refreshes the chain", async () => {
+    useTaskStore.setState({
+      token: "tok",
+      deliveryChains: {
+        "run-1": {
+          target: null,
+          superseded: [
+            { delivery_id: "del-a", task_id: "task-a", task_title: "A", run_id: "run-a" },
+            { delivery_id: "del-b", task_id: "task-b", task_title: "B", run_id: "run-b" },
+          ],
+        },
+      },
+    });
+    const teardown = vi.spyOn(taskApi, "teardownDelivery").mockResolvedValue(delivery());
+    vi.spyOn(taskApi, "deliveryChain").mockResolvedValue({ target: null, superseded: [] });
+
+    const ok = await useTaskStore.getState().teardownSuperseded("task-1", "run-1", { retention: "keep" });
+
+    expect(ok).toBe(true);
+    expect(teardown).toHaveBeenCalledWith("tok", "task-a", "run-a", { retention: "keep", confirmations: undefined });
+    expect(teardown).toHaveBeenCalledWith("tok", "task-b", "run-b", { retention: "keep", confirmations: undefined });
+    expect(useTaskStore.getState().deliveryChains["run-1"]?.superseded).toHaveLength(0);
+  });
+
+  it("teardownSuperseded stops at the first entry that requires confirmation, but still refreshes", async () => {
+    useTaskStore.setState({
+      token: "tok",
+      deliveryChains: {
+        "run-1": {
+          target: null,
+          superseded: [
+            { delivery_id: "del-a", task_id: "task-a", task_title: "A", run_id: "run-a" },
+            { delivery_id: "del-b", task_id: "task-b", task_title: "B", run_id: "run-b" },
+          ],
+        },
+      },
+    });
+    const teardown = vi.spyOn(taskApi, "teardownDelivery").mockRejectedValue(
+      new TaskApiError("branch not merged", 409, null, {
+        code: "requires_confirmation", confirmation: "force_delete_unmerged", action: "teardown",
+      })
+    );
+    const chainReload = vi.spyOn(taskApi, "deliveryChain").mockResolvedValue({
+      target: null,
+      superseded: [{ delivery_id: "del-a", task_id: "task-a", task_title: "A", run_id: "run-a" }],
+    });
+
+    const ok = await useTaskStore.getState().teardownSuperseded("task-1", "run-1", { retention: "remove_all" });
+
+    expect(ok).toBe(false);
+    expect(teardown).toHaveBeenCalledTimes(1);
+    expect(chainReload).toHaveBeenCalledWith("tok", "task-1", "run-1");
+    expect(useTaskStore.getState().deliveryConfirmation?.taskId).toBe("task-a");
+  });
+});
+
+describe("taskStore releases pagination and collapse", () => {
+  it("loadReleases fetches the first page; loadMoreReleases appends the next", async () => {
+    useTaskStore.setState({ token: "tok" });
+    const list = vi.spyOn(taskApi, "releases");
+    list.mockResolvedValueOnce({
+      releases: [{ ...release(), id: "r1" }],
+      total: 2, limit: 10, offset: 0, live: null, staged: null, remote_tip: null,
+    });
+    await useTaskStore.getState().loadReleases("board-1");
+    expect(useTaskStore.getState().releases["board-1"]).toHaveLength(1);
+    expect(useTaskStore.getState().releasesTotal["board-1"]).toBe(2);
+
+    list.mockResolvedValueOnce({
+      releases: [{ ...release(), id: "r2" }],
+      total: 2, limit: 10, offset: 1, live: null, staged: null, remote_tip: null,
+    });
+    await useTaskStore.getState().loadMoreReleases("board-1");
+    expect(list).toHaveBeenLastCalledWith("tok", "board-1", { limit: 10, offset: 1 });
+    expect(useTaskStore.getState().releases["board-1"].map((r) => r.id)).toEqual(["r1", "r2"]);
+  });
+
+  it("stores live/staged independently of the page window (Snape review)", async () => {
+    useTaskStore.setState({ token: "tok" });
+    const liveRow = release({ id: "r-live", state: "live" });
+    const stagedRow = release({ id: "r-staged", state: "staged" });
+    vi.spyOn(taskApi, "releases").mockResolvedValueOnce({
+      // Neither live nor staged is in the fetched page — both aged off.
+      releases: [{ ...release(), id: "r-newer", state: "failed" }],
+      total: 3, limit: 10, offset: 0, live: liveRow, staged: stagedRow, remote_tip: null,
+    });
+
+    await useTaskStore.getState().loadReleases("board-1");
+
+    expect(useTaskStore.getState().releaseLive["board-1"]?.id).toBe("r-live");
+    expect(useTaskStore.getState().releaseStaged["board-1"]?.id).toBe("r-staged");
+    expect(useTaskStore.getState().releases["board-1"].map((r) => r.id)).toEqual(["r-newer"]);
+  });
+
+  it("setReleasesExpanded flips state and persists to localStorage", () => {
+    useTaskStore.getState().setReleasesExpanded(true);
+    expect(useTaskStore.getState().releasesExpanded).toBe(true);
+    expect(localStorage.getItem("owlery_releases_expanded")).toBe("true");
+
+    useTaskStore.getState().setReleasesExpanded(false);
+    expect(useTaskStore.getState().releasesExpanded).toBe(false);
+    expect(localStorage.getItem("owlery_releases_expanded")).toBeNull();
   });
 });

@@ -498,19 +498,22 @@ async def list_all_tasks(
     parent_id: str | None = None,
     include_archived: bool = False,
     limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
     _: str = Depends(verify_token),
 ):
     assignee_id = await _resolve_agent(assignee, None) if assignee else None
-    return await _run(
-        task_repository.list_tasks_enriched(
+    items, total = await _run(
+        task_repository.list_tasks_summary_page(
             board_id=board_id,
             status=status_filter,
             assignee_agent_id=assignee_id,
             parent_task_id=parent_id,
             include_archived=include_archived,
             limit=limit,
+            offset=offset,
         )
     )
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
 
 
 @router.get("/api/task-boards/{board_id}/tasks")
@@ -521,10 +524,12 @@ async def list_board_tasks(
     parent_id: str | None = None,
     include_archived: bool = False,
     limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
     _: str = Depends(verify_token),
 ):
     return await list_all_tasks(
-        board_id, status_filter, assignee, parent_id, include_archived, limit, _
+        board_id, status_filter, assignee, parent_id, include_archived,
+        limit, offset, _,
     )
 
 
@@ -1140,6 +1145,72 @@ async def get_delivery(task_id: str, run_id: str, _: str = Depends(verify_token)
     return {"delivery": delivery.to_dict(), "ops": [o.to_dict() for o in ops]}
 
 
+async def _delivery_chain_entry(delivery) -> dict[str, Any]:
+    task = await task_repository.get_task(delivery.task_id)
+    return {
+        "delivery_id": delivery.id,
+        "task_id": task.id,
+        "task_title": task.title,
+        "run_id": delivery.run_id,
+    }
+
+
+async def _resolve_supersede_tip(delivery):
+    """Follow ``superseded_by_delivery_id`` to the ULTIMATE tip, not just the
+    one-hop pointer — a chain A→B→C only ever updates one link per recompute
+    (server/task_board/delivery.py's propagation skips a sibling that already
+    points somewhere), so A's stored pointer can lag behind B's own collapse
+    into C. A visited-set guards against a cycle that should never occur from
+    git ancestry, but must never hang the request if it somehow did."""
+    seen = {delivery.id}
+    current = delivery
+    while current.superseded_by_delivery_id and current.superseded_by_delivery_id not in seen:
+        seen.add(current.superseded_by_delivery_id)
+        current = await task_repository.get_delivery(current.superseded_by_delivery_id)
+    return current if current.id != delivery.id else None
+
+
+async def _resolve_all_superseded(delivery_id: str) -> list[Any]:
+    """Every delivery that transitively collapses into ``delivery_id`` — the
+    full set a chain's true tip must offer for batch teardown, not just its
+    direct predecessor (same one-hop-per-recompute reason as above)."""
+    collected: list[Any] = []
+    frontier = [delivery_id]
+    seen = {delivery_id}
+    while frontier:
+        next_frontier: list[str] = []
+        for current_id in frontier:
+            for row in await task_repository.list_superseded_by(current_id):
+                if row.id in seen:
+                    continue
+                seen.add(row.id)
+                collected.append(row)
+                next_frontier.append(row.id)
+        frontier = next_frontier
+    return collected
+
+
+@router.get("/api/tasks/{task_id}/runs/{run_id}/delivery/chain")
+async def get_delivery_chain(task_id: str, run_id: str, _: str = Depends(verify_token)):
+    """Supersede-chain context for the delivery panel (task-board-overhaul.md
+    §3.1): ``target`` is the ULTIMATE tip that has collapsed this delivery,
+    possibly transitively (null if this delivery already is the tip);
+    ``superseded`` is everything this delivery transitively contains — the
+    candidate set for the tip panel's batch-teardown affordance. Both walk
+    the full chain rather than one hop, so an intermediate delivery that has
+    itself since been collapsed never strands its own predecessors."""
+    delivery = await _delivery_for(task_id, run_id)
+
+    async def _load():
+        tip = await _resolve_supersede_tip(delivery)
+        target = await _delivery_chain_entry(tip) if tip is not None else None
+        superseded_rows = await _resolve_all_superseded(delivery.id)
+        superseded = [await _delivery_chain_entry(row) for row in superseded_rows]
+        return {"target": target, "superseded": superseded}
+
+    return await _run(_load())
+
+
 @router.get("/api/tasks/{task_id}/runs/{run_id}/delivery/ops")
 async def list_delivery_ops(task_id: str, run_id: str, _: str = Depends(verify_token)):
     delivery = await _delivery_for(task_id, run_id)
@@ -1301,13 +1372,22 @@ async def release_switch(
 
 
 @router.get("/api/task-boards/{board_id}/releases")
-async def list_releases(board_id: str, _: str = Depends(verify_token)):
-    releases = await _run(_get_manager().list_release_deployments(board_id))
+async def list_releases(
+    board_id: str,
+    limit: int = Query(10, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    _: str = Depends(verify_token),
+):
+    releases, total = await _run(
+        _get_manager().list_release_deployments(board_id, limit=limit, offset=offset)
+    )
+    live, staged = await _run(_get_manager().get_current_release_deployments(board_id))
     remote_tip = await _run(_get_manager().resolve_release_remote_tip(board_id))
-    live = next((item for item in releases if item.state == "live"), None)
-    staged = next((item for item in releases if item.state == "staged"), None)
     return {
         "releases": [_dict(item) for item in releases],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
         "live": _dict(live) if live is not None else None,
         "staged": _dict(staged) if staged is not None else None,
         "remote_tip": remote_tip,

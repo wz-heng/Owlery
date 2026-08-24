@@ -105,3 +105,27 @@ describe("TaskCard delivery chip", () => {
     expect(screen.queryByTestId("task-delivery-chip")).toBeNull();
   });
 });
+
+describe("TaskCard blocked staleness", () => {
+  it("folds the age since updated_at into the blocked badge itself", () => {
+    const twoDaysAgo = new Date(Date.now() - 2 * 24 * 3600 * 1000).toISOString();
+    render(
+      <TaskCard
+        task={task({ status: "blocked", blocked_kind: "input", updated_at: twoDaysAgo })}
+        onOpen={vi.fn()}
+      />
+    );
+    expect(screen.getByText(/input · 2d/)).toBeInTheDocument();
+  });
+
+  it("does not render a duplicate trailing age chip for blocked tasks", () => {
+    render(
+      <TaskCard
+        task={task({ status: "blocked", blocked_kind: "capability" })}
+        onOpen={vi.fn()}
+      />
+    );
+    // Only one age readout: inside the blocked badge, not a second trailing one.
+    expect(screen.getAllByText(/ago$/)).toHaveLength(1);
+  });
+});

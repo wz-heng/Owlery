@@ -7,6 +7,7 @@ import {
   IconGitMerge,
   IconGitPullRequest,
   IconTrash,
+  IconTrashX,
   IconUpload,
 } from "@tabler/icons-react";
 
@@ -90,12 +91,14 @@ function DeliveryActionButton({ label, icon, onClick, disabled, destructive }: D
 
 interface TaskDeliveryPanelProps {
   run: TaskRun;
+  onOpenTask?: (taskId: string) => void;
 }
 
-export function TaskDeliveryPanel({ run }: TaskDeliveryPanelProps) {
+export function TaskDeliveryPanel({ run, onOpenTask }: TaskDeliveryPanelProps) {
   const taskId = run.task_id;
   const runId = run.id;
   const delivery = useTaskStore((state) => state.deliveries[runId]) as TaskDelivery | undefined;
+  const chain = useTaskStore((state) => state.deliveryChains[runId]);
   const ops = useTaskStore((state) =>
     delivery ? state.deliveryOps[delivery.id] : undefined
   );
@@ -104,15 +107,43 @@ export function TaskDeliveryPanel({ run }: TaskDeliveryPanelProps) {
   const [retention, setRetention] = useState<DeliveryRetention>(
     delivery?.retention ?? "keep"
   );
+  const [teardownAllBusy, setTeardownAllBusy] = useState(false);
   const store = useTaskStore.getState();
 
   useEffect(() => {
     void useTaskStore.getState().loadDelivery(taskId, runId);
+    void useTaskStore.getState().loadDeliveryChain(taskId, runId);
   }, [taskId, runId]);
 
   useEffect(() => {
     if (delivery) setRetention(delivery.retention);
   }, [delivery?.retention]);
+
+  if (delivery?.superseded_by_delivery_id) {
+    const target = chain?.target;
+    return (
+      <section className="mt-4 rounded-xl border border-ink-300 bg-ink-50 p-3" aria-label="Git delivery">
+        <p className="flex flex-wrap items-center gap-1.5 text-xs text-ink-800">
+          <IconGitMerge size={14} className="shrink-0 text-muted-foreground" />
+          <span>
+            Collapsed — delivered by{" "}
+            {target ? (
+              <button
+                type="button"
+                className="font-medium text-primary-700 hover:underline"
+                onClick={() => onOpenTask?.(target.task_id)}
+              >
+                {target.task_title}
+              </button>
+            ) : (
+              "another task"
+            )}
+            's delivery, which already contains every commit on this branch.
+          </span>
+        </p>
+      </section>
+    );
+  }
 
   if (!delivery) {
     return (
@@ -150,8 +181,15 @@ export function TaskDeliveryPanel({ run }: TaskDeliveryPanelProps) {
   const canTeardown = (["delivered", "failed", "blocked", "conflicted"] as DeliveryStatus[]).includes(status);
 
   const opLog = ops ?? [];
+  const superseded = chain?.superseded ?? [];
+  // A batch teardown resolves confirmations one entry at a time (§3.1's
+  // "reuse the existing per-delivery confirmation" rule) — the pending
+  // confirmation may belong to any superseded run, not just this tip's own.
   const activeConfirmation =
-    confirmation && confirmation.runId === runId ? confirmation : null;
+    confirmation &&
+    (confirmation.runId === runId || superseded.some((entry) => entry.run_id === confirmation.runId))
+      ? confirmation
+      : null;
 
   return (
     <section className="mt-4 rounded-xl border border-ink-300 bg-ink-50 p-3" aria-label="Git delivery">
@@ -276,6 +314,29 @@ export function TaskDeliveryPanel({ run }: TaskDeliveryPanelProps) {
           </select>
         </label>
       </div>
+
+      {superseded.length > 0 && (
+        <div className="mt-3 flex flex-wrap items-center gap-2 rounded-lg bg-ink-100 p-2.5">
+          <p className="text-xs text-ink-800">
+            This branch has collapsed {superseded.length} earlier{" "}
+            {superseded.length === 1 ? "delivery" : "deliveries"} on the same chain.
+          </p>
+          <DeliveryActionButton
+            label="Teardown all collapsed"
+            icon={<IconTrashX size={14} />}
+            disabled={busy || teardownAllBusy}
+            destructive
+            onClick={async () => {
+              setTeardownAllBusy(true);
+              try {
+                await store.teardownSuperseded(taskId, runId, { retention });
+              } finally {
+                setTeardownAllBusy(false);
+              }
+            }}
+          />
+        </div>
+      )}
 
       <div className="mt-3">
         <p className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">

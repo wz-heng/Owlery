@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   taskApi,
+  type DeliveryChain,
   type TaskDelivery,
   type TaskDeliveryOp,
   type TaskRun,
@@ -36,6 +37,7 @@ function delivery(overrides: Partial<TaskDelivery> = {}): TaskDelivery {
     task_id: run.task_id,
     run_id: run.id,
     status: "ready",
+    superseded_by_delivery_id: null,
     repository: "/repo",
     base_ref: "main",
     base_head: "aaaaaaaaaaaa",
@@ -87,6 +89,19 @@ function seed(row: TaskDelivery, ops: TaskDeliveryOp[] = []): void {
     token: "",
     deliveries: { [run.id]: row },
     deliveryOps: { [row.id]: ops },
+  });
+}
+
+function chain(overrides: Partial<DeliveryChain> = {}): DeliveryChain {
+  return { target: null, superseded: [], ...overrides };
+}
+
+function seedChain(row: TaskDelivery, deliveryChain: DeliveryChain, ops: TaskDeliveryOp[] = []): void {
+  useTaskStore.setState({
+    token: "",
+    deliveries: { [run.id]: row },
+    deliveryOps: { [row.id]: ops },
+    deliveryChains: { [run.id]: deliveryChain },
   });
 }
 
@@ -212,5 +227,62 @@ describe("TaskDeliveryPanel", () => {
       confirmations: { allow_force_push: true },
     }));
     expect(useTaskStore.getState().deliveryConfirmation).toBeNull();
+  });
+});
+
+describe("TaskDeliveryPanel supersede collapse", () => {
+  it("collapses to a one-liner with no action buttons when superseded, and jumps to the target", () => {
+    vi.spyOn(taskApi, "deliveryChain").mockResolvedValue(chain());
+    const onOpenTask = vi.fn();
+    seedChain(
+      delivery({ superseded_by_delivery_id: "delivery-2" }),
+      chain({ target: { delivery_id: "delivery-2", task_id: "task-2", task_title: "Deliver B", run_id: "run-2" } })
+    );
+
+    render(<TaskDeliveryPanel run={run} onOpenTask={onOpenTask} />);
+
+    expect(screen.getByText(/Collapsed/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Accept" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Teardown" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Deliver B" }));
+    expect(onOpenTask).toHaveBeenCalledWith("task-2");
+  });
+
+  it("offers a full action row for the tip, plus a batch-teardown entry for what it has collapsed", async () => {
+    vi.spyOn(taskApi, "deliveryChain").mockResolvedValue(chain());
+    seedChain(
+      delivery({ status: "delivered" }),
+      chain({
+        superseded: [
+          { delivery_id: "delivery-9", task_id: "task-9", task_title: "Deliver A", run_id: "run-9" },
+        ],
+      })
+    );
+    useTaskStore.setState({ token: "token" });
+    const teardown = vi.spyOn(taskApi, "teardownDelivery").mockResolvedValue(
+      delivery({ id: "delivery-9", task_id: "task-9", run_id: "run-9", status: "delivered" })
+    );
+
+    render(<TaskDeliveryPanel run={run} />);
+
+    expect(screen.getByRole("button", { name: "Accept" })).toBeInTheDocument();
+    expect(screen.getByText(/collapsed 1 earlier delivery/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Teardown all collapsed" }));
+
+    await waitFor(() =>
+      expect(teardown).toHaveBeenCalledWith("token", "task-9", "run-9", {
+        retention: "keep",
+        confirmations: undefined,
+      })
+    );
+  });
+
+  it("renders no batch-teardown entry when nothing has been collapsed", () => {
+    vi.spyOn(taskApi, "deliveryChain").mockResolvedValue(chain());
+    seedChain(delivery({ status: "delivered" }), chain());
+
+    render(<TaskDeliveryPanel run={run} />);
+
+    expect(screen.queryByRole("button", { name: "Teardown all collapsed" })).not.toBeInTheDocument();
   });
 });

@@ -349,7 +349,11 @@ async def test_list_tree_and_detail_expose_identical_enrichment(real_client):
 
     listed = await c.get(f"/api/tasks?board_id={board.id}", headers=HEADERS)
     assert listed.status_code == 200
-    card = next(t for t in listed.json() if t["id"] == task.id)
+    listed_body = listed.json()
+    assert listed_body["total"] >= 1
+    card = next(t for t in listed_body["items"] if t["id"] == task.id)
+    assert "body" not in card
+    assert "body_excerpt" in card
 
     tree = await c.get(f"/api/task-boards/{board.id}/tree", headers=HEADERS)
     assert tree.status_code == 200
@@ -409,6 +413,138 @@ async def test_stale_patch_conflict_current_is_enriched(real_client):
     assert _ENRICHMENT_KEYS <= set(current)
     assert current["delivery"]["status"] == "ready"
     assert current["latest_run_state"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_page_omits_body_and_paginates(real_client):
+    """GET /api/tasks must never carry a task's full body — a page-sized
+    excerpt plus a total count instead (task-board-overhaul.md §3.5); full
+    text is always a `show`/single-task fetch."""
+    c, repo, root, agent_id = real_client
+    board = await repo.create_board(
+        name="Big", working_dir=str(root), default_workspace_mode="shared"
+    )
+    huge_body = "y" * 200_000
+    for n in range(3):
+        await repo.create_task(
+            board_id=board.id, title=f"T{n}", status="todo",
+            assignee_agent_id=agent_id, body=huge_body,
+        )
+
+    listed = await c.get(f"/api/tasks?board_id={board.id}", headers=HEADERS)
+    assert listed.status_code == 200
+    payload = listed.json()
+    assert payload["total"] == 3
+    assert payload["limit"] == 200
+    assert payload["offset"] == 0
+    assert len(payload["items"]) == 3
+    for item in payload["items"]:
+        assert "body" not in item
+        assert item["body_excerpt"] == huge_body[:200]
+    # The whole page stays well under the ~19-char-per-task*10^5 blowup a full
+    # body would cause — a hard ceiling that would catch a body regression.
+    assert len(listed.content) < 20_000
+
+    page1 = await c.get(
+        f"/api/tasks?board_id={board.id}&limit=2&offset=0", headers=HEADERS
+    )
+    page2 = await c.get(
+        f"/api/tasks?board_id={board.id}&limit=2&offset=2", headers=HEADERS
+    )
+    assert page1.json()["total"] == page2.json()["total"] == 3
+    ids_1 = {item["id"] for item in page1.json()["items"]}
+    ids_2 = {item["id"] for item in page2.json()["items"]}
+    assert len(ids_1) == 2 and len(ids_2) == 1
+    assert ids_1.isdisjoint(ids_2)
+
+
+async def _extra_delivery(repo, board, agent_id, root, *, suffix, title="Deliver 2"):
+    """A second (or third...) ready+accepted delivery on the SAME board, for
+    supersede-chain tests — mirrors `_accepted_task_with_delivery` but reuses
+    the given board instead of planning a new one (board names are unique)."""
+    task = await repo.create_task(
+        board_id=board.id, title=title, status="todo", assignee_agent_id=agent_id
+    )
+    run = await repo.claim_ready(
+        task.id, workspace_mode="git_worktree", workspace_path=str(root / f"wt-{suffix}")
+    )
+    await repo.complete_run(task.id, run.id, summary="done")
+    delivery = await repo.create_delivery(
+        run.id, repository="/repo", attempt_branch=f"owlery/{suffix}", base_ref="main", base_head="a"
+    )
+    await repo.start_accept(delivery.id)
+    await repo.record_baseline(delivery.id, status="ready", dirty=False, commits_ahead=2)
+    return task, await repo.get_delivery_by_run(run.id)
+
+
+@pytest.mark.asyncio
+async def test_delivery_chain_endpoint_reports_target_and_superseded(real_client):
+    """GET .../delivery/chain feeds the panel's collapse UI (task-board-
+    overhaul.md §3.1): a superseded delivery reports its target task/title
+    for the "collapsed by task X" link, and the tip reports the reverse list
+    for its batch-teardown affordance."""
+    c, repo, root, agent_id = real_client
+    board, task_a = await _accepted_task_with_delivery(repo, root, agent_id)
+    task_b, delivery_b = await _extra_delivery(repo, board, agent_id, root, suffix="y")
+    delivery_a = await repo.get_delivery_by_run((await repo.list_runs(task_a.id))[0].id)
+    await repo.set_superseded_by(delivery_a.id, delivery_b.id, expected_current=None)
+
+    tip = await c.get(
+        f"/api/tasks/{task_b.id}/runs/{delivery_b.run_id}/delivery/chain", headers=HEADERS
+    )
+    assert tip.status_code == 200
+    tip_body = tip.json()
+    assert tip_body["target"] is None
+    assert [item["task_id"] for item in tip_body["superseded"]] == [task_a.id]
+    assert tip_body["superseded"][0]["task_title"] == "Deliver"
+
+    collapsed = await c.get(
+        f"/api/tasks/{task_a.id}/runs/{delivery_a.run_id}/delivery/chain", headers=HEADERS
+    )
+    assert collapsed.status_code == 200
+    collapsed_body = collapsed.json()
+    assert collapsed_body["superseded"] == []
+    assert collapsed_body["target"]["task_id"] == task_b.id
+    assert collapsed_body["target"]["delivery_id"] == delivery_b.id
+
+
+@pytest.mark.asyncio
+async def test_delivery_chain_endpoint_resolves_transitive_chain(real_client):
+    """A→B→C: each recompute only ever updates ONE link (delivery.py's
+    propagation skips a sibling that already points somewhere), so A's stored
+    pointer still says B even after B itself gets collapsed into C. The
+    `/delivery/chain` endpoint must resolve past that one-hop staleness:
+    every node's `target` is the ultimate tip C, and C's `superseded` must
+    include BOTH A and B — otherwise C's batch-teardown never reaches A, and
+    A's collapsed panel points at a delivery (B) that is itself collapsed
+    (Snape review, task-board-overhaul.md §3.1)."""
+    c, repo, root, agent_id = real_client
+    board, task_a = await _accepted_task_with_delivery(repo, root, agent_id)
+    task_b, delivery_b = await _extra_delivery(repo, board, agent_id, root, suffix="y", title="Deliver 2")
+    task_c, delivery_c = await _extra_delivery(repo, board, agent_id, root, suffix="z", title="Deliver 3")
+    delivery_a = await repo.get_delivery_by_run((await repo.list_runs(task_a.id))[0].id)
+    # A points to B, B points to C — B's own pointer is NOT retargeted to C.
+    await repo.set_superseded_by(delivery_a.id, delivery_b.id, expected_current=None)
+    await repo.set_superseded_by(delivery_b.id, delivery_c.id, expected_current=None)
+
+    chain_a = (await c.get(
+        f"/api/tasks/{task_a.id}/runs/{delivery_a.run_id}/delivery/chain", headers=HEADERS
+    )).json()
+    assert chain_a["target"]["task_id"] == task_c.id
+    assert chain_a["target"]["delivery_id"] == delivery_c.id
+    assert chain_a["superseded"] == []
+
+    chain_b = (await c.get(
+        f"/api/tasks/{task_b.id}/runs/{delivery_b.run_id}/delivery/chain", headers=HEADERS
+    )).json()
+    assert chain_b["target"]["task_id"] == task_c.id
+    assert [item["task_id"] for item in chain_b["superseded"]] == [task_a.id]
+
+    chain_c = (await c.get(
+        f"/api/tasks/{task_c.id}/runs/{delivery_c.run_id}/delivery/chain", headers=HEADERS
+    )).json()
+    assert chain_c["target"] is None
+    assert {item["task_id"] for item in chain_c["superseded"]} == {task_a.id, task_b.id}
 
 
 @pytest.mark.asyncio

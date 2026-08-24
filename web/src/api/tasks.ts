@@ -71,7 +71,11 @@ export interface Task {
   board_id: string;
   parent_task_id: string | null;
   title: string;
-  body: string;
+  // A list-page item (`taskApi.listTasks`) never carries the full body — only
+  // `body_excerpt` (first ~200 chars). `TaskDetail` (single-task fetch) sets
+  // `body` to the full text and leaves `body_excerpt` unset.
+  body?: string;
+  body_excerpt?: string;
   status: TaskStatus;
   assignee_agent_id: string | null;
   priority: number;
@@ -206,6 +210,11 @@ export interface TaskDelivery {
   task_id: string;
   run_id: string;
   status: DeliveryStatus;
+  /** Set once another delivery on the same board/repository is proven to
+   * contain this one's commits (task-board-overhaul.md §3.1) — derived from
+   * git ancestry, never written by a delivery action. Non-null means this
+   * delivery's action row collapses in favor of the target. */
+  superseded_by_delivery_id: string | null;
   repository: string;
   base_ref: string | null;
   base_head: string | null;
@@ -228,6 +237,23 @@ export interface TaskDelivery {
   deployed_slot: string | null;
   created_at: string;
   updated_at: string;
+}
+
+/** One side of a delivery-supersede pointer (task-board-overhaul.md §3.1) —
+ * enough to render "collapsed by task X" and jump to it. */
+export interface DeliveryChainEntry {
+  delivery_id: string;
+  task_id: string;
+  task_title: string;
+  run_id: string;
+}
+
+/** `target` is who collapsed this delivery (null for a tip); `superseded` is
+ * who this delivery has itself collapsed — the tip panel's batch-teardown
+ * candidate set. */
+export interface DeliveryChain {
+  target: DeliveryChainEntry | null;
+  superseded: DeliveryChainEntry[];
 }
 
 export type ReleaseDeploymentState =
@@ -321,6 +347,18 @@ export interface TaskListFilters {
   include_archived?: boolean;
   search?: string;
   priority?: number;
+  limit?: number;
+  offset?: number;
+}
+
+/** The paginated envelope `GET /api/task-boards/{id}/tasks` returns
+ * (task-board-overhaul.md §3.5): items are summaries (`body_excerpt`, not
+ * `body`); `total` is the full matching count regardless of `limit`. */
+export interface TaskListPage {
+  items: Task[];
+  total: number;
+  limit: number;
+  offset: number;
 }
 
 export interface CreateBoardInput {
@@ -500,7 +538,7 @@ export const taskApi = {
   boardEvents: (token: string, boardId: string, afterSeq = 0) =>
     get<TaskEvent[]>(token, `/api/task-boards/${boardId}/events${query({ after_seq: afterSeq })}`),
   listTasks: (token: string, boardId: string, filters: TaskListFilters = {}) =>
-    get<Task[]>(token, `/api/task-boards/${boardId}/tasks${query(filters)}`),
+    get<TaskListPage>(token, `/api/task-boards/${boardId}/tasks${query(filters)}`),
   createTask: (token: string, boardId: string, input: CreateTaskInput) =>
     mutate<Task>(token, `/api/task-boards/${boardId}/tasks`, "POST", input),
   tree: (token: string, boardId: string) =>
@@ -540,6 +578,8 @@ export const taskApi = {
       token,
       `/api/tasks/${taskId}/runs/${runId}/delivery`
     ),
+  deliveryChain: (token: string, taskId: string, runId: string) =>
+    get<DeliveryChain>(token, `/api/tasks/${taskId}/runs/${runId}/delivery/chain`),
   deliveryOps: (token: string, taskId: string, runId: string) =>
     get<TaskDeliveryOp[]>(token, `/api/tasks/${taskId}/runs/${runId}/delivery/ops`),
   acceptDelivery: (
@@ -604,13 +644,16 @@ export const taskApi = {
       "POST",
       body
     ),
-  releases: (token: string, boardId: string) =>
+  releases: (token: string, boardId: string, opts: { limit?: number; offset?: number } = {}) =>
     get<{
       releases: ReleaseDeployment[];
+      total: number;
+      limit: number;
+      offset: number;
       live: ReleaseDeployment | null;
       staged: ReleaseDeployment | null;
       remote_tip: string | null;
-    }>(token, `/api/task-boards/${boardId}/releases`),
+    }>(token, `/api/task-boards/${boardId}/releases${query(opts)}`),
   releaseRollback: (token: string, boardId: string, confirmRollback = false) =>
     mutate<ReleaseOpResponse>(token, `/api/task-boards/${boardId}/releases/rollback`, "POST", {
       confirm_rollback: confirmRollback,

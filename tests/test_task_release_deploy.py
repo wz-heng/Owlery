@@ -564,7 +564,7 @@ async def test_release_stage_refuses_unresolvable_ref_before_planning(store, tmp
         await coord.release_stage(
             board.id, server_root=layout.slot_path("a"), stage_runner=FakeStageRunner()
         )
-    assert await repo.list_release_deployments(board.id) == []
+    assert (await repo.list_release_deployments(board.id))[0] == []
 
 
 @pytest.mark.asyncio
@@ -616,7 +616,7 @@ async def test_release_stage_refuses_without_opt_in(store, tmp_path, monkeypatch
         await coord.release_stage(
             board_id, server_root=layout.slot_path("a"), stage_runner=FakeStageRunner()
         )
-    assert await repo.list_release_deployments(board_id) == []
+    assert (await repo.list_release_deployments(board_id))[0] == []
 
 
 @pytest.mark.asyncio
@@ -633,7 +633,7 @@ async def test_release_stage_closed_admission_refuses_before_planning(store, tmp
         await coord.release_stage(
             board_id, server_root=layout.slot_path("a"), stage_runner=FakeStageRunner()
         )
-    assert await repo.list_release_deployments(board_id) == []
+    assert (await repo.list_release_deployments(board_id))[0] == []
 
 
 # ------------------------------------------------------ coordinator: switch

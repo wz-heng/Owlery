@@ -5,6 +5,7 @@ import {
   TaskApiError,
   type CreateBoardInput,
   type CreateTaskInput,
+  type DeliveryChain,
   type DispatcherStatus,
   type MergeStrategy,
   type ReleaseDeployment,
@@ -23,6 +24,11 @@ import {
   type UpdateBoardInput,
   type UpdateTaskInput,
 } from "../api/tasks";
+import { RELEASES_EXPANDED_KEY, readStored } from "../lib/storage";
+
+/** History page size for the Releases panel's expanded view
+ * (task-board-overhaul.md §3.2). */
+const RELEASES_PAGE_SIZE = 10;
 
 export type DeliveryActionKind =
   | "accept"
@@ -109,7 +115,12 @@ export function filterTasks(
     if (filters.assignee && task.assignee_agent_id !== filters.assignee) return false;
     if (filters.mine && (!activeAgentId || task.assignee_agent_id !== activeAgentId)) return false;
     if (filters.priority !== null && task.priority !== filters.priority) return false;
-    if (needle && !`${task.title}\n${task.body}`.toLocaleLowerCase().includes(needle)) {
+    if (
+      needle &&
+      !`${task.title}\n${task.body ?? task.body_excerpt ?? ""}`
+        .toLocaleLowerCase()
+        .includes(needle)
+    ) {
       return false;
     }
     return true;
@@ -131,9 +142,21 @@ interface TaskState {
   deliveries: Record<string, TaskDelivery>;
   deliveryOps: Record<string, TaskDeliveryOp[]>;
   deliveryConfirmation: DeliveryConfirmation | null;
+  /** Keyed by run_id, mirroring `deliveries` — the supersede-chain context
+   * for that run's delivery panel (task-board-overhaul.md §3.1). */
+  deliveryChains: Record<string, DeliveryChain>;
   releases: Record<string, ReleaseDeployment[]>;
+  releasesTotal: Record<string, number>;
+  /** The board's current live/staged rows, resolved server-side independent
+   * of `releases`' page window (Snape review: deriving these from the first
+   * page via `.find()` goes stale the moment either row ages off page 1). */
+  releaseLive: Record<string, ReleaseDeployment | null>;
+  releaseStaged: Record<string, ReleaseDeployment | null>;
   releaseRemoteTip: Record<string, string | null>;
   releaseConfirmation: ReleaseConfirmation | null;
+  /** Releases panel collapse state (task-board-overhaul.md §3.2), persisted
+   * via `readStored` like `integrationsExpanded`. */
+  releasesExpanded: boolean;
   dispatcher: Record<string, DispatcherStatus>;
   lastEventSeq: Record<string, number>;
   filters: TaskFilters;
@@ -197,8 +220,20 @@ interface TaskState {
     options?: { retention?: string; confirmations?: Record<string, boolean> }
   ): Promise<boolean>;
   clearDeliveryConfirmation(): void;
+  loadDeliveryChain(taskId: string, runId: string): Promise<void>;
+  /** Tear down every delivery this run's tip has collapsed, one at a time,
+   * reusing the existing single-delivery teardown op — no new batch op
+   * (task-board-overhaul.md §3.1). Stops at the first failure so a partial
+   * batch surfaces the same `error` state a single failed teardown would. */
+  teardownSuperseded(
+    taskId: string,
+    runId: string,
+    options?: { retention?: string }
+  ): Promise<boolean>;
 
   loadReleases(boardId: string): Promise<void>;
+  loadMoreReleases(boardId: string): Promise<void>;
+  setReleasesExpanded(expanded: boolean): void;
   stageRelease(boardId: string): Promise<boolean>;
   switchRelease(boardId: string, drain?: boolean): Promise<boolean>;
   rollbackRelease(boardId: string, confirm?: boolean): Promise<boolean>;
@@ -292,6 +327,37 @@ async function runDeliveryCall(
   }
 }
 
+/** REST's max page size (`le=1000` in `server/routers/task_boards.py`),
+ * matching `get_tree`'s existing precedent for a single-page fetch. */
+const TASK_PAGE_LIMIT = 1000;
+
+/** Exhaustively page a board's task list (task-board-overhaul.md §3.4/§6
+ * acceptance #4): a fixed single-page fetch — even at REST's max limit —
+ * silently truncates the Kanban/Tree's active columns once a board crosses
+ * that count (Snape review). Loops on the server's authoritative `total`
+ * until every item is collected, so no board size ever drops tasks from the
+ * default view; the Done column's OWN 15-card cap is a separate client-side
+ * render window over this fully-loaded set, not a fetch cap. */
+async function fetchAllTasks(
+  token: string,
+  boardId: string,
+  filters: Omit<TaskListFilters, "limit" | "offset">
+): Promise<Task[]> {
+  const items: Task[] = [];
+  let total = Infinity;
+  while (items.length < total) {
+    const page = await taskApi.listTasks(token, boardId, {
+      ...filters,
+      limit: TASK_PAGE_LIMIT,
+      offset: items.length,
+    });
+    total = page.total;
+    if (page.items.length === 0) break; // guards a stalled/inconsistent total
+    items.push(...page.items);
+  }
+  return items;
+}
+
 type TaskGet = () => TaskState;
 
 /** Shared reconcile for the release mutations: mutating/finally + confirmation
@@ -357,9 +423,14 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   deliveries: {},
   deliveryOps: {},
   deliveryConfirmation: null,
+  deliveryChains: {},
   releases: {},
+  releasesTotal: {},
+  releaseLive: {},
+  releaseStaged: {},
   releaseRemoteTip: {},
   releaseConfirmation: null,
+  releasesExpanded: readStored(RELEASES_EXPANDED_KEY) === "true",
   dispatcher: {},
   lastEventSeq: {},
   filters: EMPTY_FILTERS,
@@ -490,7 +561,7 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     set({ loadingTasks: true, error: null });
     try {
       const [tasks, dispatcher] = await Promise.all([
-        taskApi.listTasks(token, boardId, { include_archived: true }),
+        fetchAllTasks(token, boardId, { include_archived: true }),
         taskApi.dispatcher(token, boardId),
       ]);
       if (get().selectedBoardId !== boardId) return;
@@ -510,8 +581,7 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     const { token } = get();
     set({ loadingTasks: true, error: null });
     try {
-      const filters: TaskListFilters = { include_archived: true };
-      const tasks = await taskApi.listTasks(token, boardId, filters);
+      const tasks = await fetchAllTasks(token, boardId, { include_archived: true });
       if (get().selectedBoardId === boardId) get().setTaskSnapshot(tasks);
     } catch (error) {
       set({ error: message(error) });
@@ -748,19 +818,86 @@ export const useTaskStore = create<TaskState>((set, get) => ({
       })
     ),
   clearDeliveryConfirmation: () => set({ deliveryConfirmation: null }),
+  loadDeliveryChain: async (taskId, runId) => {
+    const { token } = get();
+    if (!token) return;
+    try {
+      const chain = await taskApi.deliveryChain(token, taskId, runId);
+      set((state) => ({ deliveryChains: { ...state.deliveryChains, [runId]: chain } }));
+    } catch (error) {
+      if (error instanceof TaskApiError && error.status === 404) return;
+      set({ error: message(error) });
+    }
+  },
+  teardownSuperseded: async (taskId, runId, options = {}) => {
+    const chain = get().deliveryChains[runId];
+    if (!chain || chain.superseded.length === 0) return true;
+    let allOk = true;
+    try {
+      for (const entry of chain.superseded) {
+        const ok = await get().teardownDelivery(entry.task_id, entry.run_id, options);
+        if (!ok) {
+          // A single entry needing a typed confirmation (e.g. deleting an
+          // unmerged branch) stops the walk there rather than skipping it —
+          // the pending confirmation is the same dialog a solo teardown
+          // would show; re-running the batch after resolving it picks up
+          // where this left off.
+          allOk = false;
+          break;
+        }
+      }
+    } finally {
+      // `superseded_by_delivery_id` is a permanent git fact — a successful
+      // teardown does NOT remove an entry from `chain.superseded` (only a
+      // history rewrite that breaks the ancestry would). Refresh anyway so
+      // any OTHER change the teardown made (op ledger, retention) is current
+      // the next time this panel reads the chain.
+      await get().loadDeliveryChain(taskId, runId);
+    }
+    return allOk;
+  },
 
   loadReleases: async (boardId) => {
     const { token } = get();
     if (!token) return;
     try {
-      const result = await taskApi.releases(token, boardId);
+      const result = await taskApi.releases(token, boardId, { limit: RELEASES_PAGE_SIZE, offset: 0 });
       set((state) => ({
         releases: { ...state.releases, [boardId]: result.releases },
+        releasesTotal: { ...state.releasesTotal, [boardId]: result.total },
+        releaseLive: { ...state.releaseLive, [boardId]: result.live },
+        releaseStaged: { ...state.releaseStaged, [boardId]: result.staged },
         releaseRemoteTip: { ...state.releaseRemoteTip, [boardId]: result.remote_tip },
       }));
     } catch (error) {
       set({ error: message(error) });
     }
+  },
+  loadMoreReleases: async (boardId) => {
+    const { token } = get();
+    if (!token) return;
+    const current = get().releases[boardId] ?? [];
+    try {
+      const result = await taskApi.releases(token, boardId, {
+        limit: RELEASES_PAGE_SIZE,
+        offset: current.length,
+      });
+      if (get().token !== token) return;
+      set((state) => ({
+        releases: { ...state.releases, [boardId]: [...current, ...result.releases] },
+        releasesTotal: { ...state.releasesTotal, [boardId]: result.total },
+        releaseLive: { ...state.releaseLive, [boardId]: result.live },
+        releaseStaged: { ...state.releaseStaged, [boardId]: result.staged },
+        releaseRemoteTip: { ...state.releaseRemoteTip, [boardId]: result.remote_tip },
+      }));
+    } catch (error) {
+      set({ error: message(error) });
+    }
+  },
+  setReleasesExpanded: (expanded) => {
+    if (expanded) localStorage.setItem(RELEASES_EXPANDED_KEY, "true");
+    else localStorage.removeItem(RELEASES_EXPANDED_KEY);
+    set({ releasesExpanded: expanded });
   },
   stageRelease: (boardId) =>
     runReleaseCall(set, get, boardId, "stage", () => taskApi.releaseStage(get().token, boardId)),
@@ -791,7 +928,11 @@ export function resetTaskStore(): void {
     deliveries: {},
     deliveryOps: {},
     deliveryConfirmation: null,
+    deliveryChains: {},
     releases: {},
+    releasesTotal: {},
+    releaseLive: {},
+    releaseStaged: {},
     releaseRemoteTip: {},
     releaseConfirmation: null,
     dispatcher: {},
