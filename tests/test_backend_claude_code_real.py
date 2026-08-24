@@ -295,11 +295,10 @@ async def test_real_credential_with_bad_key_yields_auth_error():
     await backend.start("Reply with: HI", CWD, credential=bad_cred)
     try:
         # The bad-key path makes the CLI retry the 401 with backoff before
-        # giving up; behind a proxy (e.g. Clash) this measured ~208s
-        # end-to-end (two direct `claude --print` timings, consistent to
-        # within a second) — well past the 60s budget used by every other
-        # test in this file. Widen just this one, with margin above the
-        # observed ceiling.
+        # giving up; behind a proxy (e.g. Clash) two direct timings came in
+        # around 208s, consistent within ~1.5s — well past the usual 60s
+        # drain budget. Widen just this one, with margin above the observed
+        # ceiling.
         events = await _drain(backend, timeout=240.0)
     finally:
         await backend.stop()
