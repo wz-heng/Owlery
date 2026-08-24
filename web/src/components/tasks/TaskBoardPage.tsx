@@ -160,6 +160,7 @@ export function TaskBoardPage({ token, agents, activeAgentId, liveEvent, onOpenS
           }}
           onLifecycle={(operation) => store.lifecycle(selectedTask.id, operation)}
           onArchive={(archived) => store.setTaskArchived(selectedTask.id, archived)}
+          onCloseTask={(summary) => store.closeTask(selectedTask.id, summary)}
           onComment={(body) => store.addComment(selectedTask.id, body)}
           onAddDependency={(dependencyId) => store.addDependency(selectedTask.id, dependencyId)}
           onRemoveDependency={(dependencyId) => store.removeDependency(selectedTask.id, dependencyId)}
@@ -202,7 +203,7 @@ function CreateTaskDialog({ agents, tasks, busy, onClose, onCreate }: { agents: 
           <label className="sm:col-span-2"><span className="task-label">Outcome</span><input autoFocus required className="task-input" value={title} onChange={(event) => setTitle(event.target.value)} placeholder="What should be true when this is done?" /></label>
           <label className="sm:col-span-2"><span className="task-label">Description</span><textarea className="task-input min-h-24 resize-y py-2" value={body} onChange={(event) => setBody(event.target.value)} /></label>
           <label><span className="task-label">Assignee</span><select className="task-input" value={assignee} onChange={(event) => setAssignee(event.target.value)}><option value="">Unassigned</option>{agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select></label>
-          <label><span className="task-label">Parent task</span><select className="task-input" value={parent} onChange={(event) => setParent(event.target.value)}><option value="">Top level</option>{tasks.filter((task) => !task.archived && task.status !== "done").map((task) => <option key={task.id} value={task.id}>{task.title}</option>)}</select></label>
+          <label><span className="task-label">Parent task</span><select className="task-input" value={parent} onChange={(event) => setParent(event.target.value)}><option value="">Top level</option>{tasks.filter((task) => !task.archived && task.status !== "done" && task.status !== "cancelled").map((task) => <option key={task.id} value={task.id}>{task.title}</option>)}</select></label>
           <label><span className="task-label">Priority</span><select className="task-input" value={priority} onChange={(event) => setPriority(Number(event.target.value))}>{[3, 2, 1, 0].map((p) => <option key={p} value={p}>P{p}</option>)}</select></label>
           <label><span className="task-label">Workspace</span><select className="task-input" value={workspace} onChange={(event) => setWorkspace(event.target.value as WorkspaceMode | "")}><option value="">Board default</option><option value="shared">Shared</option><option value="copy">Copy</option><option value="git_worktree">Git worktree</option></select></label>
         </div>

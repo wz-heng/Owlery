@@ -38,9 +38,24 @@ export function KanbanColumns({ tasks, agents, onOpenTask, onMoveTask }: KanbanC
   );
   const agentMap = useMemo(() => new Map(agents.map((agent) => [agent.id, agent])), [agents]);
   const dragged = draggedId ? tasks.find((task) => task.id === draggedId) : null;
-  const doneTasks = grouped.done;
-  const doneShown = doneTasks.slice(0, doneVisible);
-  const doneHiddenCount = doneTasks.length - doneShown.length;
+  // `cancelled` is a first-class terminal status (task-board-gaps.md §3.4)
+  // but is NOT one of the six lifecycle columns — it never lived in
+  // `blocked`, and it doesn't get its own column either. It folds into the
+  // Done column's tail: still visible, still batch-archivable, but never
+  // mistaken for a card still awaiting a decision.
+  const cancelledTasks = useMemo(
+    () =>
+      tasks
+        .filter((task) => task.status === "cancelled")
+        .sort((a, b) => b.priority - a.priority || a.created_at.localeCompare(b.created_at)),
+    [tasks]
+  );
+  const doneAndCancelled = useMemo(
+    () => [...grouped.done, ...cancelledTasks],
+    [grouped.done, cancelledTasks]
+  );
+  const doneShown = doneAndCancelled.slice(0, doneVisible);
+  const doneHiddenCount = doneAndCancelled.length - doneShown.length;
   const archivableInView = doneShown.filter(isArchivableDoneTask);
 
   return (
@@ -80,7 +95,7 @@ export function KanbanColumns({ tasks, agents, onOpenTask, onMoveTask }: KanbanC
               <span className={cn("h-2 w-2 rounded-full", STATUS_ACCENT[status])} />
               <h2 className="font-serif text-sm font-semibold text-foreground">{STATUS_LABEL[status]}</h2>
               <span className="ml-auto rounded-full bg-card px-2 py-0.5 text-[11px] tabular-nums text-muted-foreground shadow-[var(--elevation-inset)]">
-                {grouped[status].length}
+                {status === "done" ? doneAndCancelled.length : grouped[status].length}
               </span>
             </header>
             <div className="flex min-h-28 flex-1 flex-col gap-2.5 overflow-y-auto p-2.5">
@@ -100,7 +115,7 @@ export function KanbanColumns({ tasks, agents, onOpenTask, onMoveTask }: KanbanC
                   />
                 </div>
               ))}
-              {grouped[status].length === 0 && (
+              {(status === "done" ? doneAndCancelled.length : grouped[status].length) === 0 && (
                 <div className="flex min-h-24 items-center justify-center rounded-xl text-xs italic text-muted-foreground">
                   No {STATUS_LABEL[status].toLocaleLowerCase()} tasks
                 </div>

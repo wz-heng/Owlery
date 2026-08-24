@@ -26,6 +26,7 @@ import {
 import { cn } from "../../lib/utils";
 import {
   DELIVERY_TONE_PILL,
+  deliveryButtonState,
   deliveryStatusTone,
   formatDate,
 } from "./taskPresentation";
@@ -70,8 +71,11 @@ interface DeliveryActionButtonProps {
   onClick: () => void;
   disabled: boolean;
   destructive?: boolean;
+  /** Shown as the native tooltip. Every disabled action must carry one
+   * (task-board-gaps.md §3.5 — "each greyed-out action can answer why"). */
+  title?: string;
 }
-function DeliveryActionButton({ label, icon, onClick, disabled, destructive }: DeliveryActionButtonProps) {
+function DeliveryActionButton({ label, icon, onClick, disabled, destructive, title }: DeliveryActionButtonProps) {
   return (
     <button
       type="button"
@@ -82,12 +86,18 @@ function DeliveryActionButton({ label, icon, onClick, disabled, destructive }: D
           : "border-ink-300 text-ink-800 hover:border-primary/40 hover:bg-primary-50"
       )}
       disabled={disabled}
+      title={title}
       onClick={onClick}
     >
       {icon} {label}
     </button>
   );
 }
+
+/** Panel-wide "why is everything grey right now" reason, taking priority over
+ * a per-button reason since NONE of them are individually actionable while
+ * another op is in flight. */
+const BUSY_REASON = "A delivery action is already running";
 
 interface TaskDeliveryPanelProps {
   run: TaskRun;
@@ -164,6 +174,7 @@ export function TaskDeliveryPanel({ run, onOpenTask }: TaskDeliveryPanelProps) {
             label="Accept"
             icon={<IconGitBranch size={14} />}
             disabled={mutating}
+            title={mutating ? BUSY_REASON : undefined}
             onClick={() => void store.acceptDelivery(taskId, runId)}
           />
         </div>
@@ -173,12 +184,13 @@ export function TaskDeliveryPanel({ run, onOpenTask }: TaskDeliveryPanelProps) {
 
   const status = delivery.status;
   const busy = mutating || status === "preparing" || status === "delivering";
-  const canAccept = status === "pending";
-  const canCommit = status === "ready" && delivery.dirty;
-  const canPush = status === "ready" && !delivery.dirty && (delivery.commits_ahead ?? 0) > 0;
-  const canOpenPr = !!delivery.pushed_ref && delivery.pr_number == null;
-  const canMerge = delivery.pr_number != null && status !== "delivered";
-  const canTeardown = (["delivered", "failed", "blocked", "conflicted"] as DeliveryStatus[]).includes(status);
+  const accept = deliveryButtonState("accept", delivery);
+  const commit = deliveryButtonState("commit", delivery);
+  const push = deliveryButtonState("push", delivery);
+  const pullRequest = deliveryButtonState("pull_request", delivery);
+  const merge = deliveryButtonState("merge", delivery);
+  const teardown = deliveryButtonState("teardown", delivery);
+  const reasonFor = (state: { reason: string | null }) => (busy ? BUSY_REASON : state.reason ?? undefined);
 
   const opLog = ops ?? [];
   const superseded = chain?.superseded ?? [];
@@ -266,37 +278,43 @@ export function TaskDeliveryPanel({ run, onOpenTask }: TaskDeliveryPanelProps) {
         <DeliveryActionButton
           label="Accept"
           icon={<IconGitBranch size={14} />}
-          disabled={busy || !canAccept}
+          disabled={busy || !accept.enabled}
+          title={reasonFor(accept)}
           onClick={() => void store.acceptDelivery(taskId, runId)}
         />
         <DeliveryActionButton
           label="Commit"
           icon={<IconGitCommit size={14} />}
-          disabled={busy || !canCommit}
+          disabled={busy || !commit.enabled}
+          title={reasonFor(commit)}
           onClick={() => void store.deliveryAction(taskId, runId, "commit")}
         />
         <DeliveryActionButton
           label="Push"
           icon={<IconUpload size={14} />}
-          disabled={busy || !canPush}
+          disabled={busy || !push.enabled}
+          title={reasonFor(push)}
           onClick={() => void store.deliveryAction(taskId, runId, "push")}
         />
         <DeliveryActionButton
           label="Open PR"
           icon={<IconGitPullRequest size={14} />}
-          disabled={busy || !canOpenPr}
+          disabled={busy || !pullRequest.enabled}
+          title={reasonFor(pullRequest)}
           onClick={() => void store.deliveryAction(taskId, runId, "pull_request")}
         />
         <DeliveryActionButton
           label="Merge"
           icon={<IconGitMerge size={14} />}
-          disabled={busy || !canMerge}
+          disabled={busy || !merge.enabled}
+          title={reasonFor(merge)}
           onClick={() => void store.deliveryAction(taskId, runId, "merge")}
         />
         <DeliveryActionButton
           label="Teardown"
           icon={<IconTrash size={14} />}
-          disabled={busy || !canTeardown}
+          disabled={busy || !teardown.enabled}
+          title={reasonFor(teardown)}
           destructive
           onClick={() => void store.teardownDelivery(taskId, runId, { retention })}
         />

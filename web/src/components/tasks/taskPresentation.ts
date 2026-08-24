@@ -1,6 +1,7 @@
 import type {
   DeliveryStatus,
   Task,
+  TaskDelivery,
   TaskStatus,
   TaskRunState,
 } from "../../api/tasks";
@@ -12,6 +13,7 @@ export const STATUS_LABEL: Record<TaskStatus, string> = {
   running: "Running",
   blocked: "Blocked",
   done: "Done",
+  cancelled: "Cancelled",
 };
 
 export const STATUS_ACCENT: Record<TaskStatus, string> = {
@@ -21,6 +23,9 @@ export const STATUS_ACCENT: Record<TaskStatus, string> = {
   running: "bg-attention",
   blocked: "bg-destructive",
   done: "bg-success",
+  // Deliberately terminal-neutral, not destructive — a cancelled task is a
+  // decision, not a failure (task-board-gaps.md §3.4).
+  cancelled: "bg-ink-600",
 };
 
 export const RUN_LABEL: Record<TaskRunState, string> = {
@@ -126,17 +131,100 @@ export function deliveryChip(
   }
 }
 
-/** Whether a `done` task is safe to offer the Done column's batch "archive"
- * entry (task-board-overhaul.md §3.4). A task with no delivery (non-git-
- * worktree run, or never accepted) has nothing left to track. A task WITH a
+/** Whether a finished task is safe to offer the Done column's batch
+ * "archive" entry (task-board-overhaul.md §3.4; widened to `cancelled` by
+ * task-board-gaps.md §3.4 — a decisively closed-out card, same as `done`).
+ * A task with no delivery (non-git-worktree run, never accepted, or never
+ * even run before being cancelled) has nothing left to track. A task WITH a
  * delivery is eligible only once that delivery actually reached `delivered`
  * — `failed`/`blocked`/`conflicted` are terminal in the state-machine sense
- * but still need a human's eyes; batching them under "Archive N delivered"
+ * but still need a human's eyes; batching them under "Archive N finished"
  * would hide a real problem, not close out a finished one (Snape review). */
 export function isArchivableDoneTask(task: Pick<Task, "status" | "archived" | "delivery">): boolean {
-  if (task.status !== "done" || task.archived) return false;
+  if ((task.status !== "done" && task.status !== "cancelled") || task.archived) return false;
   if (!task.delivery) return true;
   return task.delivery.status === "delivered";
+}
+
+/** The explicit "did not pass" badge for a `done` task with `verdict: "fail"`
+ * (task-board-gaps.md §3.1) — visually distinct from an ordinary done card so
+ * nobody mistakes a failed review for a finished one. `null` for every other
+ * case (no verdict, verdict: "pass", or non-done statuses). */
+export function verdictBadge(task: Pick<Task, "status" | "verdict">): DeliveryChip | null {
+  if (task.status !== "done" || task.verdict !== "fail") return null;
+  return { label: "Review failed", tone: "destructive" };
+}
+
+export type DeliveryButtonKind =
+  | "accept"
+  | "commit"
+  | "push"
+  | "pull_request"
+  | "merge"
+  | "teardown";
+
+export interface DeliveryButtonState {
+  enabled: boolean;
+  /** Why the action is unavailable right now — every disabled delivery
+   * action must be able to answer "why" (task-board-gaps.md §3.5). `null`
+   * when `enabled` is true, or when unavailability is solely because another
+   * action is in flight (the caller renders that reason once, panel-wide). */
+  reason: string | null;
+}
+
+type DeliveryButtonInput = Pick<
+  TaskDelivery,
+  "status" | "dirty" | "commits_ahead" | "pr_number" | "pushed_ref"
+>;
+
+/** Single source of truth for whether each delivery action button is
+ * clickable and, if not, why — shared by the enable/disable logic and the
+ * tooltip text so the two can never drift apart. `delivery` is `null` before
+ * `Accept` has ever been called (task-board-gaps.md §3.5). */
+export function deliveryButtonState(
+  kind: DeliveryButtonKind,
+  delivery: DeliveryButtonInput | null
+): DeliveryButtonState {
+  if (!delivery) {
+    return kind === "accept"
+      ? { enabled: true, reason: null }
+      : { enabled: false, reason: "Accept the delivery first" };
+  }
+  const { status, dirty, commits_ahead, pr_number, pushed_ref } = delivery;
+  switch (kind) {
+    case "accept":
+      return status === "pending"
+        ? { enabled: true, reason: null }
+        : { enabled: false, reason: "Already accepted" };
+    case "commit":
+      if (status !== "ready") return { enabled: false, reason: "Not ready to commit yet" };
+      if (!dirty) return { enabled: false, reason: "Nothing to commit — the worktree is clean" };
+      return { enabled: true, reason: null };
+    case "push":
+      if (status !== "ready") return { enabled: false, reason: "Not ready to push yet" };
+      if (dirty) return { enabled: false, reason: "Commit the pending changes first" };
+      if ((commits_ahead ?? 0) <= 0)
+        return { enabled: false, reason: "Nothing to push — no commits ahead of base" };
+      return { enabled: true, reason: null };
+    case "pull_request":
+      if (!pushed_ref) return { enabled: false, reason: "Push the branch first" };
+      if (pr_number != null)
+        return { enabled: false, reason: "Pull request already open — see the link above" };
+      return { enabled: true, reason: null };
+    case "merge":
+      if (pr_number == null) return { enabled: false, reason: "Open a pull request first" };
+      if (status === "delivered")
+        return { enabled: false, reason: "Already delivered — merge on the platform" };
+      return { enabled: true, reason: null };
+    case "teardown": {
+      const terminal = (
+        ["delivered", "failed", "blocked", "conflicted"] as DeliveryStatus[]
+      ).includes(status);
+      return terminal
+        ? { enabled: true, reason: null }
+        : { enabled: false, reason: "Delivery must reach a terminal state before teardown" };
+    }
+  }
 }
 
 export function relativeTime(value: string | null | undefined): string {

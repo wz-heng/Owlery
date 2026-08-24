@@ -196,6 +196,7 @@ interface TaskState {
     body?: Record<string, unknown>
   ): Promise<boolean>;
   setTaskArchived(taskId: string, archived: boolean): Promise<void>;
+  closeTask(taskId: string, summary: string): Promise<boolean>;
   addComment(taskId: string, body: string): Promise<boolean>;
   addDependency(taskId: string, dependencyId: string): Promise<boolean>;
   removeDependency(taskId: string, dependencyId: string): Promise<boolean>;
@@ -704,6 +705,21 @@ export const useTaskStore = create<TaskState>((set, get) => ({
       get().upsertTask(await taskApi.archiveTask(token, taskId, archived));
     } catch (error) {
       set({ error: message(error) });
+    } finally {
+      set({ mutating: false });
+    }
+  },
+  closeTask: async (taskId, summary) => {
+    const { token } = get();
+    set({ mutating: true, error: null });
+    try {
+      get().upsertTask(await taskApi.close(token, taskId, summary));
+      return true;
+    } catch (error) {
+      const current = error instanceof TaskApiError ? error.currentTask : null;
+      if (current) get().upsertTask(current);
+      set({ error: message(error) });
+      return false;
     } finally {
       set({ mutating: false });
     }

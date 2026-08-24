@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   IconArchive,
   IconCalendar,
+  IconCircleCheck,
   IconGitBranch,
   IconPaperclip,
   IconRefresh,
@@ -34,6 +35,10 @@ interface TaskDrawerProps {
   onComment: (body: string) => Promise<boolean>;
   onAddDependency: (dependencyId: string) => Promise<boolean>;
   onRemoveDependency: (dependencyId: string) => Promise<boolean>;
+  /** Orchestrator-side container-card close (task-board-gaps.md §3.3) —
+   * distinct from the worker `complete`/`block` protocol; see `closeEligible`
+   * below for when this is even offered. */
+  onCloseTask: (summary: string) => Promise<boolean>;
   onRefresh: () => void;
   onOpenTask: (taskId: string) => void;
   onOpenSession?: (sessionId: string) => void;
@@ -54,6 +59,8 @@ export function TaskDrawer(props: TaskDrawerProps) {
   const [scheduledAt, setScheduledAt] = useState(task.scheduled_at ? task.scheduled_at.slice(0, 16) : "");
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode | "">(task.workspace_mode ?? "");
   const [dependency, setDependency] = useState("");
+  const [closing, setClosing] = useState(false);
+  const [closeSummary, setCloseSummary] = useState("");
 
   useEffect(() => {
     if (detail?.body !== undefined) {
@@ -69,6 +76,22 @@ export function TaskDrawer(props: TaskDrawerProps) {
   );
   const dependents = detail?.dependents ?? task.dependents ?? [];
   const children = detail?.children ?? allTasks.filter((item) => item.parent_task_id === task.id);
+  // Container-card close (task-board-gaps.md §3.3): offered only for a
+  // decomposition card (has children) that was never itself dispatched a
+  // run — mirrors the server's three rejections exactly, so the tooltip
+  // never claims something the backend would actually accept.
+  const isTerminal = task.status === "done" || task.status === "cancelled";
+  const hasRunHistory = props.runs.length > 0;
+  const openChildren = children.filter((child) => child.status !== "done" && child.status !== "cancelled");
+  const closeDisabledReason = isTerminal
+    ? "Task is already terminal"
+    : task.current_run_id != null
+      ? "A running task cannot be closed"
+      : hasRunHistory
+        ? "Has run history — close through the worker completion protocol instead"
+        : openChildren.length > 0
+          ? `${openChildren.length} child task${openChildren.length === 1 ? "" : "s"} not yet terminal`
+          : null;
   const dependencyCandidates = useMemo(
     () => allTasks.filter((item) => item.id !== task.id && item.board_id === task.board_id && !dependencies.some((dep) => dep.id === item.id)),
     [allTasks, dependencies, task.board_id, task.id]
@@ -106,6 +129,12 @@ export function TaskDrawer(props: TaskDrawerProps) {
           </section>
 
           {task.status === "blocked" && <div className="mt-4 rounded-xl border border-destructive/30 bg-destructive-surface p-3"><p className="text-xs font-semibold uppercase tracking-wide text-destructive">Blocked · {task.blocked_kind}</p><p className="mt-1 whitespace-pre-wrap text-sm text-ink-800">{task.blocked_reason ?? "No reason recorded."}</p></div>}
+          {task.status === "done" && task.verdict === "fail" && (
+            <div className="mt-4 rounded-xl border border-destructive/30 bg-destructive-surface p-3">
+              <p className="text-xs font-semibold uppercase tracking-wide text-destructive">Review failed</p>
+              <p className="mt-1 text-sm text-ink-800">This task completed with verdict=fail — dependents will not unblock on it, even though the task itself is done.</p>
+            </div>
+          )}
           {task.result_summary && <div className="mt-4 rounded-xl border border-success/30 bg-success-surface p-3"><p className="text-xs font-semibold uppercase tracking-wide text-success">Outcome</p><p className="mt-1 whitespace-pre-wrap text-sm text-ink-800">{task.result_summary}</p></div>}
 
           <div className="mt-5 flex flex-wrap gap-2 border-y border-ink-300 py-3">
@@ -113,9 +142,48 @@ export function TaskDrawer(props: TaskDrawerProps) {
             {task.status === "todo" && <><Action label="Mark ready" onClick={() => props.onLifecycle("ready")} /><Action label="Move to triage" subtle onClick={() => props.onLifecycle("triage")} /></>}
             {task.status === "ready" && <Action label="Move to triage" subtle onClick={() => props.onLifecycle("triage")} />}
             {task.status === "blocked" && <Action label="Unblock" onClick={() => props.onLifecycle("unblock")} />}
-            {(["triage", "todo", "ready"] as string[]).includes(task.status) && <Action label="Cancel" destructive onClick={() => props.onLifecycle("cancel")} />}
+            {/* cancelled is reachable directly from triage/todo/ready/blocked
+                (task-board-gaps.md §3.4) — a running task must stop its run
+                first, so it's deliberately excluded here. */}
+            {(["triage", "todo", "ready", "blocked"] as string[]).includes(task.status) && <Action label="Cancel" destructive onClick={() => props.onLifecycle("cancel")} />}
+            {children.length > 0 && !closing && (
+              <button
+                type="button"
+                className="inline-flex h-8 items-center gap-1.5 rounded-lg px-3 text-xs font-medium text-muted-foreground hover:bg-ink-200 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
+                disabled={closeDisabledReason !== null}
+                title={closeDisabledReason ?? "Close this container once every child task has settled"}
+                onClick={() => setClosing(true)}
+              >
+                <IconCircleCheck size={14} /> Close
+              </button>
+            )}
             <button type="button" className="ml-auto inline-flex h-8 items-center gap-1.5 rounded-lg px-3 text-xs text-muted-foreground hover:bg-ink-200" onClick={() => props.onArchive(!task.archived)}><IconArchive size={14} /> {task.archived ? "Unarchive" : "Archive"}</button>
             {dirty && task.status !== "done" && <button type="button" className="h-8 rounded-lg bg-primary-700 px-3 text-xs font-semibold text-white disabled:opacity-50" disabled={props.busy || !title.trim() || !bodyReady} title={!bodyReady ? "Waiting for the full task text to load" : undefined} onClick={() => void props.onSave({ title: title.trim(), body, priority, assignee_agent_id: assignee || null, scheduled_at: scheduledAt ? new Date(scheduledAt).toISOString() : null, workspace_mode: workspaceMode || null })}>Save changes</button>}
+            {closing && (
+              <form
+                className="flex w-full flex-col gap-2 rounded-lg border border-ink-300 bg-card p-2.5"
+                onSubmit={async (event) => {
+                  event.preventDefault();
+                  if (await props.onCloseTask(closeSummary.trim())) {
+                    setClosing(false);
+                    setCloseSummary("");
+                  }
+                }}
+              >
+                <textarea
+                  autoFocus
+                  className="task-input min-h-16 resize-y py-2 text-xs"
+                  value={closeSummary}
+                  onChange={(event) => setCloseSummary(event.target.value)}
+                  placeholder="Summarize why this container is done…"
+                  aria-label="Close summary"
+                />
+                <div className="flex justify-end gap-2">
+                  <button type="button" className="h-8 rounded-lg px-3 text-xs text-muted-foreground hover:bg-ink-200" onClick={() => { setClosing(false); setCloseSummary(""); }}>Cancel</button>
+                  <button type="submit" className="h-8 rounded-lg bg-primary-700 px-3 text-xs font-semibold text-white disabled:opacity-50" disabled={props.busy || !closeSummary.trim()}>Confirm close</button>
+                </div>
+              </form>
+            )}
           </div>
 
           <section className="mt-6">

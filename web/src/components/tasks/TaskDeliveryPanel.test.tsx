@@ -146,6 +146,39 @@ describe("TaskDeliveryPanel", () => {
     expect(screen.getByText(/ref: refs\/heads\/owlery\/task-1-run-1/)).toBeInTheDocument();
   });
 
+  it("gives every disabled action button a non-empty tooltip explaining why (task-board-gaps.md §3.5)", () => {
+    seed(delivery());
+    render(<TaskDeliveryPanel run={run} />);
+
+    for (const label of ["Accept", "Commit", "Open PR", "Merge", "Teardown"]) {
+      const button = screen.getByRole("button", { name: label });
+      expect(button).toBeDisabled();
+      expect(button.getAttribute("title")).toBeTruthy();
+    }
+    // Push is enabled in this fixture — no explanatory tooltip needed.
+    expect(screen.getByRole("button", { name: "Push" })).toBeEnabled();
+  });
+
+  it("explains a pre-existing PR by name on the disabled Open PR button", () => {
+    seed(delivery({ status: "delivered", pushed_ref: "refs/heads/x", pr_number: 42, pr_url: "https://example.com/pr/42" }));
+    render(<TaskDeliveryPanel run={run} />);
+
+    const openPr = screen.getByRole("button", { name: "Open PR" });
+    expect(openPr).toBeDisabled();
+    expect(openPr.getAttribute("title")).toMatch(/already open/i);
+    // The existing PR itself is surfaced as a link, not a bare error.
+    expect(screen.getByRole("link", { name: /PR #42/ })).toHaveAttribute("href", "https://example.com/pr/42");
+  });
+
+  it("explains that a delivered PR must merge on the platform", () => {
+    seed(delivery({ status: "delivered", pr_number: 42 }));
+    render(<TaskDeliveryPanel run={run} />);
+
+    const mergeButton = screen.getByRole("button", { name: "Merge" });
+    expect(mergeButton).toBeDisabled();
+    expect(mergeButton.getAttribute("title")).toMatch(/merge on the platform/i);
+  });
+
   it("shows blocked evidence and allows terminal teardown", () => {
     seed(
       delivery({

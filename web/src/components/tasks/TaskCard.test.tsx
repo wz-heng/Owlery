@@ -22,6 +22,7 @@ function task(overrides: Partial<Task> = {}): Task {
     blocked_kind: null,
     blocked_reason: null,
     result_summary: null,
+    verdict: null,
     archived: false,
     created_by_kind: "user",
     created_by_agent_id: null,
@@ -129,3 +130,32 @@ describe("TaskCard blocked staleness", () => {
     expect(screen.getAllByText(/ago$/)).toHaveLength(1);
   });
 });
+
+describe("TaskCard cancelled", () => {
+  it("shows a neutral Cancelled tag with no staleness age (task-board-gaps.md §3.4)", () => {
+    const twoDaysAgo = new Date(Date.now() - 2 * 24 * 3600 * 1000).toISOString();
+    render(<TaskCard task={task({ status: "cancelled", updated_at: twoDaysAgo })} onOpen={vi.fn()} />);
+    expect(screen.getByText("Cancelled")).toBeInTheDocument();
+    expect(screen.queryByText(/ago$/)).toBeNull();
+  });
+
+  it("is not draggable", () => {
+    render(<TaskCard task={task({ status: "cancelled" })} onOpen={vi.fn()} />);
+    expect(screen.getByRole("button")).toHaveAttribute("draggable", "false");
+  });
+});
+
+describe("TaskCard verdict", () => {
+  it("shows a Review failed badge for a done task with verdict=fail", () => {
+    render(<TaskCard task={task({ status: "done", verdict: "fail" })} onOpen={vi.fn()} />);
+    const badge = screen.getByTestId("task-verdict-badge");
+    expect(badge).toHaveTextContent("Review failed");
+    expect(badge.className).toContain("text-destructive");
+  });
+
+  it("renders no verdict badge for an ordinary done task", () => {
+    render(<TaskCard task={task({ status: "done", verdict: null })} onOpen={vi.fn()} />);
+    expect(screen.queryByTestId("task-verdict-badge")).toBeNull();
+  });
+});
+

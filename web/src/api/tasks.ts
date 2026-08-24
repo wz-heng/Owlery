@@ -12,7 +12,14 @@ export type TaskStatus =
   | "ready"
   | "running"
   | "blocked"
-  | "done";
+  | "done"
+  | "cancelled";
+
+/** A worker's review/acceptance gate on a `done` task (task-board-gaps.md
+ * §3.1): null means no verdict was recorded (ordinary, non-review work, or a
+ * legacy task predating this field) and counts as passing for dependency
+ * eligibility; only "fail" ever blocks a dependent. */
+export type TaskVerdict = "pass" | "fail";
 
 export type TaskRunState =
   | "running"
@@ -87,6 +94,7 @@ export interface Task {
   blocked_kind: BlockedKind | null;
   blocked_reason: string | null;
   result_summary: string | null;
+  verdict: TaskVerdict | null;
   archived: boolean;
   created_by_kind: "user" | "agent" | "schedule" | "api";
   created_by_agent_id: string | null;
@@ -565,6 +573,12 @@ export const taskApi = {
   ) => mutate<Task>(token, `/api/tasks/${taskId}/${operation}`, "POST", body),
   archiveTask: (token: string, taskId: string, archived: boolean) =>
     mutate<Task>(token, `/api/tasks/${taskId}/${archived ? "archive" : "unarchive"}`, "POST"),
+  /** Orchestrator-side container-card close (task-board-gaps.md §3.3): only
+   * for a never-dispatched task whose children are all terminal. Rejected
+   * server-side for a worker caller, a task with run history, or open
+   * children — see `close_task` in `server/task_board/repository.py`. */
+  close: (token: string, taskId: string, summary: string) =>
+    mutate<Task>(token, `/api/tasks/${taskId}/close`, "POST", { summary }),
   runs: (token: string, taskId: string) =>
     get<TaskRun[]>(token, `/api/tasks/${taskId}/runs`),
   events: (token: string, taskId: string) =>

@@ -29,6 +29,7 @@ function task(overrides: Partial<Task> = {}): Task {
     blocked_kind: null,
     blocked_reason: null,
     result_summary: null,
+    verdict: null,
     archived: false,
     created_by_kind: "user",
     created_by_agent_id: null,
@@ -178,6 +179,28 @@ describe("taskStore transitions", () => {
     expect(await useTaskStore.getState().moveTask(current.id, "ready")).toBe(false);
     expect(useTaskStore.getState().tasksById[current.id]).toEqual(claimed);
     expect(useTaskStore.getState().error).toBe("Already claimed");
+  });
+
+  it("closes a container task and stores the server-returned done task", async () => {
+    const container = task({ status: "triage" });
+    const closed = task({ status: "done", result_summary: "All children settled." });
+    useTaskStore.setState({ token: "tok", tasksById: { [container.id]: container }, taskOrder: [container.id] });
+    const close = vi.spyOn(taskApi, "close").mockResolvedValue(closed);
+
+    expect(await useTaskStore.getState().closeTask(container.id, "All children settled.")).toBe(true);
+    expect(close).toHaveBeenCalledWith("tok", container.id, "All children settled.");
+    expect(useTaskStore.getState().tasksById[container.id].status).toBe("done");
+  });
+
+  it("surfaces the server's rejection reason when close is refused", async () => {
+    const container = task({ status: "triage" });
+    useTaskStore.setState({ token: "tok", tasksById: { [container.id]: container }, taskOrder: [container.id] });
+    vi.spyOn(taskApi, "close").mockRejectedValue(
+      new TaskApiError("all child tasks must be terminal before closing", 409, container)
+    );
+
+    expect(await useTaskStore.getState().closeTask(container.id, "Done")).toBe(false);
+    expect(useTaskStore.getState().error).toBe("all child tasks must be terminal before closing");
   });
 });
 
