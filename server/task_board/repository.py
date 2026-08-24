@@ -34,6 +34,7 @@ from .models import (
     RELEASE_OP_KINDS,
     RELEASE_STATES,
     SWITCH_OWNED_REASON_KINDS,
+    VERDICT_KINDS,
     WORKSPACE_MODES,
     ArtifactRecord,
     BoardRecord,
@@ -323,11 +324,17 @@ class TaskRepository:
         scheduled = task["scheduled_at"]
         if scheduled is not None and scheduled > now:
             return False
+        # A dependency satisfies eligibility when done AND not verdict='fail'
+        # (task-board-gaps.md §3.1) — a review/acceptance task that reports
+        # verdict='fail' never unblocks its dependents, even though it is
+        # itself `done`. NULL verdict (no gate recorded) passes, same as any
+        # ordinary done task.
         pending = await self._fetchone(
             conn,
             "SELECT 1 FROM task_dependencies d JOIN tasks dep "
             "ON dep.id = d.depends_on_task_id "
-            "WHERE d.task_id = ? AND dep.status != 'done' LIMIT 1",
+            "WHERE d.task_id = ? "
+            "AND (dep.status != 'done' OR dep.verdict = 'fail') LIMIT 1",
             (task["id"],),
         )
         return pending is None
@@ -750,7 +757,7 @@ class TaskRepository:
             open_row = await self._fetchone(
                 conn,
                 "SELECT COUNT(*) AS n FROM tasks WHERE board_id = ? "
-                "AND archived = 0 AND status != 'done'",
+                "AND archived = 0 AND status NOT IN ('done', 'cancelled')",
                 (board_id,),
             )
             if open_row["n"] >= board["max_open_tasks"]:
@@ -1219,8 +1226,8 @@ class TaskRepository:
                 raise TaskConflictError(
                     "task was modified by another caller", current=TaskRecord.from_row(task)
                 )
-            if task["status"] in ("running", "done"):
-                raise TaskConflictError("running/done tasks cannot be edited", current=TaskRecord.from_row(task))
+            if task["status"] in ("running", "done", "cancelled"):
+                raise TaskConflictError("running/done/cancelled tasks cannot be edited", current=TaskRecord.from_row(task))
             if "parent_task_id" in updates:
                 board = await self._board_row(conn, task["board_id"])
                 await self._validate_parent(
@@ -1521,12 +1528,18 @@ class TaskRepository:
         stamp = _now_iso()
         async with self._transaction() as conn:
             task = await self._task_row(conn, task_id)
-            if task["status"] not in ("triage", "todo", "ready"):
-                raise TaskConflictError("only non-running executable tasks may be cancelled", current=TaskRecord.from_row(task))
+            # cancelled is a first-class terminal state (task-board-gaps.md
+            # §3.4): triage/todo/ready/blocked may all transition directly to
+            # it. A running task cannot — the caller must stop its run first
+            # (manager.cancel_task does this by cancelling the run, which
+            # lands the task in blocked; a second cancel call then finishes
+            # the transition to cancelled).
+            if task["status"] not in ("triage", "todo", "ready", "blocked"):
+                raise TaskConflictError("only a non-running task may be cancelled", current=TaskRecord.from_row(task))
             await conn.execute(
-                "UPDATE tasks SET status = 'blocked', blocked_kind = 'cancelled', "
-                "blocked_reason = ?, updated_at = ? WHERE id = ?",
-                (reason or "cancelled", stamp, task_id),
+                "UPDATE tasks SET status = 'cancelled', blocked_kind = NULL, "
+                "blocked_reason = ?, updated_at = ?, completed_at = ? WHERE id = ?",
+                (reason or "cancelled", stamp, stamp, task_id),
             )
             updated = await self._task_row(conn, task_id)
             await self._event(
@@ -1538,6 +1551,79 @@ class TaskRepository:
                 payload={"from": task["status"], "reason": reason},
                 now=stamp,
             )
+        return TaskRecord.from_row(updated)
+
+    async def close_task(
+        self,
+        task_id: str,
+        *,
+        summary: str,
+        actor_kind: str = "user",
+        actor_agent_id: str | None = None,
+    ) -> TaskRecord:
+        """Close a container/root task that was never dispatched a run of its
+        own, once every child has reached a terminal status
+        (task-board-gaps.md §3.3). The orchestrator-side counterpart to a
+        worker's `complete`/`block` terminal protocol — a pure-decomposition
+        task (a battle's root, say) has no run to close through, so it would
+        otherwise sit in triage forever even after every child finishes.
+
+        Three rejections, all deliberate: a task already terminal (nothing to
+        close), a task with any run history (it must close through the
+        worker terminal protocol, not this), and a task with any non-terminal
+        child (the whole point is "only after everything under it settled").
+        """
+        clean_summary = summary.strip()
+        if not clean_summary:
+            raise TaskValidationError("close summary is required")
+        stamp = _now_iso()
+        async with self._transaction() as conn:
+            task = await self._task_row(conn, task_id)
+            if task["status"] in ("done", "cancelled"):
+                raise TaskConflictError("task is already terminal", current=TaskRecord.from_row(task))
+            if task["current_run_id"] is not None:
+                raise TaskConflictError("a running task cannot be closed", current=TaskRecord.from_row(task))
+            has_run = await self._fetchone(
+                conn, "SELECT 1 FROM task_runs WHERE task_id = ? LIMIT 1", (task_id,)
+            )
+            if has_run is not None:
+                raise TaskConflictError(
+                    "only a task with no run history may be closed",
+                    current=TaskRecord.from_row(task),
+                )
+            open_child = await self._fetchone(
+                conn,
+                "SELECT 1 FROM tasks WHERE parent_task_id = ? "
+                "AND status NOT IN ('done', 'cancelled') LIMIT 1",
+                (task_id,),
+            )
+            if open_child is not None:
+                raise TaskConflictError(
+                    "all child tasks must be terminal before closing",
+                    current=TaskRecord.from_row(task),
+                )
+            await conn.execute(
+                "UPDATE tasks SET status = 'done', result_summary = ?, "
+                "updated_at = ?, completed_at = ? WHERE id = ?",
+                (clean_summary, stamp, stamp, task_id),
+            )
+            updated = await self._task_row(conn, task_id)
+            await self._event(
+                conn,
+                task=updated,
+                kind="task_closed",
+                actor_kind=actor_kind,
+                actor_agent_id=actor_agent_id,
+                payload={"summary": clean_summary},
+                now=stamp,
+            )
+            dependents = await self._fetchall(
+                conn,
+                "SELECT task_id FROM task_dependencies WHERE depends_on_task_id = ?",
+                (task_id,),
+            )
+            for dependent in dependents:
+                await self._recompute_one(conn, dependent["task_id"], now=stamp)
         return TaskRecord.from_row(updated)
 
     async def archive_task(
@@ -1886,6 +1972,7 @@ class TaskRepository:
         actor_agent_id: str | None,
         now: str | None,
         artifacts: Sequence[Mapping[str, Any]] | None = None,
+        verdict: str | None = None,
     ) -> tuple[TaskRecord, RunRecord]:
         if run_state not in {"completed", "blocked", "failed", "cancelled", "interrupted"}:
             raise TaskValidationError("invalid terminal run state")
@@ -1893,6 +1980,11 @@ class TaskRepository:
             raise TaskValidationError("invalid terminal task status")
         if blocked_kind is not None and blocked_kind not in BLOCKED_KINDS:
             raise TaskValidationError("invalid blocked kind")
+        if verdict is not None:
+            if task_status != "done":
+                raise TaskValidationError("verdict is only meaningful on a completed task")
+            if verdict not in VERDICT_KINDS:
+                raise TaskValidationError("invalid verdict")
         stamp = now or _now_iso()
         async with self._transaction() as conn:
             task = await self._task_row(conn, task_id)
@@ -1919,13 +2011,14 @@ class TaskRepository:
             )
             cursor = await conn.execute(
                 "UPDATE tasks SET status = ?, current_run_id = NULL, blocked_kind = ?, "
-                "blocked_reason = ?, result_summary = ?, updated_at = ?, completed_at = ? "
-                "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+                "blocked_reason = ?, result_summary = ?, verdict = ?, updated_at = ?, "
+                "completed_at = ? WHERE id = ? AND status = 'running' AND current_run_id = ?",
                 (
                     task_status,
                     blocked_kind,
                     blocked_reason,
                     summary,
+                    verdict,
                     stamp,
                     stamp if task_status == "done" else None,
                     task_id,
@@ -1984,7 +2077,10 @@ class TaskRepository:
                 actor_kind=actor_kind,
                 actor_agent_id=actor_agent_id,
                 run_id=run_id,
-                payload={"summary": summary, "error": error, "blocked_kind": blocked_kind},
+                payload={
+                    "summary": summary, "error": error, "blocked_kind": blocked_kind,
+                    "verdict": verdict,
+                },
                 now=stamp,
             )
             if task_status == "done":
@@ -2008,9 +2104,12 @@ class TaskRepository:
         artifacts: Sequence[Mapping[str, Any]] | None = None,
         actor_agent_id: str | None = None,
         now: str | None = None,
+        verdict: str | None = None,
     ) -> tuple[TaskRecord, RunRecord]:
         if not summary.strip():
             raise TaskValidationError("completion summary is required")
+        if verdict is not None and verdict not in VERDICT_KINDS:
+            raise TaskValidationError("invalid verdict")
         return await self._finish_run(
             task_id,
             run_id,
@@ -2025,6 +2124,7 @@ class TaskRepository:
             actor_agent_id=actor_agent_id,
             now=now,
             artifacts=artifacts,
+            verdict=verdict,
         )
 
     async def block_run(

@@ -28,6 +28,7 @@ from ..deploy_admission import DeployAdmissionClosedError, DeployAdmissionGate
 from . import workspaces as ws
 from .deploy_quiesce import BusySource, DeployQuiesce
 from .models import (
+    DELIVERED_OP_KINDS,
     DELIVERY_RETENTIONS,
     BoardRecord,
     DeliveryConfirmationRequired,
@@ -471,6 +472,20 @@ class DeliveryCoordinator:
             )
         if delivery.base_head is None:
             raise TaskConflictError("delivery has no baseline; accept it first")
+
+        # A repeat trigger of an already-succeeded external op (task-board-gaps.md
+        # §3.5, e.g. a second "Open PR" click) surfaces the existing result instead
+        # of re-attempting it: the data is already durably recorded on `delivery`
+        # (pushed_ref / pr_number+pr_url / merge_strategy) from the first success,
+        # via the op ledger's at-most-once semantics (task-git-delivery.md §3) — a
+        # retry here would only 409/422 against GitHub or no-op against git and
+        # surface as a bare conflict. Kinds outside DELIVERED_OP_KINDS (commit) are
+        # naturally idempotent already via their own preconditions (dirty/nothing
+        # to commit) and are not short-circuited here.
+        if kind in DELIVERED_OP_KINDS:
+            prior_ops = await self.repo.list_delivery_ops(delivery.id)
+            if any(op.kind == kind and op.state == "succeeded" for op in prior_ops):
+                return delivery
 
         if kind == "commit":
             return await self._op_commit(task, run, board, delivery, actor_kind, actor_agent_id)

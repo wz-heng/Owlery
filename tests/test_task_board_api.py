@@ -191,9 +191,44 @@ async def test_worker_complete_uses_only_trusted_headers(client):
         (
             "complete",
             ("task-1", "run-1", "session-1"),
-            {"summary": "Done", "metadata": {"tests": "green"}, "artifacts": []},
+            {
+                "summary": "Done", "metadata": {"tests": "green"}, "artifacts": [],
+                "verdict": None,
+            },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_worker_complete_passes_verdict_through(client):
+    """task-board-gaps.md §3.1: a review/acceptance task's `verdict` rides
+    the same trusted-header complete call, validated to pass|fail."""
+    c, manager = client
+    response = await c.post(
+        "/api/task-worker/current/complete",
+        headers={
+            **HEADERS,
+            "X-Owlery-Session-ID": "session-1",
+            "X-Owlery-Task-ID": "task-1",
+            "X-Owlery-Task-Run-ID": "run-1",
+        },
+        json={"summary": "Does not pass review", "verdict": "fail"},
+    )
+    assert response.status_code == 200
+    _, _, payload = manager.calls[0]
+    assert payload["verdict"] == "fail"
+
+    bad = await c.post(
+        "/api/task-worker/current/complete",
+        headers={
+            **HEADERS,
+            "X-Owlery-Session-ID": "session-1",
+            "X-Owlery-Task-ID": "task-1",
+            "X-Owlery-Task-Run-ID": "run-1",
+        },
+        json={"summary": "x", "verdict": "maybe"},
+    )
+    assert bad.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -275,6 +310,49 @@ async def test_real_repository_board_task_roundtrip(client, monkeypatch, tmp_pat
     finally:
         await repository.close()
         await database.close()
+
+
+@pytest.mark.asyncio
+async def test_close_endpoint_requires_summary_and_terminal_children(real_client):
+    """task-board-gaps.md §3.3: the REST `close` action for a container/root
+    task — rejects a blank summary and a still-open child, then succeeds and
+    the task lands `done`."""
+    c, repo, root, agent_id = real_client
+    board = await repo.create_board(name="Battle", working_dir=str(root))
+    container = await c.post(
+        f"/api/task-boards/{board.id}/tasks",
+        headers=HEADERS,
+        json={"title": "Battle root"},
+    )
+    container_id = container.json()["id"]
+
+    blank = await c.post(
+        f"/api/tasks/{container_id}/close", headers=HEADERS, json={"summary": "  "}
+    )
+    assert blank.status_code == 422
+
+    child = await repo.create_task(
+        board_id=board.id, title="child", status="todo",
+        assignee_agent_id=agent_id, parent_task_id=container_id,
+    )
+    with_open_child = await c.post(
+        f"/api/tasks/{container_id}/close",
+        headers=HEADERS,
+        json={"summary": "wrap it up"},
+    )
+    assert with_open_child.status_code == 409
+
+    run = await repo.claim_ready(
+        child.id, workspace_mode="copy", workspace_path=str(root / "child-run")
+    )
+    await repo.complete_run(child.id, run.id, summary="child done")
+    closed = await c.post(
+        f"/api/tasks/{container_id}/close",
+        headers=HEADERS,
+        json={"summary": "all children settled"},
+    )
+    assert closed.status_code == 200, closed.text
+    assert closed.json()["status"] == "done"
 
 
 # --------------------------------------------------------------- enrichment

@@ -21,6 +21,7 @@ from pydantic import AliasChoices, BaseModel, Field, model_validator
 from ..auth import verify_token
 from ..task_board.models import (
     BLOCKED_KINDS,
+    VERDICT_KINDS,
     DeliveryConfirmationRequired,
     TaskBoardError,
     TaskCapacityError,
@@ -357,6 +358,19 @@ class CompleteRequest(BaseModel):
     summary: str = Field(min_length=1)
     metadata: dict[str, Any] = Field(default_factory=dict)
     artifacts: list[ArtifactDeclaration] = Field(default_factory=list, max_length=100)
+    # Review/acceptance gate (task-board-gaps.md §3.1): optional, so ordinary
+    # (non-review) worker tasks keep completing exactly as before.
+    verdict: str | None = None
+
+    @model_validator(mode="after")
+    def validate_verdict(self):
+        if self.verdict is not None and self.verdict not in VERDICT_KINDS:
+            raise ValueError(f"verdict must be one of {sorted(VERDICT_KINDS)}")
+        return self
+
+
+class CloseRequest(BaseModel):
+    summary: str = Field(min_length=1)
 
 
 class WorkerCreate(TaskCreate):
@@ -856,6 +870,27 @@ async def cancel_task(
     return await _enriched(row)
 
 
+@router.post("/api/tasks/{task_id}/close")
+async def close_task(
+    task_id: str,
+    req: CloseRequest,
+    caller_session_id: str | None = Header(default=None, alias="X-Owlery-Session-ID"),
+    _: str = Depends(verify_token),
+):
+    actor_kind, actor_agent_id, _origin = await _actor(caller_session_id)
+    row = await _run(
+        task_repository.close_task(
+            task_id,
+            summary=req.summary,
+            actor_kind=actor_kind,
+            actor_agent_id=actor_agent_id,
+        )
+    )
+    await _publish(task_id)
+    await _get_manager().wake_dispatcher()
+    return await _enriched(row)
+
+
 @router.post("/api/tasks/{task_id}/archive")
 async def archive_task(
     task_id: str,
@@ -1007,6 +1042,7 @@ async def worker_complete(
                 summary=req.summary,
                 metadata=req.metadata,
                 artifacts=[item.model_dump() for item in req.artifacts],
+                verdict=req.verdict,
             )
         )
     )

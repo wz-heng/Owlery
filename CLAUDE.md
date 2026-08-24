@@ -36,8 +36,8 @@ Run all four. They total well under two minutes — there is no cheap
 tier to fall back to, so don't skip one on the grounds that a change
 "only touched the frontend".
 
-1. **Backend unit**: `.venv/bin/pytest tests/ -v` (1136)
-2. **Frontend unit**: `cd web && bun run test` (135)
+1. **Backend unit**: `.venv/bin/pytest tests/ -v` (1425)
+2. **Frontend unit**: `cd web && bun run test` (279)
 3. **TypeScript**: `cd web && npx tsc --noEmit`
 4. **E2E**: `cd web && bun run test:e2e` (76, ~2 min, Playwright auto-starts
    servers)
@@ -106,7 +106,7 @@ environment.
 
 What each suite covers; detail lives in the linked plan docs.
 
-**Backend unit** (pytest, 1172) — config, models, session manager, REST API,
+**Backend unit** (pytest, 1425) — config, models, session manager, REST API,
 DB persistence (credential split, refresh-error codes), JSONL parser/writer,
 CLI handoff/pull, import API, schedules CRUD + scheduler (interval + cron),
 NL `/schedule` parsing, Feishu bridge (fail-closed allowlist, card-value
@@ -119,7 +119,7 @@ Octopus→Owlery migration (`rename-owlery.md` §3) • durable Task Board and
 Git-worktree delivery state/CAS/recovery (`task-board.md`,
 `task-git-delivery.md`).
 
-**Frontend unit** (vitest, 135) — zustand store, `useWebSocket`, BgTaskChip,
+**Frontend unit** (vitest, 279) — zustand store, `useWebSocket`, BgTaskChip,
 FileViewerDialog, SlashCommandMenu, delegation cards, fork dialog +
 deferred-fork helper, CredentialList, ResearchCard, UsageDialog, `readStored`
 localStorage rename migration, Task Board state/event reconciliation and Git

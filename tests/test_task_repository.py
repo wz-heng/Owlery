@@ -213,10 +213,11 @@ async def test_normative_transitions_and_illegal_edges(task_store):
     task = await repo.specify_task(task.id)
     assert task.status == "ready"
     task = await repo.cancel_task(task.id, reason="no longer needed")
-    assert (task.status, task.blocked_kind) == ("blocked", "cancelled")
-    task = await repo.unblock_task(task.id, comment="resume")
-    assert task.status == "ready"
-    assert [comment.body for comment in await repo.list_comments(task.id)] == ["resume"]
+    assert (task.status, task.blocked_kind) == ("cancelled", None)
+    # cancelled is a terminal status (task-board-gaps.md §3.4) — not the
+    # `blocked` shape unblock_task expects, and not reversible.
+    with pytest.raises(TaskConflictError):
+        await repo.unblock_task(task.id, comment="resume")
     with pytest.raises(TaskConflictError):
         await repo.specify_task(task.id)
 
@@ -977,3 +978,161 @@ async def test_list_release_deployments_paginates_most_recent_first(task_store):
     page2, total2 = await repo.list_release_deployments(board.id, limit=2, offset=2)
     assert [item.id for item in page2] == [releases[0].id]
     assert total2 == 3
+
+
+@pytest.mark.asyncio
+async def test_verdict_fail_never_unblocks_a_dependent(task_store):
+    """task-board-gaps.md §3.1: a `done` task with verdict='fail' satisfies
+    no dependent, forever — the ONLY way a review/acceptance task can stop
+    downstream work through the gate itself, not just a prose summary."""
+    _, repo, root, agent = task_store
+    board = await _board(repo, root)
+
+    reviewed = await _task(repo, board.id, agent, title="reviewed")
+    dependent = await _task(repo, board.id, agent, title="dependent")
+    await repo.add_dependency(dependent.id, reviewed.id)
+
+    run = await repo.claim_ready(
+        reviewed.id, workspace_mode="copy", workspace_path=str(root / "review-run")
+    )
+    done, _ = await repo.complete_run(
+        reviewed.id, run.id, summary="does not pass review", verdict="fail"
+    )
+    assert done.status == "done" and done.verdict == "fail"
+    # The dependent never promotes to ready — a failed verdict permanently
+    # blocks it, same as an unfinished dependency would.
+    assert (await repo.get_task(dependent.id)).status == "todo"
+
+
+@pytest.mark.asyncio
+async def test_verdict_pass_and_no_verdict_both_unblock_a_dependent(task_store):
+    _, repo, root, agent = task_store
+    board = await _board(repo, root)
+
+    passed = await _task(repo, board.id, agent, title="passed review")
+    ungated = await _task(repo, board.id, agent, title="ordinary work")
+    dep_on_pass = await _task(repo, board.id, agent, title="dep on pass")
+    dep_on_ungated = await _task(repo, board.id, agent, title="dep on ungated")
+    await repo.add_dependency(dep_on_pass.id, passed.id)
+    await repo.add_dependency(dep_on_ungated.id, ungated.id)
+
+    run1 = await repo.claim_ready(
+        passed.id, workspace_mode="copy", workspace_path=str(root / "pass-run")
+    )
+    await repo.complete_run(passed.id, run1.id, summary="passes review", verdict="pass")
+    assert (await repo.get_task(dep_on_pass.id)).status == "ready"
+
+    run2 = await repo.claim_ready(
+        ungated.id, workspace_mode="copy", workspace_path=str(root / "ungated-run")
+    )
+    await repo.complete_run(ungated.id, run2.id, summary="just done")
+    assert (await repo.get_task(dep_on_ungated.id)).status == "ready"
+    assert (await repo.get_task(ungated.id)).verdict is None
+
+
+@pytest.mark.asyncio
+async def test_complete_run_rejects_invalid_verdict(task_store):
+    _, repo, root, agent = task_store
+    board = await _board(repo, root)
+    task = await _task(repo, board.id, agent, title="task")
+    run = await repo.claim_ready(
+        task.id, workspace_mode="copy", workspace_path=str(root / "bad-verdict")
+    )
+    with pytest.raises(TaskValidationError):
+        await repo.complete_run(task.id, run.id, summary="x", verdict="maybe")
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_from_blocked_reaches_terminal_cancelled_and_is_final(task_store):
+    """task-board-gaps.md §3.4: triage/todo/ready/blocked all transition
+    directly to `cancelled`; a running task is rejected (must stop its run
+    first); cancelled is never reversible (no unblock, no re-specify)."""
+    _, repo, root, agent = task_store
+    board = await _board(repo, root)
+    task = await _task(repo, board.id, agent, title="stuck")
+    run = await repo.claim_ready(
+        task.id, workspace_mode="copy", workspace_path=str(root / "stuck-run")
+    )
+    blocked, _ = await repo.block_run(task.id, run.id, reason="needs input")
+    assert blocked.status == "blocked"
+
+    cancelled = await repo.cancel_task(task.id, reason="no longer needed")
+    assert cancelled.status == "cancelled"
+    assert cancelled.blocked_kind is None
+    assert cancelled.completed_at is not None
+    with pytest.raises(TaskConflictError):
+        await repo.unblock_task(task.id, comment="resume")
+    # A cancelled task is as inert as a done one — no more editable than it.
+    with pytest.raises(TaskConflictError):
+        await repo.update_task(task.id, title="rewrite history")
+
+    still_running_task = await _task(repo, board.id, agent, title="running")
+    await repo.claim_ready(
+        still_running_task.id, workspace_mode="copy", workspace_path=str(root / "running-run")
+    )
+    with pytest.raises(TaskConflictError):
+        await repo.cancel_task(still_running_task.id)
+
+
+@pytest.mark.asyncio
+async def test_open_task_capacity_excludes_cancelled_same_as_done(task_store):
+    _, repo, root, agent = task_store
+    board = await _board(repo, root, max_open_tasks=2)
+    first = await _task(repo, board.id, agent, title="first")
+    await repo.cancel_task(first.id, reason="not needed")
+    # A cancelled task frees its capacity slot exactly like a done one would —
+    # two more tasks fit even though three have ever been created.
+    await _task(repo, board.id, agent, title="second")
+    await _task(repo, board.id, agent, title="third")
+    with pytest.raises(TaskCapacityError):
+        await _task(repo, board.id, agent, title="fourth")
+
+
+@pytest.mark.asyncio
+async def test_close_task_three_rejections_then_success_unblocks_dependent(task_store):
+    """task-board-gaps.md §3.3: close is for a container/root task that was
+    never itself dispatched a run — the mechanism a pure-decomposition
+    "battle root" needs to leave `triage` once every child settles."""
+    _, repo, root, agent = task_store
+    board = await _board(repo, root)
+    container = await _task(repo, board.id, agent, title="battle root", status="triage")
+    dependent = await _task(repo, board.id, agent, title="depends on the battle")
+    await repo.add_dependency(dependent.id, container.id)
+
+    # Rejection 1: an already-terminal task.
+    other_done = await _task(repo, board.id, agent, title="already done")
+    run = await repo.claim_ready(
+        other_done.id, workspace_mode="copy", workspace_path=str(root / "done-run")
+    )
+    await repo.complete_run(other_done.id, run.id, summary="done")
+    with pytest.raises(TaskConflictError):
+        await repo.close_task(other_done.id, summary="close a done task")
+
+    # Rejection 2: a task with run history must close through complete/block.
+    ran_task = await _task(repo, board.id, agent, title="has run history")
+    run2 = await repo.claim_ready(
+        ran_task.id, workspace_mode="copy", workspace_path=str(root / "ran-run")
+    )
+    await repo.block_run(ran_task.id, run2.id, reason="stuck")
+    with pytest.raises(TaskConflictError):
+        await repo.close_task(ran_task.id, summary="close a run-having task")
+
+    # Rejection 3: a non-terminal child blocks the close.
+    child = await _task(repo, board.id, agent, title="open child", parent_task_id=container.id)
+    with pytest.raises(TaskConflictError):
+        await repo.close_task(container.id, summary="close with an open child")
+
+    # Success once the child settles; the dependent unblocks too.
+    child_run = await repo.claim_ready(
+        child.id, workspace_mode="copy", workspace_path=str(root / "child-run")
+    )
+    await repo.complete_run(child.id, child_run.id, summary="child done")
+    closed = await repo.close_task(container.id, summary="all children settled")
+    assert closed.status == "done"
+    assert closed.result_summary == "all children settled"
+    assert (await repo.get_task(dependent.id)).status == "ready"
+
+    # Close summary is required.
+    reclosable = await _task(repo, board.id, agent, title="needs summary", status="triage")
+    with pytest.raises(TaskValidationError):
+        await repo.close_task(reclosable.id, summary="   ")

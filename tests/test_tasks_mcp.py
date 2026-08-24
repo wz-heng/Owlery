@@ -155,7 +155,50 @@ def test_worker_cannot_use_orchestrator_only_tools(monkeypatch):
     assert "not available" in _call("list_tasks").lower()
     assert "not available" in _call("assign_task", task_id="x").lower()
     assert "not available" in _call("cancel_task", task_id="x").lower()
+    assert "not available" in _call("close_task", task_id="x", summary="done").lower()
     assert "only its current task" in _call("show_task", task_id="other").lower()
+
+
+def test_worker_complete_forwards_verdict_when_set(monkeypatch):
+    """task-board-gaps.md §3.1: `verdict` rides the complete call only when
+    the caller sets it — omitted entirely otherwise (never a null literal),
+    matching the shape `test_worker_complete_never_accepts_model_identity`
+    already pins for the ordinary (non-review) path."""
+    _base_env(monkeypatch, worker=True)
+    captured = {}
+
+    def fake_request(method, url, **kwargs):
+        captured.update(method=method, url=url, **kwargs)
+        return _Response(payload={"state": "completed"})
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    _call("complete_task", summary="Does not pass review", verdict="fail")
+    assert captured["json"]["verdict"] == "fail"
+
+
+def test_orchestrator_close_task_forwards_summary(monkeypatch):
+    _base_env(monkeypatch)
+    captured = {}
+
+    def fake_request(method, url, **kwargs):
+        captured.update(method=method, url=url, **kwargs)
+        return _Response(payload={"status": "done"})
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    out = _call("close_task", task_id="root-1", summary="all children settled")
+    assert "done" in out
+    assert captured["method"] == "POST"
+    assert captured["url"].endswith("/api/tasks/root-1/close")
+    assert captured["json"] == {"summary": "all children settled"}
+
+
+def test_orchestrator_close_task_requires_summary(monkeypatch):
+    _base_env(monkeypatch)
+    assert "must be non-empty" in _call("close_task", task_id="root-1", summary="  ").lower()
 
 
 def test_worker_link_goes_through_scoped_callback(monkeypatch):

@@ -258,6 +258,39 @@ async def test_push_to_local_remote_and_force_guard(store):
 
 
 @pytest.mark.asyncio
+async def test_push_repeat_trigger_returns_existing_result_without_pushing_again(
+    store, monkeypatch
+):
+    """task-board-gaps.md §3.5: a repeat trigger of an already-succeeded
+    external op (a second "Push" click) surfaces the existing result instead
+    of re-attempting it — no second git push, no bare conflict."""
+    db, repo, tmp, agent = store
+    board, task, run, src, wt = await _ready_delivery(db, repo, tmp, agent)
+    bare = tmp / "remote.git"
+    _git(tmp, "init", "-q", "--bare", str(bare))
+    _git(src, "remote", "add", "origin", str(bare))
+    coord = _coord(db, repo, FakeConnectors({}))
+    await coord.accept(task.id, run.id)
+    first = await coord.deliver_op(task.id, run.id, kind="push")
+    assert first.status == "delivered"
+
+    push_calls = {"count": 0}
+    original_push = delivery_module.ws.push_branch
+
+    async def counting_push(*args, **kwargs):
+        push_calls["count"] += 1
+        return await original_push(*args, **kwargs)
+
+    monkeypatch.setattr(delivery_module.ws, "push_branch", counting_push)
+    second = await coord.deliver_op(task.id, run.id, kind="push")
+    assert push_calls["count"] == 0
+    assert second.status == "delivered"
+    assert second.pushed_ref == first.pushed_ref
+    ops = await repo.list_delivery_ops(first.id)
+    assert sum(1 for op in ops if op.kind == "push") == 1  # no new op planned
+
+
+@pytest.mark.asyncio
 async def test_connector_resolution_cases(store):
     db, repo, tmp, agent = store
     coord = _coord(db, repo, FakeConnectors({
@@ -284,8 +317,10 @@ async def test_pull_request_via_fake_platform(store):
     coord = _coord(db, repo, connectors)
 
     captured = {}
+    call_count = {"n": 0}
 
     async def fake_create_pr(token, owner, r, *, title, body, head, base, draft):
+        call_count["n"] += 1
         captured.update(token=token, owner=owner, repo=r, base=base, head=head, draft=draft)
         return {"number": 42, "url": "https://github.com/acme/widgets/pull/42", "state": "open"}
 
@@ -302,6 +337,17 @@ async def test_pull_request_via_fake_platform(store):
     assert d.status == "delivered" and d.pr_number == 42
     assert captured["owner"] == "acme" and captured["repo"] == "widgets"
     assert captured["base"] == "main" and captured["token"] == "tok-gh1"
+    assert call_count["n"] == 1
+
+    # Repeat trigger (task-board-gaps.md §3.5): a second "Open PR" click
+    # surfaces the existing PR (number + link) instead of re-POSTing to
+    # GitHub — no bare conflict, no duplicate-PR 422 from the platform.
+    second = await coord.deliver_op(task.id, run.id, kind="pull_request")
+    assert second.status == "delivered"
+    assert second.pr_number == 42 and second.pr_url == d.pr_url
+    assert call_count["n"] == 1  # fake_create_pr not invoked again
+    ops = await repo.list_delivery_ops(d.id)
+    assert sum(1 for op in ops if op.kind == "pull_request") == 1
 
 
 @pytest.mark.asyncio
