@@ -177,6 +177,21 @@ type DeliveryButtonInput = Pick<
   "status" | "dirty" | "commits_ahead" | "pr_number" | "pushed_ref"
 >;
 
+/** Statuses the backend's `deliver_op()` gate accepts for ANY goal op (push /
+ * pull_request / merge / commit) before even looking at the op-specific
+ * preconditions — `server/task_board/delivery.py` `_GOAL_START_STATES`. Most
+ * notably `failed` is NOT here: a failed delivery must be torn down and
+ * re-attempted, not resumed. Mirrored here so a disabled button's tooltip
+ * never promises an action the server would 409 (Snape review — `failed` with
+ * a stale `pushed_ref`/`pr_number` from before the failure was previously
+ * rendered as clickable). */
+const DELIVERY_GOAL_ACCEPTING_STATUSES: DeliveryStatus[] = [
+  "ready",
+  "delivered",
+  "blocked",
+  "conflicted",
+];
+
 /** Single source of truth for whether each delivery action button is
  * clickable and, if not, why — shared by the enable/disable logic and the
  * tooltip text so the two can never drift apart. `delivery` is `null` before
@@ -207,11 +222,15 @@ export function deliveryButtonState(
         return { enabled: false, reason: "Nothing to push — no commits ahead of base" };
       return { enabled: true, reason: null };
     case "pull_request":
+      if (!DELIVERY_GOAL_ACCEPTING_STATUSES.includes(status))
+        return { enabled: false, reason: "Delivery failed — tear down and retry before opening a pull request" };
       if (!pushed_ref) return { enabled: false, reason: "Push the branch first" };
       if (pr_number != null)
         return { enabled: false, reason: "Pull request already open — see the link above" };
       return { enabled: true, reason: null };
     case "merge":
+      if (!DELIVERY_GOAL_ACCEPTING_STATUSES.includes(status))
+        return { enabled: false, reason: "Delivery failed — tear down and retry before merging" };
       if (pr_number == null) return { enabled: false, reason: "Open a pull request first" };
       if (status === "delivered")
         return { enabled: false, reason: "Already delivered — merge on the platform" };

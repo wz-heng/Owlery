@@ -315,6 +315,28 @@ describe("deliveryButtonState", () => {
     });
   });
 
+  it("pull_request and merge are disabled once the delivery has failed, even with a stale pushed_ref/pr_number", () => {
+    // Backend gate: `deliver_op()` only accepts ready/delivered/blocked/
+    // conflicted (`_GOAL_START_STATES` in delivery.py) — `failed` is
+    // excluded, so a failed delivery must be torn down and retried, not
+    // resumed. Before this fix the frontend only looked at pushed_ref/
+    // pr_number and would render these buttons clickable on a failed
+    // delivery, 409ing on click (Snape review).
+    expect(
+      deliveryButtonState("pull_request", d({ status: "failed", pushed_ref: "refs/heads/x", pr_number: null }))
+    ).toEqual({ enabled: false, reason: expect.stringMatching(/tear down and retry/i) });
+    expect(
+      deliveryButtonState("merge", d({ status: "failed", pr_number: 7 }))
+    ).toEqual({ enabled: false, reason: expect.stringMatching(/tear down and retry/i) });
+    for (const status of ["ready", "delivered", "blocked", "conflicted"] as DeliveryStatus[]) {
+      if (status !== "delivered") {
+        expect(
+          deliveryButtonState("merge", d({ status, pr_number: 7 }))
+        ).toEqual({ enabled: true, reason: null });
+      }
+    }
+  });
+
   it("teardown requires a terminal status", () => {
     expect(deliveryButtonState("teardown", d({ status: "ready" })).reason).toMatch(/terminal state/i);
     for (const status of ["delivered", "failed", "blocked", "conflicted"] as DeliveryStatus[]) {

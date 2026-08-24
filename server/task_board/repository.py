@@ -1263,8 +1263,8 @@ class TaskRepository:
         stamp = _now_iso()
         async with self._transaction() as conn:
             task = await self._task_row(conn, task_id)
-            if task["status"] in ("running", "done"):
-                raise TaskConflictError("running/done tasks cannot move in the tree")
+            if task["status"] in ("running", "done", "cancelled"):
+                raise TaskConflictError("running/done/cancelled tasks cannot move in the tree")
             board = await self._board_row(conn, task["board_id"])
             await self._validate_parent(
                 conn,
@@ -1421,8 +1421,8 @@ class TaskRepository:
         stamp = _now_iso()
         async with self._transaction() as conn:
             task = await self._task_row(conn, task_id)
-            if task["status"] in ("running", "done"):
-                raise TaskConflictError("running/done tasks cannot be reassigned", current=TaskRecord.from_row(task))
+            if task["status"] in ("running", "done", "cancelled"):
+                raise TaskConflictError("running/done/cancelled tasks cannot be reassigned", current=TaskRecord.from_row(task))
             if agent_id is not None and not await self._agent_is_live(conn, agent_id):
                 raise TaskValidationError("assignee Agent does not exist or is archived")
             # Reassignment is a backend-changing write entry (§4.3): reject a new
@@ -1692,8 +1692,8 @@ class TaskRepository:
             dependency = await self._task_row(conn, depends_on_task_id)
             if task["board_id"] != dependency["board_id"]:
                 raise TaskValidationError("task dependencies cannot cross boards")
-            if task["status"] in ("running", "done"):
-                raise TaskConflictError("dependencies cannot be added to running/done tasks", current=TaskRecord.from_row(task))
+            if task["status"] in ("running", "done", "cancelled"):
+                raise TaskConflictError("dependencies cannot be added to running/done/cancelled tasks", current=TaskRecord.from_row(task))
             cycle = await self._fetchone(
                 conn,
                 "WITH RECURSIVE reachable(id) AS ("
@@ -1747,8 +1747,8 @@ class TaskRepository:
         stamp = _now_iso()
         async with self._transaction() as conn:
             task = await self._task_row(conn, task_id)
-            if task["status"] in ("running", "done"):
-                raise TaskConflictError("dependencies cannot be removed from running/done tasks", current=TaskRecord.from_row(task))
+            if task["status"] in ("running", "done", "cancelled"):
+                raise TaskConflictError("dependencies cannot be removed from running/done/cancelled tasks", current=TaskRecord.from_row(task))
             cursor = await conn.execute(
                 "DELETE FROM task_dependencies WHERE task_id = ? AND depends_on_task_id = ?",
                 (task_id, depends_on_task_id),

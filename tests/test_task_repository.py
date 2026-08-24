@@ -1050,11 +1050,16 @@ async def test_cancel_task_from_blocked_reaches_terminal_cancelled_and_is_final(
     _, repo, root, agent = task_store
     board = await _board(repo, root)
     task = await _task(repo, board.id, agent, title="stuck")
+    prerequisite = await _task(repo, board.id, agent, title="prerequisite")
     run = await repo.claim_ready(
         task.id, workspace_mode="copy", workspace_path=str(root / "stuck-run")
     )
     blocked, _ = await repo.block_run(task.id, run.id, reason="needs input")
     assert blocked.status == "blocked"
+    # Adding a dependency to a blocked (not yet terminal) task is still
+    # allowed — only running/done/cancelled reject it — so this sets up the
+    # remove_dependency(cancelled) check below.
+    await repo.add_dependency(task.id, prerequisite.id)
 
     cancelled = await repo.cancel_task(task.id, reason="no longer needed")
     assert cancelled.status == "cancelled"
@@ -1062,9 +1067,24 @@ async def test_cancel_task_from_blocked_reaches_terminal_cancelled_and_is_final(
     assert cancelled.completed_at is not None
     with pytest.raises(TaskConflictError):
         await repo.unblock_task(task.id, comment="resume")
-    # A cancelled task is as inert as a done one — no more editable than it.
+    # A cancelled task is as inert as a done one — no more editable than it:
+    # title/body (update_task), assignee (assign_task), tree position
+    # (set_parent), and its own dependency edges (add_dependency,
+    # remove_dependency) all reject it the same way `done` already does
+    # (Snape review — these guards originally only listed "running"/"done"
+    # and let a cancelled task keep accepting reassignment and dependency
+    # edits).
     with pytest.raises(TaskConflictError):
         await repo.update_task(task.id, title="rewrite history")
+    with pytest.raises(TaskConflictError):
+        await repo.assign_task(task.id, agent)
+    with pytest.raises(TaskConflictError):
+        await repo.set_parent(task.id, None)
+    other = await _task(repo, board.id, agent, title="other")
+    with pytest.raises(TaskConflictError):
+        await repo.add_dependency(task.id, other.id)
+    with pytest.raises(TaskConflictError):
+        await repo.remove_dependency(task.id, prerequisite.id)
 
     still_running_task = await _task(repo, board.id, agent, title="running")
     await repo.claim_ready(

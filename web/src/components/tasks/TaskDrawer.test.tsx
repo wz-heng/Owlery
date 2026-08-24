@@ -214,4 +214,23 @@ describe("TaskDrawer terminal immutability", () => {
     fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Edited anyway" } });
     expect(screen.queryByRole("button", { name: "Save changes" })).not.toBeInTheDocument();
   });
+
+  it("disables removing a dependency and hides the add-dependency picker for a cancelled task", () => {
+    // Mirrors the backend rejection (Snape review — `add_dependency` /
+    // `remove_dependency` originally only checked running/done, letting a
+    // cancelled task's own dependency edges keep changing).
+    const root = task({ id: "root", status: "cancelled" });
+    const prerequisite = task({ id: "prereq", title: "Prerequisite", status: "done" });
+    render(
+      <TaskDrawer
+        {...baseProps({
+          task: root,
+          allTasks: [root, prerequisite],
+          detail: { ...root, dependencies: [{ id: "prereq", title: "Prerequisite", status: "done" }], dependents: [], children: [] },
+        })}
+      />
+    );
+    expect(screen.getByRole("button", { name: "Remove dependency Prerequisite" })).toBeDisabled();
+    expect(screen.queryByText("Add dependency…")).not.toBeInTheDocument();
+  });
 });
