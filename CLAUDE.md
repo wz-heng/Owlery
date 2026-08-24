@@ -36,7 +36,7 @@ Run all four. They total well under two minutes — there is no cheap
 tier to fall back to, so don't skip one on the grounds that a change
 "only touched the frontend".
 
-1. **Backend unit**: `.venv/bin/pytest tests/ -v` (1425)
+1. **Backend unit**: `.venv/bin/pytest tests/ -v` (1426)
 2. **Frontend unit**: `cd web && bun run test` (279)
 3. **TypeScript**: `cd web && npx tsc --noEmit`
 4. **E2E**: `cd web && bun run test:e2e` (76, ~2 min, Playwright auto-starts
@@ -106,7 +106,7 @@ environment.
 
 What each suite covers; detail lives in the linked plan docs.
 
-**Backend unit** (pytest, 1425) — config, models, session manager, REST API,
+**Backend unit** (pytest, 1426) — config, models, session manager, REST API,
 DB persistence (credential split, refresh-error codes), JSONL parser/writer,
 CLI handoff/pull, import API, schedules CRUD + scheduler (interval + cron),
 NL `/schedule` parsing, Feishu bridge (fail-closed allowlist, card-value

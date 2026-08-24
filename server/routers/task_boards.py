@@ -870,13 +870,70 @@ async def cancel_task(
     return await _enriched(row)
 
 
+async def _reject_worker_caller(
+    action: str,
+    *,
+    caller_session_id: str | None,
+    caller_task_id: str | None,
+    caller_task_run_id: str | None,
+) -> None:
+    """Server-side half of "worker identity calling `close` is rejected"
+    (task-board-gaps.md §3.3) — the MCP tool's ``_orchestrator_only`` gate
+    only stops a well-behaved worker going through the ``close`` MCP tool;
+    it never touches this REST endpoint directly. Two checks, both against
+    server-observed state, never client-asserted role:
+
+    1. ``X-Owlery-Task-ID``/``X-Owlery-Task-Run-ID`` are the same headers
+       the tasks MCP server attaches to EVERY call it makes from inside a
+       worker run (``server/mcp_servers/tasks.py`` ``_context()``) — their
+       presence is exactly the trusted-worker-context signal
+       ``_worker_headers`` requires on the worker-scoped endpoints, just
+       inverted here for an orchestrator-only one.
+    2. If the caller names a session (``X-Owlery-Session-ID``), resolve it
+       and check whether the SERVER's own session record has ``task_id``
+       set — the same flag ``_dispatch_task`` stamps on a worker session at
+       dispatch time. A worker that skips the two headers above but still
+       names its own (real) session cannot pass this check either.
+
+    This closes the two paths a worker would take without deliberately
+    fabricating an unrelated session id it doesn't own — the shared bearer
+    token used across all sessions means a caller that also drops or
+    forges the session header entirely cannot be distinguished from an
+    ordinary anonymous orchestrator call by ANY action in this router
+    today, not just this one; closing that systemic gap needs a
+    per-session credential, out of scope here.
+    """
+    if caller_task_id or caller_task_run_id:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"`{action}` is not available to a Task Board worker run",
+        )
+    if caller_session_id:
+        from ..session_manager import session_manager
+
+        session = session_manager.get_session(caller_session_id)
+        if session is not None and session.task_id is not None:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                f"`{action}` is not available to a Task Board worker run",
+            )
+
+
 @router.post("/api/tasks/{task_id}/close")
 async def close_task(
     task_id: str,
     req: CloseRequest,
     caller_session_id: str | None = Header(default=None, alias="X-Owlery-Session-ID"),
+    caller_task_id: str | None = Header(default=None, alias="X-Owlery-Task-ID"),
+    caller_task_run_id: str | None = Header(default=None, alias="X-Owlery-Task-Run-ID"),
     _: str = Depends(verify_token),
 ):
+    await _reject_worker_caller(
+        "close",
+        caller_session_id=caller_session_id,
+        caller_task_id=caller_task_id,
+        caller_task_run_id=caller_task_run_id,
+    )
     actor_kind, actor_agent_id, _origin = await _actor(caller_session_id)
     row = await _run(
         task_repository.close_task(

@@ -355,6 +355,55 @@ async def test_close_endpoint_requires_summary_and_terminal_children(real_client
     assert closed.json()["status"] == "done"
 
 
+@pytest.mark.asyncio
+async def test_close_endpoint_rejects_worker_identity(real_client):
+    """task-board-gaps.md §3.3: "worker 身份调用一律拒绝" must hold at the
+    REST layer too, not just in the MCP tool's client-side gate — a worker
+    session could call this endpoint directly, bypassing the MCP wrapper
+    entirely. Two server-observed signals, neither client-asserted: the
+    X-Owlery-Task-ID/-Run-ID headers the tasks MCP server always attaches
+    from inside a worker run, and the dispatched session's own task_id."""
+    c, repo, root, agent_id = real_client
+    from server.session_manager import Session, session_manager
+
+    board = await repo.create_board(name="Battle", working_dir=str(root))
+    container = await repo.create_task(board_id=board.id, title="Battle root")
+
+    # Signal 1: the worker-context headers themselves.
+    via_headers = await c.post(
+        f"/api/tasks/{container.id}/close",
+        headers={**HEADERS, "X-Owlery-Task-ID": "some-task", "X-Owlery-Task-Run-ID": "some-run"},
+        json={"summary": "sneaky self-close"},
+    )
+    assert via_headers.status_code == 403
+
+    # Signal 2: a session id that resolves to a dispatched worker session,
+    # even with no task-id headers attached (a worker constructing the
+    # request by hand rather than through the trusted MCP client).
+    worker_session_id = "worker-sess-impersonation-test"
+    session_manager.sessions[worker_session_id] = Session(
+        id=worker_session_id, name="w", working_dir=str(root),
+        task_id=container.id, task_run_id="run-x",
+    )
+    try:
+        via_session = await c.post(
+            f"/api/tasks/{container.id}/close",
+            headers={**HEADERS, "X-Owlery-Session-ID": worker_session_id},
+            json={"summary": "sneaky self-close"},
+        )
+        assert via_session.status_code == 403
+    finally:
+        del session_manager.sessions[worker_session_id]
+
+    # Sanity: an ordinary orchestrator call (no worker signal) still works.
+    ordinary = await c.post(
+        f"/api/tasks/{container.id}/close",
+        headers=HEADERS,
+        json={"summary": "legitimate close"},
+    )
+    assert ordinary.status_code == 200, ordinary.text
+
+
 # --------------------------------------------------------------- enrichment
 # The list, tree, and single-task exits must all serialize the same card-facing
 # derived fields (task-card-status.md §1).  Wire a real repository behind the
