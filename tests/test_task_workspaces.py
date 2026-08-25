@@ -234,17 +234,33 @@ async def test_git_worktree_origin_base_degrades_to_cached_tracking_ref(
 async def test_git_worktree_origin_base_falls_back_when_fetch_fails_after_ls_remote_succeeds(
     task_roots, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """A live `ls-remote --symref` success does not guarantee the subsequent
-    `fetch` also succeeds (transient network blip). That must still degrade
-    to a prior successful prepare's cached tracking ref, not reject outright
-    just because the branch name it just resolved has no fresh fetch."""
+    """A live `ls-remote --symref` naming a DIFFERENT branch than the one a
+    prior successful prepare cached (origin's default branch changed since)
+    must still degrade to the cached branch's tracking ref when the fetch
+    for the newly-named branch fails — not reject just because that branch's
+    own ref was never fetched locally. (Using the same branch name for both
+    would pass even with the bug this guards against: the pre-fix code's
+    final check happened to hit the same, already-fetched ref by accident.)
+    """
     source, bare = _origin_repo(tmp_path)
-    origin_head = _rev_parse(bare, "main")
+    main_head = _rev_parse(bare, "main")
 
     live = await prepare_workspace(
         mode="git_worktree", source_dir=str(source), task_id="t1", run_id="run1", attempt_no=1,
     )
+    assert live.metadata["base_ref"] == "main"
     assert live.metadata["base_origin_degraded"] is False
+
+    # Origin's default branch changes to a sibling branch this repo has
+    # never fetched before.
+    subprocess.run(["git", "checkout", "-qb", "trunk"], cwd=source, check=True)
+    subprocess.run(["git", "commit", "--allow-empty", "-qm", "trunk"], cwd=source, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "trunk"], cwd=source, check=True)
+    # `push` incidentally writes a local `refs/remotes/origin/trunk` tracking
+    # ref as a side effect — drop it so `trunk` really has never been fetched
+    # by this repo, matching the scenario under test.
+    subprocess.run(["git", "update-ref", "-d", "refs/remotes/origin/trunk"], cwd=source, check=True)
+    subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/trunk"], cwd=bare, check=True)
 
     real_run = ws_module._run
 
@@ -258,8 +274,12 @@ async def test_git_worktree_origin_base_falls_back_when_fetch_fails_after_ls_rem
     degraded = await prepare_workspace(
         mode="git_worktree", source_dir=str(source), task_id="t1", run_id="run2", attempt_no=2,
     )
+    # `trunk` was never fetched locally and the live fetch attempt for it
+    # just failed — degrade to the branch a prior successful prepare
+    # cached (`main`), never reject just because `trunk`'s own tracking
+    # ref happens to be missing.
     assert degraded.metadata["base_ref"] == "main"
-    assert degraded.metadata["base_head"] == origin_head
+    assert degraded.metadata["base_head"] == main_head
     assert degraded.metadata["base_origin_degraded"] is True
 
 
