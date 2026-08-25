@@ -15,7 +15,10 @@ no second weaker token to leak.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, JSONResponse
@@ -29,15 +32,27 @@ from ..file_viewer import (
     PathRejected,
     ResolvedFile,
     UnsupportedType,
+    resolve_new_write_path,
+    resolve_raw_read_path,
     resolve_safe_path,
 )
 from ..harness import get_harness
 from ..model_routing import resolve_model
-from ..models import ShowMeResolveRequest, ShowMeResolveResponse
+from ..models import (
+    SaveFileRequest,
+    SaveFileResponse,
+    ShowMeResolveRequest,
+    ShowMeResolveResponse,
+)
 from ..session_manager import session_manager
 from ..showme_ai import resolve_showme_reference
 
 router = APIRouter(prefix="/api/sessions", tags=["files"])
+
+# Cap for the raw read/save endpoints (MCP-server attachment traffic,
+# mail-connector.md §4.2) — larger than the 2 MiB browser-viewer cap since
+# these move arbitrary attachment bytes, not stream to a chat-modal render.
+MAX_RAW_FILE_BYTES = 25 * 1024 * 1024
 
 
 def _verify_token(
@@ -169,3 +184,75 @@ async def get_file(
         media_type=resolved.mime_type,
         filename=resolved.abs_path.name,
     )
+
+
+@router.get("/{session_id}/files/raw")
+async def get_file_raw(
+    session_id: str,
+    path: str = Query(...),
+    _: str = Depends(_verify_token),
+) -> FileResponse:
+    """Raw bytes of any existing file under working_dir — no viewer
+    extension allowlist (an MCP server reading a send()-attachment can name
+    a .zip/.docx/etc that `/files` would reject). Internal: only connector
+    MCP subprocesses call this, not the browser."""
+    working_dir = await _working_dir_for(session_id)
+    try:
+        resolved = resolve_raw_read_path(working_dir, path)
+    except PathRejected as e:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(e))
+    except FileNotFound as e:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(e))
+    size = resolved.stat().st_size
+    if size > MAX_RAW_FILE_BYTES:
+        raise HTTPException(
+            status.HTTP_413_CONTENT_TOO_LARGE,
+            f"File is {size} bytes; limit is {MAX_RAW_FILE_BYTES} bytes",
+        )
+    return FileResponse(
+        resolved, media_type="application/octet-stream", filename=resolved.name
+    )
+
+
+def _dedupe_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem, suffix, parent = path.stem, path.suffix, path.parent
+    n = 1
+    while True:
+        candidate = parent / f"{stem}-{n}{suffix}"
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+@router.post("/{session_id}/files/save", response_model=SaveFileResponse)
+async def save_file(
+    session_id: str,
+    req: SaveFileRequest,
+    _: str = Depends(_verify_token),
+) -> SaveFileResponse:
+    """Write a new file into the session's working directory — the
+    counterpart to `/files/raw` (an MCP server, e.g. the `mail` connector's
+    attachment downloads, writing bytes it fetched from a third party).
+    Never overwrites an existing file — collisions get a `-1`, `-2`, …
+    suffix. Internal-only, same as `/files/raw`."""
+    working_dir = await _working_dir_for(session_id)
+    try:
+        path = resolve_new_write_path(working_dir, req.relative_dir, req.filename)
+    except PathRejected as e:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(e))
+    try:
+        content = base64.b64decode(req.content_base64, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "content_base64 is not valid base64")
+    if len(content) > MAX_RAW_FILE_BYTES:
+        raise HTTPException(
+            status.HTTP_413_CONTENT_TOO_LARGE,
+            f"Content is {len(content)} bytes; limit is {MAX_RAW_FILE_BYTES} bytes",
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    final = _dedupe_path(path)
+    final.write_bytes(content)
+    rel = str(final.relative_to(Path(working_dir).resolve(strict=False)))
+    return SaveFileResponse(path=rel, size=len(content))

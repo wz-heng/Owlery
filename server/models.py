@@ -282,6 +282,22 @@ class ShowMeResolveResponse(BaseModel):
     message: str | None = None
 
 
+class SaveFileRequest(BaseModel):
+    """Body for `POST /api/sessions/{id}/files/save` — an MCP server (the
+    `mail` connector's attachment downloads, mail-connector.md §4.2) writing
+    a file into the session's working directory. `filename` is sanitized to
+    its basename; `relative_dir` may add subdirectories but not escape."""
+
+    relative_dir: str = ""
+    filename: str = Field(min_length=1)
+    content_base64: str = Field(min_length=1)
+
+
+class SaveFileResponse(BaseModel):
+    path: str  # working-dir-relative
+    size: int
+
+
 class UpdateScheduleRequest(BaseModel):
     name: str | None = None
     prompt: str | None = None
@@ -410,6 +426,24 @@ class UpdateCredentialRequest(BaseModel):
 # agent-scoped (the agent_connectors join). Secrets are never returned.
 
 
+class StaticCredentialFieldInfo(BaseModel):
+    """One field of a static-credential connector's install form
+    (mail-connector.md §4.1) — drives generic frontend rendering."""
+
+    key: str
+    label: str
+    secret: bool = False
+    default: str = ""
+    placeholder: str = ""
+    help_text: str = ""
+
+
+class StaticCredentialPresetInfo(BaseModel):
+    key: str
+    label: str
+    values: dict[str, str] = {}
+
+
 class ConnectorCatalogEntry(BaseModel):
     kind: str
     display_name: str
@@ -420,6 +454,9 @@ class ConnectorCatalogEntry(BaseModel):
     custom: bool = False  # user-defined (deletable) vs built-in
     setup_url: str | None = None  # provider's app-registration page
     setup_steps: list[str] = []  # in-app "how to register" guidance
+    auth_mode: str = "oauth"  # "oauth" | "static"
+    static_fields: list[StaticCredentialFieldInfo] = []
+    static_presets: list[StaticCredentialPresetInfo] = []
 
 
 class CustomConnectorCreateRequest(BaseModel):
@@ -464,6 +501,15 @@ class ConnectorInstallationInfo(BaseModel):
     token_expires_at: str | None = None
     last_refresh_error_code: str | None = None
     created_at: str
+
+
+class InstallStaticConnectorRequest(BaseModel):
+    """Body for `POST /api/connectors/{kind}/install-static`
+    (mail-connector.md §4.1) — verified live against the real service
+    before anything is persisted."""
+
+    fields: dict[str, str]
+    label: str | None = None
 
 
 class ConnectorOAuthStartRequest(BaseModel):

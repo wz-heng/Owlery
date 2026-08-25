@@ -423,6 +423,53 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/sessions/{session_id}/files/raw": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get File Raw
+         * @description Raw bytes of any existing file under working_dir — no viewer
+         *     extension allowlist (an MCP server reading a send()-attachment can name
+         *     a .zip/.docx/etc that `/files` would reject). Internal: only connector
+         *     MCP subprocesses call this, not the browser.
+         */
+        get: operations["get_file_raw_api_sessions__session_id__files_raw_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/sessions/{session_id}/files/save": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Save File
+         * @description Write a new file into the session's working directory — the
+         *     counterpart to `/files/raw` (an MCP server, e.g. the `mail` connector's
+         *     attachment downloads, writing bytes it fetched from a third party).
+         *     Never overwrites an existing file — collisions get a `-1`, `-2`, …
+         *     suffix. Internal-only, same as `/files/raw`.
+         */
+        post: operations["save_file_api_sessions__session_id__files_save_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/sessions/{session_id}/bg-tasks": {
         parameters: {
             query?: never;
@@ -1067,6 +1114,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/tasks/{task_id}/close": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Close Task */
+        post: operations["close_task_api_tasks__task_id__close_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/tasks/{task_id}/archive": {
         parameters: {
             query?: never;
@@ -1306,6 +1370,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/tasks/{task_id}/runs/{run_id}/delivery/chain": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Delivery Chain
+         * @description Supersede-chain context for the delivery panel (task-board-overhaul.md
+         *     §3.1): ``target`` is the ULTIMATE tip that has collapsed this delivery,
+         *     possibly transitively (null if this delivery already is the tip);
+         *     ``superseded`` is everything this delivery transitively contains — the
+         *     candidate set for the tip panel's batch-teardown affordance. Both walk
+         *     the full chain rather than one hop, so an intermediate delivery that has
+         *     itself since been collapsed never strands its own predecessors.
+         */
+        get: operations["get_delivery_chain_api_tasks__task_id__runs__run_id__delivery_chain_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/tasks/{task_id}/runs/{run_id}/delivery/ops": {
         parameters: {
             query?: never;
@@ -1425,6 +1515,99 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/deployments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Deployments */
+        get: operations["list_deployments_api_deployments_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/task-boards/{board_id}/releases/stage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Release Stage
+         * @description Stage may be requested by a human or a trusted orchestrator agent —
+         *     same permission shape as the per-run `deploy/stage` verb.
+         */
+        post: operations["release_stage_api_task_boards__board_id__releases_stage_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/task-boards/{board_id}/releases/switch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Release Switch
+         * @description A restart is deliberately human-only; agents may stage but never
+         *     switch — same rule as the per-run `deploy/switch` verb.
+         */
+        post: operations["release_switch_api_task_boards__board_id__releases_switch_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/task-boards/{board_id}/releases": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Releases */
+        get: operations["list_releases_api_task_boards__board_id__releases_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/task-boards/{board_id}/releases/rollback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Release Rollback */
+        post: operations["release_rollback_api_task_boards__board_id__releases_rollback_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/task-worker/current/delivery/request": {
         parameters: {
             query?: never;
@@ -1532,6 +1715,90 @@ export interface paths {
         head?: never;
         /** Update Schedule */
         patch: operations["update_schedule_api_schedules__schedule_id__patch"];
+        trace?: never;
+    };
+    "/api/memory/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Search Memory
+         * @description Scan every agent's memory dir for `q` (case-insensitive substring).
+         *     Corpus is small (a few dozen short files per agent) so a direct scan is
+         *     the whole implementation — no search index (memory-ui.md §不做清单).
+         */
+        get: operations["search_memory_api_memory_search_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/memory/{agent_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Memory */
+        get: operations["list_memory_api_memory__agent_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/memory/{agent_id}/file": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read Memory File
+         * @description Raw file contents. Path traversal is the only real risk in this
+         *     router: `name` is validated as a plain segment, then the resolved path is
+         *     re-checked to stay under the resolved memory dir before it is opened.
+         */
+        get: operations["read_memory_file_api_memory__agent_id__file_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/memory/{agent_id}/graph": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Memory Graph
+         * @description `[[name]]` link graph for one agent (agent-scoped namespace — no
+         *     cross-agent resolution, per memory-ui.md §不做清单). `MEMORY.md` is the
+         *     index page, not a graph node, and is excluded. A link to a `name` with no
+         *     matching file still produces a node, marked `ghost`.
+         */
+        get: operations["memory_graph_api_memory__agent_id__graph_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/api/usage/summary": {
@@ -1842,6 +2109,29 @@ export interface paths {
         get: operations["list_installations_api_connectors_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/connectors/{kind}/install-static": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Install Static
+         * @description Verify `req.fields` live against the real service, then persist —
+         *     no OAuth redirect. The request blocks on that verification (typically a
+         *     few seconds); on failure the service's own error message comes back in
+         *     `detail` so the form can show it inline.
+         */
+        post: operations["install_static_api_connectors__kind__install_static_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2361,6 +2651,11 @@ export interface components {
              * @default false
              */
             allow_local_deploy: boolean;
+            /**
+             * Deploy Release Ref
+             * @default main
+             */
+            deploy_release_ref: string;
         };
         /** BoardPatch */
         BoardPatch: {
@@ -2396,6 +2691,8 @@ export interface components {
             git_delivery_default_merge?: ("none" | "fast_forward_only") | null;
             /** Allow Local Deploy */
             allow_local_deploy?: boolean | null;
+            /** Deploy Release Ref */
+            deploy_release_ref?: string | null;
             /** Updated At */
             updated_at?: string | null;
         };
@@ -2464,6 +2761,11 @@ export interface components {
             /** Reason */
             reason?: string | null;
         };
+        /** CloseRequest */
+        CloseRequest: {
+            /** Summary */
+            summary: string;
+        };
         /** CodexLoginCancelRequest */
         CodexLoginCancelRequest: {
             /** Login Id */
@@ -2508,6 +2810,8 @@ export interface components {
             };
             /** Artifacts */
             artifacts?: components["schemas"]["ArtifactDeclaration"][];
+            /** Verdict */
+            verdict?: string | null;
         };
         /** ConnectorCatalogEntry */
         ConnectorCatalogEntry: {
@@ -2538,6 +2842,21 @@ export interface components {
              * @default []
              */
             setup_steps: string[];
+            /**
+             * Auth Mode
+             * @default oauth
+             */
+            auth_mode: string;
+            /**
+             * Static Fields
+             * @default []
+             */
+            static_fields: components["schemas"]["StaticCredentialFieldInfo"][];
+            /**
+             * Static Presets
+             * @default []
+             */
+            static_presets: components["schemas"]["StaticCredentialPresetInfo"][];
         };
         /** ConnectorInstallationInfo */
         ConnectorInstallationInfo: {
@@ -2918,6 +3237,91 @@ export interface components {
              */
             messages: components["schemas"]["MessageContent"][];
         };
+        /**
+         * InstallStaticConnectorRequest
+         * @description Body for `POST /api/connectors/{kind}/install-static`
+         *     (mail-connector.md §4.1) — verified live against the real service
+         *     before anything is persisted.
+         */
+        InstallStaticConnectorRequest: {
+            /** Fields */
+            fields: {
+                [key: string]: string;
+            };
+            /** Label */
+            label?: string | null;
+        };
+        /** MemoryFileMeta */
+        MemoryFileMeta: {
+            /** File */
+            file: string;
+            /** Name */
+            name?: string | null;
+            /** Description */
+            description?: string | null;
+            /** Type */
+            type?: string | null;
+        };
+        /** MemoryGraphEdge */
+        MemoryGraphEdge: {
+            /** Source */
+            source: string;
+            /** Target */
+            target: string;
+        };
+        /** MemoryGraphNode */
+        MemoryGraphNode: {
+            /** Id */
+            id: string;
+            /** File */
+            file?: string | null;
+            /** Description */
+            description?: string | null;
+            /** Type */
+            type?: string | null;
+            /**
+             * Ghost
+             * @default false
+             */
+            ghost: boolean;
+        };
+        /** MemoryGraphResponse */
+        MemoryGraphResponse: {
+            /** Agent Id */
+            agent_id: string;
+            /** Nodes */
+            nodes: components["schemas"]["MemoryGraphNode"][];
+            /** Edges */
+            edges: components["schemas"]["MemoryGraphEdge"][];
+        };
+        /** MemoryListResponse */
+        MemoryListResponse: {
+            /** Agent Id */
+            agent_id: string;
+            index: components["schemas"]["MemoryFileMeta"] | null;
+            /** Files */
+            files: components["schemas"]["MemoryFileMeta"][];
+        };
+        /** MemorySearchHit */
+        MemorySearchHit: {
+            /** Agent Id */
+            agent_id: string;
+            /** File */
+            file: string;
+            /** Name */
+            name?: string | null;
+            /** Type */
+            type?: string | null;
+            /** Snippet */
+            snippet: string;
+        };
+        /** MemorySearchResponse */
+        MemorySearchResponse: {
+            /** Query */
+            query: string;
+            /** Hits */
+            hits: components["schemas"]["MemorySearchHit"][];
+        };
         /** MessageContent */
         MessageContent: {
             role: components["schemas"]["MessageRole"];
@@ -3034,6 +3438,47 @@ export interface components {
             questions: {
                 [key: string]: unknown;
             }[];
+        };
+        /** ReleaseRollbackRequest */
+        ReleaseRollbackRequest: {
+            /**
+             * Confirm Rollback
+             * @default false
+             */
+            confirm_rollback: boolean;
+        };
+        /** ReleaseSwitchRequest */
+        ReleaseSwitchRequest: {
+            /**
+             * Drain
+             * @default false
+             */
+            drain: boolean;
+        };
+        /**
+         * SaveFileRequest
+         * @description Body for `POST /api/sessions/{id}/files/save` — an MCP server (the
+         *     `mail` connector's attachment downloads, mail-connector.md §4.2) writing
+         *     a file into the session's working directory. `filename` is sanitized to
+         *     its basename; `relative_dir` may add subdirectories but not escape.
+         */
+        SaveFileRequest: {
+            /**
+             * Relative Dir
+             * @default
+             */
+            relative_dir: string;
+            /** Filename */
+            filename: string;
+            /** Content Base64 */
+            content_base64: string;
+        };
+        /** SaveFileResponse */
+        SaveFileResponse: {
+            /** Path */
+            path: string;
+            /** Size */
+            size: number;
         };
         /**
          * ScheduleFromTextRequest
@@ -3278,6 +3723,51 @@ export interface components {
         StartResearchRequest: {
             /** Question */
             question: string;
+        };
+        /**
+         * StaticCredentialFieldInfo
+         * @description One field of a static-credential connector's install form
+         *     (mail-connector.md §4.1) — drives generic frontend rendering.
+         */
+        StaticCredentialFieldInfo: {
+            /** Key */
+            key: string;
+            /** Label */
+            label: string;
+            /**
+             * Secret
+             * @default false
+             */
+            secret: boolean;
+            /**
+             * Default
+             * @default
+             */
+            default: string;
+            /**
+             * Placeholder
+             * @default
+             */
+            placeholder: string;
+            /**
+             * Help Text
+             * @default
+             */
+            help_text: string;
+        };
+        /** StaticCredentialPresetInfo */
+        StaticCredentialPresetInfo: {
+            /** Key */
+            key: string;
+            /** Label */
+            label: string;
+            /**
+             * Values
+             * @default {}
+             */
+            values: {
+                [key: string]: string;
+            };
         };
         /** SubmitAnswerRequest */
         SubmitAnswerRequest: {
@@ -4376,6 +4866,77 @@ export interface operations {
             };
         };
     };
+    get_file_raw_api_sessions__session_id__files_raw_get: {
+        parameters: {
+            query: {
+                path: string;
+                token?: string | null;
+            };
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    save_file_api_sessions__session_id__files_save_post: {
+        parameters: {
+            query?: {
+                token?: string | null;
+            };
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SaveFileRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SaveFileResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_bg_tasks_api_sessions__session_id__bg_tasks_get: {
         parameters: {
             query?: never;
@@ -5233,6 +5794,7 @@ export interface operations {
                 parent_id?: string | null;
                 include_archived?: boolean;
                 limit?: number;
+                offset?: number;
             };
             header?: never;
             path?: never;
@@ -5268,6 +5830,7 @@ export interface operations {
                 parent_id?: string | null;
                 include_archived?: boolean;
                 limit?: number;
+                offset?: number;
             };
             header?: never;
             path: {
@@ -5736,6 +6299,45 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["CancelRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    close_task_api_tasks__task_id__close_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Owlery-Session-ID"?: string | null;
+                "X-Owlery-Task-ID"?: string | null;
+                "X-Owlery-Task-Run-ID"?: string | null;
+            };
+            path: {
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CloseRequest"];
             };
         };
         responses: {
@@ -6274,6 +6876,38 @@ export interface operations {
             };
         };
     };
+    get_delivery_chain_api_tasks__task_id__runs__run_id__delivery_chain_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                task_id: string;
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_delivery_ops_api_tasks__task_id__runs__run_id__delivery_ops_get: {
         parameters: {
             query?: never;
@@ -6507,6 +7141,167 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["DeliveryTeardownRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_deployments_api_deployments_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    release_stage_api_task_boards__board_id__releases_stage_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Owlery-Session-ID"?: string | null;
+            };
+            path: {
+                board_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    release_switch_api_task_boards__board_id__releases_switch_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Owlery-Session-ID"?: string | null;
+            };
+            path: {
+                board_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ReleaseSwitchRequest"] | null;
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_releases_api_task_boards__board_id__releases_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                board_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    release_rollback_api_task_boards__board_id__releases_rollback_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Owlery-Session-ID"?: string | null;
+            };
+            path: {
+                board_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReleaseRollbackRequest"];
             };
         };
         responses: {
@@ -6782,6 +7577,132 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ScheduleInfo"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    search_memory_api_memory_search_get: {
+        parameters: {
+            query: {
+                q: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemorySearchResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_memory_api_memory__agent_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_memory_file_api_memory__agent_id__file_get: {
+        parameters: {
+            query: {
+                name: string;
+            };
+            header?: never;
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    memory_graph_api_memory__agent_id__graph_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryGraphResponse"];
                 };
             };
             /** @description Validation Error */
@@ -7471,6 +8392,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ConnectorInstallationInfo"][];
+                };
+            };
+        };
+    };
+    install_static_api_connectors__kind__install_static_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                kind: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InstallStaticConnectorRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectorInstallationInfo"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

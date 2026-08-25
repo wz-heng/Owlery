@@ -1,3 +1,5 @@
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
 import path from "node:path";
@@ -5,6 +7,53 @@ import path from "node:path";
 import { defineConfig } from "@playwright/test";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Self-signed TLS cert for the fake IMAP/SMTP e2e server (mail-connector.md
+// §4.5). Generated synchronously here — NOT in globalSetup — because
+// Playwright starts webServer processes (including the backend, which needs
+// this path via OWLERY_MAIL_CA_FILE below) before globalSetup runs.
+//
+// Guarded by existsSync: this config module is re-imported in more than one
+// process (the CLI process that resolves webServer/globalSetup, and each
+// test worker that imports it for the E2E_MAIL_* constants). Regenerating
+// unconditionally would win a race with whichever process started the fake
+// mail server first — that process loaded the OLD key material into its
+// listening TLS context, so a second `openssl` run rewrites the files out
+// from under it and every verification fails with a self-signed-cert error
+// even though OWLERY_MAIL_CA_FILE points at "the right" path. Generate once
+// per run (global-teardown removes the directory); every later import reuses it.
+export const E2E_MAIL_CERT_DIR = path.join(os.tmpdir(), "owlery-e2e-mail-tls");
+export const E2E_MAIL_CERTFILE = path.join(E2E_MAIL_CERT_DIR, "cert.pem");
+export const E2E_MAIL_KEYFILE = path.join(E2E_MAIL_CERT_DIR, "key.pem");
+if (!existsSync(E2E_MAIL_CERTFILE)) {
+  execFileSync("mkdir", ["-p", E2E_MAIL_CERT_DIR]);
+  execFileSync("openssl", [
+    "req",
+    "-x509",
+    "-newkey",
+    "rsa:2048",
+    "-keyout",
+    E2E_MAIL_KEYFILE,
+    "-out",
+    E2E_MAIL_CERTFILE,
+    "-days",
+    "1",
+    "-nodes",
+    "-subj",
+    "/CN=127.0.0.1",
+    "-addext",
+    "subjectAltName=IP:127.0.0.1",
+    "-addext",
+    "basicConstraints=critical,CA:true",
+  ]);
+}
+
+// Fixed ports the fake mail server (web/e2e/fake-mail/server.py) and
+// connectors.spec.ts's "Custom" preset form both hard-code — no IPC needed.
+export const E2E_MAIL_IMAP_PORT = 19993;
+export const E2E_MAIL_SMTP_PORT = 19465;
+export const E2E_MAIL_EMAIL = "e2e@example.com";
+export const E2E_MAIL_AUTH_CODE = "e2e-auth-code";
 
 // Isolate the e2e backend's per-agent state (canonical memory/ + claude-home/)
 // under a temp dir so runs never litter the developer's real
@@ -153,6 +202,12 @@ export default defineConfig({
         // connection a different database, so the integrated E2E backend must
         // use an isolated file. Global teardown removes it and its WAL files.
         OWLERY_DB_PATH: E2E_DB_PATH,
+        // Trusts the fake mail server's self-signed cert IN ADDITION to the
+        // real system CA store (server/mail_protocol.py's
+        // `_default_ssl_context` — `load_verify_locations` adds, never
+        // replaces). connectors.spec.ts's mail install flow is the only
+        // consumer; harmless to every other spec.
+        OWLERY_MAIL_CA_FILE: E2E_MAIL_CERTFILE,
       },
     },
     {
@@ -164,6 +219,16 @@ export default defineConfig({
         ...process.env,
         OWLERY_API_PORT: "8765",
       },
+    },
+    {
+      // Fake IMAP/SMTP servers for the mail connector's static-install e2e
+      // flow (mail-connector.md §4.5). Reuses the same Python fixtures the
+      // backend unit tests already exercise (tests/_fixtures/fake_*).
+      command: `../../.venv/bin/python fake-mail/server.py ${E2E_MAIL_CERTFILE} ${E2E_MAIL_KEYFILE}`,
+      cwd: "./e2e",
+      port: E2E_MAIL_IMAP_PORT,
+      reuseExistingServer: false,
+      timeout: 10_000,
     },
   ],
 });

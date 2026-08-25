@@ -3,6 +3,17 @@ import { test, expect, type Page } from "@playwright/test";
 // Connectors UI against the real backend. No real third-party OAuth is needed:
 // configuring an OAuth client (or creating a custom connector) just flips a
 // connector to "available" — which is the browser-only setup flow we verify.
+// The one exception is the static-credential `mail` kind (mail-connector.md
+// §4.5): its install genuinely round-trips IMAP LOGIN + SMTP AUTH, so this
+// spec's "Custom" preset form points at the real fake IMAP/SMTP servers
+// Playwright starts as a third webServer (playwright.config.ts).
+
+import {
+  E2E_MAIL_AUTH_CODE,
+  E2E_MAIL_EMAIL,
+  E2E_MAIL_IMAP_PORT,
+  E2E_MAIL_SMTP_PORT,
+} from "../playwright.config";
 
 const TOKEN = "changeme";
 const API = "http://localhost:8765/api";
@@ -30,6 +41,16 @@ test.afterEach(async ({ request }) => {
         await request
           .delete(`${API}/connectors/custom/${c.kind}`, { headers })
           .catch(() => {});
+      }
+    }
+  }
+  // Static installs (mail) persist in the shared backend too — clean up so
+  // "no connectors installed" assertions in other tests stay true.
+  const insts = await request.get(`${API}/connectors`, { headers });
+  if (insts.ok()) {
+    for (const i of (await insts.json()) as { id: string; kind: string }[]) {
+      if (i.kind === "mail") {
+        await request.delete(`${API}/connectors/${i.id}`, { headers }).catch(() => {});
       }
     }
   }
@@ -128,5 +149,45 @@ test.describe("Connectors", () => {
     await expect(page.locator(".agent-connectors")).toContainText(
       "No connectors installed"
     );
+  });
+
+  test("static-credential install: mail connects via a custom preset, then enables on an agent", async ({
+    page,
+  }) => {
+    await page.locator(".btn-connector-add").click();
+    const mail = page.locator(".connector-catalog-item", { hasText: "Mail (IMAP/SMTP)" });
+    await expect(mail).toBeVisible();
+    // Static kinds skip the OAuth "Set up" step entirely — straight to Connect.
+    await mail.locator(".btn-connector-connect-static").click();
+
+    await expect(page.getByText("Connect Mail (IMAP/SMTP)")).toBeVisible();
+    await page.getByLabel("Preset").selectOption("custom");
+    await page.getByLabel("Email address").fill(E2E_MAIL_EMAIL);
+    await page.getByLabel("Authorization code").fill(E2E_MAIL_AUTH_CODE);
+    await page.getByLabel("IMAP host").fill("127.0.0.1");
+    await page.getByLabel("IMAP port").fill(String(E2E_MAIL_IMAP_PORT));
+    await page.getByLabel("SMTP host").fill("127.0.0.1");
+    await page.getByLabel("SMTP port").fill(String(E2E_MAIL_SMTP_PORT));
+    await page.locator(".btn-connector-save-static").click();
+
+    // Verified live against the fake server and persisted → shows in the
+    // installed list, dialog closes.
+    await expect(page.locator(".connector-catalog")).toBeHidden();
+    const installedRow = page.locator(".connector-item", { hasText: E2E_MAIL_EMAIL });
+    await expect(installedRow).toBeVisible();
+    await expect(installedRow.locator(".btn-connector-reconnect")).toHaveCount(0);
+
+    // Enable it on the default agent.
+    const octo = page.locator(".agent-item", { hasText: "Owl" });
+    await octo.click();
+    await page.locator(".btn-account").click();
+    await page.locator(".menu-agent-settings").click();
+    await expect(page.locator(".agent-settings")).toBeVisible();
+    const row = page.locator(".agent-connector-row", { hasText: E2E_MAIL_EMAIL });
+    await expect(row).toBeVisible();
+    const toggle = row.locator(".agent-connector-toggle");
+    await expect(toggle).not.toBeChecked();
+    await toggle.check();
+    await expect(toggle).toBeChecked();
   });
 });

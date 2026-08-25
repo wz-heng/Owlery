@@ -51,6 +51,38 @@ class HealthStatus:
     detail: str | None = None
 
 
+class StaticVerifyError(Exception):
+    """A static-credential connector's `verify_static_credentials` raised
+    this to fail an install — the message is shown to the user verbatim, so
+    it should be the underlying service's own words (mail-connector.md §4.1:
+    '先验证后落库... 任一失败则整个安装失败并把服务器原话带回给前端')."""
+
+
+@dataclass(frozen=True)
+class StaticCredentialField:
+    """One field in a static-credential connector's install form
+    (mail-connector.md §4.1). The frontend renders these generically —
+    no per-kind form code needed."""
+
+    key: str
+    label: str
+    secret: bool = False
+    default: str = ""
+    placeholder: str = ""
+    help_text: str = ""
+
+
+@dataclass(frozen=True)
+class StaticCredentialPreset:
+    """A named prefill for a static connector's form (e.g. 'QQ Mail' →
+    host/port defaults). `values` maps `StaticCredentialField.key` →
+    prefill value; the user can still edit every field after picking one."""
+
+    key: str
+    label: str
+    values: dict[str, str] = field(default_factory=dict)
+
+
 def render_connectors_blurb(
     connectors: list[tuple["ConnectorBase", "ConnectorInstallation"]],
 ) -> str:
@@ -75,7 +107,15 @@ class ConnectorBase(abc.ABC):
     display_name: str  # 'Gmail'
     category: str = "other"  # for grouping in the catalog picker
     allows_multiple: bool = False  # multiple installs of the same kind?
-    oauth: ConnectorOAuthProvider
+    # 'oauth' (default): `oauth` below is required, install is the OAuth
+    # redirect flow. 'static': the connector declares `static_fields` (+
+    # optional `static_presets`) instead of `oauth`, and install is a plain
+    # form POST verified live against the service before it's persisted
+    # (mail-connector.md §4.1 — the framework's static-credential path).
+    auth_mode: str = "oauth"
+    oauth: ConnectorOAuthProvider  # required when auth_mode == "oauth"
+    static_fields: tuple[StaticCredentialField, ...] = ()
+    static_presets: tuple[StaticCredentialPreset, ...] = ()
     # Verb names this connector's MCP server exposes (without the
     # `mcp__<key>__` prefix the CLI adds). Drives the system-prompt blurb and
     # the tool-name-length invariant.
@@ -137,6 +177,16 @@ class ConnectorBase(abc.ABC):
     ) -> tuple[str, str]:
         """After OAuth, call the provider's profile endpoint for a stable
         (external_account_id, label) pair. Override per kind."""
+        raise NotImplementedError
+
+    async def verify_static_credentials(
+        self, fields: dict[str, str]
+    ) -> tuple[str, str]:
+        """Static connectors only: verify `fields` (keyed by
+        `StaticCredentialField.key`, already required-checked and stripped)
+        live against the real service. Return (external_account_id, label)
+        on success; raise `StaticVerifyError` with the service's own error
+        message on failure. Override per kind."""
         raise NotImplementedError
 
     async def health_check(

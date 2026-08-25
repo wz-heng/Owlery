@@ -8,6 +8,7 @@ import {
   fetchCatalog,
   fetchInstallations,
   getOAuthClient,
+  installStaticConnector,
   pollConnectorOAuth,
   setOAuthClient,
   startConnectorOAuth,
@@ -30,7 +31,7 @@ type Flow =
   | { kind: "waiting"; loginId: string }
   | { kind: "error"; message: string };
 
-type View = "catalog" | "setup" | "custom";
+type View = "catalog" | "setup" | "custom" | "static";
 
 const REDIRECT_PATH = "/api/connectors/oauth/callback";
 
@@ -72,9 +73,15 @@ export function ConnectorList() {
   };
   const [custom, setCustom] = useState({ ...blankCustom });
 
+  // Static-credential install form (mail-connector.md §4.1).
+  const [staticKind, setStaticKind] = useState("");
+  const [staticFields, setStaticFields] = useState<Record<string, string>>({});
+  const [presetKey, setPresetKey] = useState("");
+
   // The redirect URI to register with a provider — what the browser is hitting.
   const browserRedirect = `${window.location.origin}${REDIRECT_PATH}`;
   const setupEntry = catalog.find((c) => c.kind === setupKind);
+  const staticEntry = catalog.find((c) => c.kind === staticKind);
 
   const refreshCatalog = () => fetchCatalog(token).then(setCatalog).catch(() => {});
 
@@ -96,6 +103,9 @@ export function ConnectorList() {
     setClientId("");
     setClientSecret("");
     setCustom({ ...blankCustom });
+    setStaticKind("");
+    setStaticFields({});
+    setPresetKey("");
   };
 
   // --- OAuth install (popup + poll) ---------------------------------------
@@ -206,6 +216,44 @@ export function ConnectorList() {
     }
   };
 
+  // --- static-credential install (mail-connector.md §4.1) -----------------
+
+  const openStatic = (kind: string) => {
+    const entry = catalog.find((c) => c.kind === kind);
+    const defaults: Record<string, string> = {};
+    for (const f of entry?.static_fields ?? []) defaults[f.key] = f.default ?? "";
+    const firstPreset = entry?.static_presets?.[0];
+    if (firstPreset) Object.assign(defaults, firstPreset.values);
+    setStaticKind(kind);
+    setStaticFields(defaults);
+    setPresetKey(firstPreset?.key ?? "");
+    setFormError(null);
+    setView("static");
+  };
+
+  const applyPreset = (key: string) => {
+    setPresetKey(key);
+    const preset = staticEntry?.static_presets.find((p) => p.key === key);
+    if (preset) setStaticFields((f) => ({ ...f, ...preset.values }));
+  };
+
+  const sf = (key: string, v: string) => setStaticFields((f) => ({ ...f, [key]: v }));
+
+  const saveStatic = async () => {
+    setBusy(true);
+    setFormError(null);
+    try {
+      await installStaticConnector(token, staticKind, staticFields);
+      setInstallations(await fetchInstallations(token));
+      resetDialog();
+      setOpen(false);
+    } catch (e) {
+      setFormError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const handleOpenChange = (v: boolean) => {
     if (!v && flow.kind === "waiting") cancelConnectorOAuth(token, flow.loginId);
     if (!v) resetDialog();
@@ -279,7 +327,11 @@ export function ConnectorList() {
                 onClick={() => {
                   resetDialog();
                   setOpen(true);
-                  connect(inst.kind);
+                  if (catalog.find((c) => c.kind === inst.kind)?.auth_mode === "static") {
+                    openStatic(inst.kind);
+                  } else {
+                    connect(inst.kind);
+                  }
                 }}
                 title="Reconnect"
               >
@@ -351,7 +403,15 @@ export function ConnectorList() {
                         <IconX size={15} />
                       </button>
                     )}
-                    {c.available ? (
+                    {c.auth_mode === "static" ? (
+                      <Button
+                        size="sm"
+                        className="btn-connector-connect-static"
+                        onClick={() => openStatic(c.kind)}
+                      >
+                        Connect
+                      </Button>
+                    ) : c.available ? (
                       <Button
                         size="sm"
                         className="btn-connector-connect"
@@ -567,6 +627,69 @@ export function ConnectorList() {
                   onClick={saveCustom}
                 >
                   {busy ? "Creating…" : "Create"}
+                </Button>
+              </div>
+            </>
+          )}
+
+          {view === "static" && staticEntry && (
+            <>
+              <DialogHeader>
+                <DialogTitle>Connect {staticEntry.display_name}</DialogTitle>
+                <DialogDescription>
+                  Credentials are verified live against the mailbox before
+                  they're saved — no OAuth sign-in needed.
+                </DialogDescription>
+              </DialogHeader>
+              <div className="space-y-3">
+                {staticEntry.static_presets.length > 0 && (
+                  <div className="space-y-1.5">
+                    <Label htmlFor="static-preset">Preset</Label>
+                    <select
+                      id="static-preset"
+                      className="static-preset-select flex h-9 w-full rounded-md border border-border bg-input px-3 py-1 text-sm text-foreground outline-none focus:border-ring focus:ring-2 focus:ring-ring/30"
+                      value={presetKey}
+                      onChange={(e) => applyPreset(e.target.value)}
+                    >
+                      {staticEntry.static_presets.map((p) => (
+                        <option key={p.key} value={p.key}>
+                          {p.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+                {staticEntry.static_fields.map((f) => (
+                  <div key={f.key} className="space-y-1.5">
+                    <Label htmlFor={`static-${f.key}`}>{f.label}</Label>
+                    <Input
+                      id={`static-${f.key}`}
+                      type={f.secret ? "password" : "text"}
+                      placeholder={f.placeholder}
+                      value={staticFields[f.key] ?? ""}
+                      onChange={(e) => sf(f.key, e.target.value)}
+                    />
+                    {f.help_text && (
+                      <p className="text-xs text-muted-foreground">{f.help_text}</p>
+                    )}
+                  </div>
+                ))}
+                {formError && <p className="text-sm text-destructive">{formError}</p>}
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <Button variant="ghost" size="sm" onClick={() => setView("catalog")}>
+                  <IconArrowLeft size={14} /> Back
+                </Button>
+                <Button
+                  size="sm"
+                  className="btn-connector-save-static"
+                  disabled={
+                    busy ||
+                    staticEntry.static_fields.some((f) => !staticFields[f.key]?.trim())
+                  }
+                  onClick={saveStatic}
+                >
+                  {busy ? "Connecting…" : "Connect"}
                 </Button>
               </div>
             </>

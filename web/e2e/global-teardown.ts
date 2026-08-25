@@ -5,6 +5,7 @@ import {
   E2E_DB_PATH,
   E2E_FAKE_STATE_DIR,
   E2E_HOME_DIR,
+  E2E_MAIL_CERT_DIR,
   E2E_TRIPWIRE_LOG,
 } from "../playwright.config";
 
@@ -23,6 +24,7 @@ export default function globalTeardown(): void {
   rmSync(E2E_AGENTS_DIR, { recursive: true, force: true });
   rmSync(E2E_HOME_DIR, { recursive: true, force: true });
   rmSync(E2E_FAKE_STATE_DIR, { recursive: true, force: true });
+  rmSync(E2E_MAIL_CERT_DIR, { recursive: true, force: true });
   for (const suffix of ["", "-wal", "-shm"]) {
     rmSync(`${E2E_DB_PATH}${suffix}`, { force: true });
   }
