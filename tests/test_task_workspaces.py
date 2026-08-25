@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from server.config import settings
+from server.task_board import workspaces as ws_module
 from server.task_board.workspaces import (
     WorkspaceError,
     capture_artifacts,
@@ -138,4 +139,166 @@ async def test_git_worktree_requires_clean_repo_and_records_state(task_roots, tm
             task_id="abc124",
             run_id="run2",
             attempt_no=1,
+        )
+
+
+def _origin_repo(tmp_path: Path) -> tuple[Path, Path]:
+    """A source repo with a bare `origin` already advertising `main`."""
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    # Force the bare repo's HEAD symref to `main` regardless of the host's
+    # `init.defaultBranch` — otherwise `ls-remote --symref origin HEAD`
+    # advertises whatever the host defaulted to, not the branch pushed below.
+    subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/main"], cwd=bare, check=True)
+    source = tmp_path / "repo"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=source, check=True)
+    subprocess.run(["git", "config", "user.email", "owlery@example.invalid"], cwd=source, check=True)
+    subprocess.run(["git", "config", "user.name", "Owlery Test"], cwd=source, check=True)
+    (source / "tracked.txt").write_text("base")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=source, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=source, check=True)
+    subprocess.run(["git", "branch", "-M", "main"], cwd=source, check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=source, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=source, check=True)
+    return source, bare
+
+
+def _rev_parse(repo: Path, rev: str) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", rev], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+@pytest.mark.asyncio
+async def test_git_worktree_origin_base_ignores_dirty_and_diverged_local_head(
+    task_roots, tmp_path: Path
+):
+    """repo-consolidation.md §3: with an origin remote, the basis is origin's
+    default branch tip — never the local HEAD — and a dirty source repo no
+    longer blocks prepare (fetch-success + dirty-source-still-prepares forms).
+    """
+    source, bare = _origin_repo(tmp_path)
+    origin_head = _rev_parse(bare, "main")
+
+    # Diverge and dirty the local checkout after pushing to origin.
+    subprocess.run(["git", "commit", "--allow-empty", "-qm", "local only"], cwd=source, check=True)
+    (source / "tracked.txt").write_text("dirty and uncommitted")
+
+    prepared = await prepare_workspace(
+        mode="git_worktree", source_dir=str(source), task_id="t1", run_id="run1", attempt_no=1,
+    )
+    assert prepared.metadata["base_ref"] == "main"
+    assert prepared.metadata["base_head"] == origin_head
+    assert prepared.metadata["base_origin_degraded"] is False
+    # The worktree is checked out at origin's tip content, not the dirty local one.
+    assert (Path(prepared.path) / "tracked.txt").read_text() == "base"
+
+    # The source repo itself is untouched — still dirty, never required to be clean.
+    porcelain = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=source, check=True, capture_output=True, text=True
+    ).stdout
+    assert porcelain.strip() != ""
+
+
+@pytest.mark.asyncio
+async def test_git_worktree_origin_base_degrades_to_cached_tracking_ref(
+    task_roots, tmp_path: Path
+):
+    """A live fetch failure (origin unreachable) falls back to the
+    remote-tracking ref a prior successful prepare already cached — never to
+    local HEAD — and records the degraded path in metadata."""
+    source, bare = _origin_repo(tmp_path)
+    origin_head = _rev_parse(bare, "main")
+
+    live = await prepare_workspace(
+        mode="git_worktree", source_dir=str(source), task_id="t1", run_id="run1", attempt_no=1,
+    )
+    assert live.metadata["base_origin_degraded"] is False
+
+    # Origin becomes unreachable; only the local remote-tracking ref survives.
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", str(tmp_path / "does-not-exist.git")],
+        cwd=source, check=True,
+    )
+
+    degraded = await prepare_workspace(
+        mode="git_worktree", source_dir=str(source), task_id="t1", run_id="run2", attempt_no=2,
+    )
+    assert degraded.metadata["base_ref"] == "main"
+    assert degraded.metadata["base_head"] == origin_head
+    assert degraded.metadata["base_origin_degraded"] is True
+
+
+@pytest.mark.asyncio
+async def test_git_worktree_origin_base_falls_back_when_fetch_fails_after_ls_remote_succeeds(
+    task_roots, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A live `ls-remote --symref` naming a DIFFERENT branch than the one a
+    prior successful prepare cached (origin's default branch changed since)
+    must still degrade to the cached branch's tracking ref when the fetch
+    for the newly-named branch fails — not reject just because that branch's
+    own ref was never fetched locally. (Using the same branch name for both
+    would pass even with the bug this guards against: the pre-fix code's
+    final check happened to hit the same, already-fetched ref by accident.)
+    """
+    source, bare = _origin_repo(tmp_path)
+    main_head = _rev_parse(bare, "main")
+
+    live = await prepare_workspace(
+        mode="git_worktree", source_dir=str(source), task_id="t1", run_id="run1", attempt_no=1,
+    )
+    assert live.metadata["base_ref"] == "main"
+    assert live.metadata["base_origin_degraded"] is False
+
+    # Origin's default branch changes to a sibling branch this repo has
+    # never fetched before.
+    subprocess.run(["git", "checkout", "-qb", "trunk"], cwd=source, check=True)
+    subprocess.run(["git", "commit", "--allow-empty", "-qm", "trunk"], cwd=source, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "trunk"], cwd=source, check=True)
+    # `push` incidentally writes a local `refs/remotes/origin/trunk` tracking
+    # ref as a side effect — drop it so `trunk` really has never been fetched
+    # by this repo, matching the scenario under test.
+    subprocess.run(["git", "update-ref", "-d", "refs/remotes/origin/trunk"], cwd=source, check=True)
+    subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/trunk"], cwd=bare, check=True)
+
+    real_run = ws_module._run
+
+    async def flaky_fetch(*argv, **kwargs):
+        if argv[:2] == ("git", "fetch"):
+            return 1, "", "simulated network failure mid-fetch"
+        return await real_run(*argv, **kwargs)
+
+    monkeypatch.setattr(ws_module, "_run", flaky_fetch)
+
+    degraded = await prepare_workspace(
+        mode="git_worktree", source_dir=str(source), task_id="t1", run_id="run2", attempt_no=2,
+    )
+    # `trunk` was never fetched locally and the live fetch attempt for it
+    # just failed — degrade to the branch a prior successful prepare
+    # cached (`main`), never reject just because `trunk`'s own tracking
+    # ref happens to be missing.
+    assert degraded.metadata["base_ref"] == "main"
+    assert degraded.metadata["base_head"] == main_head
+    assert degraded.metadata["base_origin_degraded"] is True
+
+
+@pytest.mark.asyncio
+async def test_git_worktree_origin_base_rejects_when_unreachable_and_uncached(
+    task_roots, tmp_path: Path
+):
+    """Neither a live fetch nor a cached remote-tracking ref is available —
+    the only condition under which an origin-remote repo's prepare is
+    rejected outright (never silently falling back to local HEAD)."""
+    source, bare = _origin_repo(tmp_path)
+    # Break origin before any prepare ever ran against this repo, so no
+    # remote-tracking HEAD cache was ever written by a live resolution.
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", str(tmp_path / "does-not-exist.git")],
+        cwd=source, check=True,
+    )
+
+    with pytest.raises(WorkspaceError, match="origin base is unavailable"):
+        await prepare_workspace(
+            mode="git_worktree", source_dir=str(source), task_id="t1", run_id="run1", attempt_no=1,
         )

@@ -95,7 +95,14 @@ test.describe("Task Board", () => {
       git(source, "commit", "-qm", "base");
       git(source, "branch", "-M", "main");
       git(scratch, "init", "-q", "--bare", remote);
+      // Force the bare remote's HEAD symref to `main` regardless of the
+      // host's `init.defaultBranch` — prepare's origin-basis resolution
+      // reads this symref, not whatever branch happens to get pushed.
+      git(remote, "symbolic-ref", "HEAD", "refs/heads/main");
       git(source, "remote", "add", "origin", remote);
+      // prepare's origin-basis resolution needs origin to already advertise a
+      // default branch (repo-consolidation.md §3) before a task is dispatched.
+      git(source, "push", "origin", "main");
 
       const agentsResponse = await request.get(`${API}/api/agents`, { headers: AUTH });
       expect(agentsResponse.ok()).toBeTruthy();
@@ -213,7 +220,14 @@ test.describe("Task Board", () => {
       git(source, "commit", "-qm", "base");
       git(source, "branch", "-M", "main");
       git(scratch, "init", "-q", "--bare", remote);
+      // Force the bare remote's HEAD symref to `main` regardless of the
+      // host's `init.defaultBranch` — prepare's origin-basis resolution
+      // reads this symref, not whatever branch happens to get pushed.
+      git(remote, "symbolic-ref", "HEAD", "refs/heads/main");
       git(source, "remote", "add", "origin", remote);
+      // prepare's origin-basis resolution needs origin to already advertise a
+      // default branch (repo-consolidation.md §3) before a task is dispatched.
+      git(source, "push", "origin", "main");
 
       const agentsResponse = await request.get(`${API}/api/agents`, { headers: AUTH });
       const agents = await agentsResponse.json() as Array<{ id: string; name: string }>;
@@ -259,11 +273,13 @@ test.describe("Task Board", () => {
         { t: "task_complete", summary: "Delivered A." },
       )}`);
 
-      // Fast-forward the shared source repo's `main` onto A's pushed commit —
-      // shares A's worktree's object DB, so the branch ref already exists
-      // locally — so task B's worktree (branched from `main` at claim time,
-      // task_board/workspaces.py) starts with A's commit as an ancestor.
+      // Fast-forward `main` onto A's pushed commit and push it to origin too
+      // — prepare now takes its basis from origin's default branch tip, not
+      // the source repo's local HEAD (repo-consolidation.md §3), so task B's
+      // worktree only starts with A's commit as an ancestor once origin's
+      // `main` actually advertises it.
       git(source, "reset", "--hard", a.delivery.attempt_branch);
+      git(source, "push", "origin", "main");
 
       const b = await deliverThroughPush(`Deliver B ${fake(
         { t: "write_file", path: "b.txt", v: "b\n" },
