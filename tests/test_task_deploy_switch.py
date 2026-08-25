@@ -903,6 +903,10 @@ async def _staged_with_push(db, repo, tmp, agent, monkeypatch):
     _init_repo(src)
     bare = tmp / "remote.git"
     _git(tmp, "init", "-q", "--bare", str(bare))
+    # Force the bare remote's HEAD symref to `main` regardless of the host's
+    # `init.defaultBranch` — prepare's origin-basis resolution reads this
+    # symref, not whatever branch happens to get pushed.
+    _git(bare, "symbolic-ref", "HEAD", "refs/heads/main")
     _git(src, "remote", "add", "origin", str(bare))
     # origin must already advertise a default branch for prepare's
     # origin-basis resolution to succeed (repo-consolidation.md §3).

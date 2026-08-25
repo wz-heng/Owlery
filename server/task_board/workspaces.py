@@ -223,35 +223,43 @@ async def _resolve_origin_base(repo: Path) -> tuple[str, str, bool] | None:
     the local HEAD. Returns None only when neither is available, the one
     condition under which prepare is rejected (repo-consolidation.md §3).
     """
-    branch = await _origin_default_branch(repo)
-    if branch:
+    live_branch = await _origin_default_branch(repo)
+    if live_branch:
         rc, _, _ = await _run(
             "git", "fetch", "origin",
-            f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+            f"+refs/heads/{live_branch}:refs/remotes/origin/{live_branch}",
             cwd=repo, timeout=float(settings.task_delivery_op_timeout_seconds),
         )
         if rc == 0:
             rc, sha, _ = await _run(
                 "git", "rev-parse", "--verify", "--quiet",
-                f"refs/remotes/origin/{branch}", cwd=repo,
+                f"refs/remotes/origin/{live_branch}", cwd=repo,
             )
             if rc == 0 and sha:
                 # Cache the resolved name so a later degraded prepare (origin
                 # unreachable) can still find the right remote-tracking ref.
-                await _run("git", "remote", "set-head", "origin", branch, cwd=repo)
-                return branch, sha, False
+                await _run("git", "remote", "set-head", "origin", live_branch, cwd=repo)
+                return live_branch, sha, False
 
-    if branch is None:
-        branch = await _cached_origin_default_branch(repo)
-    if not branch:
-        return None
-    rc, sha, _ = await _run(
-        "git", "rev-parse", "--verify", "--quiet",
-        f"refs/remotes/origin/{branch}", cwd=repo,
-    )
-    if rc != 0 or not sha:
-        return None
-    return branch, sha, True
+    # Degraded: origin was unreachable/empty, or the live fetch itself just
+    # failed even though ls-remote resolved a name. Try every origin-derived
+    # candidate name that might already have a local tracking ref — the name
+    # ls-remote just resolved (its own ref may predate this failed fetch) and
+    # the name a prior successful prepare cached — never local HEAD.
+    cached_branch = await _cached_origin_default_branch(repo)
+    candidates = [name for name in (live_branch, cached_branch) if name]
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        rc, sha, _ = await _run(
+            "git", "rev-parse", "--verify", "--quiet",
+            f"refs/remotes/origin/{candidate}", cwd=repo,
+        )
+        if rc == 0 and sha:
+            return candidate, sha, True
+    return None
 
 
 async def inspect_git_workspace(path: str) -> dict[str, str]:

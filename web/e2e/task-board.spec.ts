@@ -95,6 +95,10 @@ test.describe("Task Board", () => {
       git(source, "commit", "-qm", "base");
       git(source, "branch", "-M", "main");
       git(scratch, "init", "-q", "--bare", remote);
+      // Force the bare remote's HEAD symref to `main` regardless of the
+      // host's `init.defaultBranch` — prepare's origin-basis resolution
+      // reads this symref, not whatever branch happens to get pushed.
+      git(remote, "symbolic-ref", "HEAD", "refs/heads/main");
       git(source, "remote", "add", "origin", remote);
       // prepare's origin-basis resolution needs origin to already advertise a
       // default branch (repo-consolidation.md §3) before a task is dispatched.
@@ -216,6 +220,10 @@ test.describe("Task Board", () => {
       git(source, "commit", "-qm", "base");
       git(source, "branch", "-M", "main");
       git(scratch, "init", "-q", "--bare", remote);
+      // Force the bare remote's HEAD symref to `main` regardless of the
+      // host's `init.defaultBranch` — prepare's origin-basis resolution
+      // reads this symref, not whatever branch happens to get pushed.
+      git(remote, "symbolic-ref", "HEAD", "refs/heads/main");
       git(source, "remote", "add", "origin", remote);
       // prepare's origin-basis resolution needs origin to already advertise a
       // default branch (repo-consolidation.md §3) before a task is dispatched.

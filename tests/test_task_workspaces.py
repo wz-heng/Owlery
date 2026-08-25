@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from server.config import settings
+from server.task_board import workspaces as ws_module
 from server.task_board.workspaces import (
     WorkspaceError,
     capture_artifacts,
@@ -145,6 +146,10 @@ def _origin_repo(tmp_path: Path) -> tuple[Path, Path]:
     """A source repo with a bare `origin` already advertising `main`."""
     bare = tmp_path / "origin.git"
     subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    # Force the bare repo's HEAD symref to `main` regardless of the host's
+    # `init.defaultBranch` — otherwise `ls-remote --symref origin HEAD`
+    # advertises whatever the host defaulted to, not the branch pushed below.
+    subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/main"], cwd=bare, check=True)
     source = tmp_path / "repo"
     source.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=source, check=True)
@@ -216,6 +221,39 @@ async def test_git_worktree_origin_base_degrades_to_cached_tracking_ref(
         ["git", "remote", "set-url", "origin", str(tmp_path / "does-not-exist.git")],
         cwd=source, check=True,
     )
+
+    degraded = await prepare_workspace(
+        mode="git_worktree", source_dir=str(source), task_id="t1", run_id="run2", attempt_no=2,
+    )
+    assert degraded.metadata["base_ref"] == "main"
+    assert degraded.metadata["base_head"] == origin_head
+    assert degraded.metadata["base_origin_degraded"] is True
+
+
+@pytest.mark.asyncio
+async def test_git_worktree_origin_base_falls_back_when_fetch_fails_after_ls_remote_succeeds(
+    task_roots, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A live `ls-remote --symref` success does not guarantee the subsequent
+    `fetch` also succeeds (transient network blip). That must still degrade
+    to a prior successful prepare's cached tracking ref, not reject outright
+    just because the branch name it just resolved has no fresh fetch."""
+    source, bare = _origin_repo(tmp_path)
+    origin_head = _rev_parse(bare, "main")
+
+    live = await prepare_workspace(
+        mode="git_worktree", source_dir=str(source), task_id="t1", run_id="run1", attempt_no=1,
+    )
+    assert live.metadata["base_origin_degraded"] is False
+
+    real_run = ws_module._run
+
+    async def flaky_fetch(*argv, **kwargs):
+        if argv[:2] == ("git", "fetch"):
+            return 1, "", "simulated network failure mid-fetch"
+        return await real_run(*argv, **kwargs)
+
+    monkeypatch.setattr(ws_module, "_run", flaky_fetch)
 
     degraded = await prepare_workspace(
         mode="git_worktree", source_dir=str(source), task_id="t1", run_id="run2", attempt_no=2,
