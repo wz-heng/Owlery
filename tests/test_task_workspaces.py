@@ -139,3 +139,108 @@ async def test_git_worktree_requires_clean_repo_and_records_state(task_roots, tm
             run_id="run2",
             attempt_no=1,
         )
+
+
+def _origin_repo(tmp_path: Path) -> tuple[Path, Path]:
+    """A source repo with a bare `origin` already advertising `main`."""
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    source = tmp_path / "repo"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=source, check=True)
+    subprocess.run(["git", "config", "user.email", "owlery@example.invalid"], cwd=source, check=True)
+    subprocess.run(["git", "config", "user.name", "Owlery Test"], cwd=source, check=True)
+    (source / "tracked.txt").write_text("base")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=source, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=source, check=True)
+    subprocess.run(["git", "branch", "-M", "main"], cwd=source, check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=source, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=source, check=True)
+    return source, bare
+
+
+def _rev_parse(repo: Path, rev: str) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", rev], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+@pytest.mark.asyncio
+async def test_git_worktree_origin_base_ignores_dirty_and_diverged_local_head(
+    task_roots, tmp_path: Path
+):
+    """repo-consolidation.md §3: with an origin remote, the basis is origin's
+    default branch tip — never the local HEAD — and a dirty source repo no
+    longer blocks prepare (fetch-success + dirty-source-still-prepares forms).
+    """
+    source, bare = _origin_repo(tmp_path)
+    origin_head = _rev_parse(bare, "main")
+
+    # Diverge and dirty the local checkout after pushing to origin.
+    subprocess.run(["git", "commit", "--allow-empty", "-qm", "local only"], cwd=source, check=True)
+    (source / "tracked.txt").write_text("dirty and uncommitted")
+
+    prepared = await prepare_workspace(
+        mode="git_worktree", source_dir=str(source), task_id="t1", run_id="run1", attempt_no=1,
+    )
+    assert prepared.metadata["base_ref"] == "main"
+    assert prepared.metadata["base_head"] == origin_head
+    assert prepared.metadata["base_origin_degraded"] is False
+    # The worktree is checked out at origin's tip content, not the dirty local one.
+    assert (Path(prepared.path) / "tracked.txt").read_text() == "base"
+
+    # The source repo itself is untouched — still dirty, never required to be clean.
+    porcelain = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=source, check=True, capture_output=True, text=True
+    ).stdout
+    assert porcelain.strip() != ""
+
+
+@pytest.mark.asyncio
+async def test_git_worktree_origin_base_degrades_to_cached_tracking_ref(
+    task_roots, tmp_path: Path
+):
+    """A live fetch failure (origin unreachable) falls back to the
+    remote-tracking ref a prior successful prepare already cached — never to
+    local HEAD — and records the degraded path in metadata."""
+    source, bare = _origin_repo(tmp_path)
+    origin_head = _rev_parse(bare, "main")
+
+    live = await prepare_workspace(
+        mode="git_worktree", source_dir=str(source), task_id="t1", run_id="run1", attempt_no=1,
+    )
+    assert live.metadata["base_origin_degraded"] is False
+
+    # Origin becomes unreachable; only the local remote-tracking ref survives.
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", str(tmp_path / "does-not-exist.git")],
+        cwd=source, check=True,
+    )
+
+    degraded = await prepare_workspace(
+        mode="git_worktree", source_dir=str(source), task_id="t1", run_id="run2", attempt_no=2,
+    )
+    assert degraded.metadata["base_ref"] == "main"
+    assert degraded.metadata["base_head"] == origin_head
+    assert degraded.metadata["base_origin_degraded"] is True
+
+
+@pytest.mark.asyncio
+async def test_git_worktree_origin_base_rejects_when_unreachable_and_uncached(
+    task_roots, tmp_path: Path
+):
+    """Neither a live fetch nor a cached remote-tracking ref is available —
+    the only condition under which an origin-remote repo's prepare is
+    rejected outright (never silently falling back to local HEAD)."""
+    source, bare = _origin_repo(tmp_path)
+    # Break origin before any prepare ever ran against this repo, so no
+    # remote-tracking HEAD cache was ever written by a live resolution.
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", str(tmp_path / "does-not-exist.git")],
+        cwd=source, check=True,
+    )
+
+    with pytest.raises(WorkspaceError, match="origin base is unavailable"):
+        await prepare_workspace(
+            mode="git_worktree", source_dir=str(source), task_id="t1", run_id="run1", attempt_no=1,
+        )

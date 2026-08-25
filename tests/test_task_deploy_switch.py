@@ -904,6 +904,9 @@ async def _staged_with_push(db, repo, tmp, agent, monkeypatch):
     bare = tmp / "remote.git"
     _git(tmp, "init", "-q", "--bare", str(bare))
     _git(src, "remote", "add", "origin", str(bare))
+    # origin must already advertise a default branch for prepare's
+    # origin-basis resolution to succeed (repo-consolidation.md §3).
+    _git(src, "push", "origin", "main")
     board = await repo.create_board(
         name=f"D-{uuid.uuid4().hex[:8]}", working_dir=str(src),
         default_workspace_mode="git_worktree", allow_local_deploy=True,

@@ -124,24 +124,45 @@ async def prepare_workspace(
     if rc or not top:
         raise WorkspaceError(err or "git_worktree requires a Git repository")
     repo = Path(top).resolve(strict=True)
-    rc, porcelain, err = await _run("git", "status", "--porcelain", cwd=repo)
-    if rc:
-        raise WorkspaceError(err or "Unable to inspect Git status")
-    if porcelain:
-        raise WorkspaceError("git_worktree requires a clean source repository")
-
-    # Capture the base BRANCH here, at worktree-creation time, alongside the
-    # base commit — the delivery closure reads this snapshot at accept time and
-    # never re-derives it from the source repo's live HEAD, which may have moved
-    # (task-git-delivery.md §5, B1). A detached source HEAD records an empty
-    # base_ref; legacy runs predating this capture record none at all.
-    rc, base_ref, _ = await _run("git", "symbolic-ref", "--short", "HEAD", cwd=repo)
-    if rc:
-        base_ref = ""
-
     branch = f"owlery/task-{task_id}-run-{attempt_no}"
+
+    # An origin remote makes the attempt basis a function of ORIGIN, never of
+    # the local HEAD or working tree (repo-consolidation.md §3): its default
+    # branch tip is the base, and a dirty source repo no longer blocks
+    # prepare — only the merge op's clean/on-base gate still guards delivery
+    # (delivery.py `_op_merge`, unchanged).
+    origin_url = await remote_url(str(repo), "origin")
+    if origin_url is not None:
+        resolved = await _resolve_origin_base(repo)
+        if resolved is None:
+            raise WorkspaceError(
+                "git_worktree origin base is unavailable: could not fetch "
+                "origin's default branch and no prior remote-tracking ref "
+                "exists to fall back to"
+            )
+        base_ref, base_head, degraded = resolved
+        start_point = base_head
+    else:
+        # No origin remote: today's semantics — the source repo's local HEAD
+        # is the only signal available, so it must be clean before use.
+        rc, porcelain, err = await _run("git", "status", "--porcelain", cwd=repo)
+        if rc:
+            raise WorkspaceError(err or "Unable to inspect Git status")
+        if porcelain:
+            raise WorkspaceError("git_worktree requires a clean source repository")
+        # Capture the base BRANCH here, at worktree-creation time, alongside the
+        # base commit — the delivery closure reads this snapshot at accept time and
+        # never re-derives it from the source repo's live HEAD, which may have moved
+        # (task-git-delivery.md §5, B1). A detached source HEAD records an empty
+        # base_ref; legacy runs predating this capture record none at all.
+        rc, base_ref, _ = await _run("git", "symbolic-ref", "--short", "HEAD", cwd=repo)
+        if rc:
+            base_ref = ""
+        degraded = None
+        start_point = "HEAD"
+
     rc, _, err = await _run(
-        "git", "worktree", "add", "-b", branch, str(destination), "HEAD", cwd=repo
+        "git", "worktree", "add", "-b", branch, str(destination), start_point, cwd=repo
     )
     if rc:
         if destination.exists() and _inside(destination.resolve(strict=False), root):
@@ -150,16 +171,87 @@ async def prepare_workspace(
     rc, head, err = await _run("git", "rev-parse", "HEAD", cwd=destination)
     if rc:
         raise WorkspaceError(err or "Unable to inspect created Git worktree")
-    return PreparedWorkspace(
-        mode=mode,
-        path=str(destination),
-        metadata={
-            "branch": branch,
-            "base_ref": base_ref,
-            "base_head": head,
-            "repository": str(repo),
-        },
+    metadata: dict[str, Any] = {
+        "branch": branch,
+        "base_ref": base_ref,
+        "base_head": head,
+        "repository": str(repo),
+    }
+    if degraded is not None:
+        metadata["base_origin_degraded"] = degraded
+    return PreparedWorkspace(mode=mode, path=str(destination), metadata=metadata)
+
+
+async def _origin_default_branch(repo: Path) -> str | None:
+    """The branch name origin's HEAD symref currently points to, resolved
+    over the network in a single round trip. None if origin has no
+    advertised HEAD — unreachable, or a bare remote with nothing pushed yet.
+    """
+    rc, out, _ = await _run(
+        "git", "ls-remote", "--symref", "origin", "HEAD",
+        cwd=repo, timeout=float(settings.task_delivery_op_timeout_seconds),
     )
+    if rc or not out:
+        return None
+    for line in out.splitlines():
+        if line.startswith("ref:"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].startswith("refs/heads/"):
+                return parts[1][len("refs/heads/") :]
+    return None
+
+
+async def _cached_origin_default_branch(repo: Path) -> str | None:
+    """The default branch name cached locally by a prior successful
+    resolution (``git remote set-head``) or an original ``git clone`` — the
+    remote-tracking HEAD cache used as a fallback when origin is unreachable.
+    """
+    rc, out, _ = await _run(
+        "git", "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD", cwd=repo
+    )
+    if rc or not out.startswith("refs/remotes/origin/"):
+        return None
+    return out[len("refs/remotes/origin/") :]
+
+
+async def _resolve_origin_base(repo: Path) -> tuple[str, str, bool] | None:
+    """The origin-derived prepare basis: ``(branch, sha, degraded)``.
+
+    Live path: resolve origin's default branch and fetch its tip. Degraded
+    path (origin unreachable or empty): fall back to a remote-tracking ref a
+    prior successful prepare already fetched — still origin-derived, never
+    the local HEAD. Returns None only when neither is available, the one
+    condition under which prepare is rejected (repo-consolidation.md §3).
+    """
+    branch = await _origin_default_branch(repo)
+    if branch:
+        rc, _, _ = await _run(
+            "git", "fetch", "origin",
+            f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+            cwd=repo, timeout=float(settings.task_delivery_op_timeout_seconds),
+        )
+        if rc == 0:
+            rc, sha, _ = await _run(
+                "git", "rev-parse", "--verify", "--quiet",
+                f"refs/remotes/origin/{branch}", cwd=repo,
+            )
+            if rc == 0 and sha:
+                # Cache the resolved name so a later degraded prepare (origin
+                # unreachable) can still find the right remote-tracking ref.
+                await _run("git", "remote", "set-head", "origin", branch, cwd=repo)
+                return branch, sha, False
+
+    if branch is None:
+        branch = await _cached_origin_default_branch(repo)
+    if not branch:
+        return None
+    rc, sha, _ = await _run(
+        "git", "rev-parse", "--verify", "--quiet",
+        f"refs/remotes/origin/{branch}", cwd=repo,
+    )
+    if rc != 0 or not sha:
+        return None
+    return branch, sha, True
 
 
 async def inspect_git_workspace(path: str) -> dict[str, str]:
