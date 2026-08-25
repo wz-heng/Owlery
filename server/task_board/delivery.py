@@ -333,27 +333,14 @@ class DeliveryCoordinator:
                 delivery.id, task.id,
             )
 
-    async def current_terminal_settle_op_id(self, delivery_id: str) -> str | None:
-        """The id of the goal op whose settle produced the delivery's CURRENT
-        terminal status — used only where no op id is available at the call
-        site itself (teardown, boot/off-critical-path reconcile passes). Every
-        primary settle path (`_op_commit`/`_op_push`/`_op_pr`/`_op_merge`) knows
-        its own `op_id` and passes it straight through instead of calling this
-        (open-pr-500.md §4 blocker-1): calling this from inside one of those
-        would race a concurrently-started next op (delivery statuses that admit
-        a new goal op, e.g. `delivered`, also admit one before this op's own
-        notify runs), misattributing this settle's payload to that other op's
-        key.  Filters candidates to the op `state` matching the delivery's
-        CURRENT status category, so a later unrelated failed retry can never
-        outrank the earlier op that actually produced a `delivered` status
-        (§4 should-1). ``None`` when the delivery reached its terminal status
-        via `accept()`'s baseline capture (no op ledger row for that settle)."""
-        delivery = await self.repo.get_delivery(delivery_id)
+    @staticmethod
+    def _pick_terminal_settle_op_id(
+        delivery: DeliveryRecord, ops: list[Any]
+    ) -> str | None:
         wanted_state = (
             "succeeded" if delivery.status in _DELIVERY_SETTLE_SUCCESS_STATUSES
             else "failed"
         )
-        ops = await self.repo.list_delivery_ops(delivery_id)
         candidates = [
             op for op in ops
             if op.kind in _DELIVERY_TERMINAL_OP_KINDS and op.state == wanted_state
@@ -362,6 +349,42 @@ class DeliveryCoordinator:
             return None
         candidates.sort(key=lambda op: (op.finished_at or op.created_at, op.id))
         return candidates[-1].id
+
+    async def current_terminal_settle_op_id(self, delivery_id: str) -> str | None:
+        """The id of the goal op whose settle produced the delivery's CURRENT
+        terminal status — used only where no op id is available at the call
+        site itself (boot/off-critical-path reconcile passes; teardown uses
+        `current_terminal_snapshot` instead, see there). Every primary settle
+        path (`_op_commit`/`_op_push`/`_op_pr`/`_op_merge`) knows its own
+        `op_id` and passes it straight through instead of calling this
+        (open-pr-500.md §4 blocker-1): calling this from inside one of those
+        would race a concurrently-started next op (delivery statuses that admit
+        a new goal op, e.g. `delivered`, also admit one before this op's own
+        notify runs), misattributing this settle's payload to that other op's
+        key. Filters candidates to the op `state` matching the delivery's
+        CURRENT status category, so a later unrelated failed retry can never
+        outrank the earlier op that actually produced a `delivered` status
+        (§4 should-1). ``None`` when the delivery reached its terminal status
+        via `accept()`'s baseline capture (no op ledger row for that settle)."""
+        delivery, ops = await self.repo.get_delivery_with_ops(delivery_id)
+        return self._pick_terminal_settle_op_id(delivery, ops)
+
+    async def current_terminal_snapshot(
+        self, delivery_id: str
+    ) -> tuple[DeliveryRecord, str | None]:
+        """The delivery AND its settle-attributed op id, read together from
+        ONE atomic snapshot (`repo.get_delivery_with_ops`). Required whenever
+        a caller publishes BOTH values from a single call — teardown reads a
+        `final` delivery snapshot to republish and, separately, needs its
+        settle key; two independent reads (delivery, then ops) could straddle
+        a concurrent goal op settling in between (teardown never itself holds
+        a running op across that gap once its own worktree/branch ops finish,
+        and `_TEARDOWN_START_STATES`/`_GOAL_START_STATES` overlap, so a new
+        goal op is free to start and finish there), publishing a STALE
+        delivery snapshot under a NEWER op's key (open-pr-500.md §4
+        blocker-1)."""
+        delivery, ops = await self.repo.get_delivery_with_ops(delivery_id)
+        return delivery, self._pick_terminal_settle_op_id(delivery, ops)
 
     @asynccontextmanager
     async def _admit_delivery_op(self):
@@ -923,13 +946,18 @@ class DeliveryCoordinator:
             except ws.WorkspaceError as exc:
                 await self.repo.finish_op(delivery.id, br_op, state="failed", error=str(exc),
                                           actor_kind=actor_kind, actor_agent_id=actor_agent_id)
-        final = await self.repo.get_delivery(delivery.id)
         # Teardown never itself settles a delivery-terminal-kind op (only
         # worktree_remove/branch_delete, neither of which touches
         # `delivery_status`) — it republishes whatever terminal status this
         # delivery already reached, so it reuses that prior event's settle id
-        # rather than fabricating a new one (open-pr-500.md §4 blocker-1).
-        settle_op_id = await self.current_terminal_settle_op_id(final.id)
+        # rather than fabricating a new one. `final` and `settle_op_id` MUST
+        # come from one atomic snapshot, not two separate reads: once the
+        # last teardown op above finishes, no op is left `running` for this
+        # delivery, and `_TEARDOWN_START_STATES`/`_GOAL_START_STATES` overlap
+        # — so a concurrent goal op is free to start and settle before a
+        # second, later read would see it, publishing a stale `final` under
+        # that newer op's key (open-pr-500.md §4 blocker-1).
+        final, settle_op_id = await self.current_terminal_snapshot(delivery.id)
         return await self._published(task, final, settle_op_id)
 
     async def _begin_teardown_op(self, delivery, kind, request, actor_kind, actor_agent_id):
@@ -1001,11 +1029,11 @@ class DeliveryCoordinator:
         if not found:
             return delivery, None
         # A PR already exists — record it without creating anything (never a re-POST).
-        updated = await self.repo.record_pr_reconcile(
+        updated, reconciled = await self.repo.record_pr_reconcile(
             delivery.id, op_id=op_id,
             pr_number=found["number"], pr_url=found["url"], pr_state=found["state"],
         )
-        return updated, (op_id if updated.status != delivery.status else None)
+        return updated, (op_id if reconciled else None)
 
     # --- release-line deploy (docs/plans/release-line-deploy.md §3) ------
     #

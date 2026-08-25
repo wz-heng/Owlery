@@ -2693,6 +2693,30 @@ class TaskRepository:
             )
         return [self._delivery_op_record(r) for r in rows]
 
+    async def get_delivery_with_ops(
+        self, delivery_id: str
+    ) -> tuple[DeliveryRecord, list[DeliveryOpRecord]]:
+        """The delivery row and its full op ledger read under ONE hold of
+        `self._lock` — the same lock every write (`finish_op`, `_transaction`)
+        also takes — so a caller deriving a settle-event attribution from
+        BOTH can never see them split across a concurrent op settling in
+        between two separate reads (open-pr-500.md §4 blocker-1: a delivery
+        snapshot taken by `get_delivery` and an op id picked moments later by
+        a fresh `list_delivery_ops` call could straddle a just-settled newer
+        op, publishing the OLDER snapshot under the NEWER op's key)."""
+        async with self._lock:
+            delivery_row = await self._delivery_row(self.conn, delivery_id)
+            op_rows = await self._fetchall(
+                self.conn,
+                "SELECT * FROM task_delivery_ops WHERE delivery_id = ? "
+                "ORDER BY created_at, id",
+                (delivery_id,),
+            )
+        return (
+            self._delivery_record(delivery_row),
+            [self._delivery_op_record(r) for r in op_rows],
+        )
+
     async def list_delivery_siblings(
         self, board_id: str, repository: str, *, exclude_delivery_id: str
     ) -> list[DeliveryRecord]:
@@ -3234,7 +3258,7 @@ class TaskRepository:
     async def record_pr_reconcile(
         self, delivery_id: str, *, op_id: str,
         pr_number: int | None, pr_url: str | None, pr_state: str | None,
-    ) -> DeliveryRecord:
+    ) -> tuple[DeliveryRecord, bool]:
         """Fold an already-existing PR (found by a read-only reconcile) into a
         blocked(interrupted) delivery, settling it delivered — never a re-POST
         (§16, S3). Also flips the interrupted `pull_request` op row itself
@@ -3243,7 +3267,19 @@ class TaskRepository:
         show this settle genuinely happened, so a caller deriving the settle
         event from the op ledger later (`current_terminal_settle_op_id`) finds
         this real succeeded op instead of treating the reconcile as having no
-        event at all (open-pr-500.md §4 should-1)."""
+        event at all (open-pr-500.md §4 should-1).
+
+        Returns ``(delivery, reconciled)`` — ``reconciled`` is True ONLY when
+        THIS call performed the settle (op row flipped AND delivery row
+        updated), never inferred from comparing the returned status against a
+        caller's stale pre-call snapshot: a concurrent path (e.g. a live PR
+        retry that creates the SAME PR independently) can resolve the
+        delivery to `delivered` before this call's own write runs, in which
+        case the precondition check below fails and the op row is left
+        untouched — a caller that instead compared `updated.status !=
+        <stale delivery>.status` would wrongly conclude THIS call settled
+        something and attribute a notification to `op_id`, an op row this
+        call never wrote to."""
         stamp = _now_iso()
         async with self._transaction() as conn:
             row = await self._delivery_row(conn, delivery_id)
@@ -3252,15 +3288,21 @@ class TaskRepository:
                 and row["reason_kind"] == "interrupted"
                 and row["pr_number"] is None
             ):
-                return self._delivery_record(row)
-            await conn.execute(
+                return self._delivery_record(row), False
+            cursor = await conn.execute(
                 "UPDATE task_delivery_ops SET state='succeeded', result=?, finished_at=? "
-                "WHERE id=? AND delivery_id=? AND state='interrupted'",
+                "WHERE id=? AND delivery_id=? AND kind='pull_request' AND state='interrupted'",
                 (
                     _json_object({"number": pr_number, "url": pr_url, "state": pr_state}),
                     stamp, op_id, delivery_id,
                 ),
             )
+            if cursor.rowcount != 1:
+                # The op row didn't move (wrong id/kind, already resolved by a
+                # concurrent path, ...). The op ledger and the delivery row
+                # must move together — never fold the PR into the delivery
+                # without a matching op-row settle.
+                return self._delivery_record(row), False
             await conn.execute(
                 "UPDATE task_deliveries SET pr_number=?, pr_url=?, pr_state=?, "
                 "status='delivered', reason_kind=NULL, reason_detail=NULL, updated_at=? "
@@ -3272,7 +3314,7 @@ class TaskRepository:
                 conn, delivery_row=row, kind="delivery_pr_reconciled",
                 actor_kind="system", now=stamp,
             )
-        return self._delivery_record(row)
+        return self._delivery_record(row), True
 
     async def record_delivery_notification_unavailable(
         self, delivery_id: str, *, reason: str

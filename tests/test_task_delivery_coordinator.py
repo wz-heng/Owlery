@@ -435,6 +435,77 @@ async def test_interrupted_pr_reconcile_reads_never_creates(store):
 
 
 @pytest.mark.asyncio
+async def test_record_pr_reconcile_is_a_noop_once_the_delivery_is_no_longer_interrupted(store):
+    """open-pr-500.md §4 should-1 (Snape round-2): a concurrent path (e.g. a
+    live PR retry that independently creates the same PR) can resolve the
+    delivery to `delivered` before this reconcile's own write runs. The
+    caller must not infer "I settled this" from `updated.status != <stale
+    snapshot>.status` — that stale comparison would be true even though this
+    call never touched the op row. `record_pr_reconcile` must report
+    `reconciled=False` and leave the (already-succeeded, by the concurrent
+    path) op row alone."""
+    db, repo, tmp, agent = store
+    board, task, run, src, wt = await _ready_delivery(db, repo, tmp, agent)
+    coord = _coord(db, repo, FakeConnectors({}))
+    await coord.accept(task.id, run.id)
+    d = await repo.get_delivery_by_run(run.id)
+    op = await repo.plan_op(d.id, kind="pull_request", source_key="k:pr",
+                            request={"installation_id": "gh1"}, actor_kind="user")
+    await repo.start_op(d.id, op.id)
+    await repo.interrupt_running_delivery_ops(reason="restart")
+
+    # Simulate the concurrent live retry: it independently created the same
+    # PR through its OWN (different) op and already settled the delivery.
+    other_op = await repo.plan_op(d.id, kind="pull_request", source_key="k:pr:retry:1",
+                                  request={"installation_id": "gh1"}, actor_kind="user")
+    await repo.start_op(d.id, other_op.id, allowed_statuses=frozenset({"blocked"}))
+    await repo.finish_op(
+        d.id, other_op.id, state="succeeded", delivery_status="delivered",
+        delivery_fields={"pr_number": 7, "pr_url": "https://github.com/acme/widgets/pull/7",
+                         "pr_state": "open"},
+        result={"number": 7},
+    )
+
+    # The reconcile for the STALE interrupted op now runs, unaware the
+    # delivery already resolved.
+    updated, reconciled = await repo.record_pr_reconcile(
+        d.id, op_id=op.id,
+        pr_number=7, pr_url="https://github.com/acme/widgets/pull/7", pr_state="open",
+    )
+    assert reconciled is False
+    assert updated.status == "delivered" and updated.pr_number == 7
+
+    stale_op = next(o for o in await repo.list_delivery_ops(d.id) if o.id == op.id)
+    assert stale_op.state == "interrupted"  # untouched — this call never wrote to it
+
+
+@pytest.mark.asyncio
+async def test_record_pr_reconcile_never_folds_the_delivery_without_settling_the_op(store):
+    """A mismatched `op_id` (or one that isn't the interrupted `pull_request`
+    op) must leave BOTH rows untouched — the op ledger and the delivery row
+    move together, never one without the other."""
+    db, repo, tmp, agent = store
+    board, task, run, src, wt = await _ready_delivery(db, repo, tmp, agent)
+    coord = _coord(db, repo, FakeConnectors({}))
+    await coord.accept(task.id, run.id)
+    d = await repo.get_delivery_by_run(run.id)
+    op = await repo.plan_op(d.id, kind="pull_request", source_key="k:pr",
+                            request={"installation_id": "gh1"}, actor_kind="user")
+    await repo.start_op(d.id, op.id)
+    await repo.interrupt_running_delivery_ops(reason="restart")
+
+    updated, reconciled = await repo.record_pr_reconcile(
+        d.id, op_id="does-not-exist",
+        pr_number=7, pr_url="https://github.com/acme/widgets/pull/7", pr_state="open",
+    )
+    assert reconciled is False
+    assert updated.status == "blocked" and updated.pr_number is None
+
+    unchanged_op = next(o for o in await repo.list_delivery_ops(d.id) if o.id == op.id)
+    assert unchanged_op.state == "interrupted"
+
+
+@pytest.mark.asyncio
 async def test_teardown_removes_worktree_and_dirty_guard(store):
     db, repo, tmp, agent = store
     board, task, run, src, wt = await _ready_delivery(db, repo, tmp, agent)
@@ -474,6 +545,70 @@ async def test_teardown_keep_policy_preserves_worktree(store):
     assert d.retention == "keep"
     assert wt.is_dir()
     assert await repo.list_delivery_ops(d.id) == []
+
+
+@pytest.mark.asyncio
+async def test_teardown_after_push_and_pr_republishes_under_the_pr_op_key(
+    bound_manager, store,
+):
+    """open-pr-500.md §4 blocker-1 (Snape round-2): teardown republishes
+    whatever terminal status the delivery already reached, using one atomic
+    (delivery, settle_op_id) snapshot (`current_terminal_snapshot`) rather
+    than two separate reads that could straddle a concurrent goal op. This
+    exercises the wiring end to end: after a real push-then-PR settle, tear
+    down the delivery and confirm the republished notification is scoped to
+    the PR op's key — never the push op's key, never the old unscoped key."""
+    manager, sessions = bound_manager
+    db, repo, tmp, agent = store
+    origin = await sessions.create_session(agent, name="origin")
+    board, task, run, src, wt = await _ready_delivery(
+        db, repo, tmp, agent, origin_session_id=origin.id
+    )
+    bare = tmp / "remote.git"
+    _git(tmp, "init", "-q", "--bare", str(bare))
+    _git(src, "remote", "add", "origin", str(bare))
+    manager.delivery.connectors = FakeConnectors({agent: [("gh1", "github", False)]})
+
+    async def fake_create_pr(token, owner, r, *, title, body, head, base, draft):
+        return {"number": 42, "url": "https://github.com/acme/widgets/pull/42", "state": "open"}
+
+    manager.delivery.create_pr = fake_create_pr
+
+    await manager.delivery.accept(task.id, run.id)
+    await manager.delivery.deliver_op(task.id, run.id, kind="push")
+    await repo.conn.execute(
+        "UPDATE task_deliveries SET remote_url='https://github.com/acme/widgets.git' "
+        "WHERE run_id=?", (run.id,),
+    )
+    await repo.conn.commit()
+    opened = await manager.delivery.deliver_op(task.id, run.id, kind="pull_request")
+    assert opened.status == "delivered" and opened.pr_number == 42
+
+    ops = await repo.list_delivery_ops(opened.id)
+    push_op = next(o for o in ops if o.kind == "push" and o.state == "succeeded")
+    pr_op = next(o for o in ops if o.kind == "pull_request" and o.state == "succeeded")
+
+    pr_key = f"task:{task.id}:run:{run.id}:delivery:terminal:{pr_op.id}"
+    push_key = f"task:{task.id}:run:{run.id}:delivery:terminal:{push_op.id}"
+    unscoped_key = f"task:{task.id}:run:{run.id}:delivery:terminal"
+    # Push's own settle and PR's own settle each already fired their own
+    # notification live, before teardown runs at all.
+    pr_injection_before = await db.get_session_injection_by_source(pr_key)
+    assert pr_injection_before is not None
+
+    await manager.delivery.teardown(
+        task.id, run.id, retention="remove_worktree_keep_branch",
+        confirmations={"force_discard_dirty": True},
+    )
+
+    # Teardown republishes the delivery's CURRENT terminal status (still the
+    # PR's) — it must land on the SAME pr_key (idempotent, no new row), never
+    # fall back to push's key or the old unscoped key.
+    pr_injection_after = await db.get_session_injection_by_source(pr_key)
+    assert pr_injection_after is not None
+    assert pr_injection_after["id"] == pr_injection_before["id"]
+    assert await db.get_session_injection_by_source(unscoped_key) is None
+    assert await db.get_session_injection_by_source(push_key) is not None
 
 
 @pytest.mark.asyncio
@@ -1070,7 +1205,7 @@ async def test_notify_terminal_exception_does_not_fail_the_delivery_op(store):
     _git(tmp, "init", "-q", "--bare", str(bare))
     _git(src, "remote", "add", "origin", str(bare))
 
-    async def boom(task, delivery):
+    async def boom(task, delivery, settle_op_id):
         raise ValueError("simulated idempotency-key collision")
 
     coord = DeliveryCoordinator()
