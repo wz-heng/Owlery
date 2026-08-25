@@ -133,6 +133,27 @@ async def test_save_rejects_relative_dir_traversal(client):
 
 
 @pytest.mark.asyncio
+async def test_save_rejects_relative_dir_symlink_escape(client, tmp_path):
+    """A `relative_dir` that resolves through a symlink pointing outside
+    working_dir must be rejected — not just literal `../` traversal."""
+    outside = tmp_path.parent / "outside-target"
+    outside.mkdir()
+    (client.working_dir / "escape-link").symlink_to(outside, target_is_directory=True)
+
+    r = await client.post(
+        "/api/sessions/s-1/files/save",
+        json={
+            "relative_dir": "escape-link",
+            "filename": "evil.txt",
+            "content_base64": base64.b64encode(b"x").decode(),
+        },
+        headers=HEADERS,
+    )
+    assert r.status_code == 403
+    assert not (outside / "evil.txt").exists()
+
+
+@pytest.mark.asyncio
 async def test_save_rejects_bad_base64(client):
     r = await client.post(
         "/api/sessions/s-1/files/save",

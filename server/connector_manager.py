@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import time
 import uuid
 from datetime import datetime, timezone
@@ -243,6 +244,76 @@ class ConnectorManager:
     async def get_installation(self, installation_id: str) -> dict[str, Any] | None:
         return await self.db.get_connector_installation(installation_id)
 
+    async def _upsert_installation(
+        self,
+        *,
+        kind: str,
+        external_id: str | None,
+        label: str,
+        auth_type: str,
+        blob: str,
+        scopes: list[str],
+        token_expires_at: str | None,
+    ) -> str:
+        """Insert-or-update on (kind, external_account_id) — the dedup key
+        both `complete_install` (OAuth) and `complete_static_install`
+        upsert on. Two installs of the same account completing at once
+        (e.g. two browser tabs) both pass the "not found" check before
+        either writes, so the loser's INSERT trips the partial unique
+        index (`connector_installations_account_unique`) — caught here and
+        retried as an update onto the winner's row instead of surfacing a
+        raw 500."""
+        existing = (
+            await self.db.get_connector_installation_by_account(kind, external_id)
+            if external_id
+            else None
+        )
+        if existing is not None:
+            iid = existing["id"]
+            await self.db.update_connector_installation(
+                iid,
+                label=label,
+                scopes=scopes,
+                token_expires_at=token_expires_at,
+                needs_reconnect=False,
+                last_refresh_error_code=None,
+                secret_encrypted=blob,
+            )
+            return iid
+
+        iid = uuid.uuid4().hex[:12]
+        try:
+            await self.db.save_connector_installation(
+                installation_id=iid,
+                kind=kind,
+                label=label,
+                auth_type=auth_type,
+                secret_encrypted=blob,
+                created_at=datetime.now(timezone.utc).isoformat(),
+                external_account_id=external_id or None,
+                scopes=scopes,
+                token_expires_at=token_expires_at,
+            )
+        except sqlite3.IntegrityError:
+            winner = (
+                await self.db.get_connector_installation_by_account(kind, external_id)
+                if external_id
+                else None
+            )
+            if winner is None:
+                raise
+            iid = winner["id"]
+            await self.db.update_connector_installation(
+                iid,
+                label=label,
+                scopes=scopes,
+                token_expires_at=token_expires_at,
+                needs_reconnect=False,
+                last_refresh_error_code=None,
+                secret_encrypted=blob,
+            )
+        return iid
+
     async def complete_install(
         self,
         *,
@@ -262,35 +333,15 @@ class ConnectorManager:
         blob = encrypt(_serialize_token_set(token_set), settings.auth_token)
         token_expires_at = _expires_iso(token_set.expires_at_epoch)
 
-        existing = (
-            await self.db.get_connector_installation_by_account(kind, external_id)
-            if external_id
-            else None
+        iid = await self._upsert_installation(
+            kind=kind,
+            external_id=external_id,
+            label=label,
+            auth_type="oauth",
+            blob=blob,
+            scopes=list(token_set.scopes),
+            token_expires_at=token_expires_at,
         )
-        if existing is not None:
-            iid = existing["id"]
-            await self.db.update_connector_installation(
-                iid,
-                label=label,
-                scopes=list(token_set.scopes),
-                token_expires_at=token_expires_at,
-                needs_reconnect=False,
-                last_refresh_error_code=None,
-                secret_encrypted=blob,
-            )
-        else:
-            iid = uuid.uuid4().hex[:12]
-            await self.db.save_connector_installation(
-                installation_id=iid,
-                kind=kind,
-                label=label,
-                auth_type="oauth",
-                secret_encrypted=blob,
-                created_at=datetime.now(timezone.utc).isoformat(),
-                external_account_id=external_id or None,
-                scopes=list(token_set.scopes),
-                token_expires_at=token_expires_at,
-            )
         inst = await self.db.get_connector_installation(iid)
         assert inst is not None
         return inst
@@ -329,35 +380,15 @@ class ConnectorManager:
         label = requested_label or identity_label
         blob = encrypt(_serialize_static_secret(cleaned), settings.auth_token)
 
-        existing = (
-            await self.db.get_connector_installation_by_account(kind, external_id)
-            if external_id
-            else None
+        iid = await self._upsert_installation(
+            kind=kind,
+            external_id=external_id,
+            label=label,
+            auth_type="api_key",
+            blob=blob,
+            scopes=[],
+            token_expires_at=None,
         )
-        if existing is not None:
-            iid = existing["id"]
-            await self.db.update_connector_installation(
-                iid,
-                label=label,
-                scopes=[],
-                token_expires_at=None,
-                needs_reconnect=False,
-                last_refresh_error_code=None,
-                secret_encrypted=blob,
-            )
-        else:
-            iid = uuid.uuid4().hex[:12]
-            await self.db.save_connector_installation(
-                installation_id=iid,
-                kind=kind,
-                label=label,
-                auth_type="api_key",
-                secret_encrypted=blob,
-                created_at=datetime.now(timezone.utc).isoformat(),
-                external_account_id=external_id or None,
-                scopes=[],
-                token_expires_at=None,
-            )
         inst = await self.db.get_connector_installation(iid)
         assert inst is not None
         return inst

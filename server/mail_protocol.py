@@ -85,10 +85,27 @@ class MailCredentials:
             email=fields["email"],
             auth_code=fields["auth_code"],
             imap_host=fields["imap_host"],
-            imap_port=int(fields["imap_port"]),
+            imap_port=_parse_port("IMAP", fields["imap_port"]),
             smtp_host=fields["smtp_host"],
-            smtp_port=int(fields["smtp_port"]),
+            smtp_port=_parse_port("SMTP", fields["smtp_port"]),
         )
+
+
+def _parse_port(label: str, raw: str) -> int:
+    """A malformed port from the install form should fail as a form error
+    (StaticVerifyError, §4.1), not an uncaught ValueError that turns into a
+    500 — this is the boundary where any string reaches an int."""
+    try:
+        port = int(raw)
+    except ValueError:
+        raise MailProtocolError(
+            f"{label} port must be a number, got {raw!r}."
+        ) from None
+    if not (1 <= port <= 65535):
+        raise MailProtocolError(
+            f"{label} port must be between 1 and 65535, got {port}."
+        )
+    return port
 
 
 def _send_imap_id(conn: imaplib.IMAP4) -> None:

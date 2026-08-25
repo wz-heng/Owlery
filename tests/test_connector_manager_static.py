@@ -6,6 +6,7 @@ dedup shared with OAuth installs, and the `auth_type='api_key'` branch of
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import pytest
 
@@ -137,6 +138,46 @@ async def test_complete_static_install_upserts_same_account(mgr):
         kind="fakestatic", fields={"email": "me@x.com", "auth_code": "new-code"}
     )
     assert a["id"] == b["id"]
+
+
+@pytest.mark.asyncio
+async def test_complete_static_install_survives_concurrent_insert_race(mgr, db, connector, monkeypatch):
+    """Two installs of the same account racing past the "not found" check
+    both try to INSERT; the loser's row.save trips the partial unique index
+    on (kind, external_account_id) as a `sqlite3.IntegrityError` — the
+    retry path must catch that and converge onto the winner's row instead
+    of leaking a raw 500."""
+    real_save = db.save_connector_installation
+    calls = {"n": 0}
+
+    async def flaky_save(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Simulate a concurrent request that already inserted the
+            # winning row for this account just before we get here.
+            await real_save(
+                installation_id="winner-id",
+                kind=kwargs["kind"],
+                label="other-tab@x.com",
+                auth_type=kwargs["auth_type"],
+                secret_encrypted=kwargs["secret_encrypted"],
+                created_at=kwargs["created_at"],
+                external_account_id=kwargs["external_account_id"],
+                scopes=kwargs["scopes"],
+                token_expires_at=kwargs["token_expires_at"],
+            )
+            raise sqlite3.IntegrityError("UNIQUE constraint failed")
+        await real_save(**kwargs)
+
+    monkeypatch.setattr(db, "save_connector_installation", flaky_save)
+
+    inst = await mgr.complete_static_install(
+        kind="fakestatic", fields={"email": "me@x.com", "auth_code": "abc"}
+    )
+    assert inst["id"] == "winner-id"
+    assert inst["label"] == "me@x.com"
+    rows = await db.load_connector_installations()
+    assert len(rows) == 1
 
 
 @pytest.mark.asyncio

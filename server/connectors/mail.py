@@ -91,8 +91,8 @@ class MailConnector(ConnectorBase):
     )
 
     async def verify_static_credentials(self, fields: dict[str, str]) -> tuple[str, str]:
-        creds = mail_protocol.MailCredentials.from_fields(fields)
         try:
+            creds = mail_protocol.MailCredentials.from_fields(fields)
             await asyncio.to_thread(mail_protocol.verify_credentials, creds)
         except mail_protocol.MailProtocolError as e:
             raise StaticVerifyError(str(e)) from e

@@ -19,7 +19,7 @@ import mimetypes
 import os
 import sys
 from email.message import EmailMessage
-from email.utils import make_msgid
+from email.utils import formataddr, getaddresses, make_msgid
 from pathlib import Path
 from typing import Any, Callable
 
@@ -353,6 +353,27 @@ def send(
     return _send_message(creds, msg, to, cc)
 
 
+def _reply_recipients(
+    original: mail_protocol.ParsedMessage, self_email: str, reply_all: bool
+) -> tuple[str, str | None]:
+    """(to, cc) for a reply: `to` is always the original sender. With
+    `reply_all`, `cc` adds everyone from the original To/Cc — minus the
+    sender (already in `to`) and minus our own mailbox — deduped by
+    address so a name/address pair isn't repeated across To and Cc."""
+    to = original.from_
+    if not reply_all:
+        return to, None
+    seen = {addr.lower() for _, addr in getaddresses([to]) if addr}
+    seen.add(self_email.lower())
+    cc_parts: list[str] = []
+    for name, addr in getaddresses([original.to, original.cc]):
+        if not addr or addr.lower() in seen:
+            continue
+        seen.add(addr.lower())
+        cc_parts.append(formataddr((name, addr)) if name else addr)
+    return to, ", ".join(cc_parts) if cc_parts else None
+
+
 @mcp.tool(name="reply")
 def reply(uid: str, body: str, reply_all: bool = False) -> str:
     """Reply to message `uid` with a plain-text body (threads via
@@ -369,8 +390,7 @@ def reply(uid: str, body: str, reply_all: bool = False) -> str:
     if err:
         return err
 
-    to = original.from_
-    cc = original.cc if reply_all else None
+    to, cc = _reply_recipients(original, creds.email, reply_all)
     subject = original.subject
     if not subject.lower().startswith("re:"):
         subject = f"Re: {subject}"

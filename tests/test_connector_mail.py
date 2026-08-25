@@ -79,3 +79,38 @@ async def test_verify_static_credentials_wraps_protocol_error(monkeypatch):
                 "smtp_port": "465",
             }
         )
+
+
+@pytest.mark.asyncio
+async def test_verify_static_credentials_rejects_malformed_port_as_form_error():
+    """A bad port must surface as a StaticVerifyError (→ 400 form error),
+    not an uncaught ValueError (→ 500) — the port string is user input from
+    the install form, parsed before any network call happens."""
+    c = mail_connector.MailConnector()
+    with pytest.raises(StaticVerifyError, match="IMAP port"):
+        await c.verify_static_credentials(
+            {
+                "email": "me@qq.com",
+                "auth_code": "code",
+                "imap_host": "imap.qq.com",
+                "imap_port": "not-a-number",
+                "smtp_host": "smtp.qq.com",
+                "smtp_port": "465",
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_verify_static_credentials_rejects_out_of_range_port():
+    c = mail_connector.MailConnector()
+    with pytest.raises(StaticVerifyError, match="between 1 and 65535"):
+        await c.verify_static_credentials(
+            {
+                "email": "me@qq.com",
+                "auth_code": "code",
+                "imap_host": "imap.qq.com",
+                "imap_port": "993",
+                "smtp_host": "smtp.qq.com",
+                "smtp_port": "70000",
+            }
+        )

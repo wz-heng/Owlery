@@ -29,10 +29,19 @@ EMAIL = "agent@example.com"
 AUTH_CODE = "s3cr3t-auth-code"
 
 
-def _msg(subject: str, from_: str, body: str = "hello", attach: bytes | None = None) -> bytes:
+def _msg(
+    subject: str,
+    from_: str,
+    body: str = "hello",
+    attach: bytes | None = None,
+    to: str = EMAIL,
+    cc: str | None = None,
+) -> bytes:
     msg = EmailMessage()
     msg["From"] = from_
-    msg["To"] = EMAIL
+    msg["To"] = to
+    if cc:
+        msg["Cc"] = cc
     msg["Subject"] = subject
     msg["Date"] = "Mon, 1 Jan 2026 00:00:00 +0000"
     msg.set_content(body)
@@ -111,7 +120,7 @@ def _set_token(monkeypatch, imap_port: int, smtp_port: int) -> None:
 @pytest.mark.asyncio
 async def test_list_recent_newest_first(env, imap_server_factory, monkeypatch):
     server = await imap_server_factory([_msg("First", "a@x.com"), _msg("Second", "b@x.com")])
-    _set_token(monkeypatch, server.port, 0)
+    _set_token(monkeypatch, server.port, 1)
     out = json.loads(await asyncio.to_thread(mailmcp.list_recent, limit=5))
     assert [m["subject"] for m in out] == ["Second", "First"]
     await server.stop()
@@ -122,7 +131,7 @@ async def test_search_server_side_ascii(env, imap_server_factory, monkeypatch):
     server = await imap_server_factory(
         [_msg("Invoice attached", "billing@corp.com"), _msg("Lunch?", "friend@x.com")]
     )
-    _set_token(monkeypatch, server.port, 0)
+    _set_token(monkeypatch, server.port, 1)
     out = json.loads(await asyncio.to_thread(mailmcp.search, query="Invoice"))
     assert len(out) == 1 and out[0]["subject"] == "Invoice attached"
     await server.stop()
@@ -133,7 +142,7 @@ async def test_search_non_ascii_falls_back_client_side(env, imap_server_factory,
     server = await imap_server_factory(
         [_msg("你好邮件", "friend@qq.com"), _msg("Unrelated", "other@x.com")]
     )
-    _set_token(monkeypatch, server.port, 0)
+    _set_token(monkeypatch, server.port, 1)
     out = json.loads(await asyncio.to_thread(mailmcp.search, query="你好"))
     assert len(out) == 1 and out[0]["subject"] == "你好邮件"
     await server.stop()
@@ -144,7 +153,7 @@ async def test_read_full_message_with_attachment(env, imap_server_factory, monke
     server = await imap_server_factory(
         [_msg("With attachment", "a@x.com", body="see attached", attach=b"file contents")]
     )
-    _set_token(monkeypatch, server.port, 0)
+    _set_token(monkeypatch, server.port, 1)
     out = json.loads(await asyncio.to_thread(mailmcp.read, uid="1"))
     assert out["subject"] == "With attachment"
     assert "see attached" in out["body"]
@@ -157,7 +166,7 @@ async def test_read_full_message_with_attachment(env, imap_server_factory, monke
 @pytest.mark.asyncio
 async def test_read_missing_uid_errors(env, imap_server_factory, monkeypatch):
     server = await imap_server_factory([_msg("Only one", "a@x.com")])
-    _set_token(monkeypatch, server.port, 0)
+    _set_token(monkeypatch, server.port, 1)
     out = await asyncio.to_thread(mailmcp.read, uid="999")
     assert out.startswith("Error:")
     await server.stop()
@@ -166,7 +175,7 @@ async def test_read_missing_uid_errors(env, imap_server_factory, monkeypatch):
 @pytest.mark.asyncio
 async def test_get_attachment_saves_via_host(env, imap_server_factory, monkeypatch):
     server = await imap_server_factory([_msg("With attachment", "a@x.com", attach=b"file contents")])
-    _set_token(monkeypatch, server.port, 0)
+    _set_token(monkeypatch, server.port, 1)
 
     captured = {}
 
@@ -221,7 +230,7 @@ async def test_bad_auth_code_marks_reconnect(env, imap_server_factory, monkeypat
             "imap_host": "127.0.0.1",
             "imap_port": str(server.port),
             "smtp_host": "127.0.0.1",
-            "smtp_port": "0",
+            "smtp_port": "1",
         }
     )
     monkeypatch.setattr(mailmcp.ctx, "access_token", lambda: blob)
@@ -239,7 +248,7 @@ async def test_bad_auth_code_marks_reconnect(env, imap_server_factory, monkeypat
 
 @pytest.mark.asyncio
 async def test_send_plain_message(env, smtp_server, monkeypatch):
-    _set_token(monkeypatch, 0, smtp_server.port)
+    _set_token(monkeypatch, 1, smtp_server.port)
     out = json.loads(await asyncio.to_thread(mailmcp.send, to="bob@x.com", subject="Hi", body="hello there"))
     assert out == {"sent": True, "to": "bob@x.com", "cc": None, "subject": "Hi"}
     assert len(smtp_server.sent) == 1
@@ -251,7 +260,7 @@ async def test_send_plain_message(env, smtp_server, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_send_with_cc_and_attachment_from_workdir(env, smtp_server, monkeypatch):
-    _set_token(monkeypatch, 0, smtp_server.port)
+    _set_token(monkeypatch, 1, smtp_server.port)
 
     class FakeResp:
         status_code = 200
@@ -305,4 +314,50 @@ async def test_reply_does_not_double_prefix_subject(env, imap_server_factory, sm
 
     out = json.loads(await asyncio.to_thread(mailmcp.reply, uid="1", body="ok"))
     assert out["subject"] == "Re: Already a reply"
+    await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_reply_all_ccs_other_recipients_excludes_self_and_dupes(
+    env, imap_server_factory, smtp_server, monkeypatch
+):
+    """reply_all must Cc everyone from the original To/Cc except the
+    sender (already in `to`) and our own mailbox — with no duplicates
+    across To and Cc."""
+    original = _msg(
+        "Team sync",
+        "alice@example.com",
+        to=f"{EMAIL}, bob@example.com",
+        cc="carol@example.com, bob@example.com",
+    )
+    server = await imap_server_factory([original])
+    _set_token(monkeypatch, server.port, smtp_server.port)
+
+    out = json.loads(
+        await asyncio.to_thread(mailmcp.reply, uid="1", body="sounds good", reply_all=True)
+    )
+    assert out["to"] == "alice@example.com"
+    cc_addrs = {a.strip() for a in out["cc"].split(",")}
+    assert cc_addrs == {"bob@example.com", "carol@example.com"}
+    assert EMAIL not in cc_addrs
+    sent = smtp_server.sent[0]
+    assert set(sent["rcpt_tos"]) == {"alice@example.com", "bob@example.com", "carol@example.com"}
+    await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_reply_without_reply_all_omits_cc(
+    env, imap_server_factory, smtp_server, monkeypatch
+):
+    original = _msg(
+        "Team sync", "alice@example.com", to=f"{EMAIL}, bob@example.com", cc="carol@example.com"
+    )
+    server = await imap_server_factory([original])
+    _set_token(monkeypatch, server.port, smtp_server.port)
+
+    out = json.loads(await asyncio.to_thread(mailmcp.reply, uid="1", body="ok", reply_all=False))
+    assert out["to"] == "alice@example.com"
+    assert out["cc"] is None
+    sent = smtp_server.sent[0]
+    assert sent["rcpt_tos"] == ["alice@example.com"]
     await server.stop()
