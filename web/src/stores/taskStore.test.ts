@@ -29,6 +29,7 @@ function task(overrides: Partial<Task> = {}): Task {
     blocked_kind: null,
     blocked_reason: null,
     result_summary: null,
+    verdict: null,
     archived: false,
     created_by_kind: "user",
     created_by_agent_id: null,
@@ -178,6 +179,68 @@ describe("taskStore transitions", () => {
     expect(await useTaskStore.getState().moveTask(current.id, "ready")).toBe(false);
     expect(useTaskStore.getState().tasksById[current.id]).toEqual(claimed);
     expect(useTaskStore.getState().error).toBe("Already claimed");
+  });
+
+  it("closes a container task and stores the server-returned done task", async () => {
+    const container = task({ status: "triage" });
+    const closed = task({ status: "done", result_summary: "All children settled." });
+    useTaskStore.setState({ token: "tok", tasksById: { [container.id]: container }, taskOrder: [container.id] });
+    const close = vi.spyOn(taskApi, "close").mockResolvedValue(closed);
+
+    expect(await useTaskStore.getState().closeTask(container.id, "All children settled.")).toBe(true);
+    expect(close).toHaveBeenCalledWith("tok", container.id, "All children settled.");
+    expect(useTaskStore.getState().tasksById[container.id].status).toBe("done");
+  });
+
+  it("surfaces the server's rejection reason when close is refused", async () => {
+    const container = task({ status: "triage" });
+    useTaskStore.setState({ token: "tok", tasksById: { [container.id]: container }, taskOrder: [container.id] });
+    vi.spyOn(taskApi, "close").mockRejectedValue(
+      new TaskApiError("all child tasks must be terminal before closing", 409, container)
+    );
+
+    expect(await useTaskStore.getState().closeTask(container.id, "Done")).toBe(false);
+    expect(useTaskStore.getState().error).toBe("all child tasks must be terminal before closing");
+  });
+
+  it("drops a task's stale cached detail/runs the instant a reload starts, not just once it resolves", async () => {
+    // Reopening a task whose run history changed since it was last cached
+    // must not render with the old (now-wrong) `runs`/`detail` for the
+    // whole fetch window — TaskDrawer's Close button treats
+    // `detail !== undefined` as "runs are current" (see the `runsLoaded`
+    // comment in TaskDrawer.tsx), so a stale cache would let it render as
+    // clickable against data the server has already moved past
+    // (Snape review).
+    const current = task();
+    const staleDetail = { ...current, dependencies: [], dependents: [], children: [] };
+    useTaskStore.setState({
+      token: "tok",
+      selectedTaskId: current.id,
+      tasksById: { [current.id]: current },
+      taskOrder: [current.id],
+      details: { [current.id]: staleDetail },
+      runs: { [current.id]: [] },
+    });
+    let resolveGetTask: (value: typeof staleDetail) => void;
+    vi.spyOn(taskApi, "getTask").mockReturnValue(
+      new Promise((resolve) => {
+        resolveGetTask = resolve;
+      })
+    );
+    vi.spyOn(taskApi, "runs").mockResolvedValue([]);
+    vi.spyOn(taskApi, "events").mockResolvedValue([]);
+    vi.spyOn(taskApi, "artifacts").mockResolvedValue([]);
+
+    const pending = useTaskStore.getState().loadTaskDetail(current.id);
+    // Synchronous assertion: the clear happens in the same tick the fetch
+    // starts, before any network response can land.
+    expect(useTaskStore.getState().details[current.id]).toBeUndefined();
+    expect(useTaskStore.getState().runs[current.id]).toBeUndefined();
+
+    resolveGetTask!(staleDetail);
+    await pending;
+    expect(useTaskStore.getState().details[current.id]).toEqual(staleDetail);
+    expect(useTaskStore.getState().runs[current.id]).toEqual([]);
   });
 });
 

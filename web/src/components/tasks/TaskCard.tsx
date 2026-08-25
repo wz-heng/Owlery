@@ -1,5 +1,6 @@
 import {
   IconAlertTriangle,
+  IconBan,
   IconCalendar,
   IconGitBranch,
   IconListTree,
@@ -18,6 +19,7 @@ import {
   relativeTime,
   RUN_LABEL,
   STATUS_ACCENT,
+  verdictBadge,
 } from "./taskPresentation";
 
 interface TaskCardProps {
@@ -29,6 +31,7 @@ interface TaskCardProps {
 
 export function TaskCard({ task, agent, onOpen, draggable = true }: TaskCardProps) {
   const delivery = deliveryChip(task);
+  const verdict = verdictBadge(task);
   // `updated_at` is the closest durable proxy for "time since blocked" —
   // there is no dedicated `blocked_at` column, so any later edit (a
   // comment, a priority change) also resets this age. Acceptable: it still
@@ -51,7 +54,7 @@ export function TaskCard({ task, agent, onOpen, draggable = true }: TaskCardProp
       tabIndex={0}
       role="button"
       aria-label={`Open task ${task.title}`}
-      draggable={draggable && task.status !== "running" && task.status !== "done"}
+      draggable={draggable && task.status !== "running" && task.status !== "done" && task.status !== "cancelled"}
       onDragStart={(event) => {
         event.dataTransfer.effectAllowed = "move";
         event.dataTransfer.setData("application/x-owlery-task", task.id);
@@ -66,6 +69,18 @@ export function TaskCard({ task, agent, onOpen, draggable = true }: TaskCardProp
         <h3 className="line-clamp-2 text-sm font-semibold leading-5 text-foreground">
           {task.title}
         </h3>
+        {verdict && (
+          <span
+            data-testid="task-verdict-badge"
+            className={cn(
+              "shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
+              DELIVERY_TONE_PILL[verdict.tone]
+            )}
+            title="This task's worker reported verdict=fail — dependents will not unblock on it"
+          >
+            {verdict.label}
+          </span>
+        )}
         {task.priority > 0 && (
           <span
             className="shrink-0 rounded-full bg-primary-50 px-1.5 py-0.5 text-[10px] font-bold text-primary-700"
@@ -139,6 +154,14 @@ export function TaskCard({ task, agent, onOpen, draggable = true }: TaskCardProp
             <span className="truncate">
               {task.blocked_kind ?? "blocked"} · {relativeTime(task.updated_at)}
             </span>
+          </span>
+        )}
+        {/* Cancelled is a decisive terminal state, not a wait — no staleness
+            age here, unlike the blocked badge above (task-board-gaps.md §3.4). */}
+        {task.status === "cancelled" && (
+          <span className="inline-flex min-w-0 items-center gap-0.5 text-muted-foreground" title="Cancelled">
+            <IconBan size={12} />
+            <span className="truncate">Cancelled</span>
           </span>
         )}
         {ageSource && task.status !== "blocked" && (

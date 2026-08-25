@@ -21,6 +21,7 @@ from pydantic import AliasChoices, BaseModel, Field, model_validator
 from ..auth import verify_token
 from ..task_board.models import (
     BLOCKED_KINDS,
+    VERDICT_KINDS,
     DeliveryConfirmationRequired,
     TaskBoardError,
     TaskCapacityError,
@@ -357,6 +358,19 @@ class CompleteRequest(BaseModel):
     summary: str = Field(min_length=1)
     metadata: dict[str, Any] = Field(default_factory=dict)
     artifacts: list[ArtifactDeclaration] = Field(default_factory=list, max_length=100)
+    # Review/acceptance gate (task-board-gaps.md §3.1): optional, so ordinary
+    # (non-review) worker tasks keep completing exactly as before.
+    verdict: str | None = None
+
+    @model_validator(mode="after")
+    def validate_verdict(self):
+        if self.verdict is not None and self.verdict not in VERDICT_KINDS:
+            raise ValueError(f"verdict must be one of {sorted(VERDICT_KINDS)}")
+        return self
+
+
+class CloseRequest(BaseModel):
+    summary: str = Field(min_length=1)
 
 
 class WorkerCreate(TaskCreate):
@@ -856,6 +870,84 @@ async def cancel_task(
     return await _enriched(row)
 
 
+async def _reject_worker_caller(
+    action: str,
+    *,
+    caller_session_id: str | None,
+    caller_task_id: str | None,
+    caller_task_run_id: str | None,
+) -> None:
+    """Server-side half of "worker identity calling `close` is rejected"
+    (task-board-gaps.md §3.3) — the MCP tool's ``_orchestrator_only`` gate
+    only stops a well-behaved worker going through the ``close`` MCP tool;
+    it never touches this REST endpoint directly. Two checks, both against
+    server-observed state, never client-asserted role:
+
+    1. ``X-Owlery-Task-ID``/``X-Owlery-Task-Run-ID`` are the same headers
+       the tasks MCP server attaches to EVERY call it makes from inside a
+       worker run (``server/mcp_servers/tasks.py`` ``_context()``) — their
+       presence is exactly the trusted-worker-context signal
+       ``_worker_headers`` requires on the worker-scoped endpoints, just
+       inverted here for an orchestrator-only one.
+    2. If the caller names a session (``X-Owlery-Session-ID``), resolve it
+       and check whether the SERVER's own session record has ``task_id``
+       set — the same flag ``_dispatch_task`` stamps on a worker session at
+       dispatch time. A worker that skips the two headers above but still
+       names its own (real) session cannot pass this check either.
+
+    This closes the two paths a worker would take without deliberately
+    fabricating an unrelated session id it doesn't own — the shared bearer
+    token used across all sessions means a caller that also drops or
+    forges the session header entirely cannot be distinguished from an
+    ordinary anonymous orchestrator call by ANY action in this router
+    today, not just this one; closing that systemic gap needs a
+    per-session credential, out of scope here.
+    """
+    if caller_task_id or caller_task_run_id:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"`{action}` is not available to a Task Board worker run",
+        )
+    if caller_session_id:
+        from ..session_manager import session_manager
+
+        session = session_manager.get_session(caller_session_id)
+        if session is not None and session.task_id is not None:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                f"`{action}` is not available to a Task Board worker run",
+            )
+
+
+@router.post("/api/tasks/{task_id}/close")
+async def close_task(
+    task_id: str,
+    req: CloseRequest,
+    caller_session_id: str | None = Header(default=None, alias="X-Owlery-Session-ID"),
+    caller_task_id: str | None = Header(default=None, alias="X-Owlery-Task-ID"),
+    caller_task_run_id: str | None = Header(default=None, alias="X-Owlery-Task-Run-ID"),
+    _: str = Depends(verify_token),
+):
+    await _reject_worker_caller(
+        "close",
+        caller_session_id=caller_session_id,
+        caller_task_id=caller_task_id,
+        caller_task_run_id=caller_task_run_id,
+    )
+    actor_kind, actor_agent_id, _origin = await _actor(caller_session_id)
+    row = await _run(
+        task_repository.close_task(
+            task_id,
+            summary=req.summary,
+            actor_kind=actor_kind,
+            actor_agent_id=actor_agent_id,
+        )
+    )
+    await _publish(task_id)
+    await _get_manager().wake_dispatcher()
+    return await _enriched(row)
+
+
 @router.post("/api/tasks/{task_id}/archive")
 async def archive_task(
     task_id: str,
@@ -1007,6 +1099,7 @@ async def worker_complete(
                 summary=req.summary,
                 metadata=req.metadata,
                 artifacts=[item.model_dump() for item in req.artifacts],
+                verdict=req.verdict,
             )
         )
     )

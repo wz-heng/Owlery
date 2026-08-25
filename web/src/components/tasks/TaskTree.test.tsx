@@ -22,6 +22,7 @@ function task(id: string, title: string, parent: string | null, deps = 0): Task 
     blocked_kind: null,
     blocked_reason: null,
     result_summary: null,
+    verdict: null,
     archived: false,
     created_by_kind: "user",
     created_by_agent_id: null,

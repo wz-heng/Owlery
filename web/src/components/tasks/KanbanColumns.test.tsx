@@ -24,6 +24,7 @@ function task(id: string, status: Task["status"], title: string, overrides: Part
     blocked_kind: status === "blocked" ? "input" : null,
     blocked_reason: null,
     result_summary: null,
+    verdict: null,
     archived: false,
     created_by_kind: "user",
     created_by_agent_id: null,
@@ -122,5 +123,47 @@ describe("KanbanColumns", () => {
     expect(archive).toHaveBeenCalledWith("token", "shipped", true);
     expect(archive).not.toHaveBeenCalledWith("token", "mid-flight", true);
     expect(archive).not.toHaveBeenCalledWith("token", "problem", true);
+  });
+
+  it("folds cancelled tasks into the Done column tail instead of a seventh column (task-board-gaps.md §3.4)", () => {
+    render(
+      <KanbanColumns
+        tasks={[
+          task("d1", "done", "Shipped"),
+          task("c1", "cancelled", "Superseded by a redo"),
+        ]}
+        agents={[]}
+        onOpenTask={vi.fn()}
+        onMoveTask={vi.fn().mockResolvedValue(true)}
+      />
+    );
+    // Still exactly six columns — cancelled never gets its own, and never
+    // reappears under Blocked.
+    for (const label of ["Triage", "Todo", "Ready", "Running", "Blocked", "Done"]) {
+      expect(screen.getByRole("region", { name: `${label} tasks` })).toBeInTheDocument();
+    }
+    const doneColumn = screen.getByRole("region", { name: "Done tasks" });
+    expect(doneColumn).toHaveTextContent("Shipped");
+    expect(doneColumn).toHaveTextContent("Superseded by a redo");
+    expect(doneColumn).toHaveTextContent("Cancelled");
+    // The header count reflects everything actually shown in the column.
+    expect(doneColumn.querySelector("header")).toHaveTextContent("2");
+  });
+
+  it("batch-archives a cancelled task alongside done ones", async () => {
+    const archive = vi.spyOn(taskApi, "archiveTask").mockImplementation(
+      async (_token, taskId) => task(taskId, "cancelled", taskId, { archived: true })
+    );
+    render(
+      <KanbanColumns
+        tasks={[task("cancelled-1", "cancelled", "Abandoned")]}
+        agents={[]}
+        onOpenTask={vi.fn()}
+        onMoveTask={vi.fn().mockResolvedValue(true)}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /Archive 1 finished/ }));
+    await vi.waitFor(() => expect(archive).toHaveBeenCalledWith("token", "cancelled-1", true));
   });
 });

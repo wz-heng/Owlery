@@ -196,6 +196,7 @@ interface TaskState {
     body?: Record<string, unknown>
   ): Promise<boolean>;
   setTaskArchived(taskId: string, archived: boolean): Promise<void>;
+  closeTask(taskId: string, summary: string): Promise<boolean>;
   addComment(taskId: string, body: string): Promise<boolean>;
   addDependency(taskId: string, dependencyId: string): Promise<boolean>;
   removeDependency(taskId: string, dependencyId: string): Promise<boolean>;
@@ -591,7 +592,21 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   },
   loadTaskDetail: async (taskId) => {
     const { token } = get();
-    set({ loadingDetail: true, error: null });
+    // Drop this task's cached `details`/`runs` before the fetch starts, not
+    // just overwrite them once it resolves. Reopening a task whose run
+    // history changed since it was last cached would otherwise render with
+    // stale data for the whole fetch window — e.g. TaskDrawer's Close button
+    // treats `detail !== undefined` as "runs are current" (taskStore-derived
+    // race-free signal), which stale cache defeats: a task cached earlier
+    // with no runs, then dispatched a run, then reopened, would show Close
+    // as clickable until the fresh response lands (Snape review).
+    set((state) => {
+      const details = { ...state.details };
+      delete details[taskId];
+      const runs = { ...state.runs };
+      delete runs[taskId];
+      return { loadingDetail: true, error: null, details, runs };
+    });
     try {
       const [detail, runs, events, artifacts] = await Promise.all([
         taskApi.getTask(token, taskId),
@@ -601,12 +616,21 @@ export const useTaskStore = create<TaskState>((set, get) => ({
       ]);
       if (get().selectedTaskId !== taskId) return;
       set((state) => ({
+        // `mergeTask` spreads first: its own `details` field only exists to
+        // keep an *already-cached* detail's base Task fields in sync with a
+        // racing WS event, and must not be allowed to win a key collision
+        // against the detail this call just authoritatively fetched — object
+        // spread order previously put it last, so on a task's first-ever
+        // load (nothing cached yet) `mergeTask` returned `details:
+        // state.details` unchanged, silently discarding the fetch result and
+        // leaving `details[taskId]` undefined forever (caught by the
+        // loadTaskDetail store test below, not by any prior test).
+        ...mergeTask(state, detail),
         details: { ...state.details, [taskId]: detail },
         comments: { ...state.comments, [taskId]: detail.comments ?? [] },
         runs: { ...state.runs, [taskId]: runs },
         events: { ...state.events, [taskId]: events },
         artifacts: { ...state.artifacts, [taskId]: artifacts },
-        ...mergeTask(state, detail),
       }));
     } catch (error) {
       set({ error: message(error) });
@@ -704,6 +728,21 @@ export const useTaskStore = create<TaskState>((set, get) => ({
       get().upsertTask(await taskApi.archiveTask(token, taskId, archived));
     } catch (error) {
       set({ error: message(error) });
+    } finally {
+      set({ mutating: false });
+    }
+  },
+  closeTask: async (taskId, summary) => {
+    const { token } = get();
+    set({ mutating: true, error: null });
+    try {
+      get().upsertTask(await taskApi.close(token, taskId, summary));
+      return true;
+    } catch (error) {
+      const current = error instanceof TaskApiError ? error.currentTask : null;
+      if (current) get().upsertTask(current);
+      set({ error: message(error) });
+      return false;
     } finally {
       set({ mutating: false });
     }

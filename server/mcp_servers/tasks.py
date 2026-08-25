@@ -275,22 +275,35 @@ def complete_task(
     summary: str,
     metadata: dict[str, Any] | None = None,
     artifacts: list[dict[str, Any]] | None = None,
+    verdict: str | None = None,
 ) -> str:
-    """Complete the owning run with a structured handoff and artifacts."""
+    """Complete the owning run with a structured handoff and artifacts.
+
+    Pass ``verdict`` ("pass" | "fail") when this task's job was to review or
+    accept someone else's work. A dependent task never unblocks on a
+    ``verdict="fail"`` completion, even though the task itself is `done` —
+    this is the ONLY way a "not passing" review stops downstream work; a
+    prose summary alone changes nothing. Every review/acceptance task must
+    end this way. Leave ``verdict`` unset for ordinary (non-review) work.
+
+    If what you found is that upstream work — or your own — does not pass:
+    report it via ``verdict="fail"`` (or ``block``) and stop there. Do not
+    create a fix/follow-up task yourself; opening new work in response to a
+    failure is the orchestrator's or user's call, not yours.
+    """
     error = _worker_only("complete")
     if error:
         return error
     if not (summary or "").strip():
         return "Error: `summary` must be non-empty."
-    code, data = _call(
-        "POST",
-        "/api/task-worker/current/complete",
-        body={
-            "summary": summary.strip(),
-            "metadata": metadata or {},
-            "artifacts": artifacts or [],
-        },
-    )
+    body: dict[str, Any] = {
+        "summary": summary.strip(),
+        "metadata": metadata or {},
+        "artifacts": artifacts or [],
+    }
+    if verdict is not None:
+        body["verdict"] = verdict
+    code, data = _call("POST", "/api/task-worker/current/complete", body=body)
     return _render(code, data, action="complete task")
 
 
@@ -419,6 +432,25 @@ def cancel_task(task_id: str, reason: str | None = None) -> str:
         "POST", f"/api/tasks/{task_id}/cancel", body={"reason": reason}
     )
     return _render(code, data, action="cancel task")
+
+
+@mcp.tool(name="close")
+def close_task(task_id: str, summary: str) -> str:
+    """Close a container/root task once every child has reached a terminal
+    status (done/cancelled). Only for a task that was never itself assigned
+    a run — a pure decomposition task (a battle's root, say) that has no
+    worker terminal protocol of its own to close through. Rejected for a
+    task that already has run history (it must close through `complete`/
+    `block` instead) or that still has a non-terminal child."""
+    error = _orchestrator_only("close")
+    if error:
+        return error
+    if not (summary or "").strip():
+        return "Error: `summary` must be non-empty."
+    code, data = _call(
+        "POST", f"/api/tasks/{task_id}/close", body={"summary": summary.strip()}
+    )
+    return _render(code, data, action="close task")
 
 
 @mcp.tool(name="request_delivery")

@@ -510,7 +510,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     title TEXT NOT NULL,
     body TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL
-        CHECK (status IN ('triage', 'todo', 'ready', 'running', 'blocked', 'done')),
+        CHECK (status IN ('triage', 'todo', 'ready', 'running', 'blocked', 'done', 'cancelled')),
     assignee_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
     priority INTEGER NOT NULL DEFAULT 0,
     origin_session_id TEXT,
@@ -530,6 +530,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     ),
     blocked_reason TEXT,
     result_summary TEXT,
+    -- Review/acceptance gate (task-board-gaps.md §3.1): the worker's verdict
+    -- on a done task. NULL = no verdict recorded (legacy tasks, or task
+    -- kinds that don't gate anything) and is treated as passing; 'fail' on a
+    -- done task means it satisfies no downstream dependency, ever.
+    verdict TEXT CHECK (verdict IS NULL OR verdict IN ('pass', 'fail')),
     archived INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0, 1)),
     created_by_kind TEXT NOT NULL
         CHECK (created_by_kind IN ('user', 'agent', 'schedule', 'api')),
@@ -1171,6 +1176,8 @@ class Database:
             await self._backfill_builtin_mcp_servers(("tasks",))
             await self._conn.execute("PRAGMA user_version = 2")
 
+        await self._migrate_task_verdict_and_cancelled_status()
+
     async def _backfill_builtin_mcp_servers(self, names: tuple[str, ...]) -> None:
         cursor = await self._conn.execute("SELECT id, mcp_servers FROM agents")
         rows = list(await cursor.fetchall())
@@ -1329,6 +1336,120 @@ class Database:
               ON task_delivery_ops(delivery_id) WHERE state = 'running';
             CREATE INDEX IF NOT EXISTS task_delivery_ops_delivery
               ON task_delivery_ops(delivery_id, created_at);
+            """
+        )
+
+    async def _migrate_task_verdict_and_cancelled_status(self) -> None:
+        """Task Board gaps rectification (docs/plans/task-board-gaps.md §3.1,
+        §3.4): add ``tasks.verdict`` and widen ``tasks.status``'s CHECK to
+        admit ``cancelled`` as a first-class terminal state. SQLite cannot
+        ALTER a CHECK constraint, so a DB predating this migration needs the
+        table rebuilt; new DBs get both straight from ``_SCHEMA``.
+
+        Guarded on the new ``verdict`` column's presence so it runs exactly
+        once. The copy also folds every legacy
+        ``status='blocked' AND blocked_kind='cancelled'`` row (the old
+        ``cancel_task()`` terminal shape) into the new
+        ``status='cancelled', blocked_kind=NULL`` shape and backfills
+        ``completed_at`` for it — the one-time cancelled migration required
+        by §3.4. Every other row is copied byte-identical; the widened CHECK
+        only ADDS an allowed value, so the copy cannot lose or reject a row.
+
+        ``tasks`` is a parent of several ON DELETE CASCADE children
+        (task_dependencies, task_runs, task_comments, task_events,
+        task_artifacts, task_deliveries) and is self-referencing
+        (parent_task_id), unlike ``task_delivery_ops`` above which nothing
+        references. SQLite refuses to DROP a table that is the target of a
+        live foreign key while enforcement is on, so — unlike the rebuild
+        above — this one brackets the swap with foreign_keys OFF/ON. Both
+        toggles live INSIDE the executescript call (not as separate
+        `execute()`s around it): SQLite silently no-ops a `PRAGMA
+        foreign_keys` change while a transaction is pending, and prior
+        migrations earlier in `_apply_migrations` (e.g. `_migrate_agents`'s
+        INSERT/UPDATE) can leave one open. `executescript()` always issues an
+        implicit COMMIT before running its script, so the OFF toggle as the
+        script's first statement is guaranteed to land outside any
+        transaction.
+        """
+        if await self._has_column("tasks", "verdict"):
+            return
+        await self._conn.execute("DROP TABLE IF EXISTS tasks__new")
+        await self._conn.executescript(
+            """
+                PRAGMA foreign_keys=OFF;
+                CREATE TABLE tasks__new (
+                    id TEXT PRIMARY KEY,
+                    board_id TEXT NOT NULL REFERENCES task_boards(id) ON DELETE CASCADE,
+                    parent_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL
+                        CHECK (status IN ('triage', 'todo', 'ready', 'running',
+                                          'blocked', 'done', 'cancelled')),
+                    assignee_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+                    priority INTEGER NOT NULL DEFAULT 0,
+                    origin_session_id TEXT,
+                    idempotency_key TEXT,
+                    scheduled_at TEXT,
+                    workspace_mode TEXT
+                        CHECK (workspace_mode IS NULL OR workspace_mode IN
+                               ('shared', 'copy', 'git_worktree')),
+                    working_dir_override TEXT,
+                    model TEXT,
+                    current_run_id TEXT,
+                    blocked_kind TEXT CHECK (
+                        blocked_kind IS NULL OR blocked_kind IN
+                        ('input', 'capability', 'failure', 'protocol', 'cancelled', 'interrupted')
+                    ),
+                    blocked_reason TEXT,
+                    result_summary TEXT,
+                    -- Review/acceptance gate (task-board-gaps.md §3.1): the
+                    -- worker's verdict on a done task. NULL = no verdict
+                    -- recorded (legacy tasks, or task kinds that don't gate
+                    -- anything) and is treated as passing; 'fail' on a done
+                    -- task means it satisfies no downstream dependency, ever.
+                    verdict TEXT CHECK (verdict IS NULL OR verdict IN ('pass', 'fail')),
+                    archived INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0, 1)),
+                    created_by_kind TEXT NOT NULL
+                        CHECK (created_by_kind IN ('user', 'agent', 'schedule', 'api')),
+                    created_by_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    archived_at TEXT
+                );
+                INSERT INTO tasks__new
+                    (id, board_id, parent_task_id, title, body, status,
+                     assignee_agent_id, priority, origin_session_id, idempotency_key,
+                     scheduled_at, workspace_mode, working_dir_override, model,
+                     current_run_id, blocked_kind, blocked_reason, result_summary,
+                     verdict, archived, created_by_kind, created_by_agent_id,
+                     created_at, updated_at, completed_at, archived_at)
+                    SELECT
+                        id, board_id, parent_task_id, title, body,
+                        CASE WHEN status = 'blocked' AND blocked_kind = 'cancelled'
+                             THEN 'cancelled' ELSE status END,
+                        assignee_agent_id, priority, origin_session_id, idempotency_key,
+                        scheduled_at, workspace_mode, working_dir_override, model,
+                        current_run_id,
+                        CASE WHEN status = 'blocked' AND blocked_kind = 'cancelled'
+                             THEN NULL ELSE blocked_kind END,
+                        blocked_reason, result_summary, NULL, archived, created_by_kind,
+                        created_by_agent_id, created_at, updated_at,
+                        CASE WHEN status = 'blocked' AND blocked_kind = 'cancelled'
+                             THEN updated_at ELSE completed_at END,
+                        archived_at
+                    FROM tasks;
+                DROP TABLE tasks;
+                ALTER TABLE tasks__new RENAME TO tasks;
+                CREATE UNIQUE INDEX IF NOT EXISTS tasks_board_idempotency
+                  ON tasks(board_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS tasks_dispatch
+                  ON tasks(board_id, archived, status, priority DESC, created_at);
+                CREATE INDEX IF NOT EXISTS tasks_assignee
+                  ON tasks(assignee_agent_id, archived, status);
+                CREATE INDEX IF NOT EXISTS tasks_parent ON tasks(parent_task_id);
+                PRAGMA foreign_keys=ON;
             """
         )
 

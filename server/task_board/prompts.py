@@ -30,6 +30,15 @@ Rules:
    acceptance are all flat children of that SAME root, not nested under the
    previous round's task. Only `task_dependencies` (the `dependencies` param)
    expresses "must finish before" — set it explicitly where order matters.
+9. If your job is to review or accept someone else's work, `complete` it
+   with `verdict="pass"` or `verdict="fail"` — never a bare summary. A
+   dependent task only unblocks on a `done` task whose verdict is not
+   `"fail"`; prose alone never gates anything.
+10. Finding that upstream work — or your own — does not pass is reported,
+    not fixed by you spawning new work. `complete(verdict="fail")` or
+    `block` and stop. Opening a fix/follow-up task in response is the
+    orchestrator's or user's call, never the worker's; creating one anyway
+    produces duplicate, uncoordinated cards.
 """
 
 

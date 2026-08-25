@@ -233,6 +233,31 @@ async def test_worker_complete_captures_artifact_and_enqueues_origin(task_runtim
 
 
 @pytest.mark.asyncio
+async def test_cancel_running_task_reaches_terminal_cancelled_in_one_call(task_runtime):
+    """task-board-gaps.md §3.4: cancelling a RUNNING task stops the run
+    (which lands it in `blocked`) and finishes the SAME cancel request
+    through to the terminal `cancelled` status — one user action, not a
+    second click needed once it's blocked. Chaining this is what keeps a
+    cancel-while-running from reproducing the "looks blocked, is actually
+    long since cancelled" card the §3.4 migration is cleaning up."""
+    db, repo, sessions, manager, root = task_runtime
+    _board, task, _ = await _ready_task(db, repo, sessions, root)
+    sessions.start_message = AsyncMock()
+    await manager._dispatch_task(task)
+    running = await repo.get_task(task.id)
+    assert running.status == "running"
+
+    result = await manager.cancel_task(task.id, reason="no longer needed")
+
+    assert result["status"] == "cancelled"
+    final = await repo.get_task(task.id)
+    assert final.status == "cancelled"
+    assert final.blocked_kind is None
+    run = (await repo.list_runs(task.id))[0]
+    assert run.state == "cancelled"
+
+
+@pytest.mark.asyncio
 async def test_restart_interrupts_run_notifies_origin_and_archives_worker(task_runtime):
     db, repo, sessions, manager, root = task_runtime
     _board, task, origin = await _ready_task(db, repo, sessions, root, origin=True)

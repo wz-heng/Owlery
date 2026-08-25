@@ -538,6 +538,7 @@ class TaskBoardManager:
         summary: str,
         metadata: Mapping[str, Any] | None = None,
         artifacts: list[dict[str, str]] | None = None,
+        verdict: str | None = None,
     ) -> dict[str, Any]:
         task, run = await self._validate_worker(task_id, run_id, session_id)
         # Preserve prep metadata (the git base branch/commit) under the worker's
@@ -560,6 +561,7 @@ class TaskBoardManager:
                 metadata=terminal_metadata,
                 artifacts=[asdict(item) for item in captured],
                 actor_agent_id=run.agent_id,
+                verdict=verdict,
             )
         except Exception:
             await discard_captured_artifacts(captured)
@@ -650,11 +652,20 @@ class TaskBoardManager:
     async def cancel_task(self, task_id: str, reason: str = "cancelled") -> dict[str, Any]:
         task = await self.repo.get_task(task_id)
         if task.status == "running" and task.current_run_id:
+            # cancelled is a terminal status, not a run outcome (task-board-gaps.md
+            # §3.4) — a running task cannot jump straight to it, so stop the run
+            # first (lands the task in `blocked`), then finish the SAME cancel
+            # request through to `cancelled` in this one call. Chaining both here
+            # (rather than requiring a second user click once it's blocked) is what
+            # keeps a cancel-while-running from re-creating the exact "looks
+            # blocked, is actually long since cancelled" card the migration in
+            # §3.4 is cleaning up.
             run = await self.repo.get_run(task.current_run_id)
             task, final = await self.repo.cancel_run(task_id, run.id, reason=reason)
             await self._notify_terminal(task, final)
             if run.session_id and self.session_mgr is not None:
                 await self.session_mgr.interrupt(run.session_id)
+            task = await self.repo.cancel_task(task_id, reason=reason)
         else:
             task = await self.repo.cancel_task(task_id, reason=reason)
         await self.publish_task_update(task_id)

@@ -11,13 +11,19 @@ from dataclasses import asdict, dataclass
 from typing import Any, Mapping
 
 
-TASK_STATUSES = frozenset({"triage", "todo", "ready", "running", "blocked", "done"})
+TASK_STATUSES = frozenset(
+    {"triage", "todo", "ready", "running", "blocked", "done", "cancelled"}
+)
 RUN_STATES = frozenset(
     {"running", "completed", "blocked", "failed", "cancelled", "interrupted"}
 )
 BLOCKED_KINDS = frozenset(
     {"input", "capability", "failure", "protocol", "cancelled", "interrupted"}
 )
+# A worker's review/acceptance gate on a `complete` (task-board-gaps.md §3.1).
+# NULL means no verdict recorded — legacy tasks and task kinds that don't
+# gate anything — and is treated as passing by dependency eligibility.
+VERDICT_KINDS = frozenset({"pass", "fail"})
 WORKSPACE_MODES = frozenset({"shared", "copy", "git_worktree"})
 ACTOR_KINDS = frozenset({"user", "agent", "schedule", "api", "system"})
 
@@ -192,6 +198,9 @@ class TaskRecord(Record):
     blocked_kind: str | None
     blocked_reason: str | None
     result_summary: str | None
+    # The worker's verdict on a `done` task (task-board-gaps.md §3.1):
+    # None | 'pass' | 'fail'. Only ever set alongside status='done'.
+    verdict: str | None
     archived: bool
     created_by_kind: str
     created_by_agent_id: str | None
