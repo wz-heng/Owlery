@@ -422,9 +422,16 @@ async def test_interrupted_pr_reconcile_reads_never_creates(store):
 
     coord.find_pr = fake_find
     coord.create_pr = fake_create
-    reconciled = await coord.reconcile_interrupted_pr(await repo.get_delivery(d.id))
+    reconciled, settle_op_id = await coord.reconcile_interrupted_pr(await repo.get_delivery(d.id))
     assert reconciled.status == "delivered" and reconciled.pr_number == 7
     assert created["count"] == 0
+    # The reconcile settles the interrupted op itself, not just the delivery
+    # row — so a later terminal-notification lookup finds a genuine succeeded
+    # event instead of treating this as having no settle at all.
+    assert settle_op_id == op.id
+    settled_ops = await repo.list_delivery_ops(d.id)
+    (settled_pr_op,) = [o for o in settled_ops if o.kind == "pull_request"]
+    assert settled_pr_op.state == "succeeded"
 
 
 @pytest.mark.asyncio
@@ -1170,6 +1177,33 @@ async def test_pull_request_idempotency_guard_skips_repost_when_pr_number_alread
     # The guard only refuses the re-POST; correcting the stale `blocked`
     # status itself is the boot self-heal's job (§4), not this call's.
     assert result.status == "blocked"
+
+
+@pytest.mark.asyncio
+async def test_pull_request_pr_number_guard_skips_the_pushed_ref_precondition_too(store):
+    """§3/should-2: `pr_number` already set means a PURE read of the existing
+    result — it must short-circuit BEFORE `_op_pr` even checks its normal
+    preconditions (a recorded push, a GitHub remote, a resolvable connector),
+    not just before the create-PR call. A row missing `pushed_ref`/
+    `remote_url` entirely (never possible for a delivery that genuinely went
+    through push) still must not raise, proving the guard is a top-of-function
+    short-circuit and not merely "skip the network call"."""
+    db, repo, tmp, agent = store
+    board, task, run, src, wt = await _ready_delivery(db, repo, tmp, agent)
+    coord = _coord(db, repo, FakeConnectors({}))  # no connector at all
+    await coord.accept(task.id, run.id)
+    await repo.conn.execute(
+        "UPDATE task_deliveries SET status='blocked', pr_number=7, "
+        "pr_url='https://github.com/acme/widgets/pull/7', pr_state='open', "
+        "reason_kind='op_failed', reason_detail='stale' WHERE run_id=?",
+        (run.id,),
+    )
+    await repo.conn.commit()
+    delivery = await repo.get_delivery_by_run(run.id)
+    assert delivery.pushed_ref is None and delivery.remote_url is None
+
+    result = await coord.deliver_op(task.id, run.id, kind="pull_request")
+    assert result.pr_number == 7 and result.status == "blocked"
 
 
 def _github_create_pr_fake_client(status_code: int, text: str):

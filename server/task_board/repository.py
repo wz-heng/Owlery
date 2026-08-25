@@ -3232,11 +3232,18 @@ class TaskRepository:
         return self._delivery_record(delivery), self._delivery_op_record(op)
 
     async def record_pr_reconcile(
-        self, delivery_id: str, *, pr_number: int | None, pr_url: str | None, pr_state: str | None
+        self, delivery_id: str, *, op_id: str,
+        pr_number: int | None, pr_url: str | None, pr_state: str | None,
     ) -> DeliveryRecord:
         """Fold an already-existing PR (found by a read-only reconcile) into a
         blocked(interrupted) delivery, settling it delivered — never a re-POST
-        (§16, S3)."""
+        (§16, S3). Also flips the interrupted `pull_request` op row itself
+        `succeeded` (it cannot go through `finish_op`'s running-only CAS, since
+        boot recovery already moved it to `interrupted`): the op ledger must
+        show this settle genuinely happened, so a caller deriving the settle
+        event from the op ledger later (`current_terminal_settle_op_id`) finds
+        this real succeeded op instead of treating the reconcile as having no
+        event at all (open-pr-500.md §4 should-1)."""
         stamp = _now_iso()
         async with self._transaction() as conn:
             row = await self._delivery_row(conn, delivery_id)
@@ -3246,6 +3253,14 @@ class TaskRepository:
                 and row["pr_number"] is None
             ):
                 return self._delivery_record(row)
+            await conn.execute(
+                "UPDATE task_delivery_ops SET state='succeeded', result=?, finished_at=? "
+                "WHERE id=? AND delivery_id=? AND state='interrupted'",
+                (
+                    _json_object({"number": pr_number, "url": pr_url, "state": pr_state}),
+                    stamp, op_id, delivery_id,
+                ),
+            )
             await conn.execute(
                 "UPDATE task_deliveries SET pr_number=?, pr_url=?, pr_state=?, "
                 "status='delivered', reason_kind=NULL, reason_detail=NULL, updated_at=? "

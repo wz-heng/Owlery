@@ -431,6 +431,110 @@ async def test_delivery_recovery_self_heals_blocked_delivery_with_pr(task_runtim
 
 
 @pytest.mark.asyncio
+async def test_delivery_recovery_notifies_under_the_op_scoped_key(task_runtime):
+    """open-pr-500.md §4 blocker-1 test gap: the existing recovery fixtures
+    only exercise op-less accept/baseline terminal deliveries, which happen
+    to sidestep the op-scoped key path entirely. A delivery that reached
+    `delivered` through a real push-then-PR settle must be notified, on boot
+    recovery, under the PR op's own scoped key — never the old unscoped key,
+    never the push op's key, and never re-fired under a second key on a
+    repeat recovery pass."""
+    db, repo, sessions, manager, root = task_runtime
+    task, run, origin, delivery = await _terminal_delivery(db, repo, sessions, root)
+
+    push_op = await repo.plan_op(
+        delivery.id, kind="push",
+        source_key=f"task:{task.id}:run:{run.id}:delivery:push", actor_kind="user",
+    )
+    await repo.start_op(delivery.id, push_op.id)
+    await repo.finish_op(
+        delivery.id, push_op.id, state="succeeded", delivery_status="delivered",
+        delivery_fields={"pushed_ref": "refs/heads/x", "remote_name": "origin"},
+        result={"remote_sha": "a" * 40},
+    )
+    pr_op = await repo.plan_op(
+        delivery.id, kind="pull_request",
+        source_key=f"task:{task.id}:run:{run.id}:delivery:pull_request", actor_kind="user",
+    )
+    await repo.start_op(delivery.id, pr_op.id, allowed_statuses=frozenset({"delivered"}))
+    await repo.finish_op(
+        delivery.id, pr_op.id, state="succeeded", delivery_status="delivered",
+        delivery_fields={
+            "pr_number": 42, "pr_url": "https://github.com/acme/widgets/pull/42",
+            "pr_state": "open",
+        },
+        result={"number": 42},
+    )
+
+    await manager.recover_deliveries()
+
+    pr_key = f"task:{task.id}:run:{run.id}:delivery:terminal:{pr_op.id}"
+    push_key = f"task:{task.id}:run:{run.id}:delivery:terminal:{push_op.id}"
+    unscoped_key = f"task:{task.id}:run:{run.id}:delivery:terminal"
+    pr_injection = await db.get_session_injection_by_source(pr_key)
+    assert pr_injection is not None
+    assert pr_injection["session_id"] == origin.id
+    assert "PR #42" in pr_injection["prompt"]
+    assert await db.get_session_injection_by_source(push_key) is None
+    assert await db.get_session_injection_by_source(unscoped_key) is None
+
+    await manager.recover_deliveries()
+    assert (await db.get_session_injection_by_source(pr_key))["id"] == pr_injection["id"]
+
+
+@pytest.mark.asyncio
+async def test_delivery_recovery_self_heal_attributes_to_the_succeeded_op_not_a_later_failed_retry(
+    task_runtime,
+):
+    """open-pr-500.md §4 should-1: the self-heal repairs a delivery that a
+    later, unrelated FAILED retry (the GitHub-422 retry that used to clobber
+    an already-delivered row back to `blocked`) knocked off `delivered`. Its
+    terminal notification must attribute to the earlier op that genuinely
+    produced the `delivered` outcome, never to that later failed retry —
+    the "last op by time" is the wrong op here; the "last op whose state
+    matches the current status" is the right one."""
+    db, repo, sessions, manager, root = task_runtime
+    task, run, origin, delivery = await _terminal_delivery(db, repo, sessions, root)
+
+    pr_op = await repo.plan_op(
+        delivery.id, kind="pull_request",
+        source_key=f"task:{task.id}:run:{run.id}:delivery:pull_request", actor_kind="user",
+    )
+    await repo.start_op(delivery.id, pr_op.id)
+    await repo.finish_op(
+        delivery.id, pr_op.id, state="succeeded", delivery_status="delivered",
+        delivery_fields={
+            "pr_number": 9, "pr_url": "https://github.com/acme/widgets/pull/9",
+            "pr_state": "open",
+        },
+        result={"number": 9},
+    )
+    retry_op = await repo.plan_op(
+        delivery.id, kind="pull_request",
+        source_key=f"task:{task.id}:run:{run.id}:delivery:pull_request:retry:1",
+        actor_kind="user",
+    )
+    await repo.start_op(delivery.id, retry_op.id, allowed_statuses=frozenset({"delivered"}))
+    await repo.finish_op(
+        delivery.id, retry_op.id, state="failed",
+        error="GitHub PR creation failed (422): already exists",
+        delivery_status="blocked", reason_kind="op_failed",
+        reason_detail="GitHub PR creation failed (422): already exists",
+    )
+    corrupted = await repo.get_delivery(delivery.id)
+    assert corrupted.status == "blocked" and corrupted.pr_number == 9
+
+    await manager.recover_deliveries()
+
+    healed = await repo.get_delivery(delivery.id)
+    assert healed.status == "delivered" and healed.pr_number == 9
+    good_key = f"task:{task.id}:run:{run.id}:delivery:terminal:{pr_op.id}"
+    bad_key = f"task:{task.id}:run:{run.id}:delivery:terminal:{retry_op.id}"
+    assert await db.get_session_injection_by_source(good_key) is not None
+    assert await db.get_session_injection_by_source(bad_key) is None
+
+
+@pytest.mark.asyncio
 async def test_list_release_deployments_and_current_release_pass_through(task_runtime):
     """The Releases panel (task-board-overhaul.md §3.2) needs a paginated
     history page AND the current live/staged rows independent of that page

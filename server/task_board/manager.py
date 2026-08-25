@@ -898,14 +898,6 @@ class TaskBoardManager:
         await self.publish_board_update(board_id)
         return release, op
 
-    # Op kinds that can fold a result into `task_deliveries.status` (§4) — the
-    # only ops whose settle is a genuine terminal-status EVENT. `branch_delete`/
-    # `worktree_remove`/`deploy_stage`/`deploy_switch` never touch
-    # `delivery_status`, so a teardown settling after a delivery is already
-    # terminal must never be mistaken for a new one (task-board-gaps
-    # open-pr-500.md §1).
-    _DELIVERY_TERMINAL_OP_KINDS = frozenset({"commit", "push", "pull_request", "merge"})
-
     @staticmethod
     def _delivery_terminal_source(
         task_id: str, run_id: str, settle_op_id: str | None = None
@@ -913,29 +905,8 @@ class TaskBoardManager:
         base = f"task:{task_id}:run:{run_id}:delivery:terminal"
         return f"{base}:{settle_op_id}" if settle_op_id else base
 
-    async def _latest_delivery_settle_op_id(self, delivery_id: str) -> str | None:
-        """The id of the goal op whose settle produced the delivery's CURRENT
-        terminal status — the idempotency key's per-event discriminator
-        (open-pr-500.md §1). A push settling `delivered` and a later PR settling
-        the SAME delivery `delivered` are two distinct events with two distinct
-        op rows, so they must never share one notification source_key (that
-        collision, with a payload that changed underneath it, is exactly what
-        turned an already-successful PR op into a 500). ``None`` when the
-        delivery reached its terminal status via `accept()`'s baseline capture
-        (no op ledger row exists for that settle)."""
-        ops = await self.repo.list_delivery_ops(delivery_id)
-        candidates = [
-            op for op in ops
-            if op.kind in self._DELIVERY_TERMINAL_OP_KINDS
-            and op.state in {"succeeded", "failed"}
-        ]
-        if not candidates:
-            return None
-        candidates.sort(key=lambda op: (op.finished_at or op.created_at, op.id))
-        return candidates[-1].id
-
     async def _notify_delivery_terminal(
-        self, task: TaskRecord, delivery: DeliveryRecord
+        self, task: TaskRecord, delivery: DeliveryRecord, settle_op_id: str | None = None
     ) -> None:
         if not task.origin_session_id or self.session_mgr is None or self.db is None:
             return
@@ -961,7 +932,6 @@ class TaskBoardManager:
             "Inspect the Task Board delivery panel before any follow-up. Never "
             "automatically retry interrupted external Git/PR work."
         )
-        settle_op_id = await self._latest_delivery_settle_op_id(delivery.id)
         await self.session_mgr.enqueue_session_injection(
             source_key=self._delivery_terminal_source(
                 task.id, delivery.run_id, settle_op_id
@@ -1027,18 +997,35 @@ class TaskBoardManager:
         if self.session_mgr is None or self.db is None:
             return
         # B2: reconstruct the terminal-delivery outbox source for live origins.
+        # The existence check must use the SAME key the live notify path would
+        # use (the settle event's own op-scoped key), not the old unscoped key
+        # — otherwise a stale unscoped row from a prior event wrongly skips a
+        # still-missing op-scoped notification, or a fresh unscoped enqueue
+        # duplicates one already sent under its op-scoped key (open-pr-500.md
+        # §4 blocker-2). Isolated per-delivery: one bad row must not abort the
+        # rest of this boot pass.
         for task, delivery in await self.repo.list_terminal_deliveries():
             if not task.origin_session_id:
                 continue
-            source_key = self._delivery_terminal_source(task.id, delivery.run_id)
-            if await self.db.get_session_injection_by_source(source_key):
-                continue
-            if not await self.db.session_exists(task.origin_session_id):
-                await self.repo.record_delivery_notification_unavailable(
-                    delivery.id, reason="origin session was deleted"
+            try:
+                settle_op_id = await self.delivery.current_terminal_settle_op_id(delivery.id)
+                source_key = self._delivery_terminal_source(
+                    task.id, delivery.run_id, settle_op_id
                 )
-                continue
-            await self._notify_delivery_terminal(task, delivery)
+                if await self.db.get_session_injection_by_source(source_key):
+                    continue
+                if not await self.db.session_exists(task.origin_session_id):
+                    await self.repo.record_delivery_notification_unavailable(
+                        delivery.id, reason="origin session was deleted"
+                    )
+                    continue
+                await self._notify_delivery_terminal(task, delivery, settle_op_id)
+            except Exception:
+                logger.exception(
+                    "boot delivery-notification reconstruction failed for delivery "
+                    "%s (task %s); continuing with the remaining deliveries",
+                    delivery.id, task.id,
+                )
         return probation
 
     # --- deploy_switch boot reconciliation + probation (§7.5/§8) ---------
@@ -1359,9 +1346,9 @@ class TaskBoardManager:
                     and delivery.pr_number is None
                 ):
                     continue
-                updated = await self.delivery.reconcile_interrupted_pr(delivery)
+                updated, settle_op_id = await self.delivery.reconcile_interrupted_pr(delivery)
                 if updated.status != delivery.status:
-                    await self._notify_delivery_terminal(task, updated)
+                    await self._notify_delivery_terminal(task, updated, settle_op_id)
                     await self.publish_task_update(task.id)
         except Exception:
             logger.exception("interrupted-PR reconcile pass failed")
