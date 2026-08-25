@@ -15,8 +15,10 @@ import pytest
 from server.config import settings
 from server.database import Database
 from server.deploy_admission import DeployAdmissionGate
+from server.session_manager import SessionManager
 from server.task_board import delivery as delivery_module
 from server.task_board.delivery import DeliveryCoordinator
+from server.task_board.manager import TaskBoardManager
 from server.task_board.models import DeliveryConfirmationRequired, TaskConflictError
 from server.task_board.repository import TaskRepository
 from server.task_board.workspaces import prepare_workspace
@@ -71,7 +73,7 @@ def _init_repo(path: Path) -> str:
     return path.name
 
 
-async def _ready_delivery(db, repo, tmp, agent, *, worker_commits=True):
+async def _ready_delivery(db, repo, tmp, agent, *, worker_commits=True, origin_session_id=None):
     src = tmp / "src"
     _init_repo(src)
     board = await repo.create_board(
@@ -80,7 +82,8 @@ async def _ready_delivery(db, repo, tmp, agent, *, worker_commits=True):
         default_workspace_mode="git_worktree",
     )
     task = await repo.create_task(
-        board_id=board.id, title="Ship it", status="todo", assignee_agent_id=agent
+        board_id=board.id, title="Ship it", status="todo", assignee_agent_id=agent,
+        origin_session_id=origin_session_id,
     )
     run_id = uuid.uuid4().hex[:12]
     planned = str((Path(settings.resolved_task_workspaces_dir) / task.id / run_id))
@@ -106,6 +109,28 @@ def _coord(db, repo, connectors):
     c = DeliveryCoordinator()
     c.bind(db=db, connectors=connectors, notify_terminal=None, repo=repo)
     return c
+
+
+@pytest.fixture
+async def bound_manager(store):
+    """A DeliveryCoordinator wired exactly like production — through
+    `TaskBoardManager.bind` — so the real terminal-notification pipeline
+    (source-key derivation, bypass isolation) is exercised end to end, not a
+    `notify_terminal=None` stub (task-board-gaps open-pr-500.md)."""
+    db, repo, tmp, agent = store
+    sessions = SessionManager()
+    await sessions.initialize(db)
+    sessions.pause_session_injection_dispatch()
+    manager = TaskBoardManager()
+    # A fresh coordinator, never the process-wide `delivery_coordinator`
+    # singleton `TaskBoardManager.__init__` defaults to — this test mutates
+    # `create_pr`/`find_pr` test seams and must not leak them across tests.
+    manager.delivery = DeliveryCoordinator()
+    manager.bind(session_mgr=sessions, db=db, repo=repo)
+    try:
+        yield manager, sessions
+    finally:
+        sessions.remove_broadcast(manager.BROADCAST_KEY)
 
 
 def _bind_admission(coord: DeliveryCoordinator, gate: DeployAdmissionGate) -> None:
@@ -960,3 +985,285 @@ async def test_supersession_reverts_to_null_when_ancestry_breaks(store):
     await coord.recompute_supersession(task_b.id, run_b.id)
     reconciled_a = await coord.recompute_supersession(task_a.id, run_a.id)
     assert reconciled_a.superseded_by_delivery_id is None
+
+
+# --- Open-PR-500 regression coverage (task-board-gaps open-pr-500.md) -------
+#
+# Forensics: push settling `delivered` fires a terminal notification under a
+# source_key fixed per task+run; PR settling the SAME delivery `delivered`
+# reused that identical key with a different payload, so the injection
+# layer's replay guard raised — and, uncaught past the router, turned an
+# already-successful PR op into a bare 500. The four tests below cover the
+# ticket's four required fixes: a settle-scoped idempotency key (so two real
+# events never share one key), bypass isolation (a notify failure never fails
+# the op), an `_op_pr` idempotency guard + 422-already-exists reconcile, and
+# the boot self-heal for the two rows that shape of bug had already corrupted.
+
+
+@pytest.mark.asyncio
+async def test_push_then_pr_terminal_notifications_both_land_no_500(bound_manager, store):
+    """The root-cause repro: push settles `delivered`, then PR settles the
+    SAME delivery `delivered` again with different content. Both must reach
+    the origin session as distinct messages — neither call may raise."""
+    manager, sessions = bound_manager
+    db, repo, tmp, agent = store
+    origin = await sessions.create_session(agent, name="origin")
+    board, task, run, src, wt = await _ready_delivery(
+        db, repo, tmp, agent, origin_session_id=origin.id
+    )
+    bare = tmp / "remote.git"
+    _git(tmp, "init", "-q", "--bare", str(bare))
+    _git(src, "remote", "add", "origin", str(bare))
+    manager.delivery.connectors = FakeConnectors({agent: [("gh1", "github", False)]})
+
+    async def fake_create_pr(token, owner, r, *, title, body, head, base, draft):
+        return {"number": 42, "url": "https://github.com/acme/widgets/pull/42", "state": "open"}
+
+    manager.delivery.create_pr = fake_create_pr
+
+    await manager.delivery.accept(task.id, run.id)
+    pushed = await manager.delivery.deliver_op(task.id, run.id, kind="push")
+    assert pushed.status == "delivered"
+
+    # `push_branch` against a bare local remote leaves a non-GitHub
+    # `remote_url`; force it GitHub-shaped the way the PR op requires (same
+    # as the other PR tests in this file — no real network involved).
+    await repo.conn.execute(
+        "UPDATE task_deliveries SET remote_url='https://github.com/acme/widgets.git' WHERE id=?",
+        (pushed.id,),
+    )
+    await repo.conn.commit()
+
+    opened = await manager.delivery.deliver_op(task.id, run.id, kind="pull_request")
+    assert opened.status == "delivered" and opened.pr_number == 42
+
+    ops = await repo.list_delivery_ops(opened.id)
+    push_op = next(o for o in ops if o.kind == "push" and o.state == "succeeded")
+    pr_op = next(o for o in ops if o.kind == "pull_request" and o.state == "succeeded")
+    assert push_op.id != pr_op.id
+
+    push_key = f"task:{task.id}:run:{run.id}:delivery:terminal:{push_op.id}"
+    pr_key = f"task:{task.id}:run:{run.id}:delivery:terminal:{pr_op.id}"
+    push_injection = await db.get_session_injection_by_source(push_key)
+    pr_injection = await db.get_session_injection_by_source(pr_key)
+    assert push_injection is not None and pr_injection is not None
+    assert push_injection["id"] != pr_injection["id"]
+    assert "PR #42" not in push_injection["prompt"]
+    assert "PR #42" in pr_injection["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_notify_terminal_exception_does_not_fail_the_delivery_op(store):
+    """Bypass isolation: a delivery op that already settled durably must
+    return normally even if the terminal-notification layer raises for any
+    reason at all — the notification is best-effort, the op is not."""
+    db, repo, tmp, agent = store
+    board, task, run, src, wt = await _ready_delivery(db, repo, tmp, agent)
+    bare = tmp / "remote.git"
+    _git(tmp, "init", "-q", "--bare", str(bare))
+    _git(src, "remote", "add", "origin", str(bare))
+
+    async def boom(task, delivery):
+        raise ValueError("simulated idempotency-key collision")
+
+    coord = DeliveryCoordinator()
+    coord.bind(db=db, connectors=FakeConnectors({}), notify_terminal=boom, repo=repo)
+    await coord.accept(task.id, run.id)
+    result = await coord.deliver_op(task.id, run.id, kind="push")
+    assert result.status == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_pull_request_422_already_exists_reconciles_instead_of_failing(store):
+    db, repo, tmp, agent = store
+    board, task, run, src, wt = await _ready_delivery(db, repo, tmp, agent)
+    connectors = FakeConnectors({agent: [("gh1", "github", False)]})
+    coord = _coord(db, repo, connectors)
+    await coord.accept(task.id, run.id)
+    await repo.conn.execute(
+        "UPDATE task_deliveries SET status='delivered', pushed_ref='refs/heads/x', "
+        "remote_url='https://github.com/acme/widgets.git' WHERE run_id=?",
+        (run.id,),
+    )
+    await repo.conn.commit()
+
+    async def fake_create_pr_422(token, owner, r, *, title, body, head, base, draft):
+        raise delivery_module.PullRequestAlreadyExistsError(
+            "GitHub PR creation failed (422): "
+            '{"message":"Validation Failed","errors":[{"message":'
+            '"A pull request already exists for acme:owlery/task-delivery-run."}]}'
+        )
+
+    async def fake_find(token, owner, r, *, head_owner, branch):
+        return {"number": 99, "url": "https://github.com/acme/widgets/pull/99", "state": "open"}
+
+    coord.create_pr = fake_create_pr_422
+    coord.find_pr = fake_find
+    d = await coord.deliver_op(task.id, run.id, kind="pull_request")
+    assert d.status == "delivered"
+    assert d.pr_number == 99 and d.pr_url == "https://github.com/acme/widgets/pull/99"
+    ops = await repo.list_delivery_ops(d.id)
+    pr_op = next(o for o in ops if o.kind == "pull_request")
+    assert pr_op.state == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_pull_request_422_already_exists_without_a_findable_pr_blocks(store):
+    """If GitHub insists a PR already exists but the read-only reconcile can't
+    find one, this must settle a normal `blocked(op_failed)` — never crash,
+    never silently drop the op."""
+    db, repo, tmp, agent = store
+    board, task, run, src, wt = await _ready_delivery(db, repo, tmp, agent)
+    connectors = FakeConnectors({agent: [("gh1", "github", False)]})
+    coord = _coord(db, repo, connectors)
+    await coord.accept(task.id, run.id)
+    await repo.conn.execute(
+        "UPDATE task_deliveries SET status='delivered', pushed_ref='refs/heads/x', "
+        "remote_url='https://github.com/acme/widgets.git' WHERE run_id=?",
+        (run.id,),
+    )
+    await repo.conn.commit()
+
+    async def fake_create_pr_422(token, owner, r, *, title, body, head, base, draft):
+        raise delivery_module.PullRequestAlreadyExistsError("GitHub PR creation failed (422): already exists")
+
+    async def fake_find_none(token, owner, r, *, head_owner, branch):
+        return None
+
+    coord.create_pr = fake_create_pr_422
+    coord.find_pr = fake_find_none
+    d = await coord.deliver_op(task.id, run.id, kind="pull_request")
+    assert d.status == "blocked" and d.reason_kind == "op_failed"
+    assert d.pr_number is None
+
+
+@pytest.mark.asyncio
+async def test_pull_request_idempotency_guard_skips_repost_when_pr_number_already_set(store):
+    """§3's first half: a delivery with `pr_number` already recorded must
+    never re-POST, even if its `status` was left corrupted (e.g. `blocked`)
+    by an unrelated failure on top of that success — the exact corruption
+    shape the §4 boot self-heal repairs."""
+    db, repo, tmp, agent = store
+    board, task, run, src, wt = await _ready_delivery(db, repo, tmp, agent)
+    connectors = FakeConnectors({agent: [("gh1", "github", False)]})
+    coord = _coord(db, repo, connectors)
+    await coord.accept(task.id, run.id)
+    await repo.conn.execute(
+        "UPDATE task_deliveries SET status='blocked', pushed_ref='refs/heads/x', "
+        "remote_url='https://github.com/acme/widgets.git', pr_number=7, "
+        "pr_url='https://github.com/acme/widgets/pull/7', pr_state='open', "
+        "reason_kind='op_failed', reason_detail='stale' WHERE run_id=?",
+        (run.id,),
+    )
+    await repo.conn.commit()
+
+    called = {"n": 0}
+
+    async def fail_if_called(*a, **k):
+        called["n"] += 1
+        raise AssertionError("must never re-POST when pr_number is already set")
+
+    coord.create_pr = fail_if_called
+    result = await coord.deliver_op(task.id, run.id, kind="pull_request")
+    assert called["n"] == 0
+    assert result.pr_number == 7
+    # The guard only refuses the re-POST; correcting the stale `blocked`
+    # status itself is the boot self-heal's job (§4), not this call's.
+    assert result.status == "blocked"
+
+
+def _github_create_pr_fake_client(status_code: int, text: str):
+    class _FakeResponse:
+        def __init__(self):
+            self.status_code = status_code
+            self.text = text
+
+        def json(self):
+            return {}
+
+    class _FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, *, headers=None, json=None):
+            return _FakeResponse()
+
+    return _FakeClient
+
+
+@pytest.mark.asyncio
+async def test_github_create_pr_classifies_422_already_exists(monkeypatch):
+    body = (
+        '{"message":"Validation Failed","errors":[{"resource":"PullRequest",'
+        '"message":"A pull request already exists for acme:widgets-branch."}]}'
+    )
+    monkeypatch.setattr(
+        delivery_module.httpx, "AsyncClient", _github_create_pr_fake_client(422, body)
+    )
+    with pytest.raises(delivery_module.PullRequestAlreadyExistsError):
+        await delivery_module._github_create_pr(
+            "tok", "acme", "widgets", title="t", body="b", head="h", base="main", draft=False,
+        )
+
+
+@pytest.mark.asyncio
+async def test_github_create_pr_other_422_stays_a_generic_failure(monkeypatch):
+    body = '{"message":"Validation Failed","errors":[{"message":"No commits between main and h."}]}'
+    monkeypatch.setattr(
+        delivery_module.httpx, "AsyncClient", _github_create_pr_fake_client(422, body)
+    )
+    with pytest.raises(delivery_module.ws.WorkspaceError) as exc_info:
+        await delivery_module._github_create_pr(
+            "tok", "acme", "widgets", title="t", body="b", head="h", base="main", draft=False,
+        )
+    assert not isinstance(exc_info.value, delivery_module.PullRequestAlreadyExistsError)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_blocked_deliveries_with_pr_self_heals(store):
+    """§4: a delivery stuck `blocked` despite already carrying a `pr_number`
+    is definitionally wrong — self-heal it to `delivered` unconditionally and
+    idempotently. A genuinely blocked delivery with no PR is left untouched."""
+    db, repo, tmp, agent = store
+    board, task, run, src, wt = await _ready_delivery(db, repo, tmp / "d1", agent)
+    coord = _coord(db, repo, FakeConnectors({}))
+    await coord.accept(task.id, run.id)
+    corrupted = await repo.get_delivery_by_run(run.id)
+    await repo.conn.execute(
+        "UPDATE task_deliveries SET status='blocked', pushed_ref='refs/heads/x', "
+        "pr_number=9, pr_url='https://github.com/acme/widgets/pull/9', pr_state='open', "
+        "reason_kind='op_failed', "
+        "reason_detail='GitHub PR creation failed (422): already exists' WHERE id=?",
+        (corrupted.id,),
+    )
+    await repo.conn.commit()
+
+    board2, task2, run2, src2, wt2 = await _ready_delivery(db, repo, tmp / "d2", agent)
+    coord2 = _coord(db, repo, FakeConnectors({}))
+    await coord2.accept(task2.id, run2.id)
+    genuinely_blocked = await repo.get_delivery_by_run(run2.id)
+    await repo.conn.execute(
+        "UPDATE task_deliveries SET status='blocked', reason_kind='no_connector', "
+        "reason_detail='the run''s Agent has no live GitHub connector' WHERE id=?",
+        (genuinely_blocked.id,),
+    )
+    await repo.conn.commit()
+
+    fixed = await repo.reconcile_blocked_deliveries_with_pr()
+    assert [f.id for f in fixed] == [corrupted.id]
+    reconciled = await repo.get_delivery(corrupted.id)
+    assert reconciled.status == "delivered"
+    assert reconciled.reason_kind is None and reconciled.reason_detail is None
+    assert reconciled.pr_number == 9
+
+    still_blocked = await repo.get_delivery(genuinely_blocked.id)
+    assert still_blocked.status == "blocked" and still_blocked.reason_kind == "no_connector"
+
+    # Idempotent: nothing left to fix on a second pass.
+    assert await repo.reconcile_blocked_deliveries_with_pr() == []

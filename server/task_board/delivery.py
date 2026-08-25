@@ -113,6 +113,12 @@ class _ReleaseSwitchCtx:
 
 
 
+class PullRequestAlreadyExistsError(ws.WorkspaceError):
+    """GitHub 422'd a PR create because one already exists for this head branch —
+    the caller must reconcile (read the existing PR) rather than record a bare
+    op_failed (task-board-gaps open-pr-500.md §4)."""
+
+
 async def _github_create_pr(
     token: str,
     owner: str,
@@ -133,9 +139,12 @@ async def _github_create_pr(
             json={"title": title, "body": body, "head": head, "base": base, "draft": draft},
         )
     if resp.status_code >= 300:
-        raise ws.WorkspaceError(
-            f"GitHub PR creation failed ({resp.status_code}): {resp.text[:300]}"
-        )
+        text = resp.text[:300]
+        if resp.status_code == 422 and "already exists" in text.lower():
+            raise PullRequestAlreadyExistsError(
+                f"GitHub PR creation failed ({resp.status_code}): {text}"
+            )
+        raise ws.WorkspaceError(f"GitHub PR creation failed ({resp.status_code}): {text}")
     data = resp.json()
     return {
         "number": data.get("number"),
@@ -289,10 +298,23 @@ class DeliveryCoordinator:
 
     async def _fire_terminal(self, task: TaskRecord, delivery: DeliveryRecord) -> None:
         if (
-            self._notify_terminal is not None
-            and delivery.status in {"delivered", "conflicted", "blocked", "failed"}
+            self._notify_terminal is None
+            or delivery.status not in {"delivered", "conflicted", "blocked", "failed"}
         ):
+            return
+        # Bypass isolation (task-board-gaps open-pr-500.md §2): the goal op this
+        # notification reports on already settled durably before this call —
+        # any failure reaching the origin session (idempotency-key collision,
+        # a deleted session, a transient DB error) must never turn an already-
+        # successful delivery op into a 500 response.
+        try:
             await self._notify_terminal(task, delivery)
+        except Exception:
+            logger.exception(
+                "delivery terminal notification failed for delivery %s (task %s); "
+                "the delivery op itself already settled and is unaffected",
+                delivery.id, task.id,
+            )
 
     @asynccontextmanager
     async def _admit_delivery_op(self):
@@ -597,6 +619,12 @@ class DeliveryCoordinator:
         return await self._published(task, final)
 
     async def _op_pr(self, task, run, board, delivery, installation_id, draft, actor_kind, actor_agent_id):
+        # Idempotency guard (task-board-gaps open-pr-500.md §3): a delivery that
+        # already carries a pr_number has a PR, full stop — never re-POST, even
+        # if the delivery's status itself was previously left in a corrupted
+        # (e.g. blocked) state by an unrelated failure after the PR was made.
+        if delivery.pr_number is not None:
+            return delivery
         if not delivery.pushed_ref:
             raise TaskConflictError("a successful push is required before opening a PR")
         base = delivery.base_ref
@@ -638,6 +666,32 @@ class DeliveryCoordinator:
                                  "pr_state": pr["state"]},
                 result=pr, actor_kind=actor_kind, actor_agent_id=actor_agent_id,
             )
+        except PullRequestAlreadyExistsError:
+            # GitHub says a PR already exists for this head branch — reconcile
+            # by reading it back (never a re-POST, §3) and settle succeeded,
+            # exactly like the off-critical-path interrupted-PR reconcile.
+            found = None
+            try:
+                found = await self.find_pr(
+                    token, owner, gh_repo, head_owner=owner, branch=delivery.attempt_branch
+                )
+            except Exception:
+                logger.exception(
+                    "PR-already-exists reconcile read failed for delivery %s", delivery.id
+                )
+            if found is not None:
+                final, _ = await self.repo.finish_op(
+                    delivery.id, op_id, state="succeeded", delivery_status="delivered",
+                    delivery_fields={"pr_number": found["number"], "pr_url": found["url"],
+                                     "pr_state": found["state"]},
+                    result=found, actor_kind=actor_kind, actor_agent_id=actor_agent_id,
+                )
+            else:
+                final = await self._fail(
+                    delivery.id, op_id, "op_failed",
+                    "GitHub reports a PR already exists for this branch but it could not be found",
+                    actor_kind, actor_agent_id,
+                )
         except ws.WorkspaceError as exc:
             final = await self._fail(delivery.id, op_id, "op_failed", str(exc), actor_kind, actor_agent_id)
         return await self._published(task, final)

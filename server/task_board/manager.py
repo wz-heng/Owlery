@@ -898,9 +898,41 @@ class TaskBoardManager:
         await self.publish_board_update(board_id)
         return release, op
 
+    # Op kinds that can fold a result into `task_deliveries.status` (§4) — the
+    # only ops whose settle is a genuine terminal-status EVENT. `branch_delete`/
+    # `worktree_remove`/`deploy_stage`/`deploy_switch` never touch
+    # `delivery_status`, so a teardown settling after a delivery is already
+    # terminal must never be mistaken for a new one (task-board-gaps
+    # open-pr-500.md §1).
+    _DELIVERY_TERMINAL_OP_KINDS = frozenset({"commit", "push", "pull_request", "merge"})
+
     @staticmethod
-    def _delivery_terminal_source(task_id: str, run_id: str) -> str:
-        return f"task:{task_id}:run:{run_id}:delivery:terminal"
+    def _delivery_terminal_source(
+        task_id: str, run_id: str, settle_op_id: str | None = None
+    ) -> str:
+        base = f"task:{task_id}:run:{run_id}:delivery:terminal"
+        return f"{base}:{settle_op_id}" if settle_op_id else base
+
+    async def _latest_delivery_settle_op_id(self, delivery_id: str) -> str | None:
+        """The id of the goal op whose settle produced the delivery's CURRENT
+        terminal status — the idempotency key's per-event discriminator
+        (open-pr-500.md §1). A push settling `delivered` and a later PR settling
+        the SAME delivery `delivered` are two distinct events with two distinct
+        op rows, so they must never share one notification source_key (that
+        collision, with a payload that changed underneath it, is exactly what
+        turned an already-successful PR op into a 500). ``None`` when the
+        delivery reached its terminal status via `accept()`'s baseline capture
+        (no op ledger row exists for that settle)."""
+        ops = await self.repo.list_delivery_ops(delivery_id)
+        candidates = [
+            op for op in ops
+            if op.kind in self._DELIVERY_TERMINAL_OP_KINDS
+            and op.state in {"succeeded", "failed"}
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda op: (op.finished_at or op.created_at, op.id))
+        return candidates[-1].id
 
     async def _notify_delivery_terminal(
         self, task: TaskRecord, delivery: DeliveryRecord
@@ -929,8 +961,11 @@ class TaskBoardManager:
             "Inspect the Task Board delivery panel before any follow-up. Never "
             "automatically retry interrupted external Git/PR work."
         )
+        settle_op_id = await self._latest_delivery_settle_op_id(delivery.id)
         await self.session_mgr.enqueue_session_injection(
-            source_key=self._delivery_terminal_source(task.id, delivery.run_id),
+            source_key=self._delivery_terminal_source(
+                task.id, delivery.run_id, settle_op_id
+            ),
             session_id=task.origin_session_id,
             prompt=prompt,
         )
@@ -976,6 +1011,19 @@ class TaskBoardManager:
             reason="server restarted; release stage interrupted"
         )
         await self.repo.reset_preparing_deliveries()
+        # Data self-heal (task-board-gaps open-pr-500.md §4): a delivery left
+        # `blocked` despite already carrying a `pr_number` is exactly the shape
+        # the terminal-notification idempotency-key collision produced — the PR
+        # op itself had already succeeded before the notify call crashed the
+        # response and a subsequent retry's `_fail` overwrote the status on top
+        # of it. Idempotent and unconditional so it also self-heals any future
+        # occurrence, not just the two historical rows this ticket names.
+        for fixed in await self.repo.reconcile_blocked_deliveries_with_pr():
+            logger.info(
+                "delivery %s (task %s) self-healed blocked -> delivered "
+                "(pr_number=%s already recorded)",
+                fixed.id, fixed.task_id, fixed.pr_number,
+            )
         if self.session_mgr is None or self.db is None:
             return
         # B2: reconstruct the terminal-delivery outbox source for live origins.

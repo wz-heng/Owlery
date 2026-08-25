@@ -405,6 +405,32 @@ async def test_delivery_recovery_records_missing_origin_once(task_runtime):
 
 
 @pytest.mark.asyncio
+async def test_delivery_recovery_self_heals_blocked_delivery_with_pr(task_runtime):
+    """task-board-gaps open-pr-500.md §4: boot recovery must repair a delivery
+    left `blocked` despite already carrying a `pr_number` — exactly the shape
+    the terminal-notification idempotency-key collision produced in
+    production (PR #9 / PR #6). Runs through the real `recover_deliveries()`
+    entry point, not the repository method directly."""
+    db, repo, sessions, manager, root = task_runtime
+    task, _run, origin, delivery = await _terminal_delivery(db, repo, sessions, root)
+    await repo.conn.execute(
+        "UPDATE task_deliveries SET status='blocked', pushed_ref='refs/heads/x', "
+        "pr_number=9, pr_url='https://github.com/acme/widgets/pull/9', pr_state='open', "
+        "reason_kind='op_failed', "
+        "reason_detail='GitHub PR creation failed (422): already exists' WHERE id=?",
+        (delivery.id,),
+    )
+    await repo.conn.commit()
+
+    await manager.recover_deliveries()
+
+    healed = await repo.get_delivery(delivery.id)
+    assert healed.status == "delivered"
+    assert healed.reason_kind is None and healed.reason_detail is None
+    assert healed.pr_number == 9
+
+
+@pytest.mark.asyncio
 async def test_list_release_deployments_and_current_release_pass_through(task_runtime):
     """The Releases panel (task-board-overhaul.md §3.2) needs a paginated
     history page AND the current live/staged rows independent of that page

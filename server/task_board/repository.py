@@ -3377,6 +3377,43 @@ class TaskRepository:
                 count += 1
         return count
 
+    async def reconcile_blocked_deliveries_with_pr(self) -> list[DeliveryRecord]:
+        """Boot self-heal (task-board-gaps open-pr-500.md §4): a delivery stuck
+        ``blocked`` while it already carries a ``pr_number`` is definitionally
+        wrong — that field is only ever folded in by a PR create/reconcile that
+        succeeded, so its presence is proof the external op worked even though
+        the delivery row itself later got forced ``blocked`` by an unrelated
+        failure on top of that success (the terminal-notification idempotency-
+        key collision this ticket fixes). Runs unconditionally at every boot;
+        a one-time historical data fix expressed as an idempotent reconcile,
+        never a manual production DB edit — a delivery this has already
+        corrected never matches the WHERE clause again."""
+        stamp = _now_iso()
+        out: list[DeliveryRecord] = []
+        async with self._transaction() as conn:
+            rows = await self._fetchall(
+                conn,
+                "SELECT * FROM task_deliveries WHERE status='blocked' AND pr_number IS NOT NULL",
+            )
+            for d in rows:
+                cursor = await conn.execute(
+                    "UPDATE task_deliveries SET status='delivered', reason_kind=NULL, "
+                    "reason_detail=NULL, updated_at=? WHERE id=? AND status='blocked'",
+                    (stamp, d["id"]),
+                )
+                if cursor.rowcount != 1:
+                    continue
+                row = await self._delivery_row(conn, d["id"])
+                await self._delivery_event(
+                    conn,
+                    delivery_row=row,
+                    kind="delivery_blocked_pr_reconciled",
+                    actor_kind="system",
+                    now=stamp,
+                )
+                out.append(self._delivery_record(row))
+        return out
+
     async def list_terminal_deliveries(
         self,
     ) -> list[tuple[TaskRecord, DeliveryRecord]]:
