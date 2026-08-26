@@ -114,6 +114,11 @@ CREATE TABLE IF NOT EXISTS messages (
     -- partial unique index is installed after additive migrations so legacy
     -- databases gain the column before SQLite parses the index.
     injection_id TEXT,
+    -- Wall-clock stamp at persist time (attempt-replay.md §3.1 point 1).
+    -- Powers turn-internal timelines and tool-call durations. Stamped on
+    -- every new write; NULL on rows written before this column existed —
+    -- never backfilled (no reliable source of truth for the real time).
+    created_at TEXT,
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
 
@@ -413,13 +418,45 @@ CREATE TABLE IF NOT EXISTS turn_usage (
     total_tokens INTEGER NOT NULL DEFAULT 0,
     duration_ms INTEGER,
     is_error INTEGER NOT NULL DEFAULT 0,
-    model_usage TEXT                        -- Claude modelUsage JSON; NULL otherwise
+    model_usage TEXT,                       -- Claude modelUsage JSON; NULL otherwise
+    -- Turn anchor (attempt-replay.md §3.1 point 4): the `messages.seq` of
+    -- this turn's `result` row, so cost/tokens can be placed on the replay
+    -- timeline. NULL for research-origin rows (no owning turn) and for rows
+    -- written before this column existed.
+    message_seq INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_turn_usage_agent_time
   ON turn_usage(agent_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_turn_usage_session
   ON turn_usage(session_id);
+
+-- Turn termination invariant (attempt-replay.md §3.1 point 2 — the spine of
+-- the replay feature): every HarnessRun, however it ends — clean result,
+-- CLI crash, SIGTERM/SIGKILL escalation, watchdog timeout, user interrupt —
+-- writes exactly one row here from the single `finally:` choke point in
+-- SessionManager._run_backend. No turn is allowed to die unexplained.
+-- New-table-only — CREATE IF NOT EXISTS is a no-op migration.
+CREATE TABLE IF NOT EXISTS harness_exits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    -- Last `messages.seq` persisted before this HarnessRun ended; NULL if
+    -- none were ever written (e.g. the subprocess never started).
+    message_seq INTEGER,
+    -- 'completed'|'process_error'|'watchdog_idle'|'watchdog_overall'|
+    -- 'interrupted'|'start_failed'. See SessionManager._classify_harness_exit.
+    reason TEXT NOT NULL,
+    exit_code INTEGER,                     -- POSIX exit status; NULL if killed by signal
+    signal INTEGER,                        -- signal number that ended the process; NULL otherwise
+    escalation TEXT,                       -- NULL|'sigterm'|'sigkill': did stop() have to force it
+    reason_detail TEXT NOT NULL DEFAULT '{}',  -- JSON: e.g. watchdog {"limit": 300}
+    stderr_tail TEXT,                      -- truncated tail of the process's stderr
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_harness_exits_session
+  ON harness_exits(session_id, created_at);
 
 -- Self-set spend gates (budget-model-routing.md §3.1). A budget caps Claude
 -- USD spend (turn_usage.cost) over a natural-calendar window, globally or per
@@ -1080,6 +1117,11 @@ class Database:
             "ALTER TABLE messages ADD COLUMN git_head TEXT",
             "ALTER TABLE messages ADD COLUMN git_status_clean INTEGER",
             "ALTER TABLE messages ADD COLUMN injection_id TEXT",
+            # attempt-replay.md §3.1 point 1: messages.created_at.
+            "ALTER TABLE messages ADD COLUMN created_at TEXT",
+            # attempt-replay.md §3.1 point 4: turn_usage's anchor onto the
+            # messages seq of the turn's `result` row.
+            "ALTER TABLE turn_usage ADD COLUMN message_seq INTEGER",
         ):
             try:
                 await self._conn.execute(ddl)
@@ -1757,10 +1799,10 @@ class Database:
                 "INSERT INTO messages "
                 "(session_id, seq, role, type, content, tool_name, tool_input, "
                 " tool_use_id, is_error, session_id_ref, cost, attachments, "
-                " git_head, git_status_clean) "
+                " git_head, git_status_clean, created_at) "
                 "SELECT ?, seq, role, type, content, tool_name, tool_input, "
                 " tool_use_id, is_error, session_id_ref, cost, attachments, "
-                " git_head, git_status_clean "
+                " git_head, git_status_clean, created_at "
                 "FROM messages WHERE session_id = ? AND seq <= ?",
                 (fork_id, parent_id, fork_after_seq),
             )
@@ -1880,8 +1922,8 @@ class Database:
             "INSERT INTO messages "
             "(session_id, seq, role, type, content, tool_name, tool_input, "
             "tool_use_id, is_error, session_id_ref, cost, attachments, "
-            "git_head, git_status_clean, injection_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "git_head, git_status_clean, injection_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 session_id,
                 seq,
@@ -1898,6 +1940,7 @@ class Database:
                 git_head,
                 git_status_clean_int,
                 injection_id,
+                datetime.now(timezone.utc).isoformat(),
             ),
         )
         if injection_id is not None:
@@ -2141,7 +2184,7 @@ class Database:
         query = (
             "SELECT seq, role, type, content, tool_name, tool_input, tool_use_id, "
             "is_error, session_id_ref, cost, attachments, git_head, "
-            "git_status_clean "
+            "git_status_clean, created_at "
             "FROM messages WHERE session_id = ? ORDER BY seq"
         )
         params: list = [session_id]
@@ -2172,6 +2215,7 @@ class Database:
                     "attachments": attachments,
                     "git_head": row[11],
                     "git_status_clean": git_status_clean,
+                    "created_at": row[13],
                 }
             )
         return results
@@ -3571,6 +3615,28 @@ class Database:
             for row in await cursor.fetchall()
         ]
 
+    async def list_all_delegation_runs_for_parent(
+        self, parent_session_id: str
+    ) -> list[dict[str, Any]]:
+        """EVERY delegation round spawned from this parent session, across
+        all children — for the replay assembly (attempt-replay.md §3.2),
+        which anchors each round on the parent's timeline at `start_seq` and
+        needs the full history, not just each child's latest round (unlike
+        `list_latest_delegation_runs_for_parent`, which is the chat-UI
+        status view)."""
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            f"SELECT {self._DELEGATION_RUN_COLS} FROM delegation_runs r "
+            "JOIN sessions s ON s.id = r.delegation_id "
+            "LEFT JOIN agents a ON a.id = s.agent_id "
+            "WHERE s.parent_session_id = ? ORDER BY r.start_seq, r.round_no",
+            (parent_session_id,),
+        )
+        return [
+            self._row_to_delegation_run(row)
+            for row in await cursor.fetchall()
+        ]
+
     async def list_latest_delegation_runs_for_parent(
         self, parent_session_id: str, *, limit: int = 25
     ) -> list[dict[str, Any]]:
@@ -3778,9 +3844,14 @@ class Database:
         is_error: bool = False,
         model_usage: dict[str, Any] | None = None,
         origin: str = "turn",
+        message_seq: int | None = None,
     ) -> None:
         """Append one consumption row (usage-tracking.md §3). `total_tokens`
-        is denormalized here so window SUMs never re-derive it."""
+        is denormalized here so window SUMs never re-derive it.
+
+        `message_seq` anchors this row onto `messages.seq` (attempt-replay.md
+        §3.1 point 4) — the seq of the turn's `result` row. None for
+        research-origin rows, which have no owning turn message."""
         await self._ensure_connected()
         total = (
             input_tokens + cache_read_tokens + cache_creation_tokens + output_tokens
@@ -3790,8 +3861,8 @@ class Database:
             "(created_at, origin, session_id, agent_id, backend, model, cost, "
             "input_tokens, cache_read_tokens, cache_creation_tokens, "
             "output_tokens, reasoning_tokens, total_tokens, duration_ms, "
-            "is_error, model_usage) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "is_error, model_usage, message_seq) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 created_at,
                 origin,
@@ -3809,9 +3880,105 @@ class Database:
                 duration_ms,
                 int(is_error),
                 json.dumps(model_usage) if model_usage else None,
+                message_seq,
             ),
         )
         await self._conn.commit()
+
+    async def list_turn_usage_for_session(self, session_id: str) -> list[dict[str, Any]]:
+        """Per-turn cost/token rows for the replay assembly (attempt-replay.md
+        §3.2), ordered oldest-first."""
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            "SELECT created_at, origin, model, cost, input_tokens, "
+            "cache_read_tokens, cache_creation_tokens, output_tokens, "
+            "reasoning_tokens, total_tokens, duration_ms, is_error, message_seq "
+            "FROM turn_usage WHERE session_id = ? ORDER BY id",
+            (session_id,),
+        )
+        rows = await cursor.fetchall()
+        return [
+            {
+                "created_at": r[0],
+                "origin": r[1],
+                "model": r[2],
+                "cost": r[3],
+                "input_tokens": r[4],
+                "cache_read_tokens": r[5],
+                "cache_creation_tokens": r[6],
+                "output_tokens": r[7],
+                "reasoning_tokens": r[8],
+                "total_tokens": r[9],
+                "duration_ms": r[10],
+                "is_error": bool(r[11]),
+                "message_seq": r[12],
+            }
+            for r in rows
+        ]
+
+    # ------------------------------------------------------------------ harness exits
+
+    async def add_harness_exit(
+        self,
+        *,
+        session_id: str,
+        reason: str,
+        created_at: str,
+        message_seq: int | None = None,
+        exit_code: int | None = None,
+        signal: int | None = None,
+        escalation: str | None = None,
+        reason_detail: dict[str, Any] | None = None,
+        stderr_tail: str | None = None,
+    ) -> None:
+        """Persist the turn-termination invariant row (attempt-replay.md §3.1
+        point 2). Called exactly once per HarnessRun from the single
+        `finally:` choke point in `SessionManager._run_backend` — never
+        skipped, regardless of how the run ended."""
+        await self._ensure_connected()
+        await self._conn.execute(
+            "INSERT INTO harness_exits "
+            "(session_id, message_seq, reason, exit_code, signal, escalation, "
+            "reason_detail, stderr_tail, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                session_id,
+                message_seq,
+                reason,
+                exit_code,
+                signal,
+                escalation,
+                json.dumps(reason_detail or {}),
+                stderr_tail,
+                created_at,
+            ),
+        )
+        await self._conn.commit()
+
+    async def list_harness_exits_for_session(self, session_id: str) -> list[dict[str, Any]]:
+        """Terminal records for the replay assembly (attempt-replay.md §3.2),
+        ordered oldest-first."""
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            "SELECT message_seq, reason, exit_code, signal, escalation, "
+            "reason_detail, stderr_tail, created_at "
+            "FROM harness_exits WHERE session_id = ? ORDER BY id",
+            (session_id,),
+        )
+        rows = await cursor.fetchall()
+        return [
+            {
+                "message_seq": r[0],
+                "reason": r[1],
+                "exit_code": r[2],
+                "signal": r[3],
+                "escalation": r[4],
+                "reason_detail": json.loads(r[5]) if r[5] else {},
+                "stderr_tail": r[6],
+                "created_at": r[7],
+            }
+            for r in rows
+        ]
 
     async def summarize_usage(
         self,

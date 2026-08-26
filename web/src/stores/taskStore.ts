@@ -10,6 +10,7 @@ import {
   type MergeStrategy,
   type ReleaseDeployment,
   type ReleaseOpResponse,
+  type ReplayTimeline,
   type Task,
   type TaskArtifact,
   type TaskBoard,
@@ -145,6 +146,10 @@ interface TaskState {
   /** Keyed by run_id, mirroring `deliveries` — the supersede-chain context
    * for that run's delivery panel (task-board-overhaul.md §3.1). */
   deliveryChains: Record<string, DeliveryChain>;
+  /** Keyed by run_id — the attempt-replay timeline (attempt-replay.md §3.3),
+   * loaded lazily when a run's timeline panel is first expanded. */
+  replays: Record<string, ReplayTimeline>;
+  loadingReplay: Record<string, boolean>;
   releases: Record<string, ReleaseDeployment[]>;
   releasesTotal: Record<string, number>;
   /** The board's current live/staged rows, resolved server-side independent
@@ -203,6 +208,7 @@ interface TaskState {
   setDispatcherEnabled(boardId: string, enabled: boolean): Promise<void>;
 
   loadDelivery(taskId: string, runId: string): Promise<void>;
+  loadRunReplay(taskId: string, runId: string): Promise<void>;
   acceptDelivery(
     taskId: string,
     runId: string,
@@ -425,6 +431,8 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   deliveryOps: {},
   deliveryConfirmation: null,
   deliveryChains: {},
+  replays: {},
+  loadingReplay: {},
   releases: {},
   releasesTotal: {},
   releaseLive: {},
@@ -818,6 +826,23 @@ export const useTaskStore = create<TaskState>((set, get) => ({
       set({ error: message(error) });
     }
   },
+
+  loadRunReplay: async (taskId, runId) => {
+    const { token } = get();
+    if (!token) return;
+    set((state) => ({ loadingReplay: { ...state.loadingReplay, [runId]: true } }));
+    try {
+      const replay = await taskApi.runReplay(token, taskId, runId);
+      set((state) => ({ replays: { ...state.replays, [runId]: replay } }));
+    } catch (error) {
+      // A run with no worker session yet (setup failed before spawn) 404s —
+      // there is nothing to replay, not an error worth surfacing globally.
+      if (error instanceof TaskApiError && error.status === 404) return;
+      set({ error: message(error) });
+    } finally {
+      set((state) => ({ loadingReplay: { ...state.loadingReplay, [runId]: false } }));
+    }
+  },
   acceptDelivery: (taskId, runId, baseRef, confirmations) =>
     runDeliveryCall(set, taskId, runId, "accept", () =>
       taskApi.acceptDelivery(get().token, taskId, runId, { base_ref: baseRef, confirmations })
@@ -968,6 +993,8 @@ export function resetTaskStore(): void {
     deliveryOps: {},
     deliveryConfirmation: null,
     deliveryChains: {},
+    replays: {},
+    loadingReplay: {},
     releases: {},
     releasesTotal: {},
     releaseLive: {},

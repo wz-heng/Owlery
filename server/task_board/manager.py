@@ -84,6 +84,14 @@ def _record(value: Any) -> Any:
 class TaskBoardManager:
     BROADCAST_KEY = "task_board_manager"
 
+    # Downsampling interval for automatic heartbeat events (attempt-replay.md
+    # §3.1 point 3). The auto paths fire on every WS broadcast chunk / every
+    # liveness-refresh tick — emitting a task_events row every time would be
+    # thousands per attempt. Minute-granularity keeps "when did the heartbeat
+    # stop" answerable at a cost of tens of rows per attempt, not tens of
+    # thousands.
+    _HEARTBEAT_EVENT_INTERVAL_SECONDS = 60.0
+
     def __init__(self) -> None:
         self.repo: TaskRepository = task_repository
         self.session_mgr: "SessionManager | None" = None
@@ -94,6 +102,12 @@ class TaskBoardManager:
         self._last_tick_at: str | None = None
         self._last_error: str | None = None
         self._idle_checks: dict[str, asyncio.Task[None]] = {}
+        # Downsampling state for automatic heartbeats (attempt-replay.md §3.1
+        # point 3): keyed by run_id, `time.monotonic()` of the last heartbeat
+        # that was also emitted as a task_events row. The lease itself is
+        # still extended on every call (heartbeat_run's UPDATE always runs);
+        # only the audit-trail event is throttled.
+        self._heartbeat_event_last: dict[str, float] = {}
         self.delivery: DeliveryCoordinator = delivery_coordinator
         # Transient (never persisted) dispatcher pause for a deploy drain
         # (docs/plans/local-deploy.md §7.1). In-memory so a restart clears it —
@@ -357,6 +371,17 @@ class TaskBoardManager:
             await self._notify_terminal(final_task, final_run)
             await self.publish_task_update(task.id)
 
+    def _should_emit_heartbeat_event(self, run_id: str) -> bool:
+        """Throttle to `_HEARTBEAT_EVENT_INTERVAL_SECONDS` (attempt-replay.md
+        §3.1 point 3). True at most once per interval per run_id; also
+        updates the last-emitted stamp as a side effect when it returns True."""
+        now = time.monotonic()
+        last = self._heartbeat_event_last.get(run_id)
+        if last is not None and now - last < self._HEARTBEAT_EVENT_INTERVAL_SECONDS:
+            return False
+        self._heartbeat_event_last[run_id] = now
+        return True
+
     async def _refresh_liveness(self) -> None:
         """Extend pending leases; interrupt only truly abandoned attempts."""
         now = _now()
@@ -372,7 +397,7 @@ class TaskBoardManager:
                     run.task_id,
                     run.id,
                     lease_expires_at=_iso(now + timedelta(seconds=settings.task_run_lease_seconds)),
-                    emit_event=False,
+                    emit_event=self._should_emit_heartbeat_event(run.id),
                 )
             elif expires is not None and expires <= now:
                 task, final = await self.repo.interrupt_run(
@@ -416,7 +441,7 @@ class TaskBoardManager:
                         lease_expires_at=_iso(
                             _now() + timedelta(seconds=settings.task_run_lease_seconds)
                         ),
-                        emit_event=False,
+                        emit_event=self._should_emit_heartbeat_event(session.task_run_id),
                     )
                 except TaskConflictError:
                     pass
@@ -769,6 +794,9 @@ class TaskBoardManager:
         return f"task:{task_id}:run:{run_id}:terminal"
 
     async def _notify_terminal(self, task: TaskRecord, run: RunRecord) -> None:
+        # The run is done; stop tracking its heartbeat-downsampling state
+        # (attempt-replay.md §3.1 point 3) so the dict doesn't grow unbounded.
+        self._heartbeat_event_last.pop(run.id, None)
         if not task.origin_session_id or self.session_mgr is None or self.db is None:
             return
         if not await self.db.session_exists(task.origin_session_id):

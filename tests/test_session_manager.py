@@ -1,5 +1,7 @@
 import asyncio
 import os
+import signal
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -1337,6 +1339,251 @@ async def test_run_backend_does_not_respawn_when_no_tool_use(manager):
 
     _ = [m async for m in manager._run_backend(session, "go")]
     assert invocations == ["go"]  # no retry — not the bug we recover from
+
+
+# ---------------------------------------------------------------------------
+# Turn-termination invariant (attempt-replay.md §3.1 point 2 — the spine of
+# the replay feature): every HarnessRun writes exactly one harness_exits row,
+# however it ends. Each test below exercises a different exit path.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_backend_records_harness_exit_reason_completed(manager):
+    from server.harness import HarnessEvent
+
+    session = await _new(manager, "ExitCompleted")
+
+    class CleanBackend:
+        async def start(self, prompt, working_dir, resume_id=None, credential=None):
+            pass
+
+        def stream(self):
+            async def _gen():
+                yield HarnessEvent(type="text", content="hi")
+                yield HarnessEvent(
+                    type="result", session_id="sid", cost=0.02, num_turns=1
+                )
+            return _gen()
+
+        async def stop(self):
+            pass
+
+    manager._make_run = lambda s, agent=None, connectors=None: CleanBackend()  # type: ignore[method-assign,assignment]
+
+    _ = [m async for m in manager._run_backend(session, "go")]
+
+    exits = await manager.db.list_harness_exits_for_session(session.id)
+    assert len(exits) == 1
+    row = exits[0]
+    assert row["reason"] == "completed"
+    assert row["exit_code"] is None  # no real process behind this stub
+    assert row["created_at"]
+    # The result row's own message seq is the anchor.
+    messages = await manager.db.load_messages(session.id)
+    result_seq = next(m["seq"] for m in messages if m["type"] == "result")
+    assert row["message_seq"] == result_seq
+
+    # turn_usage's anchor points at the same seq (attempt-replay.md §3.1 pt 4).
+    usage_rows = await manager.db.list_turn_usage_for_session(session.id)
+    assert len(usage_rows) == 1
+    assert usage_rows[0]["message_seq"] == result_seq
+
+
+@pytest.mark.asyncio
+async def test_run_backend_records_harness_exit_reason_process_error(manager):
+    """The CLI died mid-turn without ever producing a `result` — the exact
+    blind spot attempt-replay.md §2 point 1 targets. No result, no retry
+    trigger (no tool_use) — but the death must still be explained."""
+    from server.harness import HarnessEvent
+
+    session = await _new(manager, "ExitProcessError")
+
+    class CrashBackend:
+        stderr_text = "segfault or something\n"
+
+        async def start(self, prompt, working_dir, resume_id=None, credential=None):
+            pass
+
+        def stream(self):
+            async def _gen():
+                yield HarnessEvent(type="session_started", session_id="sid")
+                # Dies here — no tool_use, no result.
+            return _gen()
+
+        async def stop(self):
+            pass
+
+    manager._make_run = lambda s, agent=None, connectors=None: CrashBackend()  # type: ignore[method-assign,assignment]
+
+    _ = [m async for m in manager._run_backend(session, "go")]
+
+    exits = await manager.db.list_harness_exits_for_session(session.id)
+    assert len(exits) == 1
+    row = exits[0]
+    assert row["reason"] == "process_error"
+    assert "segfault" in (row["stderr_tail"] or "")
+
+
+@pytest.mark.asyncio
+async def test_run_backend_records_harness_exit_reason_start_failed(manager):
+    """backend.start() itself raised (e.g. the CLI vanished from PATH) —
+    before any process existed. Still not allowed to die unexplained."""
+
+    session = await _new(manager, "ExitStartFailed")
+
+    class ExplodingBackend:
+        async def start(self, prompt, working_dir, resume_id=None, credential=None):
+            raise FileNotFoundError("claude not found on PATH")
+
+        def stream(self):
+            async def _gen():
+                return
+                yield  # pragma: no cover — never reached
+            return _gen()
+
+        async def stop(self):
+            pass
+
+    manager._make_run = lambda s, agent=None, connectors=None: ExplodingBackend()  # type: ignore[method-assign,assignment]
+
+    with pytest.raises(FileNotFoundError):
+        _ = [m async for m in manager._run_backend(session, "go")]
+
+    exits = await manager.db.list_harness_exits_for_session(session.id)
+    assert len(exits) == 1
+    row = exits[0]
+    assert row["reason"] == "start_failed"
+    assert "claude not found on PATH" in row["reason_detail"]["error"]
+
+
+@pytest.mark.asyncio
+async def test_run_backend_records_harness_exit_reason_interrupted(manager):
+    """Esc/interrupt() cancels the inner task; CancelledError unwinds
+    `_run_backend` through the exact frame the invariant hooks into."""
+    session = await _new(manager, "ExitInterrupted")
+    backend = _StallBackend()
+    manager._make_run = lambda *a, **k: backend  # type: ignore[method-assign,assignment]
+
+    async def consume():
+        return [m async for m in manager._run_backend(session, "go")]
+
+    task = asyncio.create_task(consume())
+    await asyncio.sleep(0.05)  # let the stream loop actually reach the stall
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    exits = await manager.db.list_harness_exits_for_session(session.id)
+    assert len(exits) == 1
+    assert exits[0]["reason"] == "interrupted"
+    assert backend.stopped is True
+
+
+@pytest.mark.asyncio
+async def test_run_backend_records_harness_exit_reason_watchdog(manager, monkeypatch):
+    from server.config import settings as cfg
+
+    monkeypatch.setattr(cfg, "turn_idle_timeout_seconds", 0.2)
+    monkeypatch.setattr(cfg, "turn_max_seconds", 0)
+    session = await _new(manager, "ExitWatchdog")
+    backend = _StallBackend()
+    monkeypatch.setattr(manager, "_make_run", lambda *a, **k: backend)
+
+    _ = [e async for e in manager._run_backend(session, "hi")]
+
+    exits = await manager.db.list_harness_exits_for_session(session.id)
+    assert len(exits) == 1
+    row = exits[0]
+    assert row["reason"] == "watchdog_idle"
+    assert row["reason_detail"] == {"limit": 0.2}
+
+
+@pytest.mark.asyncio
+async def test_run_backend_kills_subprocess_and_records_harness_exit(manager, tmp_path):
+    """The §5 acceptance fixture, literally: kill a turn's real child
+    process out from under it, then assert the terminal record exists with
+    complete fields — session anchor, signal, and a reason that doesn't
+    pretend the turn quietly completed."""
+    from server.harness import (
+        EventParser,
+        Harness,
+        HarnessEvent,
+        ParseOutput,
+        RunConfig,
+        RuntimeProfile,
+    )
+
+    fake_cli = Path(__file__).parent / "_fixtures" / "fake_cli.py"
+
+    class _RawParser(EventParser):
+        def parse(self, obj):
+            ev = HarnessEvent(type=obj.get("type", "?"), raw=obj)
+            return ParseOutput(events=[ev], end_of_stream=obj.get("type") == "result")
+
+    def build_turn_argv(ctx):
+        # Sleeps far longer than this test needs — it gets SIGKILLed well
+        # before it would ever wake up on its own.
+        return (
+            [sys.executable, str(fake_cli), "sleep-then", "30"],
+            {"cwd": ctx.working_dir},
+        )
+
+    profile = RuntimeProfile(
+        backend="fake-kill",
+        binary=sys.executable,
+        tools_prompt="TOOLS",
+        credential_style="env_secret",
+        premature_exit_recovery=False,
+        close_stdin_after_start=False,
+        build_turn_argv=build_turn_argv,
+        new_event_parser=_RawParser,
+        build_oneshot_argv=lambda ctx: ([sys.executable], {}),
+        parse_oneshot_stdout=lambda s: s,
+    )
+
+    session = await _new(manager, "KillSubprocess", working_dir=str(tmp_path))
+    holder: dict[str, Any] = {}
+
+    def fake_factory(s, agent=None, connectors=None):
+        run = Harness(profile).create_run(RunConfig())
+        holder["run"] = run
+        return run
+
+    manager._make_run = fake_factory  # type: ignore[method-assign]
+
+    async def killer():
+        proc = None
+        for _ in range(200):
+            run = holder.get("run")
+            proc = getattr(run, "_process", None)
+            if proc is not None:
+                break
+            await asyncio.sleep(0.02)
+        assert proc is not None, "subprocess never spawned"
+        proc.kill()  # SIGKILL, direct — models an external crash/kill
+
+    kill_task = asyncio.create_task(killer())
+    try:
+        _ = await asyncio.wait_for(
+            _collect(manager._run_backend(session, "go")), timeout=10.0
+        )
+    finally:
+        await kill_task
+
+    exits = await manager.db.list_harness_exits_for_session(session.id)
+    assert len(exits) == 1
+    row = exits[0]
+    # Complete fields: session anchor (implicit — queried by session_id),
+    # exit facts, and a reason that doesn't claim the turn finished.
+    assert row["reason"] == "process_error"
+    assert row["signal"] == signal.SIGKILL
+    assert row["exit_code"] is None
+    assert row["created_at"]
+
+
+async def _collect(gen):
+    return [item async for item in gen]
 
 
 @pytest.mark.asyncio

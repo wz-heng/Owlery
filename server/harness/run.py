@@ -129,6 +129,19 @@ def _terminate_process_group(proc: "asyncio.subprocess.Process", sig: int) -> bo
     return False
 
 
+@dataclass
+class ProcessExit:
+    """Raw facts about how a HarnessRun's subprocess ended (attempt-replay.md
+    §3.1 point 2). Captured once, in `stop()`, from the one place the process
+    actually terminates — SessionManager combines this with turn-level
+    context (watchdog trip, user interrupt) to classify a `reason` and
+    persist the turn-termination invariant row."""
+
+    exit_code: int | None       # POSIX exit status; None if killed by signal
+    signal: int | None          # signal number that ended the process; None otherwise
+    escalation: str | None      # None|"sigterm"|"sigkill": did stop() have to force it
+
+
 def parse_json_line(line: str) -> dict[str, Any] | None:
     """Parse a JSONL line, returning None on parse error (logs a warning)."""
     try:
@@ -186,6 +199,10 @@ class HarnessRun:
         self._stderr_task: asyncio.Task[None] | None = None
         self._stderr_lines: list[str] = []
         self._stream_closed: bool = False
+        # Set by stop() from the last subprocess it actually tore down.
+        # None until the first stop() call completes; preserved (not reset)
+        # across the idempotent no-op calls that follow.
+        self.last_exit: ProcessExit | None = None
 
     @property
     def profile(self) -> RuntimeProfile:
@@ -311,6 +328,7 @@ class HarnessRun:
             except Exception:
                 pass
 
+        escalation: str | None = None
         if proc.returncode is None:
             try:
                 await asyncio.wait_for(proc.wait(), timeout=2.0)
@@ -319,13 +337,25 @@ class HarnessRun:
                 # (MCP servers, subagents) die too, not just the direct child
                 # (turn-safety.md §2).
                 logger.warning("CLI didn't exit on stdin close, terminating group")
+                escalation = "sigterm"
                 _terminate_process_group(proc, signal.SIGTERM)
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=2.0)
                 except asyncio.TimeoutError:
                     logger.warning("CLI didn't exit on SIGTERM, killing group")
+                    escalation = "sigkill"
                     _terminate_process_group(proc, signal.SIGKILL)
                     await proc.wait()
+
+        # Capture raw exit facts before _stderr_lines/proc are torn down
+        # (attempt-replay.md §3.1 point 2). asyncio's returncode convention:
+        # negative == killed by signal -returncode; non-negative == exit status.
+        returncode = proc.returncode
+        exit_code = returncode if returncode is not None and returncode >= 0 else None
+        exit_signal = -returncode if returncode is not None and returncode < 0 else None
+        self.last_exit = ProcessExit(
+            exit_code=exit_code, signal=exit_signal, escalation=escalation
+        )
 
         for task in (self._stdout_task, self._stderr_task):
             if task and not task.done():

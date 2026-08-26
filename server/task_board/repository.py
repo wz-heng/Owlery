@@ -134,6 +134,14 @@ class TaskRepository:
             raise RuntimeError("TaskRepository is not initialized")
         return self._conn
 
+    @property
+    def is_initialized(self) -> bool:
+        """Whether `initialize()` has run. Callers outside this module (e.g.
+        the replay assembly, which must also work for deployments/tests with
+        no Task Board involvement at all) check this instead of catching the
+        `conn` property's RuntimeError."""
+        return self._conn is not None
+
     @asynccontextmanager
     async def _transaction(self) -> AsyncIterator[aiosqlite.Connection]:
         async with self._lock:
@@ -2237,6 +2245,20 @@ class TaskRepository:
             )
         return [self._run_record(row) for row in rows]
 
+    async def get_run_by_session(self, session_id: str) -> RunRecord | None:
+        """The task_run a worker session belongs to, if any (attempt-replay.md
+        §3.2 — the task-run replay entry point resolves to a session_id and
+        calls the session-keyed assembly; this is the reverse lookup a
+        session-keyed caller uses to also pull in task_events)."""
+        async with self._lock:
+            row = await self._fetchone(
+                self.conn,
+                "SELECT * FROM task_runs WHERE session_id = ? "
+                "ORDER BY claimed_at DESC LIMIT 1",
+                (session_id,),
+            )
+        return self._run_record(row) if row else None
+
     async def list_running_runs(self) -> list[RunRecord]:
         async with self._lock:
             rows = await self._fetchall(
@@ -2371,6 +2393,19 @@ class TaskRepository:
                 "SELECT * FROM task_events WHERE task_id = ? AND seq > ? "
                 "ORDER BY seq LIMIT ?",
                 (task_id, after_seq, limit),
+            )
+        return [self._event_record(row) for row in rows]
+
+    async def list_task_events_for_run(self, run_id: str) -> list[EventRecord]:
+        """All task_events for one attempt (attempt-replay.md §3.2) — unlike
+        `list_task_events`, scoped to a single run rather than the task's
+        whole history across attempts. No task_id preflight: a run_id that
+        matches nothing simply returns an empty timeline slice."""
+        async with self._lock:
+            rows = await self._fetchall(
+                self.conn,
+                "SELECT * FROM task_events WHERE run_id = ? ORDER BY seq",
+                (run_id,),
             )
         return [self._event_record(row) for row in rows]
 

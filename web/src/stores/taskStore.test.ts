@@ -567,3 +567,31 @@ describe("taskStore releases pagination and collapse", () => {
     expect(localStorage.getItem("owlery_releases_expanded")).toBeNull();
   });
 });
+
+describe("taskStore attempt replay (attempt-replay.md §3.3)", () => {
+  it("loadRunReplay stores the timeline keyed by run_id", async () => {
+    useTaskStore.setState({ token: "tok" });
+    vi.spyOn(taskApi, "runReplay").mockResolvedValue({
+      session_id: "session-1",
+      task_run: { task_id: "task-1", run_id: "run-1" },
+      gap_threshold_seconds: 300,
+      unobserved_prefix: null,
+      timeline: [{ kind: "message", ts: "2026-08-01T00:00:00Z", seq: 0, summary: "hi", detail: {} }],
+    });
+
+    await useTaskStore.getState().loadRunReplay("task-1", "run-1");
+
+    expect(useTaskStore.getState().replays["run-1"]?.timeline).toHaveLength(1);
+    expect(useTaskStore.getState().loadingReplay["run-1"]).toBe(false);
+  });
+
+  it("loadRunReplay swallows a 404 (run never started a worker session)", async () => {
+    useTaskStore.setState({ token: "tok" });
+    vi.spyOn(taskApi, "runReplay").mockRejectedValue(new TaskApiError("Not found", 404, null));
+
+    await useTaskStore.getState().loadRunReplay("task-1", "run-1");
+
+    expect(useTaskStore.getState().replays["run-1"]).toBeUndefined();
+    expect(useTaskStore.getState().error).toBeNull();
+  });
+});

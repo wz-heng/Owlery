@@ -1006,6 +1006,39 @@ async def list_task_events(
     return [_dict(row) for row in rows]
 
 
+@router.get("/api/tasks/{task_id}/runs/{run_id}/replay")
+async def get_run_replay(
+    task_id: str,
+    run_id: str,
+    gap_threshold_seconds: float = Query(300.0, gt=0),
+    _: str = Depends(verify_token),
+):
+    """Task-run entry point onto the attempt-replay assembly
+    (docs/plans/attempt-replay.md §3.2): resolve the run's worker session,
+    then hand off to the same session-keyed assembly `/api/sessions/{id}/replay`
+    uses — the capability is generic, this is just the Task Board's door into
+    it. A run that never got a worker session (setup failed before spawn)
+    has nothing to replay yet."""
+    from ..replay import assemble_session_replay
+    from ..session_manager import session_manager
+
+    run = await _run(task_repository.get_run(run_id))
+    if run.task_id != task_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Run not found on this task")
+    if not run.session_id:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, "This run never started a worker session"
+        )
+    if session_manager.db is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Database not ready")
+    replay = await assemble_session_replay(
+        session_manager.db, run.session_id, gap_threshold_seconds=gap_threshold_seconds
+    )
+    if replay is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Worker session not found")
+    return replay
+
+
 @router.get("/api/tasks/{task_id}/artifacts")
 async def list_artifacts(task_id: str, _: str = Depends(verify_token)):
     rows = await _run(task_repository.list_artifacts(task_id))

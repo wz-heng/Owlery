@@ -1,9 +1,13 @@
+import { useState } from "react";
 import {
   IconAlertTriangle,
+  IconChevronDown,
+  IconChevronRight,
   IconCircleCheck,
   IconClock,
   IconExternalLink,
   IconFolder,
+  IconHistory,
   IconPlayerPlay,
 } from "@tabler/icons-react";
 
@@ -13,6 +17,7 @@ import { AgentSeal } from "../ui/seal";
 import { cn } from "../../lib/utils";
 import { formatDate, RUN_LABEL } from "./taskPresentation";
 import { TaskDeliveryPanel } from "./TaskDeliveryPanel";
+import { TaskRunReplay } from "./TaskRunReplay";
 
 interface TaskRunTimelineProps {
   runs: TaskRun[];
@@ -22,6 +27,7 @@ interface TaskRunTimelineProps {
 }
 export function TaskRunTimeline({ runs, agents, onOpenSession, onOpenTask }: TaskRunTimelineProps) {
   const agentMap = new Map(agents.map((agent) => [agent.id, agent]));
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   return (
     <section aria-labelledby="task-runs-title">
       <h3 id="task-runs-title" className="mb-3 flex items-center gap-2 font-serif text-base font-semibold">
@@ -67,6 +73,19 @@ export function TaskRunTimeline({ runs, agents, onOpenSession, onOpenTask }: Tas
               {run.workspace_mode === "git_worktree" && run.state === "completed" && (
                 <TaskDeliveryPanel run={run} onOpenTask={onOpenTask} />
               )}
+              <div className="mt-3 border-t border-ink-200 pt-2">
+                <button
+                  type="button"
+                  className="flex items-center gap-1.5 text-xs font-medium text-ink-700"
+                  onClick={() => setExpanded((prev) => ({ ...prev, [run.id]: !prev[run.id] }))}
+                >
+                  {expanded[run.id] ? <IconChevronDown size={13} /> : <IconChevronRight size={13} />}
+                  <IconHistory size={13} /> Timeline
+                </button>
+                {expanded[run.id] && (
+                  <TaskRunReplay taskId={run.task_id} runId={run.id} onOpenSession={onOpenSession} />
+                )}
+              </div>
             </article>
           );
         })}
