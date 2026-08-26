@@ -161,6 +161,24 @@ export async function fetchAgentConnectors(
   return r.installation_ids;
 }
 
+/** Static-credential install (mail-connector.md §4.1) — verified live
+ * against the real service before anything is persisted; on failure the
+ * service's own error message comes back as the thrown Error's message. */
+export async function installStaticConnector(
+  token: string,
+  kind: string,
+  fields: Record<string, string>,
+  label?: string
+): Promise<ConnectorInstallationInfo> {
+  return json(
+    await fetch(`${API}/api/connectors/${kind}/install-static`, {
+      method: "POST",
+      headers: authHeaders(token),
+      body: JSON.stringify({ fields, label: label ?? null }),
+    })
+  );
+}
+
 export async function toggleAgentConnector(
   token: string,
   agentId: string,

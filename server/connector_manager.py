@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import time
 import uuid
 from datetime import datetime, timezone
@@ -19,7 +20,7 @@ from typing import Any
 import re
 
 from .config import settings
-from .connectors.base import ConnectorInstallation
+from .connectors.base import ConnectorInstallation, StaticVerifyError
 from .connectors.custom import CustomConnector, resolve_connector
 from .connectors.registry import all_connectors, get_connector
 from .crypto import decrypt, encrypt
@@ -49,6 +50,14 @@ def _serialize_token_set(ts: OAuthTokenSet) -> str:
         },
         separators=(",", ":"),
     )
+
+
+def _serialize_static_secret(fields: dict[str, str]) -> str:
+    """Static connectors (auth_type='api_key') skip the OAuthTokenSet
+    envelope entirely — the encrypted blob IS the field dict, since there's
+    no access/refresh token distinction to make. `get_access_token` hands
+    this JSON straight to the MCP subprocess as `access_token`."""
+    return json.dumps(fields, separators=(",", ":"))
 
 
 def _deserialize_token_set(blob: str) -> OAuthTokenSet:
@@ -189,18 +198,42 @@ class ConnectorManager:
         ]
         out: list[dict[str, Any]] = []
         for c in connectors:
+            auth_mode = getattr(c, "auth_mode", "oauth")
+            # Static connectors have no OAuth client to configure — the
+            # install form itself is the setup step, so they're always
+            # "available" (mail-connector.md §4.1).
+            available = (
+                True
+                if auth_mode == "static"
+                else (await self.resolve_client_creds(c.kind)) is not None
+            )
             out.append(
                 {
                     "kind": c.kind,
                     "display_name": c.display_name,
                     "category": c.category,
                     "allows_multiple": c.allows_multiple,
-                    "available": (await self.resolve_client_creds(c.kind))
-                    is not None,
-                    "scopes": list(getattr(c.oauth, "default_scopes", [])),
+                    "available": available,
+                    "scopes": list(getattr(getattr(c, "oauth", None), "default_scopes", [])),
                     "custom": getattr(c, "is_custom", False),
                     "setup_url": getattr(c, "setup_url", "") or None,
                     "setup_steps": list(getattr(c, "setup_steps", [])),
+                    "auth_mode": auth_mode,
+                    "static_fields": [
+                        {
+                            "key": f.key,
+                            "label": f.label,
+                            "secret": f.secret,
+                            "default": f.default,
+                            "placeholder": f.placeholder,
+                            "help_text": f.help_text,
+                        }
+                        for f in getattr(c, "static_fields", ())
+                    ],
+                    "static_presets": [
+                        {"key": p.key, "label": p.label, "values": dict(p.values)}
+                        for p in getattr(c, "static_presets", ())
+                    ],
                 }
             )
         return out
@@ -210,6 +243,76 @@ class ConnectorManager:
 
     async def get_installation(self, installation_id: str) -> dict[str, Any] | None:
         return await self.db.get_connector_installation(installation_id)
+
+    async def _upsert_installation(
+        self,
+        *,
+        kind: str,
+        external_id: str | None,
+        label: str,
+        auth_type: str,
+        blob: str,
+        scopes: list[str],
+        token_expires_at: str | None,
+    ) -> str:
+        """Insert-or-update on (kind, external_account_id) — the dedup key
+        both `complete_install` (OAuth) and `complete_static_install`
+        upsert on. Two installs of the same account completing at once
+        (e.g. two browser tabs) both pass the "not found" check before
+        either writes, so the loser's INSERT trips the partial unique
+        index (`connector_installations_account_unique`) — caught here and
+        retried as an update onto the winner's row instead of surfacing a
+        raw 500."""
+        existing = (
+            await self.db.get_connector_installation_by_account(kind, external_id)
+            if external_id
+            else None
+        )
+        if existing is not None:
+            iid = existing["id"]
+            await self.db.update_connector_installation(
+                iid,
+                label=label,
+                scopes=scopes,
+                token_expires_at=token_expires_at,
+                needs_reconnect=False,
+                last_refresh_error_code=None,
+                secret_encrypted=blob,
+            )
+            return iid
+
+        iid = uuid.uuid4().hex[:12]
+        try:
+            await self.db.save_connector_installation(
+                installation_id=iid,
+                kind=kind,
+                label=label,
+                auth_type=auth_type,
+                secret_encrypted=blob,
+                created_at=datetime.now(timezone.utc).isoformat(),
+                external_account_id=external_id or None,
+                scopes=scopes,
+                token_expires_at=token_expires_at,
+            )
+        except sqlite3.IntegrityError:
+            winner = (
+                await self.db.get_connector_installation_by_account(kind, external_id)
+                if external_id
+                else None
+            )
+            if winner is None:
+                raise
+            iid = winner["id"]
+            await self.db.update_connector_installation(
+                iid,
+                label=label,
+                scopes=scopes,
+                token_expires_at=token_expires_at,
+                needs_reconnect=False,
+                last_refresh_error_code=None,
+                secret_encrypted=blob,
+            )
+        return iid
 
     async def complete_install(
         self,
@@ -230,35 +333,62 @@ class ConnectorManager:
         blob = encrypt(_serialize_token_set(token_set), settings.auth_token)
         token_expires_at = _expires_iso(token_set.expires_at_epoch)
 
-        existing = (
-            await self.db.get_connector_installation_by_account(kind, external_id)
-            if external_id
-            else None
+        iid = await self._upsert_installation(
+            kind=kind,
+            external_id=external_id,
+            label=label,
+            auth_type="oauth",
+            blob=blob,
+            scopes=list(token_set.scopes),
+            token_expires_at=token_expires_at,
         )
-        if existing is not None:
-            iid = existing["id"]
-            await self.db.update_connector_installation(
-                iid,
-                label=label,
-                scopes=list(token_set.scopes),
-                token_expires_at=token_expires_at,
-                needs_reconnect=False,
-                last_refresh_error_code=None,
-                secret_encrypted=blob,
+        inst = await self.db.get_connector_installation(iid)
+        assert inst is not None
+        return inst
+
+    async def complete_static_install(
+        self,
+        *,
+        kind: str,
+        fields: dict[str, str],
+        requested_label: str | None = None,
+    ) -> dict[str, Any]:
+        """Static-credential install (mail-connector.md §4.1): validate the
+        form against the connector's declared fields, verify live against
+        the real service, and only then persist. Upserts on the resulting
+        external account like `complete_install`."""
+        connector = await resolve_connector(self.db, kind)
+        if connector is None:
+            raise ConnectorError(f"unknown connector kind: {kind}")
+        if getattr(connector, "auth_mode", "oauth") != "static":
+            raise ConnectorError(f"{kind} does not use static credentials")
+
+        cleaned: dict[str, str] = {}
+        for f in connector.static_fields:
+            value = (fields.get(f.key) or "").strip()
+            if not value:
+                raise ConnectorError(f"{f.label} is required")
+            cleaned[f.key] = value
+
+        try:
+            external_id, identity_label = await connector.verify_static_credentials(
+                cleaned
             )
-        else:
-            iid = uuid.uuid4().hex[:12]
-            await self.db.save_connector_installation(
-                installation_id=iid,
-                kind=kind,
-                label=label,
-                auth_type="oauth",
-                secret_encrypted=blob,
-                created_at=datetime.now(timezone.utc).isoformat(),
-                external_account_id=external_id or None,
-                scopes=list(token_set.scopes),
-                token_expires_at=token_expires_at,
-            )
+        except StaticVerifyError as e:
+            raise ConnectorError(str(e)) from e
+
+        label = requested_label or identity_label
+        blob = encrypt(_serialize_static_secret(cleaned), settings.auth_token)
+
+        iid = await self._upsert_installation(
+            kind=kind,
+            external_id=external_id,
+            label=label,
+            auth_type="api_key",
+            blob=blob,
+            scopes=[],
+            token_expires_at=None,
+        )
         inst = await self.db.get_connector_installation(iid)
         assert inst is not None
         return inst
@@ -306,7 +436,15 @@ class ConnectorManager:
             blob = await self.db.get_connector_secret(installation_id)
             if blob is None:
                 raise ConnectorError("connector secret missing")
-            ts = _deserialize_token_set(decrypt(blob, settings.auth_token))
+            raw = decrypt(blob, settings.auth_token)
+
+            if inst["auth_type"] == "api_key":
+                # Static connectors (mail-connector.md §4.1): no OAuth
+                # token/refresh distinction — the decrypted blob IS the
+                # field-dict JSON, handed straight to the MCP subprocess.
+                return {"access_token": raw, "expires_at_epoch": 0.0}
+
+            ts = _deserialize_token_set(raw)
 
             near_expiry = (
                 ts.expires_at_epoch

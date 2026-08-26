@@ -31,6 +31,7 @@ from ..models import (
     ConnectorOAuthStatusResponse,
     ConnectorTokenResponse,
     CustomConnectorCreateRequest,
+    InstallStaticConnectorRequest,
     SetAgentConnectorsRequest,
     SetConnectorOAuthClientRequest,
     ToggleAgentConnectorRequest,
@@ -180,6 +181,32 @@ async def list_installations(_: str = Depends(verify_token)):
     return [_to_info(r) for r in rows]
 
 
+# --- static-credential install flow (mail-connector.md §4.1) ---------------
+
+
+@router.post(
+    "/{kind}/install-static",
+    response_model=ConnectorInstallationInfo,
+    status_code=status.HTTP_201_CREATED,
+)
+async def install_static(
+    kind: str,
+    req: InstallStaticConnectorRequest,
+    _: str = Depends(verify_token),
+):
+    """Verify `req.fields` live against the real service, then persist —
+    no OAuth redirect. The request blocks on that verification (typically a
+    few seconds); on failure the service's own error message comes back in
+    `detail` so the form can show it inline."""
+    try:
+        inst = await _require_manager().complete_static_install(
+            kind=kind, fields=req.fields, requested_label=req.label
+        )
+    except ConnectorError as e:
+        raise _http_error(e)
+    return _to_info(inst)
+
+
 # --- OAuth install flow ----------------------------------------------------
 
 
@@ -195,6 +222,14 @@ async def oauth_start(
     connector = await mgr.get(req.kind)
     if connector is None:
         raise HTTPException(status_code=404, detail=f"unknown connector: {req.kind}")
+    if getattr(connector, "auth_mode", "oauth") != "oauth":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{req.kind} uses static credentials — install it via "
+                f"POST /api/connectors/{req.kind}/install-static"
+            ),
+        )
     creds = await mgr.resolve_client_creds(req.kind)
     if creds is None:
         raise HTTPException(

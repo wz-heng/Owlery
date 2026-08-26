@@ -185,14 +185,20 @@ def _mime_for(path: Path, kind: str) -> str:
     return "application/octet-stream"
 
 
-def resolve_safe_path(working_dir: str | Path, requested: str) -> ResolvedFile:
-    """Validate `requested` against `working_dir`. Raises on rejection.
+def _resolved_root(working_dir: str | Path) -> Path:
+    root = Path(working_dir).resolve(strict=False)
+    if not root.is_dir():
+        raise PathRejected(f"Working directory does not exist: {working_dir}")
+    return root
 
-    `requested` may be absolute or relative. Either way, after
-    resolution it must live under `working_dir` (also resolved, so
-    symlinked roots work). Trailing whitespace, leading `~`, and
-    bare empty strings are rejected up front — they're almost always
-    a typo, not a deliberate request.
+
+def resolve_existing_path(working_dir: str | Path, requested: str) -> Path:
+    """The traversal/symlink-escape gate shared by every "read a file the
+    caller names" entry point. `requested` may be absolute or relative;
+    either way it must resolve to a regular file under `working_dir`
+    (`resolve_safe_path` layers extension/size checks on top for the
+    browser viewer; `resolve_raw_read_path` — mail-connector.md attachment
+    sends — skips those, since attachments aren't viewer-renderable types).
     """
     if not requested or not requested.strip():
         raise PathRejected("Empty path")
@@ -202,9 +208,7 @@ def resolve_safe_path(working_dir: str | Path, requested: str) -> ResolvedFile:
     if cleaned.startswith("~"):
         raise PathRejected("Tilde paths are not allowed; use a working-dir-relative path")
 
-    root = Path(working_dir).resolve(strict=False)
-    if not root.is_dir():
-        raise PathRejected(f"Working directory does not exist: {working_dir}")
+    root = _resolved_root(working_dir)
 
     candidate = Path(cleaned)
     if not candidate.is_absolute():
@@ -226,6 +230,47 @@ def resolve_safe_path(working_dir: str | Path, requested: str) -> ResolvedFile:
         raise FileNotFound(f"File not found: {requested!r}")
     if not resolved.is_file():
         raise FileNotFound(f"Not a regular file: {requested!r}")
+    return resolved
+
+
+def resolve_raw_read_path(working_dir: str | Path, requested: str) -> Path:
+    """Like `resolve_existing_path`, for callers that want raw bytes of any
+    existing file (no viewer extension allowlist, no size cap here — the
+    caller enforces its own)."""
+    return resolve_existing_path(working_dir, requested)
+
+
+def resolve_new_write_path(
+    working_dir: str | Path, relative_dir: str, filename: str
+) -> Path:
+    """Where a new file (that doesn't have to exist yet) may be written
+    under `working_dir`. `filename` is sanitized to its basename — no path
+    separators, no traversal via the filename itself. `relative_dir` may
+    add subdirectories but, after resolution, must still live under
+    `working_dir` (mail-connector.md attachment downloads)."""
+    root = _resolved_root(working_dir)
+
+    name = Path(filename).name
+    if not name or name in (".", ".."):
+        raise PathRejected(f"Invalid filename: {filename!r}")
+
+    sub = (relative_dir or "").strip().strip("/")
+    base = root if not sub else (root / sub)
+    resolved = (base / name).resolve(strict=False)
+
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        raise PathRejected(f"Path escapes working directory: {filename!r}") from None
+    return resolved
+
+
+def resolve_safe_path(working_dir: str | Path, requested: str) -> ResolvedFile:
+    """Validate `requested` against `working_dir` AND the viewer's
+    renderable-type allowlist. Raises on rejection — see
+    `resolve_existing_path` for the traversal/symlink-escape rules this
+    layers on top of."""
+    resolved = resolve_existing_path(working_dir, requested)
 
     size = resolved.stat().st_size
     if size > MAX_FILE_BYTES:
@@ -235,7 +280,7 @@ def resolve_safe_path(working_dir: str | Path, requested: str) -> ResolvedFile:
 
     kind = _classify(resolved)
     mime = _mime_for(resolved, kind)
-    rel = str(resolved.relative_to(root))
+    rel = str(resolved.relative_to(_resolved_root(working_dir)))
 
     return ResolvedFile(
         abs_path=resolved,
