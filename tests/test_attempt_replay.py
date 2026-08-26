@@ -182,8 +182,34 @@ async def test_assemble_session_replay_flags_unobserved_prefix(db):
     assert replay["unobserved_prefix"] is not None
     assert len(replay["unobserved_prefix"]["events"]) == 1
     assert replay["unobserved_prefix"]["events"][0]["seq"] == 0
+    assert replay["untimed_anomalies"] is None
     # The timestamped row still appears in the main timeline.
     assert [e["seq"] for e in replay["timeline"]] == [1]
+
+
+@pytest.mark.asyncio
+async def test_assemble_session_replay_flags_untimed_anomaly_distinctly_from_prefix(db):
+    """An untimed message AFTER a timestamped row is NOT ordinary
+    pre-tracking history (Snape review) — it must be surfaced as its own
+    anomaly, not silently absorbed into `unobserved_prefix` (which would
+    make the timeline look complete when it isn't)."""
+    await _session(db)
+    await db.append_message(session_id="s1", seq=0, role="user", type="text", content="normal")
+    # A NULL row appearing AFTER a timestamped one — shouldn't happen in
+    # normal operation, but must not be misclassified as legacy history.
+    await db.conn.execute(
+        "INSERT INTO messages (session_id, seq, role, type, content, created_at) "
+        "VALUES ('s1', 1, 'user', 'text', '\"mystery\"', NULL)"
+    )
+    await db.conn.commit()
+
+    replay = await assemble_session_replay(db, "s1")
+    assert replay["unobserved_prefix"] is None
+    assert replay["untimed_anomalies"] is not None
+    assert [e["seq"] for e in replay["untimed_anomalies"]["events"]] == [1]
+    # The anomalous row is not silently dropped from the response, but it's
+    # also not falsely placed into the timed main timeline.
+    assert [e["seq"] for e in replay["timeline"]] == [0]
 
 
 @pytest.mark.asyncio

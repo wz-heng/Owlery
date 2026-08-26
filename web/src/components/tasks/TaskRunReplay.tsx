@@ -62,7 +62,7 @@ function ReplayBody({
   replay: ReplayTimeline;
   onOpenSession?: (sessionId: string) => void;
 }) {
-  if (replay.timeline.length === 0 && !replay.unobserved_prefix) {
+  if (replay.timeline.length === 0 && !replay.unobserved_prefix && !replay.untimed_anomalies) {
     return <p className="py-4 text-xs italic text-muted-foreground">No activity recorded yet.</p>;
   }
   return (
@@ -70,6 +70,11 @@ function ReplayBody({
       {replay.unobserved_prefix && (
         <div className="mb-2 rounded-lg bg-ink-100 p-2 text-[11px] italic text-muted-foreground">
           {replay.unobserved_prefix.summary}
+        </div>
+      )}
+      {replay.untimed_anomalies && (
+        <div className="mb-2 rounded-lg border border-destructive/30 bg-destructive-surface p-2 text-[11px] text-destructive">
+          {replay.untimed_anomalies.summary}
         </div>
       )}
       {replay.timeline.map((event, i) =>

@@ -29,6 +29,7 @@ describe("TaskRunReplay", () => {
       task_run: { task_id: "task-1", run_id: "run-1" },
       gap_threshold_seconds: 300,
       unobserved_prefix: null,
+      untimed_anomalies: null,
       timeline: [
         { kind: "message", ts: "2026-08-01T00:00:00Z", seq: 0, summary: "user: go", detail: {} },
         {
@@ -68,6 +69,7 @@ describe("TaskRunReplay", () => {
       task_run: null,
       gap_threshold_seconds: 300,
       unobserved_prefix: null,
+      untimed_anomalies: null,
       timeline: [
         {
           kind: "delegation",
@@ -94,11 +96,30 @@ describe("TaskRunReplay", () => {
         summary: "1 message(s) recorded before timestamps were tracked",
         events: [{ kind: "message", ts: null, seq: 0, summary: "user: legacy", detail: {} }],
       },
+      untimed_anomalies: null,
       timeline: [
         { kind: "message", ts: "2026-08-01T00:00:00Z", seq: 1, summary: "user: new", detail: {} },
       ],
     });
     render(<TaskRunReplay taskId="task-1" runId="run-1" />);
     expect(screen.getByText(/recorded before timestamps were tracked/)).toBeInTheDocument();
+  });
+
+  it("flags untimed anomalies distinctly from the legacy unobserved prefix", () => {
+    seed({
+      session_id: "session-1",
+      task_run: null,
+      gap_threshold_seconds: 300,
+      unobserved_prefix: null,
+      untimed_anomalies: {
+        summary: "1 message(s) with no timestamp appeared AFTER timestamped rows",
+        events: [{ kind: "message", ts: null, seq: 5, summary: "user: mystery", detail: {} }],
+      },
+      timeline: [
+        { kind: "message", ts: "2026-08-01T00:00:00Z", seq: 0, summary: "user: normal", detail: {} },
+      ],
+    });
+    render(<TaskRunReplay taskId="task-1" runId="run-1" />);
+    expect(screen.getByText(/appeared AFTER timestamped rows/)).toBeInTheDocument();
   });
 });

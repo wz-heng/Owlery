@@ -2616,6 +2616,12 @@ class SessionManager:
             last_msg_seq: int | None = None
             interrupted = False
             turn_exc: BaseException | None = None
+            # Whether backend.start() itself returned — distinguishes "the
+            # process never came up" from "it started fine and something
+            # else in the loop (persistence, event translation, the stream
+            # itself) raised later" (Snape review, attempt-replay.md §3.1
+            # point 2): only the former is classified "start_failed" below.
+            started = False
 
             try:
                 await backend.start(
@@ -2624,6 +2630,7 @@ class SessionManager:
                     session.claude_session_id,
                     credential=credential,
                 )
+                started = True
 
                 async for event in backend.stream():
                     watchdog_state["last"] = time.monotonic()
@@ -2751,6 +2758,7 @@ class SessionManager:
                     watchdog_state=watchdog_state,
                     interrupted=interrupted,
                     turn_exc=turn_exc,
+                    started=started,
                     saw_result=saw_result,
                     message_seq=last_msg_seq,
                 )
@@ -3852,6 +3860,7 @@ class SessionManager:
         watchdog_state: dict[str, Any],
         interrupted: bool,
         turn_exc: BaseException | None,
+        started: bool,
         saw_result: bool,
         message_seq: int | None,
     ) -> None:
@@ -3878,10 +3887,9 @@ class SessionManager:
             wd_reason, limit = watchdog_state["tripped"]
             reason = f"watchdog_{wd_reason}"
             detail = {"limit": limit}
-        elif turn_exc is not None:
-            # backend.start() (or the stream loop itself) raised before a
-            # clean/error result ever arrived — e.g. the CLI binary vanished
-            # from PATH mid-flight.
+        elif turn_exc is not None and not started:
+            # backend.start() itself raised before any process came up —
+            # e.g. the CLI binary vanished from PATH mid-flight.
             reason = "start_failed"
             detail = {"error": str(turn_exc)}
         elif saw_result:
@@ -3893,8 +3901,14 @@ class SessionManager:
         else:
             # The blind spot §2 point 1 targets directly: the CLI's process
             # ended (crash, external kill, silent exit) without ever
-            # producing a result.
+            # producing a result. Also covers an exception raised AFTER a
+            # successful start() (persistence, event translation, the stream
+            # itself) — Snape review: that's a process/turn failure, not a
+            # "never started" one, but the exception text is still worth
+            # keeping for diagnosis.
             reason = "process_error"
+            if turn_exc is not None:
+                detail = {"error": str(turn_exc)}
 
         exit_info = getattr(backend, "last_exit", None)
         stderr_text = getattr(backend, "stderr_text", "") or ""

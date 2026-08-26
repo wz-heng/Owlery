@@ -285,13 +285,31 @@ async def assemble_session_replay(
             task_events = [r.to_dict() for r in records]
 
     # Messages written before `messages.created_at` existed have no
-    # timestamp — a strict-by-seq prefix within the session (the column is
-    # stamped unconditionally on every write going forward, so once any
-    # timestamped row exists, nothing after it is ever untimed again).
-    # Surfaced as an explicit "recording starts here" marker rather than
-    # silently guessing a time (attempt-replay.md §3.2 / §4.5).
-    untimed_messages = [m for m in messages if not m.get("created_at")]
-    timed_messages = [m for m in messages if m.get("created_at")]
+    # timestamp. In the ordinary case that's a strict-by-seq PREFIX (the
+    # column is stamped unconditionally on every write going forward, so
+    # once a timestamped row exists nothing after it should ever be untimed
+    # again) — surfaced as an explicit "recording starts here" marker rather
+    # than silently guessing a time (attempt-replay.md §3.2 / §4.5).
+    #
+    # `messages` is ordered by seq (load_messages), so a single forward scan
+    # separates the leading untimed run from everything after it. Anything
+    # untimed found AFTER the first timestamped row is NOT part of that
+    # innocuous prefix — it's an anomaly (manual insert, partial migration,
+    # a future bug) that must stay visible on its own, not get silently
+    # absorbed into "history predating tracking" and hide a real mid-session
+    # observation gap (Snape review).
+    prefix_untimed_messages: list[dict[str, Any]] = []
+    anomalous_untimed_messages: list[dict[str, Any]] = []
+    timed_messages: list[dict[str, Any]] = []
+    in_prefix = True
+    for m in messages:
+        if m.get("created_at"):
+            in_prefix = False
+            timed_messages.append(m)
+        elif in_prefix:
+            prefix_untimed_messages.append(m)
+        else:
+            anomalous_untimed_messages.append(m)
 
     timed_events: list[dict[str, Any]] = []
     timed_events.extend(_message_event(m) for m in timed_messages)
@@ -309,14 +327,29 @@ async def assemble_session_replay(
     timeline = _insert_gaps(timed_events, gap_threshold_seconds=gap_threshold_seconds)
 
     unobserved_prefix = None
-    if untimed_messages:
+    if prefix_untimed_messages:
         unobserved_prefix = {
             "summary": (
-                f"{len(untimed_messages)} message(s) recorded before "
+                f"{len(prefix_untimed_messages)} message(s) recorded before "
                 "timestamps were tracked — chronology within this span is "
                 "unknown, ordered by sequence only"
             ),
-            "events": [_message_event(m) for m in untimed_messages],
+            "events": [_message_event(m) for m in prefix_untimed_messages],
+        }
+
+    untimed_anomalies = None
+    if anomalous_untimed_messages:
+        # Should not happen in normal operation — every write after the
+        # first timestamped row is expected to carry a timestamp. Surfaced
+        # distinctly (never merged into `unobserved_prefix` or silently
+        # dropped) precisely because it's unexpected.
+        untimed_anomalies = {
+            "summary": (
+                f"{len(anomalous_untimed_messages)} message(s) with no "
+                "timestamp appeared AFTER timestamped rows — this shouldn't "
+                "happen; their position in the timeline is unknown"
+            ),
+            "events": [_message_event(m) for m in anomalous_untimed_messages],
         }
 
     return {
@@ -324,5 +357,6 @@ async def assemble_session_replay(
         "task_run": task_run_ref,
         "gap_threshold_seconds": gap_threshold_seconds,
         "unobserved_prefix": unobserved_prefix,
+        "untimed_anomalies": untimed_anomalies,
         "timeline": timeline,
     }

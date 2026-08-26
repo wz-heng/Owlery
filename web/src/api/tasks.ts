@@ -197,6 +197,12 @@ export interface ReplayTimeline {
    * unknown, ordered by sequence only. Null when the whole session postdates
    * that migration (the common case going forward). */
   unobserved_prefix: ReplayUnobservedPrefix | null;
+  /** Untimed messages found AFTER a timestamped row — shouldn't happen in
+   * normal operation (every write past the first timestamped row is
+   * expected to carry one). Surfaced distinctly from `unobserved_prefix`
+   * rather than silently absorbed into it, since it signals an anomaly
+   * (manual insert, partial migration, a future bug), not ordinary history. */
+  untimed_anomalies: ReplayUnobservedPrefix | null;
   timeline: ReplayEvent[];
 }
 

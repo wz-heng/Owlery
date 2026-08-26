@@ -576,6 +576,7 @@ describe("taskStore attempt replay (attempt-replay.md §3.3)", () => {
       task_run: { task_id: "task-1", run_id: "run-1" },
       gap_threshold_seconds: 300,
       unobserved_prefix: null,
+      untimed_anomalies: null,
       timeline: [{ kind: "message", ts: "2026-08-01T00:00:00Z", seq: 0, summary: "hi", detail: {} }],
     });
 

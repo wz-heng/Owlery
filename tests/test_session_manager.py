@@ -1458,6 +1458,42 @@ async def test_run_backend_records_harness_exit_reason_start_failed(manager):
 
 
 @pytest.mark.asyncio
+async def test_run_backend_records_harness_exit_reason_process_error_when_stream_raises_after_start(
+    manager,
+):
+    """An exception raised AFTER backend.start() succeeded (persistence,
+    event translation, the stream itself) is a process/turn failure, not a
+    "never started" one — Snape review caught this misclassification. The
+    exception text is still preserved for diagnosis."""
+
+    session = await _new(manager, "ExitProcessErrorMidStream")
+
+    class ExplodesMidStreamBackend:
+        async def start(self, prompt, working_dir, resume_id=None, credential=None):
+            pass
+
+        def stream(self):
+            async def _gen():
+                raise RuntimeError("stream reader crashed")
+                yield  # pragma: no cover — never reached
+            return _gen()
+
+        async def stop(self):
+            pass
+
+    manager._make_run = lambda s, agent=None, connectors=None: ExplodesMidStreamBackend()  # type: ignore[method-assign,assignment]
+
+    with pytest.raises(RuntimeError):
+        _ = [m async for m in manager._run_backend(session, "go")]
+
+    exits = await manager.db.list_harness_exits_for_session(session.id)
+    assert len(exits) == 1
+    row = exits[0]
+    assert row["reason"] == "process_error"
+    assert "stream reader crashed" in row["reason_detail"]["error"]
+
+
+@pytest.mark.asyncio
 async def test_run_backend_records_harness_exit_reason_interrupted(manager):
     """Esc/interrupt() cancels the inner task; CancelledError unwinds
     `_run_backend` through the exact frame the invariant hooks into."""
