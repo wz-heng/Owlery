@@ -899,11 +899,14 @@ class TaskBoardManager:
         return release, op
 
     @staticmethod
-    def _delivery_terminal_source(task_id: str, run_id: str) -> str:
-        return f"task:{task_id}:run:{run_id}:delivery:terminal"
+    def _delivery_terminal_source(
+        task_id: str, run_id: str, settle_op_id: str | None = None
+    ) -> str:
+        base = f"task:{task_id}:run:{run_id}:delivery:terminal"
+        return f"{base}:{settle_op_id}" if settle_op_id else base
 
     async def _notify_delivery_terminal(
-        self, task: TaskRecord, delivery: DeliveryRecord
+        self, task: TaskRecord, delivery: DeliveryRecord, settle_op_id: str | None = None
     ) -> None:
         if not task.origin_session_id or self.session_mgr is None or self.db is None:
             return
@@ -930,7 +933,9 @@ class TaskBoardManager:
             "automatically retry interrupted external Git/PR work."
         )
         await self.session_mgr.enqueue_session_injection(
-            source_key=self._delivery_terminal_source(task.id, delivery.run_id),
+            source_key=self._delivery_terminal_source(
+                task.id, delivery.run_id, settle_op_id
+            ),
             session_id=task.origin_session_id,
             prompt=prompt,
         )
@@ -976,21 +981,51 @@ class TaskBoardManager:
             reason="server restarted; release stage interrupted"
         )
         await self.repo.reset_preparing_deliveries()
+        # Data self-heal (task-board-gaps open-pr-500.md §4): a delivery left
+        # `blocked` despite already carrying a `pr_number` is exactly the shape
+        # the terminal-notification idempotency-key collision produced — the PR
+        # op itself had already succeeded before the notify call crashed the
+        # response and a subsequent retry's `_fail` overwrote the status on top
+        # of it. Idempotent and unconditional so it also self-heals any future
+        # occurrence, not just the two historical rows this ticket names.
+        for fixed in await self.repo.reconcile_blocked_deliveries_with_pr():
+            logger.info(
+                "delivery %s (task %s) self-healed blocked -> delivered "
+                "(pr_number=%s already recorded)",
+                fixed.id, fixed.task_id, fixed.pr_number,
+            )
         if self.session_mgr is None or self.db is None:
             return
         # B2: reconstruct the terminal-delivery outbox source for live origins.
+        # The existence check must use the SAME key the live notify path would
+        # use (the settle event's own op-scoped key), not the old unscoped key
+        # — otherwise a stale unscoped row from a prior event wrongly skips a
+        # still-missing op-scoped notification, or a fresh unscoped enqueue
+        # duplicates one already sent under its op-scoped key (open-pr-500.md
+        # §4 blocker-2). Isolated per-delivery: one bad row must not abort the
+        # rest of this boot pass.
         for task, delivery in await self.repo.list_terminal_deliveries():
             if not task.origin_session_id:
                 continue
-            source_key = self._delivery_terminal_source(task.id, delivery.run_id)
-            if await self.db.get_session_injection_by_source(source_key):
-                continue
-            if not await self.db.session_exists(task.origin_session_id):
-                await self.repo.record_delivery_notification_unavailable(
-                    delivery.id, reason="origin session was deleted"
+            try:
+                settle_op_id = await self.delivery.current_terminal_settle_op_id(delivery.id)
+                source_key = self._delivery_terminal_source(
+                    task.id, delivery.run_id, settle_op_id
                 )
-                continue
-            await self._notify_delivery_terminal(task, delivery)
+                if await self.db.get_session_injection_by_source(source_key):
+                    continue
+                if not await self.db.session_exists(task.origin_session_id):
+                    await self.repo.record_delivery_notification_unavailable(
+                        delivery.id, reason="origin session was deleted"
+                    )
+                    continue
+                await self._notify_delivery_terminal(task, delivery, settle_op_id)
+            except Exception:
+                logger.exception(
+                    "boot delivery-notification reconstruction failed for delivery "
+                    "%s (task %s); continuing with the remaining deliveries",
+                    delivery.id, task.id,
+                )
         return probation
 
     # --- deploy_switch boot reconciliation + probation (§7.5/§8) ---------
@@ -1311,9 +1346,9 @@ class TaskBoardManager:
                     and delivery.pr_number is None
                 ):
                     continue
-                updated = await self.delivery.reconcile_interrupted_pr(delivery)
+                updated, settle_op_id = await self.delivery.reconcile_interrupted_pr(delivery)
                 if updated.status != delivery.status:
-                    await self._notify_delivery_terminal(task, updated)
+                    await self._notify_delivery_terminal(task, updated, settle_op_id)
                     await self.publish_task_update(task.id)
         except Exception:
             logger.exception("interrupted-PR reconcile pass failed")

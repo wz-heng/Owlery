@@ -2693,6 +2693,30 @@ class TaskRepository:
             )
         return [self._delivery_op_record(r) for r in rows]
 
+    async def get_delivery_with_ops(
+        self, delivery_id: str
+    ) -> tuple[DeliveryRecord, list[DeliveryOpRecord]]:
+        """The delivery row and its full op ledger read under ONE hold of
+        `self._lock` — the same lock every write (`finish_op`, `_transaction`)
+        also takes — so a caller deriving a settle-event attribution from
+        BOTH can never see them split across a concurrent op settling in
+        between two separate reads (open-pr-500.md §4 blocker-1: a delivery
+        snapshot taken by `get_delivery` and an op id picked moments later by
+        a fresh `list_delivery_ops` call could straddle a just-settled newer
+        op, publishing the OLDER snapshot under the NEWER op's key)."""
+        async with self._lock:
+            delivery_row = await self._delivery_row(self.conn, delivery_id)
+            op_rows = await self._fetchall(
+                self.conn,
+                "SELECT * FROM task_delivery_ops WHERE delivery_id = ? "
+                "ORDER BY created_at, id",
+                (delivery_id,),
+            )
+        return (
+            self._delivery_record(delivery_row),
+            [self._delivery_op_record(r) for r in op_rows],
+        )
+
     async def list_delivery_siblings(
         self, board_id: str, repository: str, *, exclude_delivery_id: str
     ) -> list[DeliveryRecord]:
@@ -3232,11 +3256,30 @@ class TaskRepository:
         return self._delivery_record(delivery), self._delivery_op_record(op)
 
     async def record_pr_reconcile(
-        self, delivery_id: str, *, pr_number: int | None, pr_url: str | None, pr_state: str | None
-    ) -> DeliveryRecord:
+        self, delivery_id: str, *, op_id: str,
+        pr_number: int | None, pr_url: str | None, pr_state: str | None,
+    ) -> tuple[DeliveryRecord, bool]:
         """Fold an already-existing PR (found by a read-only reconcile) into a
         blocked(interrupted) delivery, settling it delivered — never a re-POST
-        (§16, S3)."""
+        (§16, S3). Also flips the interrupted `pull_request` op row itself
+        `succeeded` (it cannot go through `finish_op`'s running-only CAS, since
+        boot recovery already moved it to `interrupted`): the op ledger must
+        show this settle genuinely happened, so a caller deriving the settle
+        event from the op ledger later (`current_terminal_settle_op_id`) finds
+        this real succeeded op instead of treating the reconcile as having no
+        event at all (open-pr-500.md §4 should-1).
+
+        Returns ``(delivery, reconciled)`` — ``reconciled`` is True ONLY when
+        THIS call performed the settle (op row flipped AND delivery row
+        updated), never inferred from comparing the returned status against a
+        caller's stale pre-call snapshot: a concurrent path (e.g. a live PR
+        retry that creates the SAME PR independently) can resolve the
+        delivery to `delivered` before this call's own write runs, in which
+        case the precondition check below fails and the op row is left
+        untouched — a caller that instead compared `updated.status !=
+        <stale delivery>.status` would wrongly conclude THIS call settled
+        something and attribute a notification to `op_id`, an op row this
+        call never wrote to."""
         stamp = _now_iso()
         async with self._transaction() as conn:
             row = await self._delivery_row(conn, delivery_id)
@@ -3245,7 +3288,21 @@ class TaskRepository:
                 and row["reason_kind"] == "interrupted"
                 and row["pr_number"] is None
             ):
-                return self._delivery_record(row)
+                return self._delivery_record(row), False
+            cursor = await conn.execute(
+                "UPDATE task_delivery_ops SET state='succeeded', result=?, finished_at=? "
+                "WHERE id=? AND delivery_id=? AND kind='pull_request' AND state='interrupted'",
+                (
+                    _json_object({"number": pr_number, "url": pr_url, "state": pr_state}),
+                    stamp, op_id, delivery_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                # The op row didn't move (wrong id/kind, already resolved by a
+                # concurrent path, ...). The op ledger and the delivery row
+                # must move together — never fold the PR into the delivery
+                # without a matching op-row settle.
+                return self._delivery_record(row), False
             await conn.execute(
                 "UPDATE task_deliveries SET pr_number=?, pr_url=?, pr_state=?, "
                 "status='delivered', reason_kind=NULL, reason_detail=NULL, updated_at=? "
@@ -3257,7 +3314,7 @@ class TaskRepository:
                 conn, delivery_row=row, kind="delivery_pr_reconciled",
                 actor_kind="system", now=stamp,
             )
-        return self._delivery_record(row)
+        return self._delivery_record(row), True
 
     async def record_delivery_notification_unavailable(
         self, delivery_id: str, *, reason: str
@@ -3376,6 +3433,43 @@ class TaskRepository:
                 )
                 count += 1
         return count
+
+    async def reconcile_blocked_deliveries_with_pr(self) -> list[DeliveryRecord]:
+        """Boot self-heal (task-board-gaps open-pr-500.md §4): a delivery stuck
+        ``blocked`` while it already carries a ``pr_number`` is definitionally
+        wrong — that field is only ever folded in by a PR create/reconcile that
+        succeeded, so its presence is proof the external op worked even though
+        the delivery row itself later got forced ``blocked`` by an unrelated
+        failure on top of that success (the terminal-notification idempotency-
+        key collision this ticket fixes). Runs unconditionally at every boot;
+        a one-time historical data fix expressed as an idempotent reconcile,
+        never a manual production DB edit — a delivery this has already
+        corrected never matches the WHERE clause again."""
+        stamp = _now_iso()
+        out: list[DeliveryRecord] = []
+        async with self._transaction() as conn:
+            rows = await self._fetchall(
+                conn,
+                "SELECT * FROM task_deliveries WHERE status='blocked' AND pr_number IS NOT NULL",
+            )
+            for d in rows:
+                cursor = await conn.execute(
+                    "UPDATE task_deliveries SET status='delivered', reason_kind=NULL, "
+                    "reason_detail=NULL, updated_at=? WHERE id=? AND status='blocked'",
+                    (stamp, d["id"]),
+                )
+                if cursor.rowcount != 1:
+                    continue
+                row = await self._delivery_row(conn, d["id"])
+                await self._delivery_event(
+                    conn,
+                    delivery_row=row,
+                    kind="delivery_blocked_pr_reconciled",
+                    actor_kind="system",
+                    now=stamp,
+                )
+                out.append(self._delivery_record(row))
+        return out
 
     async def list_terminal_deliveries(
         self,

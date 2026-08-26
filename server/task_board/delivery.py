@@ -60,7 +60,22 @@ _TEARDOWN_START_STATES = frozenset(
     {"ready", "delivered", "blocked", "conflicted", "failed"}
 )
 
-NotifyTerminal = Callable[[TaskRecord, DeliveryRecord], Awaitable[None]]
+# Op kinds that can fold a result into `task_deliveries.status` (§4) — the only
+# ops whose settle is a genuine terminal-status EVENT. `branch_delete`/
+# `worktree_remove`/`deploy_stage`/`deploy_switch` never touch `delivery_status`,
+# so teardown settling after a delivery is already terminal must never be
+# mistaken for a new one (task-board-gaps open-pr-500.md §1).
+_DELIVERY_TERMINAL_OP_KINDS = frozenset({"commit", "push", "pull_request", "merge"})
+# A settle event's op `state` must match the CURRENT delivery status's outcome
+# category — a delivery sitting `delivered` can only be truthfully attributed to
+# a `succeeded` op, `blocked`/`conflicted`/`failed` only to a `failed` one. This
+# stops a later, unrelated FAILED retry (e.g. the GitHub-422 retry that used to
+# clobber an already-delivered row back to `blocked`) from being picked as the
+# "latest" event over the earlier op that actually produced the current status
+# (open-pr-500.md §4 should-1).
+_DELIVERY_SETTLE_SUCCESS_STATUSES = frozenset({"delivered"})
+
+NotifyTerminal = Callable[[TaskRecord, DeliveryRecord, "str | None"], Awaitable[None]]
 
 # Delivery states from which a deploy_switch may legally begin (§4.1.1). A switch
 # deploys an already-settled delivery, so the same set the git goal ops use.
@@ -113,6 +128,12 @@ class _ReleaseSwitchCtx:
 
 
 
+class PullRequestAlreadyExistsError(ws.WorkspaceError):
+    """GitHub 422'd a PR create because one already exists for this head branch —
+    the caller must reconcile (read the existing PR) rather than record a bare
+    op_failed (task-board-gaps open-pr-500.md §4)."""
+
+
 async def _github_create_pr(
     token: str,
     owner: str,
@@ -133,9 +154,12 @@ async def _github_create_pr(
             json={"title": title, "body": body, "head": head, "base": base, "draft": draft},
         )
     if resp.status_code >= 300:
-        raise ws.WorkspaceError(
-            f"GitHub PR creation failed ({resp.status_code}): {resp.text[:300]}"
-        )
+        text = resp.text[:300]
+        if resp.status_code == 422 and "already exists" in text.lower():
+            raise PullRequestAlreadyExistsError(
+                f"GitHub PR creation failed ({resp.status_code}): {text}"
+            )
+        raise ws.WorkspaceError(f"GitHub PR creation failed ({resp.status_code}): {text}")
     data = resp.json()
     return {
         "number": data.get("number"),
@@ -287,12 +311,80 @@ class DeliveryCoordinator:
             f"Owlery-Task: {task.id}\nOwlery-Run: {run.id}\n"
         )
 
-    async def _fire_terminal(self, task: TaskRecord, delivery: DeliveryRecord) -> None:
+    async def _fire_terminal(
+        self, task: TaskRecord, delivery: DeliveryRecord, settle_op_id: str | None
+    ) -> None:
         if (
-            self._notify_terminal is not None
-            and delivery.status in {"delivered", "conflicted", "blocked", "failed"}
+            self._notify_terminal is None
+            or delivery.status not in {"delivered", "conflicted", "blocked", "failed"}
         ):
-            await self._notify_terminal(task, delivery)
+            return
+        # Bypass isolation (task-board-gaps open-pr-500.md §2): the goal op this
+        # notification reports on already settled durably before this call —
+        # any failure reaching the origin session (idempotency-key collision,
+        # a deleted session, a transient DB error) must never turn an already-
+        # successful delivery op into a 500 response.
+        try:
+            await self._notify_terminal(task, delivery, settle_op_id)
+        except Exception:
+            logger.exception(
+                "delivery terminal notification failed for delivery %s (task %s); "
+                "the delivery op itself already settled and is unaffected",
+                delivery.id, task.id,
+            )
+
+    @staticmethod
+    def _pick_terminal_settle_op_id(
+        delivery: DeliveryRecord, ops: list[Any]
+    ) -> str | None:
+        wanted_state = (
+            "succeeded" if delivery.status in _DELIVERY_SETTLE_SUCCESS_STATUSES
+            else "failed"
+        )
+        candidates = [
+            op for op in ops
+            if op.kind in _DELIVERY_TERMINAL_OP_KINDS and op.state == wanted_state
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda op: (op.finished_at or op.created_at, op.id))
+        return candidates[-1].id
+
+    async def current_terminal_settle_op_id(self, delivery_id: str) -> str | None:
+        """The id of the goal op whose settle produced the delivery's CURRENT
+        terminal status — used only where no op id is available at the call
+        site itself (boot/off-critical-path reconcile passes; teardown uses
+        `current_terminal_snapshot` instead, see there). Every primary settle
+        path (`_op_commit`/`_op_push`/`_op_pr`/`_op_merge`) knows its own
+        `op_id` and passes it straight through instead of calling this
+        (open-pr-500.md §4 blocker-1): calling this from inside one of those
+        would race a concurrently-started next op (delivery statuses that admit
+        a new goal op, e.g. `delivered`, also admit one before this op's own
+        notify runs), misattributing this settle's payload to that other op's
+        key. Filters candidates to the op `state` matching the delivery's
+        CURRENT status category, so a later unrelated failed retry can never
+        outrank the earlier op that actually produced a `delivered` status
+        (§4 should-1). ``None`` when the delivery reached its terminal status
+        via `accept()`'s baseline capture (no op ledger row for that settle)."""
+        delivery, ops = await self.repo.get_delivery_with_ops(delivery_id)
+        return self._pick_terminal_settle_op_id(delivery, ops)
+
+    async def current_terminal_snapshot(
+        self, delivery_id: str
+    ) -> tuple[DeliveryRecord, str | None]:
+        """The delivery AND its settle-attributed op id, read together from
+        ONE atomic snapshot (`repo.get_delivery_with_ops`). Required whenever
+        a caller publishes BOTH values from a single call — teardown reads a
+        `final` delivery snapshot to republish and, separately, needs its
+        settle key; two independent reads (delivery, then ops) could straddle
+        a concurrent goal op settling in between (teardown never itself holds
+        a running op across that gap once its own worktree/branch ops finish,
+        and `_TEARDOWN_START_STATES`/`_GOAL_START_STATES` overlap, so a new
+        goal op is free to start and finish there), publishing a STALE
+        delivery snapshot under a NEWER op's key (open-pr-500.md §4
+        blocker-1)."""
+        delivery, ops = await self.repo.get_delivery_with_ops(delivery_id)
+        return delivery, self._pick_terminal_settle_op_id(delivery, ops)
 
     @asynccontextmanager
     async def _admit_delivery_op(self):
@@ -555,7 +647,7 @@ class DeliveryCoordinator:
             )
         except ws.WorkspaceError as exc:
             final = await self._fail(delivery.id, op_id, "op_failed", str(exc), actor_kind, actor_agent_id)
-        return await self._published(task, final)
+        return await self._published(task, final, op_id)
 
     async def _op_push(self, task, run, board, delivery, confirmations, actor_kind, actor_agent_id):
         if (delivery.commits_ahead or 0) < 1:
@@ -568,7 +660,7 @@ class DeliveryCoordinator:
                                       actor_kind=actor_kind, actor_agent_id=actor_agent_id)
             final = await self._fail(delivery.id, op_id, "no_remote",
                                      f"repository has no remote named {remote!r}", actor_kind, actor_agent_id)
-            return await self._published(task, final)
+            return await self._published(task, final, op_id)
         # Destructive guard: refuse to overwrite a non-ancestor remote ref (§13).
         force = bool(confirmations.get("allow_force_push"))
         remote_tip = await ws.remote_branch_tip(repo, remote, delivery.attempt_branch)
@@ -594,9 +686,23 @@ class DeliveryCoordinator:
         except ws.WorkspaceError as exc:
             reason = "push_auth_failed" if "auth" in str(exc).lower() or "denied" in str(exc).lower() else "op_failed"
             final = await self._fail(delivery.id, op_id, reason, str(exc), actor_kind, actor_agent_id)
-        return await self._published(task, final)
+        return await self._published(task, final, op_id)
 
     async def _op_pr(self, task, run, board, delivery, installation_id, draft, actor_kind, actor_agent_id):
+        # Idempotency guard (task-board-gaps open-pr-500.md §3, should-2): a
+        # delivery that already carries a pr_number has a PR, full stop — a
+        # PURE READ of that already-durable result. It short-circuits before
+        # EVERY precondition below (pushed_ref, base_ref, GitHub remote,
+        # connector resolution), not just before the create-PR network call —
+        # those preconditions describe what a FRESH PR attempt needs, and are
+        # meaningless once a PR already exists (a delivery reaching this state
+        # via the boot self-heal, e.g., may never even have `pushed_ref` set on
+        # this code path). Applies even if the delivery's `status` itself was
+        # left corrupted (e.g. `blocked`) by an unrelated failure after the PR
+        # was made — correcting `status` is the boot self-heal's job (§4), not
+        # this call's.
+        if delivery.pr_number is not None:
+            return delivery
         if not delivery.pushed_ref:
             raise TaskConflictError("a successful push is required before opening a PR")
         base = delivery.base_ref
@@ -608,7 +714,7 @@ class DeliveryCoordinator:
                                       actor_kind=actor_kind, actor_agent_id=actor_agent_id)
             final = await self._fail(delivery.id, op_id, "no_connector",
                                      "remote is not a GitHub repository", actor_kind, actor_agent_id)
-            return await self._published(task, final)
+            return await self._published(task, final, op_id)
         owner, gh_repo = gh
         resolved = await self._resolve_connector(run.agent_id, installation_id)
         if resolved.get("error"):
@@ -616,7 +722,7 @@ class DeliveryCoordinator:
                                       actor_kind=actor_kind, actor_agent_id=actor_agent_id)
             final = await self._fail(delivery.id, op_id, resolved["error"],
                                      resolved["detail"], actor_kind, actor_agent_id)
-            return await self._published(task, final)
+            return await self._published(task, final, op_id)
         is_draft = board.git_delivery_default_draft_pr if draft is None else bool(draft)
         op_id = await self._begin(
             delivery, "pull_request",
@@ -638,9 +744,35 @@ class DeliveryCoordinator:
                                  "pr_state": pr["state"]},
                 result=pr, actor_kind=actor_kind, actor_agent_id=actor_agent_id,
             )
+        except PullRequestAlreadyExistsError:
+            # GitHub says a PR already exists for this head branch — reconcile
+            # by reading it back (never a re-POST, §3) and settle succeeded,
+            # exactly like the off-critical-path interrupted-PR reconcile.
+            found = None
+            try:
+                found = await self.find_pr(
+                    token, owner, gh_repo, head_owner=owner, branch=delivery.attempt_branch
+                )
+            except Exception:
+                logger.exception(
+                    "PR-already-exists reconcile read failed for delivery %s", delivery.id
+                )
+            if found is not None:
+                final, _ = await self.repo.finish_op(
+                    delivery.id, op_id, state="succeeded", delivery_status="delivered",
+                    delivery_fields={"pr_number": found["number"], "pr_url": found["url"],
+                                     "pr_state": found["state"]},
+                    result=found, actor_kind=actor_kind, actor_agent_id=actor_agent_id,
+                )
+            else:
+                final = await self._fail(
+                    delivery.id, op_id, "op_failed",
+                    "GitHub reports a PR already exists for this branch but it could not be found",
+                    actor_kind, actor_agent_id,
+                )
         except ws.WorkspaceError as exc:
             final = await self._fail(delivery.id, op_id, "op_failed", str(exc), actor_kind, actor_agent_id)
-        return await self._published(task, final)
+        return await self._published(task, final, op_id)
 
     async def _op_merge(self, task, run, board, delivery, strategy, actor_kind, actor_agent_id):
         base = delivery.base_ref
@@ -677,7 +809,7 @@ class DeliveryCoordinator:
                 )
         except ws.WorkspaceError as exc:
             final = await self._fail(delivery.id, op_id, "op_failed", str(exc), actor_kind, actor_agent_id)
-        return await self._published(task, final)
+        return await self._published(task, final, op_id)
 
 
     async def _drain_wait(self, op_id: str) -> list[BusySource]:
@@ -814,8 +946,19 @@ class DeliveryCoordinator:
             except ws.WorkspaceError as exc:
                 await self.repo.finish_op(delivery.id, br_op, state="failed", error=str(exc),
                                           actor_kind=actor_kind, actor_agent_id=actor_agent_id)
-        final = await self.repo.get_delivery(delivery.id)
-        return await self._published(task, final)
+        # Teardown never itself settles a delivery-terminal-kind op (only
+        # worktree_remove/branch_delete, neither of which touches
+        # `delivery_status`) — it republishes whatever terminal status this
+        # delivery already reached, so it reuses that prior event's settle id
+        # rather than fabricating a new one. `final` and `settle_op_id` MUST
+        # come from one atomic snapshot, not two separate reads: once the
+        # last teardown op above finishes, no op is left `running` for this
+        # delivery, and `_TEARDOWN_START_STATES`/`_GOAL_START_STATES` overlap
+        # — so a concurrent goal op is free to start and settle before a
+        # second, later read would see it, publishing a stale `final` under
+        # that newer op's key (open-pr-500.md §4 blocker-1).
+        final, settle_op_id = await self.current_terminal_snapshot(delivery.id)
+        return await self._published(task, final, settle_op_id)
 
     async def _begin_teardown_op(self, delivery, kind, request, actor_kind, actor_agent_id):
         async with self._admit_delivery_op():
@@ -853,31 +996,44 @@ class DeliveryCoordinator:
                     "detail": "the run's Agent has multiple GitHub connectors; select one"}
         return {"installation_id": live[0]}
 
-    async def reconcile_interrupted_pr(self, delivery: DeliveryRecord) -> DeliveryRecord:
-        """Off-critical-path read reconcile for an interrupted PR op (§16, S3)."""
+    async def reconcile_interrupted_pr(
+        self, delivery: DeliveryRecord
+    ) -> tuple[DeliveryRecord, str | None]:
+        """Off-critical-path read reconcile for an interrupted PR op (§16, S3).
+
+        Returns the reconciled delivery plus the settle event's op id (the
+        interrupted `pull_request` op, flipped `succeeded` in the same write as
+        the delivery) so the caller's terminal notification is scoped to that
+        genuine event rather than falling back to a dynamic "latest op" lookup
+        that a self-heal reconcile must never let a later, unrelated op shadow
+        (open-pr-500.md §4 should-1). ``None`` op id means nothing changed —
+        the caller must not notify."""
         gh = ws.parse_github_remote(delivery.remote_url)
         if gh is None or delivery.pr_number is not None:
-            return delivery
+            return delivery, None
         ops = await self.repo.list_delivery_ops(delivery.id)
         pr_ops = [o for o in ops if o.kind == "pull_request" and o.state == "interrupted"]
         if not pr_ops:
-            return delivery
+            return delivery, None
+        op_id = pr_ops[-1].id
         inst = pr_ops[-1].request.get("installation_id")
         if not inst:
-            return delivery
+            return delivery, None
         owner, repo = gh
         try:
             token = (await self.connectors.get_access_token(inst))["access_token"]
             found = await self.find_pr(token, owner, repo, head_owner=owner, branch=delivery.attempt_branch)
         except Exception:
             logger.exception("PR reconcile read failed for delivery %s", delivery.id)
-            return delivery
+            return delivery, None
         if not found:
-            return delivery
+            return delivery, None
         # A PR already exists — record it without creating anything (never a re-POST).
-        return await self.repo.record_pr_reconcile(
-            delivery.id, pr_number=found["number"], pr_url=found["url"], pr_state=found["state"],
+        updated, reconciled = await self.repo.record_pr_reconcile(
+            delivery.id, op_id=op_id,
+            pr_number=found["number"], pr_url=found["url"], pr_state=found["state"],
         )
+        return updated, (op_id if reconciled else None)
 
     # --- release-line deploy (docs/plans/release-line-deploy.md §3) ------
     #
@@ -1332,9 +1488,14 @@ class DeliveryCoordinator:
         )
         return final
 
-    async def _published(self, task: TaskRecord, delivery: DeliveryRecord) -> DeliveryRecord:
+    async def _published(
+        self,
+        task: TaskRecord,
+        delivery: DeliveryRecord,
+        settle_op_id: str | None = None,
+    ) -> DeliveryRecord:
         delivery = await self._recompute_supersession(task, delivery)
-        await self._fire_terminal(task, delivery)
+        await self._fire_terminal(task, delivery, settle_op_id)
         return delivery
 
     # --- supersede derivation (docs/plans/task-board-overhaul.md §3.1) --
