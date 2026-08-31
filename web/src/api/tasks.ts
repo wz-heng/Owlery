@@ -170,6 +170,42 @@ export interface TaskEvent {
   created_at: string;
 }
 
+/** One entry in an attempt-replay timeline (docs/plans/attempt-replay.md
+ * §3.2). `kind` distinguishes the merged source: "message" | "tool_call" |
+ * "tool_result" | "turn_usage" | "turn_terminal" (the turn-termination
+ * invariant row — the answer to "how did it die") | "task_event" |
+ * "delegation" | "bg_task_started" | "bg_task_finished" | "gap" (an
+ * explicit silence longer than the threshold — the "black hole" block). */
+export interface ReplayEvent {
+  kind: string;
+  ts: string | null;
+  seq: number | null;
+  summary: string;
+  detail: Record<string, unknown>;
+}
+
+export interface ReplayUnobservedPrefix {
+  summary: string;
+  events: ReplayEvent[];
+}
+
+export interface ReplayTimeline {
+  session_id: string;
+  task_run: { task_id: string; run_id: string } | null;
+  gap_threshold_seconds: number;
+  /** Messages written before `messages.created_at` existed — chronology
+   * unknown, ordered by sequence only. Null when the whole session postdates
+   * that migration (the common case going forward). */
+  unobserved_prefix: ReplayUnobservedPrefix | null;
+  /** Untimed messages found AFTER a timestamped row — shouldn't happen in
+   * normal operation (every write past the first timestamped row is
+   * expected to carry one). Surfaced distinctly from `unobserved_prefix`
+   * rather than silently absorbed into it, since it signals an anomaly
+   * (manual insert, partial migration, a future bug), not ordinary history. */
+  untimed_anomalies: ReplayUnobservedPrefix | null;
+  timeline: ReplayEvent[];
+}
+
 export interface TaskArtifact {
   id: string;
   task_id: string;
@@ -583,6 +619,8 @@ export const taskApi = {
     get<TaskRun[]>(token, `/api/tasks/${taskId}/runs`),
   events: (token: string, taskId: string) =>
     get<TaskEvent[]>(token, `/api/tasks/${taskId}/events`),
+  runReplay: (token: string, taskId: string, runId: string) =>
+    get<ReplayTimeline>(token, `/api/tasks/${taskId}/runs/${runId}/replay`),
   artifacts: (token: string, taskId: string) =>
     get<TaskArtifact[]>(token, `/api/tasks/${taskId}/artifacts`),
   deleteArtifact: (token: string, taskId: string, artifactId: string) =>

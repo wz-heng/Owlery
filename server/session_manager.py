@@ -2549,6 +2549,11 @@ class SessionManager:
     # 12 × 30min comfortably outlasts one 5-hour window.
     _MAX_LIMIT_PROBES = 12
 
+    # Tail of a dead HarnessRun's stderr kept in the terminal record
+    # (attempt-replay.md §3.1 point 2). Smaller than bg_tasks.MAX_STREAM_BYTES
+    # (200KB) — this is diagnostic context for a crash, not a full log.
+    _HARNESS_EXIT_STDERR_TAIL_BYTES = 16 * 1024
+
     async def _run_backend(
         self, session: Session, prompt: str
     ) -> AsyncIterator[dict[str, Any]]:
@@ -2605,6 +2610,18 @@ class SessionManager:
             # never hang forever the way the deep-research wedge did.
             watchdog_state = {"last": time.monotonic(), "tripped": None}
             watchdog = self._start_turn_watchdog(backend, watchdog_state)
+            # Last messages.seq this HarnessRun persisted — the anchor the
+            # turn-termination row (below) attaches to (attempt-replay.md
+            # §3.1 points 2 and 4).
+            last_msg_seq: int | None = None
+            interrupted = False
+            turn_exc: BaseException | None = None
+            # Whether backend.start() itself returned — distinguishes "the
+            # process never came up" from "it started fine and something
+            # else in the loop (persistence, event translation, the stream
+            # itself) raised later" (Snape review, attempt-replay.md §3.1
+            # point 2): only the former is classified "start_failed" below.
+            started = False
 
             try:
                 await backend.start(
@@ -2613,6 +2630,7 @@ class SessionManager:
                     session.claude_session_id,
                     credential=credential,
                 )
+                started = True
 
                 async for event in backend.stream():
                     watchdog_state["last"] = time.monotonic()
@@ -2642,6 +2660,8 @@ class SessionManager:
                     msg_seq: int | None = None
                     if msg_content is not None:
                         msg_seq = await self._persist_message(session, msg_content)
+                        if msg_seq is not None:
+                            last_msg_seq = msg_seq
 
                     # Track pending question state for reconnect re-render
                     if event.type == "question_request" and event.tool_use_id:
@@ -2674,7 +2694,8 @@ class SessionManager:
                         # result — error ones included — appends a turn_usage
                         # row. Recording must never fail the turn.
                         await self._record_turn_usage(
-                            session, resolve_model(session, agent), event
+                            session, resolve_model(session, agent), event,
+                            message_seq=msg_seq,
                         )
                         # First fork turn produced a result: drop the ephemeral
                         # fork state so turn 2+ behaves like a normal resumed
@@ -2701,6 +2722,19 @@ class SessionManager:
                         if msg_seq is not None:
                             ws_event["seq"] = msg_seq
                         yield ws_event
+            except asyncio.CancelledError:
+                # Esc/interrupt() cancels the inner task; the CancelledError
+                # unwinds this generator through this exact frame (see the
+                # comment on the classification ladder below). Record it as
+                # the turn-termination reason before it propagates further.
+                interrupted = True
+                raise
+            except Exception as exc:
+                # E.g. backend.start() raised (CLI not on PATH, spawn
+                # failure) before any process existed. Still must not die
+                # unexplained — recorded as "start_failed" below.
+                turn_exc = exc
+                raise
             finally:
                 if watchdog is not None:
                     watchdog.cancel()
@@ -2714,6 +2748,20 @@ class SessionManager:
                     logger.exception(
                         "backend.stop() failed cleanly for session %s", session.id
                     )
+                # Turn-termination invariant (attempt-replay.md §3.1 point 2):
+                # no HarnessRun may end without a persisted terminal record,
+                # on ANY exit path — clean result, crash, watchdog, interrupt,
+                # or a start() failure. This finally runs on every one of them.
+                await self._record_harness_exit(
+                    session,
+                    backend,
+                    watchdog_state=watchdog_state,
+                    interrupted=interrupted,
+                    turn_exc=turn_exc,
+                    started=started,
+                    saw_result=saw_result,
+                    message_seq=last_msg_seq,
+                )
                 session._backend = None
 
             # Turn watchdog tripped (idle or overall cap): the backend was
@@ -3764,11 +3812,19 @@ class SessionManager:
     # ------------------------------------------------------------------ event translation
 
     async def _record_turn_usage(
-        self, session: Session, model: str | None, event: HarnessEvent
+        self,
+        session: Session,
+        model: str | None,
+        event: HarnessEvent,
+        *,
+        message_seq: int | None = None,
     ) -> None:
         """Append this turn's consumption to the turn_usage ledger
         (usage-tracking.md §4). Best-effort: a ledger failure is logged,
-        never propagated — it must not fail the turn."""
+        never propagated — it must not fail the turn.
+
+        `message_seq` is the seq of the `result` message this row reports on
+        (attempt-replay.md §3.1 point 4) — the replay assembly's turn anchor."""
         if self.db is None:
             return
         usage = event.usage
@@ -3789,10 +3845,93 @@ class SessionManager:
                 is_error=event.is_error,
                 model_usage=event.model_usage,
                 origin="turn",
+                message_seq=message_seq,
             )
         except Exception:
             logger.exception(
                 "failed to record turn usage for session %s", session.id
+            )
+
+    async def _record_harness_exit(
+        self,
+        session: Session,
+        backend: HarnessRun,
+        *,
+        watchdog_state: dict[str, Any],
+        interrupted: bool,
+        turn_exc: BaseException | None,
+        started: bool,
+        saw_result: bool,
+        message_seq: int | None,
+    ) -> None:
+        """Persist the turn-termination invariant row (attempt-replay.md §3.1
+        point 2 — the spine of the replay feature): every HarnessRun writes
+        exactly one row here, however it ended. Called unconditionally from
+        the `finally:` in `_run_backend`, so it runs on every exit path —
+        clean result, crash, watchdog trip, user interrupt, or a start()
+        failure. Best-effort: recording must never mask whatever real
+        exception is already propagating out of the turn loop.
+
+        Classification order matters — checked most-specific-cause-first,
+        since more than one condition can be simultaneously true (e.g. a
+        watchdog-stopped backend also has a real OS exit code from the
+        SIGTERM/SIGKILL escalation, but "watchdog" is the reason that
+        actually explains the death)."""
+        if self.db is None:
+            return
+        reason: str
+        detail: dict[str, Any] = {}
+        if interrupted:
+            reason = "interrupted"
+        elif watchdog_state.get("tripped") is not None:
+            wd_reason, limit = watchdog_state["tripped"]
+            reason = f"watchdog_{wd_reason}"
+            detail = {"limit": limit}
+        elif turn_exc is not None and not started:
+            # backend.start() itself raised before any process came up —
+            # e.g. the CLI binary vanished from PATH mid-flight.
+            reason = "start_failed"
+            detail = {"error": str(turn_exc)}
+        elif saw_result:
+            # The CLI delivered a final `result` event — success or a logical
+            # error, either way the process finished its turn. A slow exit
+            # afterward that needed SIGTERM/SIGKILL escalation to reap is
+            # still "completed"; `escalation` below records that separately.
+            reason = "completed"
+        else:
+            # The blind spot §2 point 1 targets directly: the CLI's process
+            # ended (crash, external kill, silent exit) without ever
+            # producing a result. Also covers an exception raised AFTER a
+            # successful start() (persistence, event translation, the stream
+            # itself) — Snape review: that's a process/turn failure, not a
+            # "never started" one, but the exception text is still worth
+            # keeping for diagnosis.
+            reason = "process_error"
+            if turn_exc is not None:
+                detail = {"error": str(turn_exc)}
+
+        exit_info = getattr(backend, "last_exit", None)
+        stderr_text = getattr(backend, "stderr_text", "") or ""
+        stderr_tail = (
+            stderr_text[-self._HARNESS_EXIT_STDERR_TAIL_BYTES :]
+            if stderr_text
+            else None
+        )
+        try:
+            await self.db.add_harness_exit(
+                session_id=session.id,
+                message_seq=message_seq,
+                reason=reason,
+                exit_code=exit_info.exit_code if exit_info else None,
+                signal=exit_info.signal if exit_info else None,
+                escalation=exit_info.escalation if exit_info else None,
+                reason_detail=detail,
+                stderr_tail=stderr_tail,
+                created_at=datetime.now(timezone.utc).isoformat(),
+            )
+        except Exception:
+            logger.exception(
+                "failed to record harness exit for session %s", session.id
             )
 
     @staticmethod

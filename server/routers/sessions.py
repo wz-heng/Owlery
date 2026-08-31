@@ -4,6 +4,7 @@ from ..auth import verify_token
 from ..harness import BackendForkNotSupported
 from ..models import CreateSessionRequest, DuplicateSessionRequest, ForkSessionRequest, ImportSessionRequest, MessageContent, PendingParkInfo, PendingQuestionInfo, SessionDetail, SessionInfo, SessionStatus
 from ..model_routing import ModelBackendError, validate_model_for_backend
+from ..replay import DEFAULT_GAP_THRESHOLD_SECONDS, assemble_session_replay
 from ..session_manager import ForkError, fork_info_fields, session_manager
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
@@ -220,6 +221,26 @@ async def get_session(session_id: str, _: str = Depends(verify_token)):
     if archived_detail is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Session not found")
     return archived_detail
+
+
+@router.get("/{session_id}/replay")
+async def get_session_replay(
+    session_id: str,
+    gap_threshold_seconds: float = Query(DEFAULT_GAP_THRESHOLD_SECONDS, gt=0),
+    _: str = Depends(verify_token),
+):
+    """Attempt-replay assembly (docs/plans/attempt-replay.md §3.2): the
+    merged, time-ordered timeline for this session — turns, tool calls,
+    delegations, cost, and how each turn ended. Works for live, archived, or
+    otherwise-dead sessions alike — everything is read from durable storage."""
+    if session_manager.db is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Database not ready")
+    replay = await assemble_session_replay(
+        session_manager.db, session_id, gap_threshold_seconds=gap_threshold_seconds
+    )
+    if replay is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Session not found")
+    return replay
 
 
 @router.delete("/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
