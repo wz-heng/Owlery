@@ -1429,7 +1429,7 @@ export function ChatView({
       )}
 
       {activeSessionId && (
-        <div className="research-card-wrap shrink-0 px-4 empty:hidden">
+        <div className="research-card-wrap shrink-0 px-4 empty:hidden max-h-48 overflow-y-auto">
           <ResearchCard sessionId={activeSessionId} />
         </div>
       )}

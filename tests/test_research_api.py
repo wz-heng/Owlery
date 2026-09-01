@@ -58,13 +58,17 @@ async def _session(client):
 
 @pytest.mark.asyncio
 async def test_start_get_list_research(client, monkeypatch):
-    async def fake_run_research(question, *, on_progress=None, **kw):
-        return ResearchReport(
-            question=question, report="report", findings=[], sources=[],
-            angles=["a"], claims_examined=0, cost=None,
-        )
+    # `list` is now a `running`-only snapshot (see test_list_excludes_terminal_
+    # jobs), so the pipeline must still be in flight when we check it — an
+    # instantly-resolving fake would race the list GET and flake.
+    import asyncio as _asyncio
 
-    monkeypatch.setattr(rm_mod, "run_research", fake_run_research)
+    async def slow_run(question, *, on_progress=None, **kw):
+        await _asyncio.sleep(30)
+        return ResearchReport(question=question, report="report", findings=[],
+                              sources=[], angles=["a"], claims_examined=0, cost=None)
+
+    monkeypatch.setattr(rm_mod, "run_research", slow_run)
 
     session = await _session(client)
     r = await client.post(
@@ -75,11 +79,85 @@ async def test_start_get_list_research(client, monkeypatch):
     rid = r.json()["id"]
     assert r.json()["status"] == "running"
 
-    # GET single + list
-    got = await client.get(f"/api/sessions/{session['id']}/research/{rid}", headers=HEADERS)
-    assert got.status_code == 200 and got.json()["question"] == "what is X?"
-    lst = await client.get(f"/api/sessions/{session['id']}/research", headers=HEADERS)
-    assert any(j["id"] == rid for j in lst.json())
+    try:
+        # GET single + list
+        got = await client.get(f"/api/sessions/{session['id']}/research/{rid}", headers=HEADERS)
+        assert got.status_code == 200 and got.json()["question"] == "what is X?"
+        lst = await client.get(f"/api/sessions/{session['id']}/research", headers=HEADERS)
+        assert any(j["id"] == rid for j in lst.json())
+    finally:
+        # Don't leave the 30s sleep task for pytest-asyncio's loop teardown to
+        # reap (Snape review).
+        await client.post(
+            f"/api/sessions/{session['id']}/research/{rid}/cancel", headers=HEADERS
+        )
+
+
+@pytest.mark.asyncio
+async def test_list_excludes_terminal_jobs(client, monkeypatch):
+    """The list route is a snapshot for session load / WS reconnect, not a
+    history log. A job that went terminal long ago must not reappear from a
+    refresh once the frontend's own linger timer has (or will have)
+    dismissed its card (ResearchCard dismiss task). A job that went terminal
+    only moments ago DOES still appear — this covers a client reconnecting
+    right after missing the terminal WS broadcast (Snape review), for which
+    failed/cancelled/interrupted jobs have no transcript-message fallback."""
+    import asyncio as _asyncio
+    from datetime import datetime, timedelta, timezone
+
+    async def slow_run(question, *, on_progress=None, **kw):
+        await _asyncio.sleep(30)
+        return ResearchReport(question=question, report="r", findings=[],
+                              sources=[], angles=[], claims_examined=0, cost=None)
+
+    monkeypatch.setattr(rm_mod, "run_research", slow_run)
+
+    session = await _session(client)
+    started = await client.post(
+        f"/api/sessions/{session['id']}/research",
+        json={"question": "still running?"}, headers=HEADERS,
+    )
+    running_id = started.json()["id"]
+
+    # Bypass the manager for the terminal fixture rows — inserting them
+    # directly avoids any race with a background pipeline task completing on
+    # its own.
+    long_ago = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    stale_id = "stale-finished-job"
+    await research_manager.db.create_research_job(
+        stale_id, session["id"], "finished ages ago?", "t0",
+    )
+    await research_manager.db.update_research_job(
+        stale_id, status="completed", phase="done", completed_at=long_ago,
+    )
+
+    just_now = datetime.now(timezone.utc).isoformat()
+    recent_id = "recent-failed-job"
+    await research_manager.db.create_research_job(
+        recent_id, session["id"], "just failed?", "t0",
+    )
+    await research_manager.db.update_research_job(
+        recent_id, status="failed", error="boom", completed_at=just_now,
+    )
+
+    lst = (await client.get(f"/api/sessions/{session['id']}/research", headers=HEADERS)).json()
+    ids = {j["id"] for j in lst}
+    assert running_id in ids
+    assert recent_id in ids
+    assert stale_id not in ids
+
+    # The single-job GET is unaffected — a terminal job is still fetchable by id
+    # regardless of how long ago it finished.
+    got = await client.get(
+        f"/api/sessions/{session['id']}/research/{stale_id}", headers=HEADERS
+    )
+    assert got.status_code == 200
+    assert got.json()["status"] == "completed"
+
+    # Cleanup: cancel the still-running job so it doesn't leak into teardown.
+    await client.post(
+        f"/api/sessions/{session['id']}/research/{running_id}/cancel", headers=HEADERS
+    )
 
 
 @pytest.mark.asyncio

@@ -5,9 +5,9 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
-import { ResearchCard } from "./ResearchCard";
+import { ResearchCard, RESEARCH_LINGER_MS } from "./ResearchCard";
 import { useSessionStore, type ResearchJob } from "../stores/sessionStore";
 
 function job(overrides: Partial<ResearchJob> = {}): ResearchJob {
@@ -88,5 +88,58 @@ describe("ResearchCard", () => {
         )
       ).toBe(true)
     );
+  });
+
+  describe("terminal auto-dismiss", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    it("removes a completed job from the store after the linger window", () => {
+      useSessionStore.setState({
+        research: { s1: [job({ status: "completed", phase: "done" })] },
+      });
+      render(<ResearchCard sessionId="s1" />);
+      expect(screen.getByText(/Report delivered below/)).toBeTruthy();
+
+      act(() => {
+        vi.advanceTimersByTime(RESEARCH_LINGER_MS - 1);
+      });
+      expect(useSessionStore.getState().research["s1"]).toHaveLength(1);
+
+      act(() => {
+        vi.advanceTimersByTime(1);
+      });
+      expect(useSessionStore.getState().research["s1"]).toHaveLength(0);
+      expect(screen.queryByText(/Report delivered below/)).toBeNull();
+    });
+
+    it("does not auto-dismiss a running job", () => {
+      useSessionStore.setState({ research: { s1: [job()] } });
+      render(<ResearchCard sessionId="s1" />);
+
+      act(() => {
+        vi.advanceTimersByTime(RESEARCH_LINGER_MS * 5);
+      });
+      expect(useSessionStore.getState().research["s1"]).toHaveLength(1);
+    });
+
+    it("dismisses a failed job independently of a still-running one", () => {
+      useSessionStore.setState({
+        research: {
+          s1: [
+            job({ id: "running-job", status: "running" }),
+            job({ id: "failed-job", status: "failed", error: "boom" }),
+          ],
+        },
+      });
+      render(<ResearchCard sessionId="s1" />);
+
+      act(() => {
+        vi.advanceTimersByTime(RESEARCH_LINGER_MS);
+      });
+      const remaining = useSessionStore.getState().research["s1"];
+      expect(remaining).toHaveLength(1);
+      expect(remaining[0].id).toBe("running-job");
+    });
   });
 });

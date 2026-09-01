@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import aiosqlite
@@ -3483,14 +3483,36 @@ class Database:
         row = await cursor.fetchone()
         return self._row_to_research_job(row) if row else None
 
+    # A terminal `research_failed`/`research_cancelled`/`research_completed`
+    # broadcast can be missed by a client that's mid-reconnect (unlike a
+    # completed job, failed/cancelled/interrupted jobs have no fallback
+    # transcript message). Widen the snapshot to also cover jobs that went
+    # terminal within this window, so a reconnect shortly after the miss
+    # still surfaces the card instead of the job vanishing without a trace
+    # (Snape review — research-card dismiss task).
+    _RESEARCH_SNAPSHOT_TERMINAL_WINDOW_SECONDS = 30
+
     async def list_research_jobs_for_session(
         self, session_id: str, *, limit: int = 200
     ) -> list[dict[str, Any]]:
+        """Snapshot for session load / WS reconnect: `running` jobs, plus
+        anything that went terminal in the last
+        `_RESEARCH_SNAPSHOT_TERMINAL_WINDOW_SECONDS`. The card is a progress
+        indicator, not a history log — a terminal job outside that window
+        must never come back from a page refresh once the frontend's own
+        linger-then-dismiss timer has (or will have) removed it. Browsing
+        finished research jobs is a separate, unbuilt feature (research-card
+        dismiss task, §"不做")."""
         await self._ensure_connected()
+        cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=self._RESEARCH_SNAPSHOT_TERMINAL_WINDOW_SECONDS)
+        ).isoformat()
         cursor = await self._conn.execute(
             f"SELECT {self._RESEARCH_COLS} FROM research_jobs "
-            "WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
-            (session_id, limit),
+            "WHERE session_id = ? AND (status = 'running' OR completed_at > ?) "
+            "ORDER BY created_at DESC LIMIT ?",
+            (session_id, cutoff, limit),
         )
         rows = await cursor.fetchall()
         return [self._row_to_research_job(r) for r in rows]

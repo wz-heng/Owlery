@@ -262,6 +262,7 @@ interface SessionStore {
   research: Record<string, ResearchJob[]>;
   upsertResearch: (sessionId: string, job: Partial<ResearchJob> & { id: string }) => void;
   setResearch: (sessionId: string, jobs: ResearchJob[]) => void;
+  removeResearch: (sessionId: string, jobId: string) => void;
 }
 
 export interface ResearchJob {
@@ -569,6 +570,14 @@ export const useSessionStore = create<SessionStore>((set) => ({
     }),
   setResearch: (sessionId, jobs) =>
     set((s) => ({ research: { ...s.research, [sessionId]: jobs } })),
+  removeResearch: (sessionId, jobId) =>
+    set((s) => {
+      const current = s.research[sessionId];
+      if (!current) return {};
+      const next = current.filter((j) => j.id !== jobId);
+      if (next.length === current.length) return {};
+      return { research: { ...s.research, [sessionId]: next } };
+    }),
 
   delegations: {},
   upsertDelegation: (parentSessionId, d) =>

@@ -85,4 +85,39 @@ test("the /research command surfaces a live research card", async ({ page, reque
   await expect(card).toHaveAttribute("data-status", "cancelled", {
     timeout: 20_000,
   });
+
+  // The card is a progress indicator, not a history log: once terminal it
+  // lingers (RESEARCH_LINGER_MS in ResearchCard.tsx) then auto-dismisses
+  // from the DOM entirely — no fixed sleep, just Playwright's auto-wait.
+  await expect(page.locator(".research-card")).toHaveCount(0, { timeout: 15_000 });
+
+  // A reload must not permanently resurrect it. The token persists across
+  // reload but `activeSessionId` doesn't, so land back on the session list
+  // first, same as the initial navigation above. Selecting a session fetches
+  // `/api/sessions/{id}/research` (SessionList.tsx, mirroring the bg-tasks
+  // fetch right next to it) — explicitly wait for that response instead of
+  // just asserting a final DOM state, or this test could pass vacuously by
+  // observing 0 cards before the fetch has even landed (Snape review).
+  await page.reload();
+  await expect(page.locator(".agent-list-header")).toBeVisible();
+  const [researchResp] = await Promise.all([
+    page.waitForResponse(
+      (r) => r.request().method() === "GET" && r.url().endsWith("/research")
+    ),
+    page
+      .locator(".session-item .session-name", { hasText: "Research E2E" })
+      .click(),
+  ]);
+  await expect(page.locator(".chat-header h3")).toHaveText("Research E2E");
+
+  // The snapshot (server/database.py list_research_jobs_for_session) still
+  // covers a terminal job for a short window after it finished, so it may
+  // legitimately come back once here (Snape review: without that window, a
+  // missed terminal WS broadcast would make the job disappear with no trace
+  // at all) — but it must re-linger-and-vanish, not stick around forever.
+  const snapshotJobs: unknown[] = await researchResp.json();
+  if (snapshotJobs.length > 0) {
+    await expect(page.locator(".research-card")).toBeVisible();
+  }
+  await expect(page.locator(".research-card")).toHaveCount(0, { timeout: 15_000 });
 });
