@@ -454,14 +454,23 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   setView: (view) => set({ view }),
   setFilters: (patch) => set((state) => ({ filters: { ...state.filters, ...patch } })),
   resetFilters: () => set({ filters: EMPTY_FILTERS }),
-  selectBoard: (boardId) =>
+  selectBoard: (boardId) => {
+    // Re-selecting the board that's already active is a no-op: the caller
+    // (a real re-pick, or a redundant re-dispatch of the same `<select>`
+    // value — e.g. Playwright's selectOption() always fires a change event
+    // even when the value doesn't change) must not blow away tasks already
+    // loaded for it. Clearing unconditionally here previously left the
+    // board stuck empty forever, since the board-load effect keys off the
+    // boardId *value* and never re-fires for an unchanged id.
+    if (boardId === get().selectedBoardId) return;
     set({
       selectedBoardId: boardId,
       selectedTaskId: null,
       tasksById: {},
       taskOrder: [],
       error: null,
-    }),
+    });
+  },
   selectTask: (taskId) => set({ selectedTaskId: taskId }),
   setTaskSnapshot: (tasks) =>
     set({

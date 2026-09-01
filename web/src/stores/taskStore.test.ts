@@ -129,6 +129,42 @@ describe("taskStore transitions", () => {
     expect(dragOperation("done", "ready")).toBeNull();
   });
 
+  it("re-selecting the already-active board keeps its loaded tasks (no-op, not a wipe)", () => {
+    const loaded = task({ id: "task-1", status: "done" });
+    useTaskStore.setState({
+      selectedBoardId: "board-1",
+      tasksById: { [loaded.id]: loaded },
+      taskOrder: [loaded.id],
+    });
+
+    // A redundant re-select of the SAME board — e.g. a `<select>` onChange
+    // firing again for an unchanged value — must not blow away tasks
+    // already loaded for it: the board-load effect that would normally
+    // refill them is keyed on the boardId *value* and never re-fires for
+    // an unchanged id, so a naive unconditional reset here leaves the
+    // board permanently empty.
+    useTaskStore.getState().selectBoard("board-1");
+
+    expect(useTaskStore.getState().selectedBoardId).toBe("board-1");
+    expect(useTaskStore.getState().taskOrder).toEqual([loaded.id]);
+    expect(useTaskStore.getState().tasksById[loaded.id]).toBe(loaded);
+  });
+
+  it("selecting a different board does clear the previous board's tasks", () => {
+    const loaded = task({ id: "task-1", status: "done" });
+    useTaskStore.setState({
+      selectedBoardId: "board-1",
+      tasksById: { [loaded.id]: loaded },
+      taskOrder: [loaded.id],
+    });
+
+    useTaskStore.getState().selectBoard("board-2");
+
+    expect(useTaskStore.getState().selectedBoardId).toBe("board-2");
+    expect(useTaskStore.getState().taskOrder).toEqual([]);
+    expect(useTaskStore.getState().tasksById).toEqual({});
+  });
+
   it("invokes the lifecycle endpoint and stores the server-authoritative task", async () => {
     const current = task();
     const ready = task({ status: "ready", updated_at: "2026-07-26T00:01:00Z" });
