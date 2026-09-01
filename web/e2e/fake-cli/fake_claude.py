@@ -29,7 +29,15 @@ Ops:
   task_block    call `mcp__tasks__block` over MCP for the owning run
   task_reflect  call `mcp__tasks__reflect` over MCP (experience-consolidation.md §3.2/§3.3)
   skill_propose call `mcp__skills__propose` over MCP (experience-consolidation.md §3.4)
-  invoke_skill  emit a native `Skill` tool_use (no MCP call) to exercise use_count tracking
+  discover_skill  read the REAL `--plugin-dir` argv this process was actually
+                  spawned with, find the one landed SKILL.md there, and emit a
+                  native `Skill` tool_use naming whatever slug that file's
+                  frontmatter actually says — never a slug the test script
+                  hands in. This is what makes the touchstone e2e prove real
+                  discovery (experience-consolidation.md §3.5) instead of a
+                  scripted stand-in: only the model's DECISION to use the
+                  skill is canned, the file it found is the one the server
+                  really materialized (skill_registry.py `_materialize_plugin`).
   write_file    write a relative file inside the current worker workspace
   remember    persist a word into this session's transcript
   recall      read that word back out of the transcript
@@ -186,6 +194,7 @@ def parse_argv(argv: list[str]) -> dict:
         "resume": None,
         "mcp_servers": {},
         "prompt": "",
+        "plugin_dirs": [],
     }
     i = 0
     while i < len(argv):
@@ -195,6 +204,13 @@ def parse_argv(argv: list[str]) -> dict:
             break
         if arg.startswith("--output-format="):
             out["output_format"] = arg.split("=", 1)[1]
+        elif arg == "--plugin-dir":
+            # Repeatable, unlike the single-value flags below — collect every
+            # occurrence, matching how `claude` really takes it (server/harness/
+            # claude_code.py build_turn_argv).
+            value = argv[i + 1] if i + 1 < len(argv) else ""
+            out["plugin_dirs"].append(value)
+            i += 1
         elif arg in _VALUE_FLAGS:
             value = argv[i + 1] if i + 1 < len(argv) else ""
             if arg == "--output-format":
@@ -209,6 +225,30 @@ def parse_argv(argv: list[str]) -> dict:
             i += 1  # skip the value
         i += 1
     return out
+
+
+_SKILL_NAME_RE = re.compile(r"^name:\s*(\S+)\s*$", re.MULTILINE)
+
+
+def _discover_landed_skill(plugin_dirs: list[str]) -> tuple[str, str] | None:
+    """Scan the real `--plugin-dir` paths for a landed `skills/*/SKILL.md`
+    and return `(slug, path)` for the first one found, reading the slug out
+    of the file's own frontmatter rather than trusting the directory name —
+    same identity the real CLI would key skill invocation on. None if no
+    plugin dir carries any skill at all."""
+    for plugin_dir in plugin_dirs:
+        skills_root = pathlib.Path(plugin_dir) / "skills"
+        if not skills_root.is_dir():
+            continue
+        for skill_file in sorted(skills_root.glob("*/SKILL.md")):
+            try:
+                body = skill_file.read_text()
+            except OSError:
+                continue
+            match = _SKILL_NAME_RE.search(body)
+            slug = match.group(1) if match else skill_file.parent.name
+            return slug, str(skill_file)
+    return None
 
 
 def parse_directive(prompt: str) -> list[dict]:
@@ -370,7 +410,7 @@ def run_ops(ops: list[dict], parsed: dict, state: dict) -> None:
             arguments = {
                 key: op[key]
                 for key in (
-                    "memory_note", "claude_md_note", "skill_candidate_ids",
+                    "memory_pointer", "claude_md_note", "skill_candidate_ids",
                     "nothing_note",
                 )
                 if key in op
@@ -412,14 +452,26 @@ def run_ops(ops: list[dict], parsed: dict, state: dict) -> None:
                 pass
             _emit_text("proposed")
 
-        elif kind == "invoke_skill":
-            # Simulate the CLI's own native `Skill` tool_use — this is NOT an
-            # MCP call (skills are a CLI-native mechanism), just the same
-            # tool_use/tool_result shape a real skill invocation would stream,
-            # so the server's use_count hook (session_manager.py) fires on it.
-            tool_use_id = f"toolu_fake_invoke_skill_{index}"
-            _emit_tool_use(tool_use_id, "Skill", {"skill": op["slug"]})
-            _emit_tool_result(tool_use_id, f"Loaded skill {op['slug']}")
+        elif kind == "discover_skill":
+            # Real discovery, not a scripted stand-in: read the actual
+            # `--plugin-dir` argv (rendered by the real
+            # server/harness/claude_code.py build_turn_argv, only the model
+            # reply below is canned) and find whatever landed SKILL.md is
+            # really there. If the server never materialized one — approval
+            # didn't really land it, or --plugin-dir never made it into argv
+            # — there is nothing to discover and the fake says so, exactly as
+            # a real CLI with no matching plugin would.
+            tool_use_id = f"toolu_fake_discover_skill_{index}"
+            found = _discover_landed_skill(parsed["plugin_dirs"])
+            if found is None:
+                _emit_text(
+                    "No matching skill found under any configured plugin "
+                    f"directory ({parsed['plugin_dirs']!r})."
+                )
+                continue
+            slug, skill_path = found
+            _emit_tool_use(tool_use_id, "Skill", {"skill": slug})
+            _emit_tool_result(tool_use_id, f"Loaded skill {slug} from {skill_path}")
 
         elif kind == "write_file":
             tool_use_id = f"toolu_fake_write_{index}"

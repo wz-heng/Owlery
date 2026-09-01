@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -330,6 +331,131 @@ async def test_record_usage_increments_use_count_on_approved_candidate(registry)
 async def test_record_usage_unknown_slug_is_a_noop(registry):
     reg, _db, _repo, _agent_id = registry
     await reg.record_usage("does-not-exist")  # must not raise
+
+
+# --- Real skill discovery (Snape review point 1): approval must make the
+# skill invocable through a real loading path a future session's own
+# `claude` process actually reads — not just leave a commit on an orphan
+# branch nobody checks out. ------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_approve_materializes_a_real_plugin_file_for_the_agent(registry):
+    from server.skill_registry import agent_skills_plugin_dir
+
+    reg, _db, repo, agent_id = registry
+    candidate = await _propose(reg)
+    approved = await reg.approve(candidate["id"])
+
+    repository = await reg.resolve_repository(str(repo))
+    plugin_dir = agent_skills_plugin_dir(agent_id, repository)
+    manifest = plugin_dir / ".claude-plugin" / "plugin.json"
+    skill_file = plugin_dir / "skills" / "hermes-pr-flow" / "SKILL.md"
+    assert manifest.is_file()
+    assert json.loads(manifest.read_text())["name"]
+    assert skill_file.is_file()
+    assert skill_file.read_text() == approved["body_markdown"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_plugin_dir_none_before_any_approval(registry):
+    reg, _db, repo, agent_id = registry
+    assert await reg.resolve_plugin_dir(agent_id=agent_id, working_dir=str(repo)) is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_plugin_dir_returns_the_landed_dir_after_approval(registry):
+    reg, _db, repo, agent_id = registry
+    candidate = await _propose(reg)
+    await reg.approve(candidate["id"])
+
+    plugin_dir = await reg.resolve_plugin_dir(agent_id=agent_id, working_dir=str(repo))
+    assert plugin_dir is not None
+    assert (Path(plugin_dir) / "skills" / "hermes-pr-flow" / "SKILL.md").is_file()
+
+
+@pytest.mark.asyncio
+async def test_resolve_plugin_dir_none_for_a_different_repository(registry, tmp_path):
+    """A skill landed for one repository must not silently show up in a
+    different repository's session — no merge action ever moves it there."""
+    reg, _db, repo, agent_id = registry
+    candidate = await _propose(reg)
+    await reg.approve(candidate["id"])
+
+    other_repo = tmp_path / "other-repo"
+    other_repo.mkdir()
+    _git(other_repo, "init", "-q")
+    _git(other_repo, "config", "user.name", "Test")
+    _git(other_repo, "config", "user.email", "test@example.com")
+    (other_repo / "README.md").write_text("base\n")
+    _git(other_repo, "add", "README.md")
+    _git(other_repo, "commit", "-q", "-m", "base")
+
+    assert (
+        await reg.resolve_plugin_dir(agent_id=agent_id, working_dir=str(other_repo))
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_usage_scoped_by_repository_two_repos_same_slug(tmp_path):
+    """Two different repositories independently land a skill under the same
+    slug (each proposed and approved on its own). `record_usage` must
+    attribute a use to the candidate whose repository actually matches the
+    invoking session, not whichever same-slug candidate was approved most
+    recently — the bug Snape review point 2 flagged in the old
+    `get_latest_approved_skill_by_slug(slug)` (no scope at all)."""
+    repo_a = tmp_path / "repo-a"
+    repo_b = tmp_path / "repo-b"
+    for repo in (repo_a, repo_b):
+        repo.mkdir()
+        _git(repo, "init", "-q")
+        _git(repo, "config", "user.name", "Test")
+        _git(repo, "config", "user.email", "test@example.com")
+        (repo / "README.md").write_text("base\n")
+        _git(repo, "add", "README.md")
+        _git(repo, "commit", "-q", "-m", "base")
+
+    db = Database(str(tmp_path / "db.sqlite"))
+    await db.initialize()
+    agent = await db.get_default_agent()
+
+    session_a = SimpleNamespace(agent_id=agent["id"], working_dir=str(repo_a))
+    session_b = SimpleNamespace(agent_id=agent["id"], working_dir=str(repo_b))
+    session_mgr = SimpleNamespace(
+        sessions={"session-a": session_a, "session-b": session_b}
+    )
+
+    reg = SkillRegistry()
+    reg.bind(db=db, session_mgr=session_mgr)
+    try:
+        candidate_a = await reg.propose(
+            session_id="session-a", slug="hermes-pr-flow", title="A",
+            description=_DESCRIPTION, body_markdown=SKILL_BODY,
+            rationale="Walked this once in repo A.",
+        )
+        candidate_b = await reg.propose(
+            session_id="session-b", slug="hermes-pr-flow", title="B",
+            description=_DESCRIPTION, body_markdown=SKILL_BODY,
+            rationale="Walked this once in repo B.",
+        )
+        await reg.approve(candidate_a["id"])
+        # Approved AFTER a — the trap: an unscoped "latest approved by slug"
+        # lookup would attribute EVERY subsequent use to b, even one that
+        # really happened in repo a's session.
+        await reg.approve(candidate_b["id"])
+
+        repository_a = await reg.resolve_repository(str(repo_a))
+        await reg.record_usage(
+            "hermes-pr-flow", agent_id=agent["id"], repository=repository_a
+        )
+
+        after_a = await reg.get_candidate(candidate_a["id"])
+        after_b = await reg.get_candidate(candidate_b["id"])
+        assert after_a["use_count"] == 1
+        assert after_b["use_count"] == 0
+    finally:
+        await db.close()
 
 
 @pytest.mark.asyncio

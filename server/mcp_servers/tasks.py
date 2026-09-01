@@ -314,7 +314,7 @@ def complete_task(
 
 @mcp.tool(name="reflect")
 def reflect_task(
-    memory_note: str | None = None,
+    memory_pointer: str | None = None,
     claude_md_note: str | None = None,
     skill_candidate_ids: list[str] | None = None,
     nothing_note: str | None = None,
@@ -326,12 +326,22 @@ def reflect_task(
     `retrospective_required` until this has been called once for the run.
 
     Triage each lesson into the channel it belongs to, then pass the
-    matching argument (more than one may apply):
+    matching argument (more than one may apply). Two of the three are gated
+    by a real artifact, not by this call's text alone — a DB string is not a
+    retrospective:
 
-    - ``memory_note``: a judgment call specific to you — write it the way
-      you'd write your own agent memory.
+    - ``memory_pointer``: a judgment call specific to you. FIRST write it
+      yourself as a real file in your own memory directory (the one named in
+      your long-term-memory instructions), the way you'd write any other
+      memory — then pass that file's path RELATIVE to your memory directory
+      here. This call is checked to prove the file actually exists and is
+      non-empty; text passed here without a file behind it is rejected.
     - ``claude_md_note``: a rule every agent working in this repo should
-      know — a CLAUDE.md nomination landed via the normal branch+PR flow.
+      know. FIRST commit the CLAUDE.md edit on this run's own branch (the
+      normal branch+PR flow — no separate approval queue), THEN describe it
+      here. This call is checked to prove that commit actually exists on
+      this run's branch; a description with no real diff behind it is
+      rejected.
     - ``skill_candidate_ids``: ids returned by the `skills` MCP server's
       `propose`, for any repeatable multi-step process worth codifying —
       call `propose` first, then pass its id(s) here.
@@ -343,13 +353,13 @@ def reflect_task(
     error = _worker_only("reflect")
     if error:
         return error
-    if not (memory_note or claude_md_note or skill_candidate_ids or nothing_note):
+    if not (memory_pointer or claude_md_note or skill_candidate_ids or nothing_note):
         return (
-            "Error: at least one of memory_note/claude_md_note/"
+            "Error: at least one of memory_pointer/claude_md_note/"
             "skill_candidate_ids/nothing_note is required."
         )
     body: dict[str, Any] = {
-        "memory_note": memory_note,
+        "memory_pointer": memory_pointer,
         "claude_md_note": claude_md_note,
         "skill_candidate_ids": skill_candidate_ids or [],
         "nothing_note": nothing_note,

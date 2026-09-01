@@ -2590,6 +2590,15 @@ class SessionManager:
             agent.get("credential_id") if agent else None
         )
         connectors = await self._load_connectors(agent)
+        # Real skill discovery (experience-consolidation.md §3.4, Snape
+        # review point 1): resolve once per turn, not per recovery-loop
+        # iteration — the working dir doesn't change mid-turn, and this is
+        # the only part of the wiring that spawns a subprocess.
+        skills_plugin_dir: str | None = None
+        if session.agent_id and self._skill_registry is not None:
+            skills_plugin_dir = await self._skill_registry.resolve_plugin_dir(
+                agent_id=session.agent_id, working_dir=session.working_dir
+            )
         current_prompt = prompt
         recovery_attempts = 0
         transient_attempts = 0
@@ -2602,7 +2611,9 @@ class SessionManager:
         resume_at_turn_start = session.claude_session_id
 
         while True:
-            backend = self._make_run(session, agent, connectors)
+            backend = self._make_run(
+                session, agent, connectors, skills_plugin_dir=skills_plugin_dir
+            )
             session._backend = backend
             saw_result = False
             saw_tool_use = False
@@ -2675,7 +2686,26 @@ class SessionManager:
                                     slug = value
                                     break
                             if slug:
-                                await self._skill_registry.record_usage(slug)
+                                # Scope by (agent, repository) — the exact
+                                # identity a `--plugin-dir` was built from
+                                # (skill_registry.resolve_plugin_dir) — so
+                                # use_count attributes to the candidate this
+                                # session actually has loaded, not whichever
+                                # same-slug candidate from a different agent
+                                # or repository happened to be approved most
+                                # recently (Snape review point 2).
+                                usage_repository: str | None = None
+                                try:
+                                    usage_repository = await self._skill_registry.resolve_repository(
+                                        session.working_dir
+                                    )
+                                except Exception:
+                                    pass
+                                await self._skill_registry.record_usage(
+                                    slug,
+                                    agent_id=session.agent_id,
+                                    repository=usage_repository,
+                                )
                     if event.type == "text" and event.content and event.content.strip():
                         saw_text = True
 
@@ -3010,12 +3040,16 @@ class SessionManager:
         session: Session,
         agent: dict[str, Any] | None = None,
         connectors: list[tuple[Any, Any]] | None = None,
+        *,
+        skills_plugin_dir: str | None = None,
     ) -> HarnessRun:
         """Build the per-turn run for a session via its harness. Single seam
         the run loop calls (and tests monkeypatch); dispatches on
         `session.backend` through the registry — no kind branching here."""
         return get_harness(session.backend).create_run(
-            self._run_config(session, agent, connectors)
+            self._run_config(
+                session, agent, connectors, skills_plugin_dir=skills_plugin_dir
+            )
         )
 
     def _run_config(
@@ -3023,6 +3057,8 @@ class SessionManager:
         session: Session,
         agent: dict[str, Any] | None = None,
         connectors: list[tuple[Any, Any]] | None = None,
+        *,
+        skills_plugin_dir: str | None = None,
     ) -> RunConfig:
         """Build the per-turn RunConfig from the (freshly-loaded) agent. The
         agent supplies the system prompt, model, built-in MCP set, and tool
@@ -3086,6 +3122,7 @@ class SessionManager:
             task_id=session.task_id,
             task_run_id=session.task_run_id,
             task_worker_prompt=task_worker_prompt,
+            skills_plugin_dir=skills_plugin_dir,
         )
 
     # Refresh the access_token if it expires within this many seconds. A

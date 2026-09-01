@@ -677,12 +677,24 @@ CREATE TABLE IF NOT EXISTS task_artifacts (
 -- must be set, `nothing_note` covering the "nothing new" case explicitly
 -- rather than silently skipping. `complete` refuses to finish a non-clean
 -- run until this row exists (task_board/manager.py `complete_worker`).
+--
+-- `memory_pointer` and `claude_md_note` are gated by a real artifact, not
+-- accepted as free text (Snape review point 3 — a DB string alone is
+-- checkbox theater): `memory_pointer` is a relative path the manager
+-- verifies actually exists (non-empty) under the run's agent's memory dir
+-- (server/agent_memory.py `resolve_memory_pointer`) before this row is ever
+-- written — the worker wrote that file itself via its normal tools, this
+-- column stores a POINTER to it, not the note's substantive content.
+-- `claude_md_note` is the human-readable nomination text, but is only
+-- accepted alongside a real, already-committed CLAUDE.md diff on the run's
+-- own git_worktree branch (verified against `prepared.base_head`) — the
+-- text nominates, the commit is the auditable candidate artifact.
 CREATE TABLE IF NOT EXISTS task_retrospectives (
     id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     run_id TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
     agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
-    memory_note TEXT,
+    memory_pointer TEXT,
     claude_md_note TEXT,
     skill_candidate_ids TEXT,   -- JSON list of skill_candidates.id
     nothing_note TEXT,
@@ -3697,15 +3709,38 @@ class Database:
             )
         return [self._row_to_skill_candidate(r) for r in await cursor.fetchall()]
 
-    async def get_latest_approved_skill_by_slug(self, slug: str) -> dict[str, Any] | None:
+    async def get_latest_approved_skill_by_slug(
+        self,
+        slug: str,
+        *,
+        agent_id: str | None = None,
+        repository: str | None = None,
+    ) -> dict[str, Any] | None:
         """The current landed skill for `slug`, if any — the row use_count/
-        last_used tracking accrues on (there is no separate skills table)."""
+        last_used tracking accrues on (there is no separate skills table).
+
+        `agent_id`/`repository`, when given, scope the lookup to the
+        candidate proposed by that agent for that repository — without this,
+        two different repositories (or agents) independently landing a skill
+        under the same slug collide and whichever was approved most recently
+        wins the lookup regardless of which one a given session actually has
+        loaded (Snape review, experience-consolidation.md). Callers that
+        genuinely want the newest approved candidate across all scopes (e.g.
+        the review-queue diff view before a scope is known) may omit both."""
         await self._ensure_connected()
-        cursor = await self._conn.execute(
+        query = (
             f"SELECT {self._SKILL_CANDIDATE_COLS} FROM skill_candidates "
-            "WHERE slug = ? AND status = 'approved' ORDER BY updated_at DESC LIMIT 1",
-            (slug,),
+            "WHERE slug = ? AND status = 'approved'"
         )
+        params: list[Any] = [slug]
+        if agent_id is not None:
+            query += " AND proposed_by_agent_id = ?"
+            params.append(agent_id)
+        if repository is not None:
+            query += " AND repository = ?"
+            params.append(repository)
+        query += " ORDER BY updated_at DESC LIMIT 1"
+        cursor = await self._conn.execute(query, params)
         row = await cursor.fetchone()
         return self._row_to_skill_candidate(row) if row else None
 

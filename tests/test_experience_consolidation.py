@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 
+from server import agent_memory
 from server.config import settings
 from server.database import Database
 from server.session_manager import SessionManager
@@ -118,9 +120,14 @@ async def test_verdict_fail_gates_completion_even_on_attempt_one(task_runtime):
             verdict="fail",
         )
 
+    memory_dir = agent_memory.agent_memory_dir(run.agent_id)
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    (memory_dir / "reviewer-checklist.md").write_text(
+        "Reviewer checklist missed an edge case; noted for next time.\n"
+    )
     await manager.submit_retrospective(
         task.id, run.id, run.session_id,
-        memory_note="Reviewer checklist missed an edge case; noted for next time.",
+        memory_pointer="reviewer-checklist.md",
     )
     result = await manager.complete_worker(
         task.id, run.id, run.session_id,
@@ -199,3 +206,137 @@ async def test_is_non_clean_pass_true_for_a_prior_blocked_run(task_runtime):
 
     assert await repo.is_non_clean_pass(task.id, run2.id) is True
     assert await repo.is_non_clean_pass(task.id, run1.id) is False
+
+
+# --- memory_pointer / claude_md_note are gated by a real artifact, not free
+# text (Snape review point 3: a DB string alone is checkbox theater). -------
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+
+async def _git_ready_task(db, repo, root: Path):
+    """A git_worktree-mode board/task whose source repo already has a
+    committed CLAUDE.md — real `_dispatch` (not the DB-only `claim_ready`
+    shortcut other Task Board tests use) so `run.workspace_path` is an
+    actual git worktree `_verify_claude_md_artifact` can `git diff` on.
+
+    The repo lives in its OWN subdirectory of `root`, not `root` itself —
+    `root` is also where the fixture's sqlite db file lives, and
+    `git_worktree` dispatch refuses a dirty source repo."""
+    source = root / "repo"
+    source.mkdir()
+    _git(source, "init", "-q")
+    _git(source, "config", "user.name", "Test")
+    _git(source, "config", "user.email", "test@example.com")
+    (source / "CLAUDE.md").write_text("# Rules\n\nExisting rule.\n")
+    _git(source, "add", "CLAUDE.md")
+    _git(source, "commit", "-q", "-m", "base")
+    _git(source, "branch", "-M", "main")
+
+    agent = await db.get_default_agent()
+    board = await repo.create_board(
+        name="Git Board", working_dir=str(source), default_workspace_mode="git_worktree"
+    )
+    task = await repo.create_task(
+        board_id=board.id,
+        title="Nominate a CLAUDE.md rule",
+        body="Land a real CLAUDE.md edit.",
+        status="todo",
+        assignee_agent_id=agent["id"],
+    )
+    assert task.status == "ready"
+    return board, task
+
+
+@pytest.mark.asyncio
+async def test_reflect_rejects_a_memory_pointer_with_no_file_behind_it(task_runtime):
+    db, repo, sessions, manager, root = task_runtime
+    _board, task = await _ready_task(db, repo, root)
+    _current, run = await _dispatch(manager, sessions, repo, task)
+
+    with pytest.raises(TaskValidationError):
+        await manager.submit_retrospective(
+            task.id, run.id, run.session_id, memory_pointer="never-written.md",
+        )
+
+
+@pytest.mark.asyncio
+async def test_reflect_rejects_a_memory_pointer_that_escapes_the_memory_dir(task_runtime):
+    db, repo, sessions, manager, root = task_runtime
+    _board, task = await _ready_task(db, repo, root)
+    _current, run = await _dispatch(manager, sessions, repo, task)
+
+    with pytest.raises(TaskValidationError):
+        await manager.submit_retrospective(
+            task.id, run.id, run.session_id, memory_pointer="../../etc/passwd",
+        )
+    with pytest.raises(TaskValidationError):
+        await manager.submit_retrospective(
+            task.id, run.id, run.session_id, memory_pointer="/etc/passwd",
+        )
+
+
+@pytest.mark.asyncio
+async def test_reflect_accepts_a_memory_pointer_to_a_real_file(task_runtime):
+    db, repo, sessions, manager, root = task_runtime
+    _board, task = await _ready_task(db, repo, root)
+    _current, run = await _dispatch(manager, sessions, repo, task)
+
+    memory_dir = agent_memory.agent_memory_dir(run.agent_id)
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    (memory_dir / "lesson.md").write_text("Retry with backoff next time.\n")
+
+    result = await manager.submit_retrospective(
+        task.id, run.id, run.session_id, memory_pointer="lesson.md",
+    )
+    assert result["memory_pointer"] == "lesson.md"
+
+
+@pytest.mark.asyncio
+async def test_reflect_rejects_a_claude_md_note_on_a_non_git_worktree_run(task_runtime):
+    db, repo, sessions, manager, root = task_runtime
+    _board, task = await _ready_task(db, repo, root)  # default "shared" mode
+    _current, run = await _dispatch(manager, sessions, repo, task)
+
+    with pytest.raises(TaskValidationError):
+        await manager.submit_retrospective(
+            task.id, run.id, run.session_id,
+            claude_md_note="Everyone should know this.",
+        )
+
+
+@pytest.mark.asyncio
+async def test_reflect_rejects_a_claude_md_note_with_no_real_diff(task_runtime):
+    db, repo, sessions, manager, root = task_runtime
+    _board, task = await _git_ready_task(db, repo, root)
+    _current, run = await _dispatch(manager, sessions, repo, task)
+
+    with pytest.raises(TaskValidationError):
+        await manager.submit_retrospective(
+            task.id, run.id, run.session_id,
+            claude_md_note="Everyone should know this.",
+        )
+
+
+@pytest.mark.asyncio
+async def test_reflect_accepts_a_claude_md_note_backed_by_a_real_commit(task_runtime):
+    db, repo, sessions, manager, root = task_runtime
+    _board, task = await _git_ready_task(db, repo, root)
+    _current, run = await _dispatch(manager, sessions, repo, task)
+
+    workspace = Path(run.workspace_path)
+    claude_md = workspace / "CLAUDE.md"
+    claude_md.write_text(claude_md.read_text() + "\nNew rule from the retro.\n")
+    _git(workspace, "add", "CLAUDE.md")
+    _git(
+        workspace, "-c", "user.name=Worker", "-c", "user.email=w@example.com",
+        "commit", "-q", "-m", "claude.md: new rule",
+    )
+
+    result = await manager.submit_retrospective(
+        task.id, run.id, run.session_id,
+        claude_md_note="Everyone should know this.",
+    )
+    assert result["claude_md_note"] == "Everyone should know this."

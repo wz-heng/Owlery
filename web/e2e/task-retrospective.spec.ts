@@ -200,10 +200,13 @@ test.describe("Experience consolidation", () => {
         "Fork, branch, push."
       );
 
-      // --- Replay: a later, unrelated, CLEAN first-pass run invokes the
-      // landed skill directly instead of re-discovering the flow. ---------
+      // --- Replay: a later, unrelated, CLEAN first-pass run discovers and
+      // invokes the landed skill through the REAL --plugin-dir loading path
+      // (server/session_manager.py resolves it fresh from `skills_plugin_dir`
+      // wiring; the fake CLI reads the real argv and finds the real file —
+      // nothing here hardcodes which skill it is). ------------------------
       const invokeTitle = `Reuse ${fake(
-        { t: "invoke_skill", slug },
+        { t: "discover_skill" },
         { t: "task_complete", summary: "Reused the landed skill." }
       )}`;
       const invokeTaskResponse = await request.post(`${API}/api/task-boards/${board.id}/tasks`, {

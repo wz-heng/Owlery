@@ -183,6 +183,11 @@ class RunConfig:
     # Native-deep-research web leaf (native-deep-research.md §4): render a
     # scoped, web-enabled, read-only-ish turn (no destructive/fan-out tools).
     web_research: bool = False
+    # Real skill discovery (experience-consolidation.md §3.4): the agent's
+    # `--plugin-dir` for THIS session's repository, when it has one or more
+    # approved skills landed there (skill_registry.resolve_plugin_dir). None
+    # when there's nothing to load — Claude-only, ignored by other profiles.
+    skills_plugin_dir: str | None = None
 
 
 class HarnessRun:
@@ -252,6 +257,7 @@ class HarnessRun:
             credential=credential,
             memory_dir=self._config.memory_dir,
             web_research=self._config.web_research,
+            skills_plugin_dir=self._config.skills_plugin_dir,
         )
 
     def build_argv(

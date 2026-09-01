@@ -120,12 +120,12 @@ def test_worker_reflect_posts_triage_to_the_scoped_route(monkeypatch):
     monkeypatch.setattr(httpx, "request", fake_request)
     out = _call(
         "reflect_task",
-        memory_note="Watch for the transient-429 retry trap next time.",
+        memory_pointer="task-retro-transient-429.md",
     )
     assert "retro-1" in out
     assert captured["url"].endswith("/api/task-worker/current/reflect")
     assert captured["json"] == {
-        "memory_note": "Watch for the transient-429 retry trap next time.",
+        "memory_pointer": "task-retro-transient-429.md",
         "claude_md_note": None,
         "skill_candidate_ids": [],
         "nothing_note": None,

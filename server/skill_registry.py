@@ -7,16 +7,34 @@ skill; there is no separate "skills" table, and use_count/last_used accrue
 on the same row as later sessions invoke it, mirroring hermes' single skill
 entity with a `.usage.json` sidecar.
 
-Landing (on approve) writes the SKILL.md into a throwaway worktree off the
-target repo, commits it there, then removes the worktree — leaving only a
-new local branch behind. It deliberately never pushes or opens a PR: that
-stays a human's separate, explicit action, exactly like any other
-Owlery-authored branch (CLAUDE.md: "commit to the branch, default no push").
+Approval lands the skill TWO ways:
+
+1. A git branch off the target repo (`_land`) — the durable, human-auditable
+   diff/commit. Never pushed or merged automatically: that stays a human's
+   separate, explicit action, exactly like any other Owlery-authored branch
+   (CLAUDE.md: "commit to the branch, default no push"). This alone is NOT
+   enough to make the skill invocable — nothing checks that branch out, so a
+   future session's real `claude` process never sees the file (Snape review:
+   the old e2e touchstone papered over this with a hardcoded fake `Skill`
+   tool_use instead of proving real discovery).
+2. A real file under the proposing agent's per-(agent, repository) skills
+   plugin directory (`_materialize_plugin`) — `--plugin-dir` loads this for
+   real on every subsequent turn for that agent in that repository
+   (`resolve_plugin_dir`, wired in `session_manager._run_backend`), so a new
+   session finds and can invoke the skill through Claude Code's own native
+   plugin-skill discovery, no merge action required. Scoped by (agent,
+   repository) rather than agent alone because that is exactly the axis
+   use_count needs to disambiguate two independently-landed same-slug skills
+   (see `get_latest_approved_skill_by_slug`), and it is the natural
+   granularity for a `--plugin-dir` argument built from a session's
+   (agent_id, working_dir).
 """
 
 from __future__ import annotations
 
 import difflib
+import hashlib
+import json
 import logging
 import re
 import shutil
@@ -28,6 +46,7 @@ from typing import Any
 
 import yaml
 
+from .agent_memory import agent_state_dir
 from .task_board import workspaces as ws
 
 logger = logging.getLogger(__name__)
@@ -75,6 +94,32 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _repo_fingerprint(repository: str) -> str:
+    """A stable, filesystem-safe identity for `repository`'s absolute path —
+    used to key a per-(agent, repository) plugin dir so two repos never
+    collide on disk even if they share a skill slug."""
+    return hashlib.sha256(repository.encode()).hexdigest()[:16]
+
+
+def agent_skills_plugin_root(agent_id: str) -> Path:
+    """`<agents_dir>/<agent_id>/skills/` — every repository this agent has
+    ever landed an approved skill for gets one subdirectory here."""
+    return agent_state_dir(agent_id) / "skills"
+
+
+def agent_skills_plugin_dir(agent_id: str, repository: str) -> Path:
+    """The real `--plugin-dir` target for `agent_id` working in `repository`
+    (experience-consolidation.md §3.4, Snape review point 1). A Claude Code
+    plugin directory: `.claude-plugin/plugin.json` + `skills/<slug>/SKILL.md`
+    per landed skill. Materialized on approve, read by
+    `resolve_plugin_dir`/`build_turn_argv` on every later turn — no git
+    merge or checkout involved, so a brand-new session for this agent in
+    this repository discovers the skill through Claude Code's own native
+    plugin-skill loading, exactly as required for approval to actually take
+    effect."""
+    return agent_skills_plugin_root(agent_id) / _repo_fingerprint(repository)
+
+
 class SkillRegistry:
     """Bound once at boot (main.py), mirrors research_manager/delegation_manager."""
 
@@ -90,7 +135,7 @@ class SkillRegistry:
         if self.db is None:
             raise RuntimeError("SkillRegistry is not bound")
 
-    async def _resolve_repository(self, working_dir: str) -> str:
+    async def resolve_repository(self, working_dir: str) -> str:
         """The stable repo root shared by every worktree of the same repo,
         resolved fresh so a candidate proposed from an ephemeral Task Board
         worktree still lands correctly after that worktree is torn down."""
@@ -155,7 +200,7 @@ class SkillRegistry:
         )
         if session is None:
             raise SkillValidationError(f"session {session_id!r} is not live")
-        repository = await self._resolve_repository(session.working_dir)
+        repository = await self.resolve_repository(session.working_dir)
         candidate_id = uuid.uuid4().hex[:12]
         return await self.db.create_skill_candidate(
             candidate_id=candidate_id,
@@ -193,7 +238,11 @@ class SkillRegistry:
         never merged/checked out automatically, so the live working tree
         would not reflect it."""
         candidate = await self.get_candidate(candidate_id)
-        landed = await self.db.get_latest_approved_skill_by_slug(candidate["slug"])
+        landed = await self.db.get_latest_approved_skill_by_slug(
+            candidate["slug"],
+            agent_id=candidate["proposed_by_agent_id"],
+            repository=candidate["repository"],
+        )
         before = (
             landed["body_markdown"]
             if landed is not None and landed["id"] != candidate_id
@@ -222,6 +271,13 @@ class SkillRegistry:
             candidate["repository"], candidate["slug"], candidate["body_markdown"],
             candidate_id,
         )
+        if candidate["proposed_by_agent_id"]:
+            self._materialize_plugin(
+                candidate["proposed_by_agent_id"],
+                candidate["repository"],
+                candidate["slug"],
+                candidate["body_markdown"],
+            )
         result = await self.db.review_skill_candidate(
             candidate_id,
             status="approved",
@@ -250,13 +306,26 @@ class SkillRegistry:
         assert result is not None
         return result
 
-    async def record_usage(self, slug: str) -> None:
+    async def record_usage(
+        self, slug: str, *, agent_id: str | None = None, repository: str | None = None
+    ) -> None:
         """Best-effort use_count/last_used tracking (§5): never raises, so a
-        skill invocation can never break the turn that made it."""
+        skill invocation can never break the turn that made it.
+
+        `agent_id`/`repository` scope the lookup to the exact candidate the
+        invoking session actually has loaded (Snape review point 2) —
+        without them, two independently-landed same-slug skills (different
+        repos, or different agents) collide and use_count gets attributed to
+        whichever was approved most recently instead of the one that was
+        really invoked. The caller (session_manager, on a native `Skill`
+        tool_use) always has both, since they are exactly what it used to
+        build the `--plugin-dir` the invoking turn ran with."""
         if self.db is None:
             return
         try:
-            candidate = await self.db.get_latest_approved_skill_by_slug(slug)
+            candidate = await self.db.get_latest_approved_skill_by_slug(
+                slug, agent_id=agent_id, repository=repository
+            )
             if candidate is None:
                 return
             await self.db.record_skill_candidate_usage(
@@ -264,6 +333,58 @@ class SkillRegistry:
             )
         except Exception:
             logger.exception("failed to record skill usage for %r", slug)
+
+    def _materialize_plugin(
+        self, agent_id: str, repository: str, slug: str, content: str
+    ) -> Path:
+        """Write the real, directly-loadable skill file behind
+        `resolve_plugin_dir` (module docstring point 2). Synchronous and
+        filesystem-only (no git) — this dir is never committed, so overwrite
+        semantics naturally implement "landing a replacement for an existing
+        slug"."""
+        plugin_dir = agent_skills_plugin_dir(agent_id, repository)
+        manifest = plugin_dir / ".claude-plugin" / "plugin.json"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        if not manifest.exists():
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "name": f"owlery-skills-{_repo_fingerprint(repository)}",
+                        "description": (
+                            "Owlery-approved skill candidates for this agent, "
+                            "landed via the human review queue."
+                        ),
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+        skill_file = plugin_dir / "skills" / slug / "SKILL.md"
+        skill_file.parent.mkdir(parents=True, exist_ok=True)
+        skill_file.write_text(content)
+        return plugin_dir
+
+    async def resolve_plugin_dir(
+        self, *, agent_id: str, working_dir: str
+    ) -> str | None:
+        """The `--plugin-dir` this agent's turn in `working_dir` should load,
+        or None when there is nothing to load. Cheap on the (overwhelmingly
+        common) case of an agent with no landed skills at all: that check is
+        a filesystem stat, so the git resolution below — the only part of
+        this that spawns a subprocess — only runs for agents that actually
+        have something landed."""
+        root = agent_skills_plugin_root(agent_id)
+        if not root.is_dir() or not any(root.iterdir()):
+            return None
+        try:
+            repository = await self.resolve_repository(working_dir)
+        except SkillRegistryError:
+            return None
+        plugin_dir = agent_skills_plugin_dir(agent_id, repository)
+        skills_dir = plugin_dir / "skills"
+        if not skills_dir.is_dir() or not any(skills_dir.iterdir()):
+            return None
+        return str(plugin_dir)
 
     async def _land(
         self, repository: str, slug: str, content: str, candidate_id: str

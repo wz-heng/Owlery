@@ -2268,7 +2268,7 @@ class TaskRepository:
         run_id: str,
         *,
         agent_id: str | None,
-        memory_note: str | None,
+        memory_pointer: str | None,
         claude_md_note: str | None,
         skill_candidate_ids: Sequence[str] | None,
         nothing_note: str | None,
@@ -2276,14 +2276,19 @@ class TaskRepository:
     ) -> RetrospectiveRecord:
         # Whitespace-only text must not satisfy this gate — trim before the
         # emptiness check AND before storage, or a blank string trivially
-        # defeats the whole point of forcing a real retrospective.
-        memory_note = (memory_note or "").strip() or None
+        # defeats the whole point of forcing a real retrospective. The
+        # manager layer (task_board/manager.py submit_retrospective) has
+        # already verified memory_pointer names a real, non-empty file and
+        # claude_md_note is backed by a real committed CLAUDE.md diff before
+        # calling this — this method only re-applies the blank-string guard,
+        # it does not re-verify either artifact.
+        memory_pointer = (memory_pointer or "").strip() or None
         claude_md_note = (claude_md_note or "").strip() or None
         nothing_note = (nothing_note or "").strip() or None
         clean_ids = [cid.strip() for cid in (skill_candidate_ids or []) if cid.strip()]
-        if not any([memory_note, claude_md_note, clean_ids, nothing_note]):
+        if not any([memory_pointer, claude_md_note, clean_ids, nothing_note]):
             raise TaskValidationError(
-                "a retrospective must set at least one of memory_note / "
+                "a retrospective must set at least one of memory_pointer / "
                 "claude_md_note / skill_candidate_ids / nothing_note"
             )
         stamp = now or _now_iso()
@@ -2295,11 +2300,11 @@ class TaskRepository:
             try:
                 await self.conn.execute(
                     "INSERT INTO task_retrospectives "
-                    "(id, task_id, run_id, agent_id, memory_note, claude_md_note, "
+                    "(id, task_id, run_id, agent_id, memory_pointer, claude_md_note, "
                     "skill_candidate_ids, nothing_note, created_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
-                        retro_id, task_id, run_id, agent_id, memory_note,
+                        retro_id, task_id, run_id, agent_id, memory_pointer,
                         claude_md_note, ids_json, nothing_note, stamp,
                     ),
                 )

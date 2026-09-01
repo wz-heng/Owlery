@@ -249,13 +249,17 @@ class RunRecord(Record):
 class RetrospectiveRecord(Record):
     """The worker's own triage of a non-clean-pass run into the three reuse
     channels (experience-consolidation.md §3.3). At least one of
-    memory_note/claude_md_note/skill_candidate_ids/nothing_note is set."""
+    memory_pointer/claude_md_note/skill_candidate_ids/nothing_note is set.
+
+    `memory_pointer` is a relative path into the run's agent's memory dir,
+    verified to already exist before this record is created — not the
+    note's substantive content (Snape review point 3)."""
 
     id: str
     task_id: str
     run_id: str
     agent_id: str | None
-    memory_note: str | None
+    memory_pointer: str | None
     claude_md_note: str | None
     skill_candidate_ids: list[str]
     nothing_note: str | None

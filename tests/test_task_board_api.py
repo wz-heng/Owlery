@@ -712,7 +712,7 @@ def test_reflect_request_rejects_whitespace_only_fields():
     with pytest.raises(pydantic.ValidationError):
         routes.ReflectRequest(nothing_note="   ")
     with pytest.raises(pydantic.ValidationError):
-        routes.ReflectRequest(memory_note="\n\t ")
+        routes.ReflectRequest(memory_pointer="\n\t ")
     with pytest.raises(pydantic.ValidationError):
         routes.ReflectRequest(skill_candidate_ids=["  ", ""])
 

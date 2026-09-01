@@ -76,6 +76,11 @@ class TurnContext:
     # web tools and forbids destructive/fan-out tools (no Bash/Write/subagents),
     # so a throwaway research leaf can search the web but can't touch the box.
     web_research: bool = False
+    # Real skill discovery (experience-consolidation.md §3.4): a directory a
+    # Claude Code profile passes via `--plugin-dir` so this turn's session can
+    # actually load an approved skill, no git merge/checkout involved. None
+    # when the agent has nothing landed for this repository.
+    skills_plugin_dir: str | None = None
 
 
 @dataclass
