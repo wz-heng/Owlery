@@ -1,8 +1,13 @@
+import { useEffect, useRef } from "react";
 import { IconWorldSearch, IconX, IconCheck, IconAlertTriangle } from "@tabler/icons-react";
 import { useSessionStore, type ResearchJob } from "../stores/sessionStore";
 import { SealChip, type CardTone } from "./ui/sheet-card";
 
 const API = window.location.origin;
+
+// How long a terminal (completed/failed/cancelled/interrupted) card stays
+// visible before it's auto-dismissed from the store. Exported for tests.
+export const RESEARCH_LINGER_MS = 6000;
 
 const PHASES = ["scope", "search", "verify", "synthesize", "done"];
 const PHASE_LABEL: Record<string, string> = {
@@ -23,10 +28,41 @@ const STATUS_TONE: Record<string, CardTone> = {
 
 /** Live deep-research progress for the active session (native-deep-research.md
  * §7). The final cited report arrives as a normal injected turn; this card is
- * the progress/affordance surface. Terminal jobs linger briefly as a result. */
+ * the progress/affordance surface. A terminal job lingers for
+ * `RESEARCH_LINGER_MS` so the user can see the outcome, then this component
+ * removes it from the store itself — the card is a progress indicator, not a
+ * history log. */
 export function ResearchCard({ sessionId }: { sessionId: string }) {
   const token = useSessionStore((s) => s.token);
   const jobs = useSessionStore((s) => s.research[sessionId]) ?? [];
+
+  // Job ids are server-generated and never reused, so a flat map keyed by id
+  // is safe across session switches — a timer scheduled while viewing
+  // session A still fires (and removes from session A) after switching to
+  // session B, since `sessionId` is captured in the closure at schedule time.
+  const scheduledRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+
+  useEffect(() => {
+    const scheduled = scheduledRef.current;
+    for (const job of jobs) {
+      if (job.status === "running" || scheduled.has(job.id)) continue;
+      const timer = setTimeout(() => {
+        scheduled.delete(job.id);
+        useSessionStore.getState().removeResearch(sessionId, job.id);
+      }, RESEARCH_LINGER_MS);
+      scheduled.set(job.id, timer);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobs, sessionId]);
+
+  useEffect(() => {
+    const scheduled = scheduledRef.current;
+    return () => {
+      scheduled.forEach((timer) => clearTimeout(timer));
+      scheduled.clear();
+    };
+  }, []);
+
   if (jobs.length === 0) return null;
 
   const cancel = async (job: ResearchJob) => {

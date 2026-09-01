@@ -3486,10 +3486,17 @@ class Database:
     async def list_research_jobs_for_session(
         self, session_id: str, *, limit: int = 200
     ) -> list[dict[str, Any]]:
+        """Snapshot for session load / WS reconnect. Only `running` jobs — the
+        card is a progress indicator, not a history log, so a terminal job
+        must never come back from a page refresh once the frontend's own
+        linger-then-dismiss timer has (or will have) removed it. Browsing
+        finished research jobs is a separate, unbuilt feature (research-card
+        dismiss task, §"不做")."""
         await self._ensure_connected()
         cursor = await self._conn.execute(
             f"SELECT {self._RESEARCH_COLS} FROM research_jobs "
-            "WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
+            "WHERE session_id = ? AND status = 'running' "
+            "ORDER BY created_at DESC LIMIT ?",
             (session_id, limit),
         )
         rows = await cursor.fetchall()

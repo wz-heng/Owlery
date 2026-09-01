@@ -186,6 +186,14 @@ A module singleton bound in `main.py`'s lifespan (mirrors `bg_task_manager`
   (`[deep-research:<id>] …report…`) via the same `start_message` path bg
   delivery uses — so the agent can read/act on it and the user sees it.
 - **Cancel**: a cancel control on the card → route → `ResearchManager.cancel`.
+- **Card lifecycle**: the card is a progress indicator, not a history log. A
+  terminal job (completed/failed/cancelled/interrupted) lingers for
+  `RESEARCH_LINGER_MS` (`ResearchCard.tsx`) so the user sees the outcome, then
+  the component removes it from the store itself (`removeResearch`). The
+  session-load / WS-reconnect snapshot (`GET /api/sessions/{sid}/research` →
+  `list_research_jobs_for_session`) only ever returns `running` jobs, so a
+  refresh never resurrects an already-finished card; browsing finished jobs is
+  a separate, unbuilt history feature.
 
 ## 8. Limits & safety
 

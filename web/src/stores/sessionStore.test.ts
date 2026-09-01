@@ -161,6 +161,23 @@ describe("sessionStore", () => {
     expect(tasks[0].id).toBe("new");
   });
 
+  it("removeResearch drops a job by id and is a no-op for an unknown id/session", () => {
+    const { upsertResearch, removeResearch } = useSessionStore.getState();
+    upsertResearch("s1", { id: "r1", session_id: "s1", question: "q1", status: "running", phase: "scope" });
+    upsertResearch("s1", { id: "r2", session_id: "s1", question: "q2", status: "completed", phase: "done" });
+    expect(useSessionStore.getState().research["s1"]).toHaveLength(2);
+
+    removeResearch("s1", "r2");
+    const remaining = useSessionStore.getState().research["s1"];
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0].id).toBe("r1");
+
+    // Unknown job id / unknown session: no crash, no accidental mutation.
+    removeResearch("s1", "does-not-exist");
+    removeResearch("no-such-session", "r1");
+    expect(useSessionStore.getState().research["s1"]).toHaveLength(1);
+  });
+
   it("opens and closes the file viewer", () => {
     const { openViewer, closeViewer } = useSessionStore.getState();
     expect(useSessionStore.getState().viewer).toBeNull();
