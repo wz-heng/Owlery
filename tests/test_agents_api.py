@@ -79,7 +79,7 @@ async def test_default_agent_present(client):
     # agent-collaboration.md §5.1). ask_agent landed alongside the
     # collaboration feature; the migration backfills it into any
     # pre-existing agent rows too.
-    assert owls[0]["mcp_servers"] == ["ask", "bg", "ask_agent", "research", "tasks"]
+    assert owls[0]["mcp_servers"] == ["ask", "bg", "ask_agent", "research", "tasks", "skills"]
 
 
 @pytest.mark.asyncio
@@ -166,7 +166,7 @@ async def test_create_agent_defaults_to_all_builtin_mcp_servers(client):
     This default is the single source of truth alongside the DB column
     default in database.py (keep the two in sync)."""
     agent = await _create_agent(client, name="Fresh")
-    assert agent["mcp_servers"] == ["ask", "bg", "ask_agent", "research", "tasks"]
+    assert agent["mcp_servers"] == ["ask", "bg", "ask_agent", "research", "tasks", "skills"]
 
 
 @pytest.mark.asyncio

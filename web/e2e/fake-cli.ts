@@ -34,7 +34,11 @@ export type FakeOp =
   /**
    * File the worker's own retrospective triage over the real tasks MCP
    * (experience-consolidation.md §3.2/§3.3) — required before `task_complete`
-   * succeeds on a non-clean-pass run.
+   * succeeds on a non-clean-pass run. `skill_candidate_ids` entries equal to
+   * the literal `"$last_skill_candidate_id"` resolve at run time to the id
+   * the most recent `skill_propose` op in this same fake-cli run actually got
+   * back — ops are scripted ahead of the run, so this sentinel is how a
+   * retrospective can reference the real proposed candidate.
    */
   | {
       t: "task_reflect";

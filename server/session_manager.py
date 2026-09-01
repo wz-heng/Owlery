@@ -2660,9 +2660,20 @@ class SessionManager:
                         # Skill usage tracking (experience-consolidation.md
                         # §3.4/§5): the CLI's own native `Skill` tool_use is
                         # the ground truth for "this skill was actually
-                        # invoked" — best-effort, never blocks the turn.
+                        # invoked" — best-effort, never blocks the turn. The
+                        # native tool's exact input key isn't documented
+                        # anywhere we have on hand, so this checks the
+                        # plausible candidates rather than betting on one;
+                        # confirm against a real transcript and trim this to
+                        # the actual key once observed.
                         if event.tool_name == "Skill" and self._skill_registry is not None:
-                            slug = (event.tool_input or {}).get("skill")
+                            tool_input = event.tool_input or {}
+                            slug = None
+                            for key in ("skill", "name", "skill_name", "command"):
+                                value = tool_input.get(key)
+                                if isinstance(value, str) and value:
+                                    slug = value
+                                    break
                             if slug:
                                 await self._skill_registry.record_usage(slug)
                     if event.type == "text" and event.content and event.content.strip():

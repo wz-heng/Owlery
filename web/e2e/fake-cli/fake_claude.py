@@ -375,6 +375,20 @@ def run_ops(ops: list[dict], parsed: dict, state: dict) -> None:
                 )
                 if key in op
             }
+            # "$last_skill_candidate_id" resolves to whatever id the most
+            # recent `skill_propose` op in this same fake-cli run got back —
+            # ops can't see each other's real API responses ahead of time
+            # (the directive is authored before the task ever runs), so this
+            # sentinel is how the retrospective's `skill_candidate_ids` can
+            # reference the ACTUAL proposed candidate instead of a fake one.
+            if "skill_candidate_ids" in arguments:
+                def _resolve(v: str) -> str:
+                    if v != "$last_skill_candidate_id":
+                        return v
+                    return state.get("last_skill_candidate_id") or v
+                arguments["skill_candidate_ids"] = [
+                    _resolve(v) for v in arguments["skill_candidate_ids"]
+                ]
             _emit_tool_use(tool_use_id, "mcp__tasks__reflect", arguments)
             reflected = call_mcp_tool(mcp_servers, "tasks", "reflect", arguments)
             _emit_tool_result(tool_use_id, reflected)
@@ -392,6 +406,10 @@ def run_ops(ops: list[dict], parsed: dict, state: dict) -> None:
             _emit_tool_use(tool_use_id, "mcp__skills__propose", arguments)
             proposed = call_mcp_tool(mcp_servers, "skills", "propose", arguments)
             _emit_tool_result(tool_use_id, proposed)
+            try:
+                state["last_skill_candidate_id"] = json.loads(proposed).get("id")
+            except (json.JSONDecodeError, AttributeError):
+                pass
             _emit_text("proposed")
 
         elif kind == "invoke_skill":

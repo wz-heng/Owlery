@@ -57,6 +57,15 @@ procedure, or a note in your own memory if it is a judgment call specific
 to you. Do not wait to be asked, and do not defer it to "later" — later is
 a fresh session with no memory of the friction you just hit.
 
+**Delegations do not have this gate** — only Task Board `complete` does.
+`experience-consolidation.md` §3.2 permits narrowing to Task Board alone
+when a delegation-side gate isn't proportionate, provided the narrowing is
+written down; this is that note. A delegation's terminal turn is delivered
+by `_inject_terminal` (`server/delegations.py`), which has no equivalent
+"was this a clean pass" signal to gate on today. If delegation retries
+start showing the same repeated-mistake pattern Task Board attempts did,
+revisit this rather than bolting a gate on blind.
+
 ## After Every Code Change
 
 Run all four. They total well under two minutes — there is no cheap

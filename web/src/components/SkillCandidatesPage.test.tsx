@@ -102,7 +102,7 @@ describe("SkillCandidatesPage", () => {
     await act(async () => {
       render(<SkillCandidatesPage />);
     });
-    await screen.findByText("Hermes PR flow");
+    await screen.findByRole("heading", { name: "Hermes PR flow" });
     await waitFor(() => expect(screen.getByText(/new line/)).toBeTruthy());
     expect(screen.getByText(/Walked this once/)).toBeTruthy();
   });
@@ -111,7 +111,7 @@ describe("SkillCandidatesPage", () => {
     await act(async () => {
       render(<SkillCandidatesPage />);
     });
-    await screen.findByText("Hermes PR flow");
+    await screen.findByRole("heading", { name: "Hermes PR flow" });
     const approveBtn = await screen.findByRole("button", { name: "Approve" });
     await act(async () => {
       fireEvent.click(approveBtn);
@@ -128,7 +128,7 @@ describe("SkillCandidatesPage", () => {
     await act(async () => {
       render(<SkillCandidatesPage />);
     });
-    await screen.findByText("Hermes PR flow");
+    await screen.findByRole("heading", { name: "Hermes PR flow" });
     const rejectBtn = screen.getByRole("button", { name: /Reject/ });
     expect(rejectBtn).toBeDisabled();
 

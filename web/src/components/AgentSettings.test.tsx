@@ -29,12 +29,12 @@ afterEach(() => {
 });
 
 describe("AgentSettings built-in tools", () => {
-  it("offers all four built-in MCP servers, checked by default for a new agent", () => {
+  it("offers all built-in MCP servers, checked by default for a new agent", () => {
     render(
       <AgentSettings open initialAgentId={null} onOpenChange={() => {}} />
     );
 
-    for (const id of ["ask", "bg", "ask_agent", "research", "tasks"]) {
+    for (const id of ["ask", "bg", "ask_agent", "research", "tasks", "skills"]) {
       const box = screen.getByRole("checkbox", { name: id }) as HTMLInputElement;
       expect(box).toBeInTheDocument();
       expect(box.checked).toBe(true);

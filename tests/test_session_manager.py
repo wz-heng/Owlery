@@ -1341,6 +1341,75 @@ async def test_run_backend_does_not_respawn_when_no_tool_use(manager):
     assert invocations == ["go"]  # no retry — not the bug we recover from
 
 
+@pytest.mark.asyncio
+async def test_run_backend_records_skill_usage_on_native_skill_tool_use(manager):
+    """experience-consolidation.md §3.4/§5: a native `Skill` tool_use is the
+    ground truth for "this skill was actually invoked" — the hook must fire
+    with the slug and must not touch the registry for ordinary tool_use."""
+    from unittest.mock import AsyncMock
+
+    from server.harness import HarnessEvent
+
+    session = await _new(manager, "InvokesSkill")
+    registry = AsyncMock()
+    manager.set_skill_registry(registry)
+
+    class SkillBackend:
+        async def start(self, prompt, working_dir, resume_id=None, credential=None):
+            pass
+
+        def stream(self):
+            async def _gen():
+                yield HarnessEvent(
+                    type="tool_use", tool_name="Bash", tool_input={"command": "ls"},
+                    tool_use_id="t1",
+                )
+                yield HarnessEvent(
+                    type="tool_use", tool_name="Skill",
+                    tool_input={"skill": "hermes-pr-flow"}, tool_use_id="t2",
+                )
+                yield HarnessEvent(type="result", session_id="sid", num_turns=1)
+            return _gen()
+
+        async def stop(self):
+            pass
+
+    manager._make_run = lambda s, agent=None, connectors=None: SkillBackend()  # type: ignore[method-assign,assignment]
+
+    _ = [m async for m in manager._run_backend(session, "go")]
+    registry.record_usage.assert_awaited_once_with("hermes-pr-flow")
+
+
+@pytest.mark.asyncio
+async def test_run_backend_skill_usage_hook_is_a_noop_without_a_bound_registry(manager):
+    """No registry bound (bare manager, e.g. most unit tests) — a `Skill`
+    tool_use must not raise."""
+    from server.harness import HarnessEvent
+
+    session = await _new(manager, "InvokesSkillNoRegistry")
+
+    class SkillBackend:
+        async def start(self, prompt, working_dir, resume_id=None, credential=None):
+            pass
+
+        def stream(self):
+            async def _gen():
+                yield HarnessEvent(
+                    type="tool_use", tool_name="Skill",
+                    tool_input={"skill": "hermes-pr-flow"}, tool_use_id="t1",
+                )
+                yield HarnessEvent(type="result", session_id="sid", num_turns=1)
+            return _gen()
+
+        async def stop(self):
+            pass
+
+    manager._make_run = lambda s, agent=None, connectors=None: SkillBackend()  # type: ignore[method-assign,assignment]
+
+    events = [m async for m in manager._run_backend(session, "go")]
+    assert events  # completed without raising
+
+
 # ---------------------------------------------------------------------------
 # Turn-termination invariant (attempt-replay.md §3.1 point 2 — the spine of
 # the replay feature): every HarnessRun writes exactly one harness_exits row,
