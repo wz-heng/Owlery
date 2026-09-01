@@ -124,6 +124,16 @@ export default defineConfig({
   globalTeardown: "./e2e/global-teardown.ts",
   timeout: 30_000,
   retries: 0,
+  // Every spec shares ONE backend + DB for the whole run (globalSetup starts
+  // it once). A couple of specs assert on truly global state — e.g.
+  // task-board.spec.ts's first test expects the task-board list to be empty
+  // system-wide — which is only safe if no other spec's task board exists
+  // yet. The default (multi-worker, files interleaved across processes) made
+  // that racy the moment a second spec started creating task boards
+  // (task-retrospective.spec.ts). Serial execution is the fix, not per-spec
+  // workarounds: any future spec sharing global state gets the same
+  // guarantee for free.
+  workers: 1,
   use: {
     baseURL: "http://localhost:5174",
     headless: true,

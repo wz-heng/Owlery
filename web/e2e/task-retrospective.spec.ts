@@ -71,15 +71,17 @@ test.describe("Experience consolidation", () => {
       expect(boardResponse.ok()).toBeTruthy();
       const board = (await boardResponse.json()) as { id: string };
 
-      const slug = `hermes-pr-flow-e2e-${Date.now()}`;
-      const skillBody =
-        "---\nname: hermes-pr-flow\ndescription: Walk a PR through the external hermes repo\n" +
-        "---\n\n1. Fork, branch, push.\n2. Open the PR against upstream.\n3. Answer the CLA bot.\n";
+      // Task titles cap at 500 chars (TaskPatch.title) and the fake CLI's
+      // directive only rides in the title — the assignment prompt
+      // (server/task_board/prompts.py) never includes the body — so every
+      // string below is kept terse on purpose.
+      const slug = `hermes-pr-${Date.now()}`;
+      const skillBody = "---\nname: hermes-pr-flow\n---\nFork, branch, push.\n";
 
       // --- Attempt 1: a first pass that hits friction and blocks. --------
       const blockTitle = `Hermes PR flow ${fake({
         t: "task_block",
-        reason: "hit an unfamiliar CLA-bot gate walking the flow for the first time",
+        reason: "hit friction the first time",
       })}`;
       const taskResponse = await request.post(`${API}/api/task-boards/${board.id}/tasks`, {
         headers: AUTH,
@@ -105,16 +107,14 @@ test.describe("Experience consolidation", () => {
         .toBe("blocked");
 
       // --- A human retries it: same task, a fresh directive for attempt 2.
-      const retryTitle = `Hermes PR flow retry ${fake(
+      const retryTitle = `Retry ${fake(
         {
           t: "skill_propose",
           slug,
-          title: `Hermes external PR flow (${slug})`,
-          description: "Walk a PR through the external hermes repo, including the CLA-bot gate.",
+          title: "Hermes external PR flow",
+          description: "PR flow through the external hermes repo.",
           body_markdown: skillBody,
-          rationale:
-            "Walked this multi-step external flow for the first time with real friction " +
-            "(an unfamiliar CLA-bot gate); it will recur, so it is worth codifying.",
+          rationale: "Hit friction first time; will recur.",
         },
         {
           t: "task_reflect",
@@ -122,7 +122,7 @@ test.describe("Experience consolidation", () => {
         },
         {
           t: "task_complete",
-          summary: "Walked the flow on retry; filed a skill candidate for next time.",
+          summary: "Filed a skill candidate.",
         }
       )}`;
       const patchResponse = await request.patch(`${API}/api/tasks/${task.id}`, {
@@ -133,6 +133,7 @@ test.describe("Experience consolidation", () => {
 
       const unblockResponse = await request.post(`${API}/api/tasks/${task.id}/unblock`, {
         headers: AUTH,
+        data: {},
       });
       expect(unblockResponse.ok()).toBeTruthy();
 
@@ -196,9 +197,9 @@ test.describe("Experience consolidation", () => {
 
       // --- Replay: a later, unrelated, CLEAN first-pass run invokes the
       // landed skill directly instead of re-discovering the flow. ---------
-      const invokeTitle = `Reuse the hermes PR flow ${fake(
+      const invokeTitle = `Reuse ${fake(
         { t: "invoke_skill", slug },
-        { t: "task_complete", summary: "Reused the landed skill directly." }
+        { t: "task_complete", summary: "Reused the landed skill." }
       )}`;
       const invokeTaskResponse = await request.post(`${API}/api/task-boards/${board.id}/tasks`, {
         headers: AUTH,
