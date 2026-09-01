@@ -295,29 +295,42 @@ class SkillRegistry:
             commit = result["head"]
             landed = True
         finally:
-            # Best-effort only: the branch+commit are the durable result once
-            # committed, and a cleanup failure here must never strand that
-            # commit with the candidate stuck `pending` — approve() persists
-            # the DB row right after this returns, and a raise from cleanup
-            # would skip that, leaving a retry to collide with the branch
-            # this attempt already created. Conversely, if `worktree add`
-            # created `branch` but nothing ever got committed to it (e.g. the
-            # "would not change anything on disk" no-op case), the branch
-            # itself must go too — otherwise it, not a commit, is what a
-            # retry would collide with.
+            # The worktree itself is unconditionally best-effort: `scratch`
+            # is a fresh mkdtemp path every call, so a stray leftover
+            # worktree can never collide with a future attempt — and once
+            # committed, the branch+commit are the durable result, so a
+            # cleanup failure here must never strand that commit with the
+            # candidate stuck `pending` (approve() persists the DB row right
+            # after this returns; a raise from cleanup would skip that).
             try:
                 if worktree_registered:
                     await ws.remove_git_worktree(repository, scratch, force=True)
-                    if not landed:
-                        await ws.delete_branch(repository, branch, force=True)
                 elif Path(scratch).exists():
                     shutil.rmtree(scratch, ignore_errors=True)
             except Exception:
                 logger.exception(
                     "failed to clean up landing worktree %r for candidate %r "
-                    "(branch %r may still exist) — continuing anyway",
-                    scratch, candidate_id, branch,
+                    "— continuing anyway", scratch, candidate_id,
                 )
+            if worktree_registered and not landed:
+                # Unlike the worktree, `branch` is a NAME a retry will
+                # collide with (`worktree add -b` on an existing branch
+                # fails) — so unlike the worktree cleanup above, a failure
+                # here must surface rather than vanish, or the candidate is
+                # stuck `pending` forever with no visible cause. This raise
+                # supersedes whatever exception is already propagating from
+                # the `try` block above (normally the informative "would not
+                # change anything on disk" no-op message) only when deleting
+                # the branch ALSO fails — the common case still surfaces
+                # that original message untouched.
+                try:
+                    await ws.delete_branch(repository, branch, force=True)
+                except Exception as exc:
+                    raise SkillValidationError(
+                        f"landed nothing, and cleaning up the unused branch "
+                        f"{branch!r} also failed: {exc}. Delete it manually "
+                        "before retrying this candidate."
+                    ) from exc
         return {
             "path": f".claude/skills/{slug}/SKILL.md",
             "branch": branch,

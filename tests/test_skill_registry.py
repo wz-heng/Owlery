@@ -190,6 +190,34 @@ async def test_approve_no_op_leaves_no_orphan_branch(registry):
 
 
 @pytest.mark.asyncio
+async def test_approve_no_op_branch_delete_failure_surfaces(registry, monkeypatch):
+    """Unlike worktree cleanup, a failure deleting the orphan branch on the
+    no-op path must not vanish — it must replace the generic "nothing to
+    commit" message with something actionable, or the candidate is stuck
+    `pending` with no visible explanation for why every retry fails."""
+    from server import skill_registry as sr_module
+
+    reg, _db, repo, _agent_id = registry
+    skill_dir = repo / ".claude" / "skills" / "hermes-pr-flow"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(SKILL_BODY)
+    _git(repo, "add", ".claude")
+    _git(repo, "commit", "-q", "-m", "pre-existing skill")
+
+    async def _boom(*_args, **_kwargs):
+        raise RuntimeError("simulated branch delete failure")
+
+    monkeypatch.setattr(sr_module.ws, "delete_branch", _boom)
+
+    candidate = await _propose(reg)
+    with pytest.raises(SkillValidationError, match="also failed"):
+        await reg.approve(candidate["id"])
+
+    fresh = await reg.get_candidate(candidate["id"])
+    assert fresh["status"] == "pending"
+
+
+@pytest.mark.asyncio
 async def test_approve_lands_file_on_a_new_branch_without_pushing(registry):
     reg, _db, repo, _agent_id = registry
     candidate = await _propose(reg)
