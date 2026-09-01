@@ -321,6 +321,32 @@ async def test_reflect_rejects_a_claude_md_note_with_no_real_diff(task_runtime):
 
 
 @pytest.mark.asyncio
+async def test_reflect_rejects_a_claude_md_note_backed_only_by_a_nested_file(task_runtime):
+    """A commit touching `docs/CLAUDE.md` (or any other nested CLAUDE.md)
+    must not satisfy this gate — only the repo's ROOT CLAUDE.md is the
+    "loaded for every agent" carrier the channel is about (Snape review)."""
+    db, repo, sessions, manager, root = task_runtime
+    _board, task = await _git_ready_task(db, repo, root)
+    _current, run = await _dispatch(manager, sessions, repo, task)
+
+    workspace = Path(run.workspace_path)
+    nested = workspace / "docs" / "CLAUDE.md"
+    nested.parent.mkdir(parents=True, exist_ok=True)
+    nested.write_text("Nested rule.\n")
+    _git(workspace, "add", "docs/CLAUDE.md")
+    _git(
+        workspace, "-c", "user.name=Worker", "-c", "user.email=w@example.com",
+        "commit", "-q", "-m", "docs: nested claude.md",
+    )
+
+    with pytest.raises(TaskValidationError):
+        await manager.submit_retrospective(
+            task.id, run.id, run.session_id,
+            claude_md_note="Everyone should know this.",
+        )
+
+
+@pytest.mark.asyncio
 async def test_reflect_accepts_a_claude_md_note_backed_by_a_real_commit(task_runtime):
     db, repo, sessions, manager, root = task_runtime
     _board, task = await _git_ready_task(db, repo, root)

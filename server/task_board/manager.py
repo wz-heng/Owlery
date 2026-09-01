@@ -745,12 +745,20 @@ class TaskBoardManager:
                 f"could not inspect this run's CLAUDE.md diff: {err}"
             )
         changed = out.splitlines()
-        if not any(p == "CLAUDE.md" or p.endswith("/CLAUDE.md") for p in changed):
+        # Root CLAUDE.md ONLY — not `docs/CLAUDE.md` or any other nested
+        # file (Snape review). experience-consolidation.md §3.3 point 2
+        # frames this channel as "a rule every agent working in this repo
+        # should know", and CLAUDE.md.md's own §2 table calls the ROOT
+        # CLAUDE.md the "全员(随 repo 加载)" carrier — a nested file isn't
+        # that carrier and must not satisfy this gate.
+        if "CLAUDE.md" not in changed:
             raise TaskValidationError(
                 "claude_md_note requires an actual CLAUDE.md edit committed "
-                "on this run's own branch — a real, auditable diff, not "
-                "just this note's text. Commit the CLAUDE.md change on this "
-                "branch, then call reflect() again."
+                "on this run's own branch — a real, auditable diff to the "
+                "repo's ROOT CLAUDE.md specifically (not a nested "
+                "docs/CLAUDE.md or similar), not just this note's text. "
+                "Commit the CLAUDE.md change on this branch, then call "
+                "reflect() again."
             )
 
     async def create_worker_task(
