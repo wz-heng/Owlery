@@ -154,9 +154,15 @@ export function SessionList({
     setActiveAgentId(agentId);
     setActiveSessionId(id);
     try {
-      const [detailRes, bgRes] = await Promise.all([
+      const [detailRes, bgRes, researchRes] = await Promise.all([
         fetch(`${API_URL}/api/sessions/${id}`, { headers }),
         fetch(`${API_URL}/api/sessions/${id}/bg-tasks`, { headers }),
+        // Same snapshot the WS reconnect path uses (useWebSocket.ts) — this is
+        // the ONLY research fetch on a fresh page load / reload, since the WS
+        // onopen fetch only fires once `activeSessionId` is already set.
+        // Without it, a page reload can never restore an in-flight or
+        // just-finished research card (Snape review).
+        fetch(`${API_URL}/api/sessions/${id}/research`, { headers }),
       ]);
       if (detailRes.ok) {
         const data = await detailRes.json();
@@ -178,6 +184,9 @@ export function SessionList({
       }
       if (bgRes.ok) {
         useSessionStore.getState().setBgTasks(id, await bgRes.json());
+      }
+      if (researchRes.ok) {
+        useSessionStore.getState().setResearch(id, await researchRes.json());
       }
     } catch {
       // ignore
