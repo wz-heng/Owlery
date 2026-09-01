@@ -36,23 +36,21 @@ _SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 _FRONTMATTER_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n?", re.DOTALL)
 
 
-def _frontmatter_name(body_markdown: str) -> str | None:
-    """The SKILL.md frontmatter `name:` field, or None if missing/unparsable.
-    Usage tracking (session_manager.py's native `Skill` tool_use hook) looks
-    candidates up by this identity in whatever form the CLI actually reports
-    it, so `propose` requires it to match `slug` — otherwise a landed skill's
-    use_count would silently never increment."""
+def _parse_frontmatter(body_markdown: str) -> dict[str, Any]:
+    """The SKILL.md frontmatter as a dict, or {} if missing/unparsable."""
     match = _FRONTMATTER_RE.match(body_markdown)
     if not match:
-        return None
+        return {}
     try:
         data = yaml.safe_load(match.group(1))
     except yaml.YAMLError:
-        return None
-    if not isinstance(data, dict):
-        return None
-    name = data.get("name")
-    return name.strip() if isinstance(name, str) else None
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _frontmatter_str(frontmatter: dict[str, Any], key: str) -> str | None:
+    value = frontmatter.get(key)
+    return value.strip() if isinstance(value, str) else None
 
 
 class SkillRegistryError(RuntimeError):
@@ -135,12 +133,22 @@ class SkillRegistry:
             raise SkillValidationError("body_markdown is required")
         if not rationale:
             raise SkillValidationError("rationale is required")
-        frontmatter_name = _frontmatter_name(body_markdown)
+        frontmatter = _parse_frontmatter(body_markdown)
+        frontmatter_name = _frontmatter_str(frontmatter, "name")
         if frontmatter_name != slug:
             raise SkillValidationError(
                 "body_markdown's frontmatter `name:` "
                 f"({frontmatter_name!r}) must equal slug ({slug!r}) — usage "
                 "tracking looks candidates up by this identity"
+            )
+        frontmatter_description = _frontmatter_str(frontmatter, "description")
+        if frontmatter_description != description:
+            raise SkillValidationError(
+                "body_markdown's frontmatter `description:` "
+                f"({frontmatter_description!r}) must equal the description "
+                f"argument ({description!r}) — the frontmatter is what a "
+                "future session actually sees when deciding whether to load "
+                "this skill, so it must be the same text, not a stray copy"
             )
         session = (
             self.session_mgr.sessions.get(session_id) if self.session_mgr else None
@@ -263,6 +271,7 @@ class SkillRegistry:
         branch = f"owlery/skill-{slug}-{candidate_id[:8]}"
         scratch = tempfile.mkdtemp(prefix=f"owlery-skill-{slug}-")
         worktree_registered = False
+        landed = False
         try:
             rc, _, err = await ws._git(
                 "worktree", "add", "-b", branch, scratch, "HEAD", cwd=repository
@@ -284,16 +293,23 @@ class SkillRegistry:
                     "approving this candidate would not change anything on disk"
                 )
             commit = result["head"]
+            landed = True
         finally:
             # Best-effort only: the branch+commit are the durable result once
             # committed, and a cleanup failure here must never strand that
             # commit with the candidate stuck `pending` — approve() persists
             # the DB row right after this returns, and a raise from cleanup
             # would skip that, leaving a retry to collide with the branch
-            # this attempt already created.
+            # this attempt already created. Conversely, if `worktree add`
+            # created `branch` but nothing ever got committed to it (e.g. the
+            # "would not change anything on disk" no-op case), the branch
+            # itself must go too — otherwise it, not a commit, is what a
+            # retry would collide with.
             try:
                 if worktree_registered:
                     await ws.remove_git_worktree(repository, scratch, force=True)
+                    if not landed:
+                        await ws.delete_branch(repository, branch, force=True)
                 elif Path(scratch).exists():
                     shutil.rmtree(scratch, ignore_errors=True)
             except Exception:

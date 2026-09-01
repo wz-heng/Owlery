@@ -19,12 +19,11 @@ def _git(cwd: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
 
 
-def _skill_body(name: str = "hermes-pr-flow") -> str:
-    return (
-        f"---\nname: {name}\n"
-        "description: How to open a PR against an external repo through hermes.\n"
-        "---\n\nBody content.\n"
-    )
+_DESCRIPTION = "How to open a PR against an external repo."
+
+
+def _skill_body(name: str = "hermes-pr-flow", description: str = _DESCRIPTION) -> str:
+    return f"---\nname: {name}\ndescription: {description}\n---\n\nBody content.\n"
 
 
 SKILL_BODY = _skill_body()
@@ -58,12 +57,13 @@ async def registry(tmp_path: Path):
 
 async def _propose(reg: SkillRegistry, **overrides):
     slug = overrides.get("slug", "hermes-pr-flow")
+    description = overrides.get("description", _DESCRIPTION)
     kwargs = dict(
         session_id="session-1",
         slug=slug,
         title="Hermes PR flow",
-        description="How to open a PR against an external repo.",
-        body_markdown=_skill_body(slug),
+        description=description,
+        body_markdown=_skill_body(slug, description),
         rationale="Walked this once, hit real friction, will recur.",
     )
     kwargs.update(overrides)
@@ -102,6 +102,20 @@ async def test_propose_rejects_body_markdown_without_frontmatter(registry):
     reg, _db, _repo, _agent_id = registry
     with pytest.raises(SkillValidationError):
         await _propose(reg, body_markdown="No frontmatter here, just body text.\n")
+
+
+@pytest.mark.asyncio
+async def test_propose_rejects_frontmatter_description_mismatch(registry):
+    """The frontmatter `description:` is what a future session actually sees
+    when deciding whether to load the skill — it must be the same text as
+    the `description` argument, not a stray copy that can drift."""
+    reg, _db, _repo, _agent_id = registry
+    with pytest.raises(SkillValidationError):
+        await _propose(
+            reg,
+            description="How to open a PR against an external repo.",
+            body_markdown=_skill_body(description="A completely different description."),
+        )
 
 
 @pytest.mark.asyncio
@@ -145,6 +159,34 @@ async def test_approve_persists_even_when_worktree_cleanup_fails(registry, monke
         cwd=repo, check=True, capture_output=True, text=True,
     ).stdout
     assert approved["landed_branch"] in branches
+
+
+@pytest.mark.asyncio
+async def test_approve_no_op_leaves_no_orphan_branch(registry):
+    """When the target file already matches on HEAD (nothing to commit),
+    `_land` raises before the candidate is marked approved — but the branch
+    `worktree add -b` created must not survive that failure, or a retry
+    (e.g. after the human rejects and re-proposes under the same slug) would
+    collide with a branch that never actually landed anything."""
+    reg, _db, repo, _agent_id = registry
+    skill_dir = repo / ".claude" / "skills" / "hermes-pr-flow"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(SKILL_BODY)
+    _git(repo, "add", ".claude")
+    _git(repo, "commit", "-q", "-m", "pre-existing skill")
+
+    candidate = await _propose(reg)
+    with pytest.raises(SkillValidationError):
+        await reg.approve(candidate["id"])
+
+    fresh = await reg.get_candidate(candidate["id"])
+    assert fresh["status"] == "pending"
+
+    branches = subprocess.run(
+        ["git", "branch", "--list", "owlery/skill-hermes-pr-flow-*"],
+        cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout
+    assert branches.strip() == ""
 
 
 @pytest.mark.asyncio

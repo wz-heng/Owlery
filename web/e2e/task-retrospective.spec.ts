@@ -76,9 +76,12 @@ test.describe("Experience consolidation", () => {
       // (server/task_board/prompts.py) never includes the body — so every
       // string below is kept terse on purpose.
       const slug = `hermes-pr-${Date.now()}`;
-      // `propose` requires the frontmatter `name:` to equal `slug` (usage
-      // tracking looks candidates up by it) — keep them in lockstep.
-      const skillBody = `---\nname: ${slug}\n---\nFork, branch, push.\n`;
+      const description = "PR flow through the external hermes repo.";
+      // `propose` requires the frontmatter `name:`/`description:` to equal
+      // `slug`/`description` (usage tracking looks candidates up by the
+      // former; the latter is what a future session actually sees when
+      // deciding whether to load the skill) — keep them in lockstep.
+      const skillBody = `---\nname: ${slug}\ndescription: ${description}\n---\nFork, branch, push.\n`;
 
       // --- Attempt 1: a first pass that hits friction and blocks. --------
       const blockTitle = `Hermes PR flow ${fake({
@@ -114,7 +117,7 @@ test.describe("Experience consolidation", () => {
           t: "skill_propose",
           slug,
           title: "Hermes external PR flow",
-          description: "PR flow through the external hermes repo.",
+          description,
           body_markdown: skillBody,
           rationale: "Hit friction first time; will recur.",
         },
