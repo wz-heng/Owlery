@@ -91,15 +91,19 @@ test("the /research command surfaces a live research card", async ({ page, reque
   // from the DOM entirely — no fixed sleep, just Playwright's auto-wait.
   await expect(page.locator(".research-card")).toHaveCount(0, { timeout: 15_000 });
 
-  // A reload must not resurrect it — the session snapshot only serves
-  // `running` jobs (server/database.py list_research_jobs_for_session). The
-  // token persists across reload but `activeSessionId` doesn't, so land back
-  // on the session list first, same as the initial navigation above.
+  // A reload must not permanently resurrect it. The token persists across
+  // reload but `activeSessionId` doesn't, so land back on the session list
+  // first, same as the initial navigation above.
   await page.reload();
   await expect(page.locator(".agent-list-header")).toBeVisible();
   await page
     .locator(".session-item .session-name", { hasText: "Research E2E" })
     .click();
   await expect(page.locator(".chat-header h3")).toHaveText("Research E2E");
-  await expect(page.locator(".research-card")).toHaveCount(0);
+  // The snapshot (server/database.py list_research_jobs_for_session) still
+  // covers a terminal job for a short window after it finished — so it may
+  // legitimately reappear once here — but it must re-linger-and-vanish, not
+  // stick around permanently (Snape review: without that window, a missed
+  // terminal WS broadcast would make the job disappear with no trace at all).
+  await expect(page.locator(".research-card")).toHaveCount(0, { timeout: 15_000 });
 });

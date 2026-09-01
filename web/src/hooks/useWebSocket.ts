@@ -549,9 +549,13 @@ export function useWebSocket() {
                 if (tasks) getState().setBgTasks(activeSessionId, tasks);
               })
               .catch(() => {});
-            // Research jobs: same reconnect reload, so an in-flight job's card
-            // (and recently-finished ones) reappear without a missed
-            // `research_started` (native-deep-research.md §7).
+            // Research jobs: same reconnect reload, so an in-flight job's
+            // card reappears without a missed `research_started`, and a job
+            // that went terminal moments ago (its own `research_completed`/
+            // `research_failed` broadcast possibly missed while disconnected)
+            // still surfaces once — `list_research_jobs_for_session` only
+            // covers `running` plus a short terminal window, not full
+            // history (native-deep-research.md §7).
             fetch(
               `${window.location.origin}/api/sessions/${activeSessionId}/research`,
               { headers: { Authorization: `Bearer ${t}` } }

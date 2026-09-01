@@ -191,9 +191,14 @@ A module singleton bound in `main.py`'s lifespan (mirrors `bg_task_manager`
   `RESEARCH_LINGER_MS` (`ResearchCard.tsx`) so the user sees the outcome, then
   the component removes it from the store itself (`removeResearch`). The
   session-load / WS-reconnect snapshot (`GET /api/sessions/{sid}/research` →
-  `list_research_jobs_for_session`) only ever returns `running` jobs, so a
-  refresh never resurrects an already-finished card; browsing finished jobs is
-  a separate, unbuilt history feature.
+  `list_research_jobs_for_session`) returns `running` jobs plus anything that
+  went terminal within `_RESEARCH_SNAPSHOT_TERMINAL_WINDOW_SECONDS`
+  (`database.py`) — wide enough to cover a client that reconnects shortly
+  after missing the terminal WS broadcast (failed/cancelled/interrupted jobs
+  have no transcript-message fallback the way a completed job's report does),
+  narrow enough that a refresh well after the fact never resurrects an
+  already-finished card. Browsing finished jobs beyond that window is a
+  separate, unbuilt history feature.
 
 ## 8. Limits & safety
 

@@ -79,20 +79,31 @@ async def test_start_get_list_research(client, monkeypatch):
     rid = r.json()["id"]
     assert r.json()["status"] == "running"
 
-    # GET single + list
-    got = await client.get(f"/api/sessions/{session['id']}/research/{rid}", headers=HEADERS)
-    assert got.status_code == 200 and got.json()["question"] == "what is X?"
-    lst = await client.get(f"/api/sessions/{session['id']}/research", headers=HEADERS)
-    assert any(j["id"] == rid for j in lst.json())
+    try:
+        # GET single + list
+        got = await client.get(f"/api/sessions/{session['id']}/research/{rid}", headers=HEADERS)
+        assert got.status_code == 200 and got.json()["question"] == "what is X?"
+        lst = await client.get(f"/api/sessions/{session['id']}/research", headers=HEADERS)
+        assert any(j["id"] == rid for j in lst.json())
+    finally:
+        # Don't leave the 30s sleep task for pytest-asyncio's loop teardown to
+        # reap (Snape review).
+        await client.post(
+            f"/api/sessions/{session['id']}/research/{rid}/cancel", headers=HEADERS
+        )
 
 
 @pytest.mark.asyncio
 async def test_list_excludes_terminal_jobs(client, monkeypatch):
     """The list route is a snapshot for session load / WS reconnect, not a
-    history log — a job that has already reached a terminal status must not
-    reappear from a refresh once the frontend's own linger timer has (or
-    will have) dismissed its card (ResearchCard dismiss task)."""
+    history log. A job that went terminal long ago must not reappear from a
+    refresh once the frontend's own linger timer has (or will have)
+    dismissed its card (ResearchCard dismiss task). A job that went terminal
+    only moments ago DOES still appear — this covers a client reconnecting
+    right after missing the terminal WS broadcast (Snape review), for which
+    failed/cancelled/interrupted jobs have no transcript-message fallback."""
     import asyncio as _asyncio
+    from datetime import datetime, timedelta, timezone
 
     async def slow_run(question, *, on_progress=None, **kw):
         await _asyncio.sleep(30)
@@ -108,24 +119,37 @@ async def test_list_excludes_terminal_jobs(client, monkeypatch):
     )
     running_id = started.json()["id"]
 
-    # Bypass the manager for the terminal fixture row — inserting it directly
-    # avoids any race with the background pipeline task completing on its own.
-    finished_id = "finished-job-1"
+    # Bypass the manager for the terminal fixture rows — inserting them
+    # directly avoids any race with a background pipeline task completing on
+    # its own.
+    long_ago = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    stale_id = "stale-finished-job"
     await research_manager.db.create_research_job(
-        finished_id, session["id"], "already done?", "t0",
+        stale_id, session["id"], "finished ages ago?", "t0",
     )
     await research_manager.db.update_research_job(
-        finished_id, status="completed", phase="done", completed_at="t1",
+        stale_id, status="completed", phase="done", completed_at=long_ago,
+    )
+
+    just_now = datetime.now(timezone.utc).isoformat()
+    recent_id = "recent-failed-job"
+    await research_manager.db.create_research_job(
+        recent_id, session["id"], "just failed?", "t0",
+    )
+    await research_manager.db.update_research_job(
+        recent_id, status="failed", error="boom", completed_at=just_now,
     )
 
     lst = (await client.get(f"/api/sessions/{session['id']}/research", headers=HEADERS)).json()
     ids = {j["id"] for j in lst}
     assert running_id in ids
-    assert finished_id not in ids
+    assert recent_id in ids
+    assert stale_id not in ids
 
-    # The single-job GET is unaffected — a terminal job is still fetchable by id.
+    # The single-job GET is unaffected — a terminal job is still fetchable by id
+    # regardless of how long ago it finished.
     got = await client.get(
-        f"/api/sessions/{session['id']}/research/{finished_id}", headers=HEADERS
+        f"/api/sessions/{session['id']}/research/{stale_id}", headers=HEADERS
     )
     assert got.status_code == 200
     assert got.json()["status"] == "completed"
