@@ -19,13 +19,15 @@ def _git(cwd: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
 
 
-SKILL_BODY = """---
-name: hermes-pr-flow
-description: How to open a PR against an external repo through hermes.
----
+def _skill_body(name: str = "hermes-pr-flow") -> str:
+    return (
+        f"---\nname: {name}\n"
+        "description: How to open a PR against an external repo through hermes.\n"
+        "---\n\nBody content.\n"
+    )
 
-Body content.
-"""
+
+SKILL_BODY = _skill_body()
 
 
 @pytest.fixture
@@ -55,12 +57,13 @@ async def registry(tmp_path: Path):
 
 
 async def _propose(reg: SkillRegistry, **overrides):
+    slug = overrides.get("slug", "hermes-pr-flow")
     kwargs = dict(
         session_id="session-1",
-        slug="hermes-pr-flow",
+        slug=slug,
         title="Hermes PR flow",
         description="How to open a PR against an external repo.",
-        body_markdown=SKILL_BODY,
+        body_markdown=_skill_body(slug),
         rationale="Walked this once, hit real friction, will recur.",
     )
     kwargs.update(overrides)
@@ -86,6 +89,22 @@ async def test_propose_rejects_bad_slug(registry):
 
 
 @pytest.mark.asyncio
+async def test_propose_rejects_frontmatter_name_slug_mismatch(registry):
+    """Usage tracking looks candidates up by slug; a frontmatter `name:` that
+    disagrees with it would silently break use_count for a landed skill."""
+    reg, _db, _repo, _agent_id = registry
+    with pytest.raises(SkillValidationError):
+        await _propose(reg, slug="hermes-pr-flow", body_markdown=_skill_body("other-name"))
+
+
+@pytest.mark.asyncio
+async def test_propose_rejects_body_markdown_without_frontmatter(registry):
+    reg, _db, _repo, _agent_id = registry
+    with pytest.raises(SkillValidationError):
+        await _propose(reg, body_markdown="No frontmatter here, just body text.\n")
+
+
+@pytest.mark.asyncio
 async def test_propose_requires_a_live_session(registry):
     reg, _db, _repo, _agent_id = registry
     with pytest.raises(SkillValidationError):
@@ -99,6 +118,33 @@ async def test_propose_rejects_blank_fields(registry):
         await _propose(reg, title="   ")
     with pytest.raises(SkillValidationError):
         await _propose(reg, rationale="")
+
+
+@pytest.mark.asyncio
+async def test_approve_persists_even_when_worktree_cleanup_fails(registry, monkeypatch):
+    """A cleanup failure after a successful commit must not strand the
+    candidate `pending` while the branch+commit already exist — that would
+    make a retry collide with the branch this attempt created and leave the
+    candidate stuck forever."""
+    from server import skill_registry as sr_module
+
+    reg, _db, repo, _agent_id = registry
+    candidate = await _propose(reg)
+
+    async def _boom(*_args, **_kwargs):
+        raise RuntimeError("simulated worktree cleanup failure")
+
+    monkeypatch.setattr(sr_module.ws, "remove_git_worktree", _boom)
+
+    approved = await reg.approve(candidate["id"])
+    assert approved["status"] == "approved"
+    assert approved["landed_branch"]
+
+    branches = subprocess.run(
+        ["git", "branch", "--list", approved["landed_branch"]],
+        cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout
+    assert approved["landed_branch"] in branches
 
 
 @pytest.mark.asyncio

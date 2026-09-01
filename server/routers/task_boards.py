@@ -385,6 +385,15 @@ class ReflectRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_non_empty(self):
+        # A whitespace-only string must not satisfy this gate — its entire
+        # point is forcing a real retrospective to happen, and blank text
+        # trivially defeats that.
+        self.memory_note = (self.memory_note or "").strip() or None
+        self.claude_md_note = (self.claude_md_note or "").strip() or None
+        self.nothing_note = (self.nothing_note or "").strip() or None
+        self.skill_candidate_ids = [
+            cid.strip() for cid in self.skill_candidate_ids if cid.strip()
+        ]
         if not (
             self.memory_note
             or self.claude_md_note

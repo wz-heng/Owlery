@@ -19,17 +19,40 @@ from __future__ import annotations
 import difflib
 import logging
 import re
+import shutil
 import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from .task_board import workspaces as ws
 
 logger = logging.getLogger(__name__)
 
 _SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+_FRONTMATTER_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n?", re.DOTALL)
+
+
+def _frontmatter_name(body_markdown: str) -> str | None:
+    """The SKILL.md frontmatter `name:` field, or None if missing/unparsable.
+    Usage tracking (session_manager.py's native `Skill` tool_use hook) looks
+    candidates up by this identity in whatever form the CLI actually reports
+    it, so `propose` requires it to match `slug` — otherwise a landed skill's
+    use_count would silently never increment."""
+    match = _FRONTMATTER_RE.match(body_markdown)
+    if not match:
+        return None
+    try:
+        data = yaml.safe_load(match.group(1))
+    except yaml.YAMLError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    name = data.get("name")
+    return name.strip() if isinstance(name, str) else None
 
 
 class SkillRegistryError(RuntimeError):
@@ -112,6 +135,13 @@ class SkillRegistry:
             raise SkillValidationError("body_markdown is required")
         if not rationale:
             raise SkillValidationError("rationale is required")
+        frontmatter_name = _frontmatter_name(body_markdown)
+        if frontmatter_name != slug:
+            raise SkillValidationError(
+                "body_markdown's frontmatter `name:` "
+                f"({frontmatter_name!r}) must equal slug ({slug!r}) — usage "
+                "tracking looks candidates up by this identity"
+            )
         session = (
             self.session_mgr.sessions.get(session_id) if self.session_mgr else None
         )
@@ -232,12 +262,14 @@ class SkillRegistry:
     ) -> dict[str, str]:
         branch = f"owlery/skill-{slug}-{candidate_id[:8]}"
         scratch = tempfile.mkdtemp(prefix=f"owlery-skill-{slug}-")
+        worktree_registered = False
         try:
             rc, _, err = await ws._git(
                 "worktree", "add", "-b", branch, scratch, "HEAD", cwd=repository
             )
             if rc:
                 raise SkillValidationError(err or "unable to create a landing worktree")
+            worktree_registered = True
             target = Path(scratch) / ".claude" / "skills" / slug / "SKILL.md"
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content)
@@ -253,7 +285,23 @@ class SkillRegistry:
                 )
             commit = result["head"]
         finally:
-            await ws.remove_git_worktree(repository, scratch, force=True)
+            # Best-effort only: the branch+commit are the durable result once
+            # committed, and a cleanup failure here must never strand that
+            # commit with the candidate stuck `pending` — approve() persists
+            # the DB row right after this returns, and a raise from cleanup
+            # would skip that, leaving a retry to collide with the branch
+            # this attempt already created.
+            try:
+                if worktree_registered:
+                    await ws.remove_git_worktree(repository, scratch, force=True)
+                elif Path(scratch).exists():
+                    shutil.rmtree(scratch, ignore_errors=True)
+            except Exception:
+                logger.exception(
+                    "failed to clean up landing worktree %r for candidate %r "
+                    "(branch %r may still exist) — continuing anyway",
+                    scratch, candidate_id, branch,
+                )
         return {
             "path": f".claude/skills/{slug}/SKILL.md",
             "branch": branch,

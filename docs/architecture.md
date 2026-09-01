@@ -132,7 +132,8 @@ The harness is the **only** place that talks to a model runtime. There is one
 
 Every turn injects a small set of stdio MCP servers into the CLI's
 `--mcp-config`. The built-ins are configurable per agent (default
-`["ask", "bg", "ask_agent"]`); each enabled connector adds one more.
+`["ask", "bg", "ask_agent", "research", "tasks", "skills"]`); each enabled
+connector adds one more.
 
 | Server | Tool(s) | Purpose |
 |---|---|---|
@@ -143,6 +144,8 @@ Every turn injects a small set of stdio MCP servers into the CLI's
 | `connectors/custom.py` | generic `request(method, path, …)` | One tool for any user-defined OAuth2 API. |
 | `connectors/_shared.py` | — | Token fetch+cache, 401→reconnect, 32 KB truncation. |
 | `research.py` | `mcp__research__deep_research(question)` | Start a native deep-research job. Thin HTTP shim to `/api/sessions/{sid}/research`; returns `research_id` immediately so the model's turn ends cleanly. See Native Deep Research below. |
+| `tasks.py` | `mcp__tasks__list` / `show` / `create` / `comment` / `heartbeat` / `complete` / `reflect` / `block` / `triage` / `specify` / `assign` / `link` / `unlink` / `unblock` / `cancel` / `close` / `request_delivery` / `delivery_status` / `deliver` / `delivery_teardown` | Durable Task Board orchestration and the worker terminal protocol; `reflect` files the experience-consolidation.md §3.2/§3.3 retrospective a non-clean-pass run's `complete` is gated on. |
+| `skills.py` | `mcp__skills__propose` / `list_pending` / `diff` | Propose a skill candidate for human review (experience-consolidation.md §3.3/§3.4) — thin shim to `/api/sessions/{sid}/skills/candidates` in front of `SkillRegistry`. Deliberately excludes `approve`/`reject`: a candidate takes effect only through the human review queue, never a model call. |
 
 ### Connector system (`server/connectors/` + `connector_manager.py`)
 

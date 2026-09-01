@@ -95,9 +95,9 @@ Almost none, by design (`docs/plans/e2e-slim.md`). A fake CLI on PATH emits
 canned output through the real spawn → stream-json → MCP path; only the
 model is canned.
 
-- **E2E**: 3 of the 76 burn real quota — claude chat, codex chat, 2-hop
+- **E2E**: 3 of the 84 burn real quota — claude chat, codex chat, 2-hop
   delegation. They opt in by marking their working dir via `realCliDir()`;
-  everything else gets the fake. `bun run test:e2e:fast` (73, ~1.4 min) skips
+  everything else gets the fake. `bun run test:e2e:fast` (81, ~3 min) skips
   them via `--grep-invert @llm` — fine while iterating, but run the full
   suite before committing.
 - **Backend**: `test_*_real.py` auto-skip unless their CLI is on PATH.

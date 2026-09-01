@@ -2274,14 +2274,21 @@ class TaskRepository:
         nothing_note: str | None,
         now: str | None = None,
     ) -> RetrospectiveRecord:
-        if not any([memory_note, claude_md_note, skill_candidate_ids, nothing_note]):
+        # Whitespace-only text must not satisfy this gate — trim before the
+        # emptiness check AND before storage, or a blank string trivially
+        # defeats the whole point of forcing a real retrospective.
+        memory_note = (memory_note or "").strip() or None
+        claude_md_note = (claude_md_note or "").strip() or None
+        nothing_note = (nothing_note or "").strip() or None
+        clean_ids = [cid.strip() for cid in (skill_candidate_ids or []) if cid.strip()]
+        if not any([memory_note, claude_md_note, clean_ids, nothing_note]):
             raise TaskValidationError(
                 "a retrospective must set at least one of memory_note / "
                 "claude_md_note / skill_candidate_ids / nothing_note"
             )
         stamp = now or _now_iso()
         retro_id = _short_id()
-        ids_json = json.dumps(list(skill_candidate_ids or []))
+        ids_json = json.dumps(clean_ids)
         async with self._lock:
             await self._task_row(self.conn, task_id)
             await self._run_row(self.conn, run_id)

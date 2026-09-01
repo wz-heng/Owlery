@@ -141,6 +141,24 @@ async def test_reflect_requires_at_least_one_field(task_runtime):
 
 
 @pytest.mark.asyncio
+async def test_reflect_rejects_whitespace_only_fields(task_runtime):
+    """A blank string must not satisfy the gate — that would defeat the
+    entire point of forcing a real retrospective to happen."""
+    db, repo, sessions, manager, root = task_runtime
+    _board, task = await _ready_task(db, repo, root)
+    _current, run = await _dispatch(manager, sessions, repo, task)
+
+    with pytest.raises(TaskValidationError):
+        await manager.submit_retrospective(
+            task.id, run.id, run.session_id, nothing_note="   "
+        )
+    with pytest.raises(TaskValidationError):
+        await manager.submit_retrospective(
+            task.id, run.id, run.session_id, skill_candidate_ids=["  ", ""]
+        )
+
+
+@pytest.mark.asyncio
 async def test_reflect_twice_for_the_same_run_conflicts(task_runtime):
     from server.task_board.models import TaskConflictError
 

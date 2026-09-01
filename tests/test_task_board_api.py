@@ -701,3 +701,23 @@ async def test_enriched_accepts_task_record_or_mapping(monkeypatch):
     payload = {"id": "task-9", "title": "keep me"}
     assert await routes._enriched(payload) == payload
     assert (await routes._enriched(_Record("task-8")))["id"] == "task-8"
+
+
+def test_reflect_request_rejects_whitespace_only_fields():
+    """experience-consolidation.md §3.2/§3.3: the retrospective gate exists
+    to force a real retrospective — a whitespace-only field must not satisfy
+    it, and stray whitespace in skill_candidate_ids must not count either."""
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError):
+        routes.ReflectRequest(nothing_note="   ")
+    with pytest.raises(pydantic.ValidationError):
+        routes.ReflectRequest(memory_note="\n\t ")
+    with pytest.raises(pydantic.ValidationError):
+        routes.ReflectRequest(skill_candidate_ids=["  ", ""])
+
+    req = routes.ReflectRequest(nothing_note="  Nothing new.  ")
+    assert req.nothing_note == "Nothing new."
+
+    req = routes.ReflectRequest(skill_candidate_ids=[" cand-1 ", "  "])
+    assert req.skill_candidate_ids == ["cand-1"]

@@ -76,7 +76,9 @@ test.describe("Experience consolidation", () => {
       // (server/task_board/prompts.py) never includes the body — so every
       // string below is kept terse on purpose.
       const slug = `hermes-pr-${Date.now()}`;
-      const skillBody = "---\nname: hermes-pr-flow\n---\nFork, branch, push.\n";
+      // `propose` requires the frontmatter `name:` to equal `slug` (usage
+      // tracking looks candidates up by it) — keep them in lockstep.
+      const skillBody = `---\nname: ${slug}\n---\nFork, branch, push.\n`;
 
       // --- Attempt 1: a first pass that hits friction and blocks. --------
       const blockTitle = `Hermes PR flow ${fake({
