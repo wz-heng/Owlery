@@ -68,15 +68,17 @@ revisit this rather than bolting a gate on blind.
 
 ## After Every Code Change
 
-Run all four. They total well under two minutes — there is no cheap
-tier to fall back to, so don't skip one on the grounds that a change
-"only touched the frontend".
+Run all four. There is no cheap tier to fall back to, so don't skip one
+on the grounds that a change "only touched the frontend".
 
-1. **Backend unit**: `.venv/bin/pytest tests/ -v` (1426)
-2. **Frontend unit**: `cd web && bun run test` (279)
+1. **Backend unit**: `.venv/bin/pytest tests/ -v` (1564)
+2. **Frontend unit**: `cd web && bun run test` (345)
 3. **TypeScript**: `cd web && npx tsc --noEmit`
-4. **E2E**: `cd web && bun run test:e2e` (76, ~2 min, Playwright auto-starts
-   servers)
+4. **E2E**: `cd web && bun run test:e2e` (84, ~4 min, Playwright auto-starts
+   servers). Runs with `workers: 1` — every spec shares one backend/DB for
+   the whole run, and a couple of specs (e.g. task-board.spec.ts's first
+   test) assert on truly global state, so serial execution is load-bearing,
+   not a knob to bump back up for speed.
 
 **Zero test failures are acceptable.** All tests must pass before
 committing. If a test fails, investigate and fix it — never ignore, skip,
@@ -142,7 +144,7 @@ environment.
 
 What each suite covers; detail lives in the linked plan docs.
 
-**Backend unit** (pytest, 1426) — config, models, session manager, REST API,
+**Backend unit** (pytest, 1564) — config, models, session manager, REST API,
 DB persistence (credential split, refresh-error codes), JSONL parser/writer,
 CLI handoff/pull, import API, schedules CRUD + scheduler (interval + cron),
 NL `/schedule` parsing, Feishu bridge (fail-closed allowlist, card-value
@@ -153,22 +155,27 @@ OAuth registry, agents • harness layer
 (`agent-collaboration.md`) • usage tracking (`usage-tracking.md`) •
 Octopus→Owlery migration (`rename-owlery.md` §3) • durable Task Board and
 Git-worktree delivery state/CAS/recovery (`task-board.md`,
-`task-git-delivery.md`).
+`task-git-delivery.md`) • experience consolidation: retrospective gate,
+skill candidate registry + review queue, use_count tracking
+(`experience-consolidation.md`).
 
-**Frontend unit** (vitest, 279) — zustand store, `useWebSocket`, BgTaskChip,
+**Frontend unit** (vitest, 345) — zustand store, `useWebSocket`, BgTaskChip,
 FileViewerDialog, SlashCommandMenu, delegation cards, fork dialog +
 deferred-fork helper, CredentialList, ResearchCard, UsageDialog, `readStored`
 localStorage rename migration, Task Board state/event reconciliation and Git
-delivery controls.
+delivery controls, SkillCandidatesPage.
 
-**E2E** (Playwright, 76) — login, session CRUD, chat (send / Enter /
+**E2E** (Playwright, 84) — login, session CRUD, chat (send / Enter /
 disabled-while-running / AskUserQuestion / resume), WS reconnect, mobile
 layout, CLI handoff/pull + roundtrip, schedules, archived sessions, message
 queue + Esc interrupt, virtualized chat, OAuth + Codex device-code sign-in,
 credential override, agents rail/settings, connectors, `/research`,
 `/rewind` + deferred fork, usage page, cross-turn `mcp__bg__run` + spill
-pointer, `/showme`, Task Board worker completion, and Git-worktree
-accept/commit/push/teardown. Plus 6 Feishu-bridge tests under their own config.
+pointer, `/showme`, Task Board worker completion, Git-worktree
+accept/commit/push/teardown, and the experience-consolidation touchstone
+(non-clean-pass gate → retrospective → skill candidate → human review →
+direct reuse, `task-retrospective.spec.ts`). Plus 6 Feishu-bridge tests
+under their own config.
 
 ## Project Structure
 
