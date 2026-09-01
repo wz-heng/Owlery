@@ -7,6 +7,7 @@ dispatcher code gets stable attribute access and no accidental write-through.
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping
 
@@ -132,6 +133,14 @@ class TaskCapacityError(TaskConflictError):
     code = "capacity"
 
 
+class TaskRetrospectiveRequiredError(TaskConflictError):
+    """`complete` refused a non-clean-pass run because no retrospective has
+    been filed yet (experience-consolidation.md §3.2). The worker must call
+    `reflect` first, then retry `complete`."""
+
+    code = "retrospective_required"
+
+
 @dataclass(frozen=True, slots=True)
 class Record:
     def to_dict(self) -> dict[str, Any]:
@@ -234,6 +243,30 @@ class RunRecord(Record):
     last_heartbeat_at: str | None
     lease_expires_at: str | None
     finished_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class RetrospectiveRecord(Record):
+    """The worker's own triage of a non-clean-pass run into the three reuse
+    channels (experience-consolidation.md §3.3). At least one of
+    memory_note/claude_md_note/skill_candidate_ids/nothing_note is set."""
+
+    id: str
+    task_id: str
+    run_id: str
+    agent_id: str | None
+    memory_note: str | None
+    claude_md_note: str | None
+    skill_candidate_ids: list[str]
+    nothing_note: str | None
+    created_at: str
+
+    @classmethod
+    def from_row(cls, row: Mapping[str, Any]) -> RetrospectiveRecord:
+        values = dict(row)
+        raw_ids = values.pop("skill_candidate_ids", None)
+        ids: list[str] = json.loads(raw_ids) if raw_ids else []
+        return cls(skill_candidate_ids=ids, **values)
 
 
 @dataclass(frozen=True, slots=True)

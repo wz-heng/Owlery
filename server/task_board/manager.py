@@ -18,7 +18,15 @@ from ..deploy_admission import DeployAdmissionClosedError
 from ..model_routing import ModelBackendError, validate_model_for_backend
 from .delivery import DeliveryCoordinator, delivery_coordinator
 from .deploy_quiesce import DeployQuiesce
-from .models import DeliveryRecord, RunRecord, TaskBoardError, TaskConflictError, TaskRecord
+from .models import (
+    DeliveryRecord,
+    RetrospectiveRecord,
+    RunRecord,
+    TaskBoardError,
+    TaskConflictError,
+    TaskRecord,
+    TaskRetrospectiveRequiredError,
+)
 from .prompts import render_assignment_prompt
 from .repository import TaskRepository, task_repository
 from . import workspaces as ws
@@ -566,6 +574,24 @@ class TaskBoardManager:
         verdict: str | None = None,
     ) -> dict[str, Any]:
         task, run = await self._validate_worker(task_id, run_id, session_id)
+        # Experience consolidation gate (experience-consolidation.md §3.2):
+        # a non-clean-pass run may not `complete` until the worker has filed
+        # a retrospective for THIS run. A clean first pass skips the gate
+        # entirely — no history to retrospect, and forcing one every time
+        # would just breed reflection fatigue.
+        if await self.repo.is_non_clean_pass(task_id, run_id, verdict=verdict):
+            if not await self.repo.has_retrospective(run_id):
+                raise TaskRetrospectiveRequiredError(
+                    "this run was not a clean first pass (a retry, a prior "
+                    "blocked/failed/interrupted run, or verdict='fail') — call "
+                    "`reflect` first: (1) a judgment call specific to you goes "
+                    "to your own memory, (2) a rule everyone should know "
+                    "becomes a CLAUDE.md edit + PR, (3) a repeatable multi-step "
+                    "process becomes a skill candidate via the `skills` MCP "
+                    "server's `propose`. If none apply, pass `nothing_note` "
+                    "explaining why there's nothing to add. Then retry `complete`.",
+                    current=task,
+                )
         # Preserve prep metadata (the git base branch/commit) under the worker's
         # declared metadata and the terminal git inspection (B1).
         terminal_metadata = dict(run.metadata or {})
@@ -626,6 +652,33 @@ class TaskBoardManager:
             session._auto_archive_requested = True
         await self.publish_task_update(task_id)
         return {"task": task.to_dict(), "run": final.to_dict()}
+
+    async def submit_retrospective(
+        self,
+        task_id: str,
+        run_id: str,
+        session_id: str,
+        *,
+        memory_note: str | None = None,
+        claude_md_note: str | None = None,
+        skill_candidate_ids: list[str] | None = None,
+        nothing_note: str | None = None,
+    ) -> dict[str, Any]:
+        """File the worker's own three-way triage for this run
+        (experience-consolidation.md §3.3) — a precondition for `complete`
+        on a non-clean-pass run, but callable any time a worker wants to
+        record one early."""
+        task, run = await self._validate_worker(task_id, run_id, session_id)
+        record: RetrospectiveRecord = await self.repo.create_retrospective(
+            task_id,
+            run_id,
+            agent_id=run.agent_id,
+            memory_note=memory_note,
+            claude_md_note=claude_md_note,
+            skill_candidate_ids=skill_candidate_ids,
+            nothing_note=nothing_note,
+        )
+        return record.to_dict()
 
     async def create_worker_task(
         self, task_id: str, run_id: str, session_id: str, **create: Any

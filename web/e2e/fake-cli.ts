@@ -29,6 +29,37 @@ export type FakeOp =
   | { t: "bg"; command: string; description?: string }
   /** Complete the current durable Task Board run over the real tasks MCP. */
   | { t: "task_complete"; summary: string }
+  /** Block the current durable Task Board run over the real tasks MCP. */
+  | { t: "task_block"; reason: string; kind?: string }
+  /**
+   * File the worker's own retrospective triage over the real tasks MCP
+   * (experience-consolidation.md §3.2/§3.3) — required before `task_complete`
+   * succeeds on a non-clean-pass run.
+   */
+  | {
+      t: "task_reflect";
+      memory_note?: string;
+      claude_md_note?: string;
+      skill_candidate_ids?: string[];
+      nothing_note?: string;
+    }
+  /**
+   * Propose a skill candidate for human review over the real skills MCP
+   * (experience-consolidation.md §3.4).
+   */
+  | {
+      t: "skill_propose";
+      slug: string;
+      title: string;
+      description: string;
+      body_markdown: string;
+      rationale: string;
+    }
+  /**
+   * Emit a native `Skill` tool_use (no MCP call) — simulates the CLI
+   * actually invoking a landed skill, exercising the use_count hook.
+   */
+  | { t: "invoke_skill"; slug: string }
   /** Write a relative file inside the current fake worker workspace. */
   | { t: "write_file"; path: string; v: string }
   /** Persist a word into this session's fake-CLI state. */

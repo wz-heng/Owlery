@@ -26,6 +26,10 @@ Ops:
   ask         call `mcp__ask__user` over MCP and echo the answer
   bg          call `mcp__bg__run` over MCP and end the turn
   task_complete call `mcp__tasks__complete` over MCP for the owning run
+  task_block    call `mcp__tasks__block` over MCP for the owning run
+  task_reflect  call `mcp__tasks__reflect` over MCP (experience-consolidation.md §3.2/§3.3)
+  skill_propose call `mcp__skills__propose` over MCP (experience-consolidation.md §3.4)
+  invoke_skill  emit a native `Skill` tool_use (no MCP call) to exercise use_count tracking
   write_file    write a relative file inside the current worker workspace
   remember    persist a word into this session's transcript
   recall      read that word back out of the transcript
@@ -352,6 +356,52 @@ def run_ops(ops: list[dict], parsed: dict, state: dict) -> None:
             completed = call_mcp_tool(mcp_servers, "tasks", "complete", arguments)
             _emit_tool_result(tool_use_id, completed)
             _emit_text("completed")
+
+        elif kind == "task_block":
+            tool_use_id = f"toolu_fake_task_block_{index}"
+            arguments = {"reason": op["reason"], "kind": op.get("kind", "input")}
+            _emit_tool_use(tool_use_id, "mcp__tasks__block", arguments)
+            blocked = call_mcp_tool(mcp_servers, "tasks", "block", arguments)
+            _emit_tool_result(tool_use_id, blocked)
+            _emit_text("blocked")
+
+        elif kind == "task_reflect":
+            tool_use_id = f"toolu_fake_task_reflect_{index}"
+            arguments = {
+                key: op[key]
+                for key in (
+                    "memory_note", "claude_md_note", "skill_candidate_ids",
+                    "nothing_note",
+                )
+                if key in op
+            }
+            _emit_tool_use(tool_use_id, "mcp__tasks__reflect", arguments)
+            reflected = call_mcp_tool(mcp_servers, "tasks", "reflect", arguments)
+            _emit_tool_result(tool_use_id, reflected)
+            _emit_text("reflected")
+
+        elif kind == "skill_propose":
+            tool_use_id = f"toolu_fake_skill_propose_{index}"
+            arguments = {
+                "slug": op["slug"],
+                "title": op["title"],
+                "description": op["description"],
+                "body_markdown": op["body_markdown"],
+                "rationale": op["rationale"],
+            }
+            _emit_tool_use(tool_use_id, "mcp__skills__propose", arguments)
+            proposed = call_mcp_tool(mcp_servers, "skills", "propose", arguments)
+            _emit_tool_result(tool_use_id, proposed)
+            _emit_text("proposed")
+
+        elif kind == "invoke_skill":
+            # Simulate the CLI's own native `Skill` tool_use — this is NOT an
+            # MCP call (skills are a CLI-native mechanism), just the same
+            # tool_use/tool_result shape a real skill invocation would stream,
+            # so the server's use_count hook (session_manager.py) fires on it.
+            tool_use_id = f"toolu_fake_invoke_skill_{index}"
+            _emit_tool_use(tool_use_id, "Skill", {"skill": op["slug"]})
+            _emit_tool_result(tool_use_id, f"Loaded skill {op['slug']}")
 
         elif kind == "write_file":
             tool_use_id = f"toolu_fake_write_{index}"

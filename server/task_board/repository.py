@@ -47,6 +47,7 @@ from .models import (
     EventRecord,
     ReleaseDeploymentRecord,
     ReleaseDeploymentOpRecord,
+    RetrospectiveRecord,
     RunRecord,
     TaskCapacityError,
     TaskConflictError,
@@ -2230,6 +2231,81 @@ class TaskRepository:
             now=now,
             artifacts=None,
         )
+
+    # --- Retrospectives (experience-consolidation.md §3.2/§3.3) -------------
+
+    async def is_non_clean_pass(
+        self, task_id: str, run_id: str, *, verdict: str | None = None
+    ) -> bool:
+        """True when this run's `complete` is NOT a clean first pass: this
+        run's own attempt_no > 1, an earlier run on the same task ended
+        blocked/failed/interrupted, or the worker is self-reporting
+        verdict='fail'. A clean pass (attempt 1, no prior blocked history, no
+        fail verdict) has nothing to retrospect and skips the gate."""
+        if verdict == "fail":
+            return True
+        runs = await self.list_runs(task_id)
+        current = next((r for r in runs if r.id == run_id), None)
+        if current is not None and current.attempt_no > 1:
+            return True
+        return any(
+            r.id != run_id and r.state in ("blocked", "failed", "interrupted")
+            for r in runs
+        )
+
+    async def has_retrospective(self, run_id: str) -> bool:
+        async with self._lock:
+            row = await self._fetchone(
+                self.conn,
+                "SELECT 1 FROM task_retrospectives WHERE run_id = ?",
+                (run_id,),
+            )
+        return row is not None
+
+    async def create_retrospective(
+        self,
+        task_id: str,
+        run_id: str,
+        *,
+        agent_id: str | None,
+        memory_note: str | None,
+        claude_md_note: str | None,
+        skill_candidate_ids: Sequence[str] | None,
+        nothing_note: str | None,
+        now: str | None = None,
+    ) -> RetrospectiveRecord:
+        if not any([memory_note, claude_md_note, skill_candidate_ids, nothing_note]):
+            raise TaskValidationError(
+                "a retrospective must set at least one of memory_note / "
+                "claude_md_note / skill_candidate_ids / nothing_note"
+            )
+        stamp = now or _now_iso()
+        retro_id = _short_id()
+        ids_json = json.dumps(list(skill_candidate_ids or []))
+        async with self._lock:
+            await self._task_row(self.conn, task_id)
+            await self._run_row(self.conn, run_id)
+            try:
+                await self.conn.execute(
+                    "INSERT INTO task_retrospectives "
+                    "(id, task_id, run_id, agent_id, memory_note, claude_md_note, "
+                    "skill_candidate_ids, nothing_note, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        retro_id, task_id, run_id, agent_id, memory_note,
+                        claude_md_note, ids_json, nothing_note, stamp,
+                    ),
+                )
+            except aiosqlite.IntegrityError as exc:
+                raise TaskConflictError(
+                    f"run {run_id!r} already has a retrospective"
+                ) from exc
+            await self.conn.commit()
+            row = await self._fetchone(
+                self.conn, "SELECT * FROM task_retrospectives WHERE id = ?", (retro_id,)
+            )
+        assert row is not None
+        return RetrospectiveRecord.from_row(row)
 
     async def get_run(self, run_id: str) -> RunRecord:
         async with self._lock:

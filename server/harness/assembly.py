@@ -36,6 +36,9 @@ _BUILTIN_MODULES = {
     "research": "server.mcp_servers.research",
     # Durable Task Board orchestration / worker terminal protocol.
     "tasks": "server.mcp_servers.tasks",
+    # Skill candidate proposal (experience-consolidation.md §3.3/§3.4). Thin
+    # shim to /api/sessions/{sid}/skills/candidates in front of SkillRegistry.
+    "skills": "server.mcp_servers.skills",
 }
 
 
@@ -100,6 +103,11 @@ def select_mcp_servers(
         "tasks": {
             "command": sys.executable,
             "args": ["-m", _BUILTIN_MODULES["tasks"]],
+            "env": dict(callback_env),
+        },
+        "skills": {
+            "command": sys.executable,
+            "args": ["-m", _BUILTIN_MODULES["skills"]],
             "env": dict(callback_env),
         },
     }

@@ -46,6 +46,10 @@ class _Manager:
         self.calls.append(("complete", identity, payload))
         return {"state": "completed"}
 
+    async def submit_retrospective(self, *identity, **payload):
+        self.calls.append(("reflect", identity, payload))
+        return {"id": "retro-1", "task_id": identity[0], "run_id": identity[1]}
+
     async def create_worker_task(self, *identity, **payload):
         self.calls.append(("worker_create", identity, payload))
         return {"id": "child-1", "status": payload["status"]}

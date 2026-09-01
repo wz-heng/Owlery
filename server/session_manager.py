@@ -314,6 +314,10 @@ class SessionManager:
         # no park machinery is wired (unit tests with a bare manager), and a
         # usage-limit failure just surfaces as-is, as it did before this feature.
         self._parked_turns: Any = None
+        # Likewise — the SkillRegistry (experience-consolidation.md §3.4/§5).
+        # None means no use_count tracking (unit tests with a bare manager);
+        # a `Skill` tool_use is simply not attributed to any candidate.
+        self._skill_registry: Any = None
         # Injections remain `pending` on disk while merely accepted into an
         # in-memory turn queue.  This set prevents the same pending outbox row
         # from being queued twice in one process; a restart clears it and
@@ -337,6 +341,9 @@ class SessionManager:
 
     def set_parked_turn_runner(self, runner: Any) -> None:
         self._parked_turns = runner
+
+    def set_skill_registry(self, registry: Any) -> None:
+        self._skill_registry = registry
 
     def set_deploy_admission_gate(self, gate: DeployAdmissionGate) -> None:
         """Wire the process-wide deploy work-admission gate at boot."""
@@ -2650,6 +2657,14 @@ class SessionManager:
 
                     if event.type == "tool_use":
                         saw_tool_use = True
+                        # Skill usage tracking (experience-consolidation.md
+                        # §3.4/§5): the CLI's own native `Skill` tool_use is
+                        # the ground truth for "this skill was actually
+                        # invoked" — best-effort, never blocks the turn.
+                        if event.tool_name == "Skill" and self._skill_registry is not None:
+                            slug = (event.tool_input or {}).get("skill")
+                            if slug:
+                                await self._skill_registry.record_usage(slug)
                     if event.type == "text" and event.content and event.content.strip():
                         saw_text = True
 

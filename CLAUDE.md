@@ -30,6 +30,33 @@ This rule exists because past sessions repeatedly took the shortcut
 and then had to be told to go back and do the real thing. Skip the
 shortcut. Do the real thing the first time.
 
+## Retrospective Discipline (Experience Consolidation)
+
+Owlery mechanizes "a retrospective must happen" for Task Board work
+(`docs/plans/experience-consolidation.md`): a worker's `complete` on a
+**non-clean-pass** run (a retry, a prior blocked/failed/interrupted attempt
+on the same task, or `verdict="fail"`) is refused by the `tasks` MCP server
+until it has called `reflect` — a self-authored triage into exactly one of
+three channels: your own agent memory (a judgment call specific to you),
+a CLAUDE.md nomination (a rule everyone working in this repo should know —
+edit this file and land it through the normal branch+PR flow, same as any
+other change), or a skill candidate (`skills` MCP server's `propose` — a
+repeatable multi-step process, reviewed by a human via the pending-candidate
+queue before it ever lands on disk). `reflect` also accepts a bare
+`nothing_note` when reflection genuinely finds nothing new. A clean first
+pass skips the gate entirely — do not add one.
+
+**This mechanism has no terminal hook to attach to for a standing agent**
+(there is no Task Board run wrapping an ordinary chat session). If you are
+a standing agent (not a one-shot Task Board worker) and you just walked a
+multi-step external workflow to completion for the first time — with any
+real friction along the way — stop before ending your turn and ask
+yourself: *will I walk this path again?* If yes, codify it on the spot,
+right now, in this same turn: a skill candidate if it is a repeatable
+procedure, or a note in your own memory if it is a judgment call specific
+to you. Do not wait to be asked, and do not defer it to "later" — later is
+a fresh session with no memory of the friction you just hit.
+
 ## After Every Code Change
 
 Run all four. They total well under two minutes — there is no cheap
