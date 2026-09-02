@@ -233,7 +233,8 @@ export function deliveryButtonState(
       if (!dirty) return { enabled: false, reason: "Nothing to commit — the worktree is clean" };
       return { enabled: true, reason: null };
     case "push":
-      if (status !== "ready") return { enabled: false, reason: "Not ready to push yet" };
+      if (!DELIVERY_GOAL_ACCEPTING_STATUSES.includes(status))
+        return { enabled: false, reason: "Delivery failed — tear down and retry before pushing" };
       if (dirty) return { enabled: false, reason: "Commit the pending changes first" };
       if ((commits_ahead ?? 0) <= 0)
         return { enabled: false, reason: "Nothing to push — no commits ahead of base" };

@@ -282,7 +282,7 @@ describe("deliveryButtonState", () => {
     expect(deliveryButtonState("commit", d({ status: "pending", dirty: true })).reason).toBeTruthy();
   });
 
-  it("push requires ready + clean + commits ahead, each with its own reason", () => {
+  it("push requires a goal-accepting status + clean + commits ahead, each with its own reason", () => {
     expect(
       deliveryButtonState("push", d({ status: "ready", dirty: false, commits_ahead: 2 }))
     ).toEqual({ enabled: true, reason: null });
@@ -292,6 +292,22 @@ describe("deliveryButtonState", () => {
     expect(
       deliveryButtonState("push", d({ status: "ready", dirty: false, commits_ahead: 0 })).reason
     ).toMatch(/nothing to push/i);
+  });
+
+  it("push is retryable from blocked/conflicted/delivered — the backend's `_GOAL_START_STATES` accepts a new op from any of them — but not from failed", () => {
+    // Mirrors the pull_request/merge fix below: before this fix `push`
+    // required status === "ready" exactly, so a delivery that landed in
+    // `blocked` (e.g. a push that failed on a transient network error) could
+    // never retry from the UI even though the backend's `deliver_op()` gate
+    // (`_GOAL_START_STATES`) explicitly accepts a fresh op from blocked.
+    for (const status of ["ready", "delivered", "blocked", "conflicted"] as DeliveryStatus[]) {
+      expect(
+        deliveryButtonState("push", d({ status, dirty: false, commits_ahead: 2 }))
+      ).toEqual({ enabled: true, reason: null });
+    }
+    expect(
+      deliveryButtonState("push", d({ status: "failed", dirty: false, commits_ahead: 2 }))
+    ).toEqual({ enabled: false, reason: expect.stringMatching(/tear down and retry/i) });
   });
 
   it("pull_request explains a missing push, and a pre-existing PR by name", () => {
