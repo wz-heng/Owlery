@@ -3193,24 +3193,59 @@ class SessionManager:
         missing/needs_reconnect, or it can't be resolved — the caller then runs
         with whatever auth the CLI finds on its own. `context` labels log lines.
 
-        - ``home_dir`` (Codex): the credential is directory-backed; its dir is
-          deterministic (`<codex_home_dir>/<credential_id>/`), so we resolve it
-          with no DB read and require a completed login (auth.json present).
+        - ``home_dir`` (Codex): the credential is directory-backed
+          (`<codex_home_dir>/<credential_id>/`) and requires a completed login
+          (auth.json present). `cred_id` MUST name a real `backend_credentials`
+          row with `backend='codex'` — unlike the historical "no DB read"
+          shortcut, this is now checked before `codex_home_for` ever computes
+          a path: `sessions.py`'s `_check_credential_backend` tolerates a
+          missing row (resolved later, by design), so a session can otherwise
+          carry an attacker-chosen `credential_id` (e.g. a path-traversal
+          string) all the way to this resolver with nothing upstream having
+          validated it — and `sync_codex_skills_dir`
+          (experience-consolidation-v2.md §3④) turns a wrongly-resolved
+          `home_dir` into a real filesystem WRITE, not just a misdirected
+          read (Snape review).
         - ``env_secret`` (Claude): decrypt the secret; refresh an OAuth bundle
           if near expiry, else use the long-lived key as-is.
 
         `require_auth=False` resolves the credential only for locating on-disk
-        artifacts (e.g. fork transcript copy/cleanup), NOT for making API calls:
-        a directory-backed credential returns its home dir even with a
+        artifacts (e.g. fork transcript copy/cleanup — by design this must
+        still work after the DB row itself is gone, since the rollout can
+        outlive the credential that created it), NOT for making API calls: a
+        directory-backed credential returns its home dir even with a
         missing/revoked `auth.json` (the rollout still lives there and must be
         cleaned up — Vera review), and a secret-backed credential returns None
-        (its transcripts aren't keyed by credential, so no home to locate)."""
+        (its transcripts aren't keyed by credential, so no home to locate).
+
+        `require_auth=True` (the default, and what every real turn-spawning
+        path uses — `_resolve_credential` never passes `require_auth`) DOES
+        require a real `backend_credentials` row for `home_dir` style, unlike
+        the historical "no DB read" shortcut: `sessions.py`'s
+        `_check_credential_backend` tolerates a missing row (resolved later,
+        by design), so a session can otherwise carry an attacker-chosen
+        `credential_id` (e.g. a path-traversal string) all the way to this
+        resolver with nothing upstream having validated it — and
+        `sync_codex_skills_dir` (experience-consolidation-v2.md §3④) turns a
+        wrongly-resolved `home_dir` into a real filesystem WRITE, not just a
+        misdirected read (Snape review)."""
         if not cred_id:
             return None
 
         if style == "home_dir":
             from .codex_login import codex_home_for
 
+            if require_auth:
+                if self.db is None:
+                    return None
+                row = await self.db.get_credential(cred_id)
+                if row is None or row["backend"] != "codex":
+                    logger.warning(
+                        "%s references a missing or non-codex credential %s; "
+                        "running without a directory-backed auth override",
+                        context or "caller", cred_id,
+                    )
+                    return None
             home = codex_home_for(cred_id)
             if require_auth and not os.path.exists(os.path.join(home, "auth.json")):
                 return None  # inherit the host default ~/.codex (option A)

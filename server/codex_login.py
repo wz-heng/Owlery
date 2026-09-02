@@ -78,7 +78,22 @@ def codex_home_root() -> str:
 
 
 def codex_home_for(credential_id: str) -> str:
-    return os.path.join(codex_home_root(), credential_id)
+    """`<codex_home_dir>/<credential_id>/`. Structurally refuses to resolve
+    outside `codex_home_root()` — every real credential_id is a server-minted
+    `uuid4().hex` (fresh login) or a validated pre-existing row's id (re-auth,
+    `routers/credentials.py` checks it exists before reuse), so this should
+    never trigger in practice; it exists as a hard backstop so a `credential_id`
+    that reaches this call some OTHER, less-guarded way (Snape review:
+    `sessions.py`'s `_check_credential_backend` tolerates a not-yet-existing
+    row) can never turn into a path-traversal write outside Owlery's own
+    codex-homes root — e.g. into a real user's actual `~/.codex`."""
+    if not credential_id or "/" in credential_id or "\\" in credential_id:
+        raise ValueError(f"invalid credential_id {credential_id!r}")
+    root = os.path.realpath(codex_home_root())
+    home = os.path.realpath(os.path.join(root, credential_id))
+    if os.path.dirname(home) != root:
+        raise ValueError(f"credential_id {credential_id!r} resolves outside codex_home_root")
+    return home
 
 
 def _kill_process_group(proc: asyncio.subprocess.Process | None) -> None:

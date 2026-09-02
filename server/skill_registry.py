@@ -78,6 +78,11 @@ _BUNDLE_REF_RE = re.compile(
 
 _RESERVED_BUNDLE_PATH = "SKILL.md"
 
+# Written into every Codex-canonical skill dir sync_codex_skills_dir lands —
+# the ownership check that gates a destructive rmtree/overwrite there (never
+# manifest membership alone; see that method's docstring).
+_OWLERY_OWNED_MARKER = ".owlery-owned"
+
 
 def _parse_frontmatter(body_markdown: str) -> dict[str, Any]:
     """The SKILL.md frontmatter as a dict, or {} if missing/unparsable."""
@@ -450,6 +455,37 @@ class SkillRegistry:
             raise SkillConflictError(f"candidate is already {candidate['status']}")
         final_scope = _validate_scope(scope) if scope else candidate["scope"]
         bundle_files = candidate.get("bundle_files")
+
+        # Supersession cleanup (Snape review): find whatever candidate is
+        # CURRENTLY the active landed view of this slug for this repository
+        # (the exact same (repository OR agent-global) lookup diff()/
+        # record_usage() use, so an independent same-slug candidate approved
+        # for a DIFFERENT repository is structurally excluded — it can never
+        # be `prior` here). If this approval's final location differs from
+        # where `prior` actually lives, remove prior's stale materialized
+        # copy — otherwise a scope change (or a global<->repo relocation)
+        # would leave the OLD location serving a version this approval was
+        # meant to replace, forever.
+        if candidate["proposed_by_agent_id"]:
+            prior = await self.db.get_latest_approved_skill_by_slug(
+                candidate["slug"], agent_id=candidate["proposed_by_agent_id"],
+                repository=candidate["repository"],
+            )
+            if prior is not None:
+                prior_key = (
+                    "_global" if prior["scope"] == "agent-global"
+                    else _repo_fingerprint(prior["repository"])
+                )
+                new_key = (
+                    "_global" if final_scope == "agent-global"
+                    else _repo_fingerprint(candidate["repository"])
+                )
+                if prior_key != new_key:
+                    self._remove_materialized(
+                        candidate["proposed_by_agent_id"], prior["repository"],
+                        prior["scope"], candidate["slug"],
+                    )
+
         landed = await self._land(
             candidate["repository"], candidate["slug"], candidate["body_markdown"],
             candidate_id, bundle_files=bundle_files,
@@ -585,6 +621,11 @@ class SkillRegistry:
                 + "\n"
             )
         skill_dir = plugin_dir / "skills" / slug
+        # Clear before rewriting: a replacement candidate that DROPS a bundle
+        # file a prior approval landed must not leave that stale file behind
+        # (Snape review) — mkdir(exist_ok=True) alone only ever adds/
+        # overwrites, never removes.
+        shutil.rmtree(skill_dir, ignore_errors=True)
         skill_dir.mkdir(parents=True, exist_ok=True)
         (skill_dir / "SKILL.md").write_text(content)
         for relpath, file_content in (bundle_files or {}).items():
@@ -592,6 +633,23 @@ class SkillRegistry:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(file_content)
         return plugin_dir
+
+    @staticmethod
+    def _remove_materialized(
+        agent_id: str, repository: str, scope: str, slug: str
+    ) -> None:
+        """Remove `slug`'s materialized directory at (agent_id, scope,
+        repository) from both the Claude plugin dir and the Codex canonical
+        store — the cleanup half of a supersession that relocates a slug to
+        a different scope/repository (see `approve()`). `repository` is
+        ignored by both helpers when `scope == 'agent-global'`."""
+        plugin_skill_dir = (
+            agent_skills_plugin_dir(agent_id, repository, scope=scope)
+            / "skills" / slug
+        )
+        shutil.rmtree(plugin_skill_dir, ignore_errors=True)
+        codex_skill_dir = agent_codex_skills_dir(agent_id, repository, scope=scope) / slug
+        shutil.rmtree(codex_skill_dir, ignore_errors=True)
 
     def _materialize_codex_canonical(
         self,
@@ -608,6 +666,7 @@ class SkillRegistry:
         credential — `sync_codex_skills_dir` projects it into a real
         `$CODEX_HOME/skills` per turn (module docstring point 3)."""
         skill_dir = agent_codex_skills_dir(agent_id, repository, scope=scope) / slug
+        shutil.rmtree(skill_dir, ignore_errors=True)  # see _materialize_plugin
         skill_dir.mkdir(parents=True, exist_ok=True)
         (skill_dir / "SKILL.md").write_text(content)
         for relpath, file_content in (bundle_files or {}).items():
@@ -663,12 +722,23 @@ class SkillRegistry:
         `resolve_plugin_dir` this REWRITES real disk state on every turn to
         keep the projection scoped to (agent, current repository) — without
         that, a skill landed for repo A would keep showing up in repo B's
-        turns forever after the first sync. A sidecar manifest
-        (`.owlery-manifest.json`) records exactly which slugs Owlery
-        currently owns in this directory, so a sync only ever adds/removes
-        Owlery-managed entries — anything else already in that directory
-        (a user's own personal skill, dropped into this same real,
-        credential-owned home) is left untouched.
+        turns forever after the first sync.
+
+        Every directory this method creates gets an `.owlery-owned` marker
+        file, and it will only ever overwrite or delete a slug directory that
+        already carries that marker (Snape review: a bare slug-name manifest
+        is not enough — it protects against removing a DIFFERENT slug the
+        user owns, but not against clobbering a user's own skill that
+        happens to share a slug Owlery also wants to land, since the naive
+        version would `rmtree` + `copytree` over it unconditionally). A
+        sidecar manifest (`.owlery-manifest.json`) is still used to know
+        which slugs to consider for removal on the NEXT sync, but the marker
+        check — not manifest membership — is what actually gates a
+        destructive filesystem op; a corrupted/tampered manifest can at worst
+        cause a stale Owlery-owned dir to survive an extra sync, never cause
+        a non-Owlery dir to be touched. Manifest slugs (and desired slugs)
+        are also filtered through `_SLUG_RE` before ever being joined into a
+        path, so a malformed manifest entry can't smuggle a `..` segment.
 
         Never raises: a sync failure must not block the turn it would have
         prepared skills for."""
@@ -685,13 +755,13 @@ class SkillRegistry:
             global_dir = source_root / "_global"
             if global_dir.is_dir():
                 for slug_dir in global_dir.iterdir():
-                    if slug_dir.is_dir():
+                    if slug_dir.is_dir() and _SLUG_RE.match(slug_dir.name):
                         desired[slug_dir.name] = slug_dir
             if repository is not None:
                 repo_dir = source_root / _repo_fingerprint(repository)
                 if repo_dir.is_dir():
                     for slug_dir in repo_dir.iterdir():
-                        if slug_dir.is_dir():
+                        if slug_dir.is_dir() and _SLUG_RE.match(slug_dir.name):
                             # Repo-scoped wins over global on a slug collision
                             # — more specific takes precedence, matching
                             # Codex's own project-over-user config layering.
@@ -702,21 +772,41 @@ class SkillRegistry:
             previous: list[str] = []
             if manifest_path.is_file():
                 try:
-                    previous = json.loads(manifest_path.read_text()).get("slugs", [])
+                    raw = json.loads(manifest_path.read_text()).get("slugs", [])
+                    previous = [s for s in raw if isinstance(s, str) and _SLUG_RE.match(s)]
                 except (json.JSONDecodeError, OSError):
                     previous = []
 
             if not desired and not previous:
                 return  # nothing to do, and nothing Owlery-managed to clean up
 
+            def _owned(dest: Path) -> bool:
+                return (dest / _OWLERY_OWNED_MARKER).is_file()
+
             target.mkdir(parents=True, exist_ok=True)
             for stale_slug in set(previous) - set(desired):
-                shutil.rmtree(target / stale_slug, ignore_errors=True)
+                stale_dest = target / stale_slug
+                if _owned(stale_dest):
+                    shutil.rmtree(stale_dest, ignore_errors=True)
+
+            managed: list[str] = []
             for slug, source_dir in desired.items():
                 dest = target / slug
+                if dest.exists() and not _owned(dest):
+                    # A real, non-Owlery directory already lives at this
+                    # slug (a user's own skill) — never touch it. This Owlery
+                    # candidate silently loses the naming collision rather
+                    # than clobbering something it doesn't own.
+                    logger.warning(
+                        "skipping Codex skill sync for slug %r: a non-Owlery "
+                        "directory already exists at %s", slug, dest,
+                    )
+                    continue
                 shutil.rmtree(dest, ignore_errors=True)
                 shutil.copytree(source_dir, dest)
-            manifest_path.write_text(json.dumps({"slugs": sorted(desired)}))
+                (dest / _OWLERY_OWNED_MARKER).write_text("")
+                managed.append(slug)
+            manifest_path.write_text(json.dumps({"slugs": sorted(managed)}))
         except Exception:
             logger.exception(
                 "failed to sync Codex skills for agent %r into %r",
@@ -744,6 +834,12 @@ class SkillRegistry:
                 raise SkillValidationError(err or "unable to create a landing worktree")
             worktree_registered = True
             skill_dir = Path(scratch) / ".claude" / "skills" / slug
+            # Clear first: the worktree is checked out at HEAD, which already
+            # has whatever a PRIOR landing committed for this slug — without
+            # this, a bundle file a replacement candidate drops would never
+            # get staged as a deletion (git add -A only sees what's still on
+            # disk) and would survive forever in the git-landed copy.
+            shutil.rmtree(skill_dir, ignore_errors=True)
             skill_dir.mkdir(parents=True, exist_ok=True)
             (skill_dir / "SKILL.md").write_text(content)
             for relpath, file_content in (bundle_files or {}).items():

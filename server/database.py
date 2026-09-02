@@ -3797,7 +3797,15 @@ class Database:
         which one a given session actually has loaded (Snape review,
         experience-consolidation.md). Callers that genuinely want the newest
         approved candidate across all scopes (e.g. the review-queue diff view
-        before a scope is known) may omit both."""
+        before a scope is known) may omit both.
+
+        When `repository` is given and BOTH an exact-repository and an
+        agent-global candidate exist for the same slug, the exact-repository
+        one always ranks first regardless of which was approved more
+        recently — matching `sync_codex_skills_dir`'s own "repo-scoped wins
+        over global" precedence (Snape review: an unqualified
+        `ORDER BY updated_at` could attribute a real invocation to the
+        candidate that ISN'T actually the one loaded/discovered)."""
         await self._ensure_connected()
         query = (
             f"SELECT {self._SKILL_CANDIDATE_COLS} FROM skill_candidates "
@@ -3807,10 +3815,23 @@ class Database:
         if agent_id is not None:
             query += " AND proposed_by_agent_id = ?"
             params.append(agent_id)
+        order_by = "updated_at DESC"
         if repository is not None:
             query += " AND (repository = ? OR scope = 'agent-global')"
             params.append(repository)
-        query += " ORDER BY updated_at DESC LIMIT 1"
+            # An 'agent-global' row still has SOME `repository` value stored
+            # (propose() always resolves one, regardless of scope — it's
+            # just not what determines that row's landing location), so the
+            # CASE must also require scope='agent+repo' or a global row
+            # proposed from this same repository would wrongly tie for
+            # priority 0 instead of correctly ranking behind an actual
+            # repo-scoped match.
+            order_by = (
+                "(CASE WHEN scope = 'agent+repo' AND repository = ? "
+                "THEN 0 ELSE 1 END), " + order_by
+            )
+            params.append(repository)
+        query += f" ORDER BY {order_by} LIMIT 1"
         cursor = await self._conn.execute(query, params)
         row = await cursor.fetchone()
         return self._row_to_skill_candidate(row) if row else None

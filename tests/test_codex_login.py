@@ -148,38 +148,87 @@ async def test_codex_login_status_unknown(client):
 
 
 @pytest.mark.asyncio
-async def test_codex_home_credential_resolution():
+async def test_codex_home_credential_resolution(tmp_path):
     """The codex home_dir credential resolves deterministically and only when
-    it's a completed login (auth.json present). Resolution now lives in
-    resolve_credential_by_id(style="home_dir") + _resolve_credential's
-    session→agent precedence (the old _codex_home_for, folded in)."""
+    it's a completed login (auth.json present) AND `credential_id` names a
+    real `backend_credentials` row with backend='codex' (Snape review: a
+    session's `credential_id` isn't otherwise validated to exist before
+    reaching this resolver — see test_resolve_credential_home_dir_requires_a_
+    real_row below — so this resolver is the one place that must check).
+    Resolution lives in resolve_credential_by_id(style="home_dir") +
+    _resolve_credential's session→agent precedence (the old
+    _codex_home_for, folded in)."""
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from server.crypto import encrypt
+    from server.harness import get_harness
+    from server.session_manager import SessionManager
+
+    db = Database(str(tmp_path / "db.sqlite"))
+    await db.initialize()
+    mgr = SessionManager()
+    await mgr.initialize(db)
+    try:
+        await db.save_credential(
+            credential_id="credX", backend="codex", label="Bound",
+            auth_type="oauth", secret_encrypted=encrypt("", settings.auth_token),
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        codex = get_harness("codex")  # credential_style == "home_dir"
+        sess = SimpleNamespace(credential_id="credX", id="s1")
+
+        # No dir yet → fall back to host login (None).
+        assert await mgr._resolve_credential(sess, None, codex) is None
+
+        home = codex_login.codex_home_for("credX")
+        os.makedirs(home, exist_ok=True)
+        # Dir exists but no auth.json (interrupted login) → still None.
+        assert await mgr._resolve_credential(sess, None, codex) is None
+
+        open(os.path.join(home, "auth.json"), "w").close()
+        cred = await mgr._resolve_credential(sess, None, codex)
+        assert cred is not None and cred.home_dir == home and cred.backend == "codex"
+
+        # Falls back to the agent's default credential when the session has none.
+        no_cred = SimpleNamespace(credential_id=None, id="s2")
+        cred2 = await mgr._resolve_credential(no_cred, {"credential_id": "credX"}, codex)
+        assert cred2 is not None and cred2.home_dir == home
+        # No credential anywhere → None.
+        assert await mgr._resolve_credential(no_cred, None, codex) is None
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_credential_home_dir_requires_a_real_row(tmp_path):
+    """Snape review: `sessions.py`'s `_check_credential_backend` tolerates a
+    credential_id with no matching row (resolved later, by design) — so a
+    session can carry an arbitrary string all the way to this resolver.
+    Without a DB check here, a crafted id (e.g. a path-traversal string)
+    plus a coincidentally-real auth.json at the resolved location would
+    resolve to a live credential; sync_codex_skills_dir would then WRITE
+    real files there. A completed login with no matching DB row must
+    resolve to None, not a working credential."""
     from types import SimpleNamespace
 
     from server.harness import get_harness
     from server.session_manager import SessionManager
 
+    db = Database(str(tmp_path / "db.sqlite"))
+    await db.initialize()
     mgr = SessionManager()
-    codex = get_harness("codex")  # credential_style == "home_dir"
-    sess = SimpleNamespace(credential_id="credX", id="s1")
+    await mgr.initialize(db)
+    try:
+        codex = get_harness("codex")
+        home = codex_login.codex_home_for("no-such-row")
+        os.makedirs(home, exist_ok=True)
+        open(os.path.join(home, "auth.json"), "w").close()
 
-    # No dir yet → fall back to host login (None).
-    assert await mgr._resolve_credential(sess, None, codex) is None
-
-    home = codex_login.codex_home_for("credX")
-    os.makedirs(home, exist_ok=True)
-    # Dir exists but no auth.json (interrupted login) → still None.
-    assert await mgr._resolve_credential(sess, None, codex) is None
-
-    open(os.path.join(home, "auth.json"), "w").close()
-    cred = await mgr._resolve_credential(sess, None, codex)
-    assert cred is not None and cred.home_dir == home and cred.backend == "codex"
-
-    # Falls back to the agent's default credential when the session has none.
-    no_cred = SimpleNamespace(credential_id=None, id="s2")
-    cred2 = await mgr._resolve_credential(no_cred, {"credential_id": "credX"}, codex)
-    assert cred2 is not None and cred2.home_dir == home
-    # No credential anywhere → None.
-    assert await mgr._resolve_credential(no_cred, None, codex) is None
+        sess = SimpleNamespace(credential_id="no-such-row", id="s1")
+        assert await mgr._resolve_credential(sess, None, codex) is None
+    finally:
+        await db.close()
 
 
 @pytest.mark.asyncio
