@@ -107,9 +107,41 @@ def test_worker_complete_never_accepts_model_identity(monkeypatch):
     assert "run_id" not in captured["json"]
 
 
+def test_worker_reflect_posts_triage_to_the_scoped_route(monkeypatch):
+    _base_env(monkeypatch, worker=True)
+    captured = {}
+
+    def fake_request(method, url, **kwargs):
+        captured.update(method=method, url=url, **kwargs)
+        return _Response(status_code=201, payload={"id": "retro-1"})
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    out = _call(
+        "reflect_task",
+        memory_pointer="task-retro-transient-429.md",
+    )
+    assert "retro-1" in out
+    assert captured["url"].endswith("/api/task-worker/current/reflect")
+    assert captured["json"] == {
+        "memory_pointer": "task-retro-transient-429.md",
+        "claude_md_note": None,
+        "skill_candidate_ids": [],
+        "nothing_note": None,
+    }
+
+
+def test_worker_reflect_requires_at_least_one_field(monkeypatch):
+    _base_env(monkeypatch, worker=True)
+    out = _call("reflect_task")
+    assert "at least one of" in out.lower()
+
+
 def test_worker_only_terminal_tools_fail_closed(monkeypatch):
     _base_env(monkeypatch)
     assert "only inside" in _call("heartbeat_task").lower()
+    assert "only inside" in _call("reflect_task").lower()
     assert "only inside" in _call("complete_task", summary="done").lower()
     assert "only inside" in _call("block_task", reason="need input").lower()
 

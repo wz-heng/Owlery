@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 # Built-in MCP servers attached to the Default Agent (and the default for
 # any newly-created agent). Kept here so the migration backfill and the
 # CREATE TABLE default stay in lock-step.
-_DEFAULT_MCP_SERVERS = ["ask", "bg", "ask_agent", "research", "tasks"]
+_DEFAULT_MCP_SERVERS = ["ask", "bg", "ask_agent", "research", "tasks", "skills"]
 _DEFAULT_MCP_SERVERS_JSON = json.dumps(_DEFAULT_MCP_SERVERS)
 
 _SCHEMA = """
@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS agents (
     model TEXT,                             -- e.g. "claude-opus-4-7"; null = backend default
     credential_id TEXT REFERENCES backend_credentials(id) ON DELETE SET NULL,
     backend TEXT NOT NULL DEFAULT 'claude-code',  -- default harness for new sessions
-    mcp_servers TEXT NOT NULL DEFAULT '["ask","bg","ask_agent","research","tasks"]',
+    mcp_servers TEXT NOT NULL DEFAULT '["ask","bg","ask_agent","research","tasks","skills"]',
                                             -- JSON array of built-in Owlery MCP server ids.
     tool_allow TEXT NOT NULL DEFAULT '',    -- newline-separated tool/MCP names; empty = allow all
     tool_deny  TEXT NOT NULL DEFAULT '',    -- newline-separated; deny takes precedence over allow
@@ -668,6 +668,75 @@ CREATE TABLE IF NOT EXISTS task_artifacts (
     UNIQUE (run_id, name)
 );
 
+-- Experience consolidation (experience-consolidation.md §3.2/§3.3): filed at
+-- most once per run, only for a "non-clean-pass" `complete` (attempts > 1,
+-- a prior blocked/failed/interrupted run on the same task, or verdict=fail).
+-- The worker triages its own retrospective into memory (self, off-DB) /
+-- CLAUDE.md (nominated, delivered via the normal PR path) / a skill candidate
+-- (this DB, see skill_candidates below) — at least one of the four fields
+-- must be set, `nothing_note` covering the "nothing new" case explicitly
+-- rather than silently skipping. `complete` refuses to finish a non-clean
+-- run until this row exists (task_board/manager.py `complete_worker`).
+--
+-- `memory_pointer` and `claude_md_note` are gated by a real artifact, not
+-- accepted as free text (Snape review point 3 — a DB string alone is
+-- checkbox theater): `memory_pointer` is a relative path the manager
+-- verifies actually exists (non-empty) under the run's agent's memory dir
+-- (server/agent_memory.py `resolve_memory_pointer`) before this row is ever
+-- written — the worker wrote that file itself via its normal tools, this
+-- column stores a POINTER to it, not the note's substantive content.
+-- `claude_md_note` is the human-readable nomination text, but is only
+-- accepted alongside a real, already-committed CLAUDE.md diff on the run's
+-- own git_worktree branch (verified against `prepared.base_head`) — the
+-- text nominates, the commit is the auditable candidate artifact.
+CREATE TABLE IF NOT EXISTS task_retrospectives (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+    memory_pointer TEXT,
+    claude_md_note TEXT,
+    skill_candidate_ids TEXT,   -- JSON list of skill_candidates.id
+    nothing_note TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (run_id)
+);
+CREATE INDEX IF NOT EXISTS task_retrospectives_task ON task_retrospectives(task_id);
+
+-- Skill candidate review queue (experience-consolidation.md §3.4/§5): the
+-- hermes-style pending -> diff -> approve/reject shape. A row starts
+-- `pending` (a proposed SKILL.md an agent wrote during retrospective, or ad
+-- hoc); a human approves or rejects it (skill_registry.py — never the
+-- proposing agent, per §4 "no auto-generated skill takes effect"). There is
+-- no separate "landed skills" table: an `approved` row IS the landed skill,
+-- and use_count/last_used accrue on it directly, mirroring hermes' single
+-- skill entity with a `.usage.json` sidecar.
+CREATE TABLE IF NOT EXISTS skill_candidates (
+    id TEXT PRIMARY KEY,
+    slug TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    body_markdown TEXT NOT NULL,        -- full SKILL.md content (frontmatter + body)
+    repository TEXT NOT NULL,           -- absolute path of the target repo (board.working_dir snapshot)
+    rationale TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+    proposed_by_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+    proposed_by_session_id TEXT,
+    task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+    run_id TEXT REFERENCES task_runs(id) ON DELETE SET NULL,
+    reviewed_at TEXT,
+    review_note TEXT,
+    landed_path TEXT,                   -- e.g. ".claude/skills/<slug>/SKILL.md"
+    landed_branch TEXT,                 -- local branch the landing commit lives on (never auto-pushed)
+    landed_commit TEXT,
+    use_count INTEGER NOT NULL DEFAULT 0,
+    last_used_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS skill_candidates_status ON skill_candidates(status, created_at);
+CREATE INDEX IF NOT EXISTS skill_candidates_slug ON skill_candidates(slug, status);
+
 -- Git delivery closure for git_worktree runs (task-git-delivery.md §11). One
 -- durable delivery per completed worktree run records the fate of its branch;
 -- an append-only op log records each at-most-once local/external operation.
@@ -1217,6 +1286,11 @@ class Database:
         if user_version < 2:
             await self._backfill_builtin_mcp_servers(("tasks",))
             await self._conn.execute("PRAGMA user_version = 2")
+        if user_version < 3:
+            # `skills` — skill candidate proposal, experience-consolidation.md
+            # §3.3/§3.4.
+            await self._backfill_builtin_mcp_servers(("skills",))
+            await self._conn.execute("PRAGMA user_version = 3")
 
         await self._migrate_task_verdict_and_cancelled_status()
 
@@ -3538,6 +3612,172 @@ class Database:
         )
         await self._conn.commit()
         return cursor.rowcount
+
+    # --- Skill candidates (experience-consolidation.md §3.4/§5) ---
+
+    _SKILL_CANDIDATE_COLS = (
+        "id, slug, title, description, body_markdown, repository, rationale, "
+        "status, proposed_by_agent_id, proposed_by_session_id, task_id, run_id, "
+        "reviewed_at, review_note, landed_path, landed_branch, landed_commit, "
+        "use_count, last_used_at, created_at, updated_at"
+    )
+
+    @staticmethod
+    def _row_to_skill_candidate(row: Any) -> dict[str, Any]:
+        return {
+            "id": row[0],
+            "slug": row[1],
+            "title": row[2],
+            "description": row[3],
+            "body_markdown": row[4],
+            "repository": row[5],
+            "rationale": row[6],
+            "status": row[7],
+            "proposed_by_agent_id": row[8],
+            "proposed_by_session_id": row[9],
+            "task_id": row[10],
+            "run_id": row[11],
+            "reviewed_at": row[12],
+            "review_note": row[13],
+            "landed_path": row[14],
+            "landed_branch": row[15],
+            "landed_commit": row[16],
+            "use_count": row[17],
+            "last_used_at": row[18],
+            "created_at": row[19],
+            "updated_at": row[20],
+        }
+
+    async def create_skill_candidate(
+        self,
+        *,
+        candidate_id: str,
+        slug: str,
+        title: str,
+        description: str,
+        body_markdown: str,
+        repository: str,
+        rationale: str,
+        proposed_by_agent_id: str | None,
+        proposed_by_session_id: str | None,
+        task_id: str | None,
+        run_id: str | None,
+        created_at: str,
+    ) -> dict[str, Any]:
+        await self._ensure_connected()
+        await self._conn.execute(
+            "INSERT INTO skill_candidates "
+            "(id, slug, title, description, body_markdown, repository, rationale, "
+            "status, proposed_by_agent_id, proposed_by_session_id, task_id, run_id, "
+            "use_count, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, 0, ?, ?)",
+            (
+                candidate_id, slug, title, description, body_markdown, repository,
+                rationale, proposed_by_agent_id, proposed_by_session_id, task_id,
+                run_id, created_at, created_at,
+            ),
+        )
+        await self._conn.commit()
+        candidate = await self.get_skill_candidate(candidate_id)
+        assert candidate is not None
+        return candidate
+
+    async def get_skill_candidate(self, candidate_id: str) -> dict[str, Any] | None:
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            f"SELECT {self._SKILL_CANDIDATE_COLS} FROM skill_candidates WHERE id = ?",
+            (candidate_id,),
+        )
+        row = await cursor.fetchone()
+        return self._row_to_skill_candidate(row) if row else None
+
+    async def list_skill_candidates(
+        self, *, status: str | None = None, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        await self._ensure_connected()
+        if status:
+            cursor = await self._conn.execute(
+                f"SELECT {self._SKILL_CANDIDATE_COLS} FROM skill_candidates "
+                "WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+                (status, limit),
+            )
+        else:
+            cursor = await self._conn.execute(
+                f"SELECT {self._SKILL_CANDIDATE_COLS} FROM skill_candidates "
+                "ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            )
+        return [self._row_to_skill_candidate(r) for r in await cursor.fetchall()]
+
+    async def get_latest_approved_skill_by_slug(
+        self,
+        slug: str,
+        *,
+        agent_id: str | None = None,
+        repository: str | None = None,
+    ) -> dict[str, Any] | None:
+        """The current landed skill for `slug`, if any — the row use_count/
+        last_used tracking accrues on (there is no separate skills table).
+
+        `agent_id`/`repository`, when given, scope the lookup to the
+        candidate proposed by that agent for that repository — without this,
+        two different repositories (or agents) independently landing a skill
+        under the same slug collide and whichever was approved most recently
+        wins the lookup regardless of which one a given session actually has
+        loaded (Snape review, experience-consolidation.md). Callers that
+        genuinely want the newest approved candidate across all scopes (e.g.
+        the review-queue diff view before a scope is known) may omit both."""
+        await self._ensure_connected()
+        query = (
+            f"SELECT {self._SKILL_CANDIDATE_COLS} FROM skill_candidates "
+            "WHERE slug = ? AND status = 'approved'"
+        )
+        params: list[Any] = [slug]
+        if agent_id is not None:
+            query += " AND proposed_by_agent_id = ?"
+            params.append(agent_id)
+        if repository is not None:
+            query += " AND repository = ?"
+            params.append(repository)
+        query += " ORDER BY updated_at DESC LIMIT 1"
+        cursor = await self._conn.execute(query, params)
+        row = await cursor.fetchone()
+        return self._row_to_skill_candidate(row) if row else None
+
+    async def review_skill_candidate(
+        self,
+        candidate_id: str,
+        *,
+        status: str,
+        review_note: str | None,
+        reviewed_at: str,
+        landed_path: str | None = None,
+        landed_branch: str | None = None,
+        landed_commit: str | None = None,
+    ) -> dict[str, Any] | None:
+        await self._ensure_connected()
+        await self._conn.execute(
+            "UPDATE skill_candidates SET status = ?, review_note = ?, "
+            "reviewed_at = ?, landed_path = ?, landed_branch = ?, landed_commit = ?, "
+            "updated_at = ? WHERE id = ?",
+            (
+                status, review_note, reviewed_at, landed_path, landed_branch,
+                landed_commit, reviewed_at, candidate_id,
+            ),
+        )
+        await self._conn.commit()
+        return await self.get_skill_candidate(candidate_id)
+
+    async def record_skill_candidate_usage(
+        self, candidate_id: str, *, used_at: str
+    ) -> None:
+        await self._ensure_connected()
+        await self._conn.execute(
+            "UPDATE skill_candidates SET use_count = use_count + 1, "
+            "last_used_at = ? WHERE id = ?",
+            (used_at, candidate_id),
+        )
+        await self._conn.commit()
 
     # --- Per-round agent delegation execution ledger ---
 

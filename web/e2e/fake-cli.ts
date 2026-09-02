@@ -29,6 +29,53 @@ export type FakeOp =
   | { t: "bg"; command: string; description?: string }
   /** Complete the current durable Task Board run over the real tasks MCP. */
   | { t: "task_complete"; summary: string }
+  /** Block the current durable Task Board run over the real tasks MCP. */
+  | { t: "task_block"; reason: string; kind?: string }
+  /**
+   * File the worker's own retrospective triage over the real tasks MCP
+   * (experience-consolidation.md §3.2/§3.3) — required before `task_complete`
+   * succeeds on a non-clean-pass run. `skill_candidate_ids` entries equal to
+   * the literal `"$last_skill_candidate_id"` resolve at run time to the id
+   * the most recent `skill_propose` op in this same fake-cli run actually got
+   * back — ops are scripted ahead of the run, so this sentinel is how a
+   * retrospective can reference the real proposed candidate.
+   *
+   * `memory_pointer` and `claude_md_note` are gated server-side by a real
+   * artifact (task_board/manager.py `_verify_memory_pointer` /
+   * `_verify_claude_md_artifact`) — passing bare text here without first
+   * writing the pointed-to memory file / committing the CLAUDE.md diff for
+   * real (e.g. via a `write_file`/`bash` op earlier in the same run) makes
+   * the `reflect` call fail exactly as it would for a real worker that
+   * skipped the write.
+   */
+  | {
+      t: "task_reflect";
+      memory_pointer?: string;
+      claude_md_note?: string;
+      skill_candidate_ids?: string[];
+      nothing_note?: string;
+    }
+  /**
+   * Propose a skill candidate for human review over the real skills MCP
+   * (experience-consolidation.md §3.4).
+   */
+  | {
+      t: "skill_propose";
+      slug: string;
+      title: string;
+      description: string;
+      body_markdown: string;
+      rationale: string;
+    }
+  /**
+   * Read the REAL `--plugin-dir` argv this fake-CLI process was actually
+   * spawned with (server/harness/claude_code.py build_turn_argv), find the
+   * one landed SKILL.md under it, and emit a native `Skill` tool_use naming
+   * whatever slug that file's own frontmatter says — never a slug supplied
+   * here. Proves real discovery (experience-consolidation.md §3.5) instead
+   * of a scripted stand-in for the `Skill` tool_use.
+   */
+  | { t: "discover_skill" }
   /** Write a relative file inside the current fake worker workspace. */
   | { t: "write_file"; path: string; v: string }
   /** Persist a word into this session's fake-CLI state. */

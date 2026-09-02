@@ -373,6 +373,48 @@ class CloseRequest(BaseModel):
     summary: str = Field(min_length=1)
 
 
+class ReflectRequest(BaseModel):
+    """Worker's own three-way retrospective triage (experience-consolidation.md
+    §3.3). At least one field must be set — `nothing_note` covers the
+    "reflected, found nothing new" case explicitly.
+
+    `memory_pointer` is a relative path into the run's agent's own memory
+    dir, not free text — `TaskBoardManager.submit_retrospective` verifies it
+    names a file the worker already wrote for real before accepting it.
+    `claude_md_note` is free text, but is only accepted alongside a real,
+    already-committed CLAUDE.md diff on the run's own branch (same manager
+    method) — text alone does not satisfy either channel (Snape review
+    point 3)."""
+
+    memory_pointer: str | None = None
+    claude_md_note: str | None = None
+    skill_candidate_ids: list[str] = Field(default_factory=list)
+    nothing_note: str | None = None
+
+    @model_validator(mode="after")
+    def validate_non_empty(self):
+        # A whitespace-only string must not satisfy this gate — its entire
+        # point is forcing a real retrospective to happen, and blank text
+        # trivially defeats that.
+        self.memory_pointer = (self.memory_pointer or "").strip() or None
+        self.claude_md_note = (self.claude_md_note or "").strip() or None
+        self.nothing_note = (self.nothing_note or "").strip() or None
+        self.skill_candidate_ids = [
+            cid.strip() for cid in self.skill_candidate_ids if cid.strip()
+        ]
+        if not (
+            self.memory_pointer
+            or self.claude_md_note
+            or self.skill_candidate_ids
+            or self.nothing_note
+        ):
+            raise ValueError(
+                "at least one of memory_pointer/claude_md_note/skill_candidate_ids/"
+                "nothing_note is required"
+            )
+        return self
+
+
 class WorkerCreate(TaskCreate):
     working_dir_override: None = None
     workspace_mode: None = None
@@ -1155,6 +1197,28 @@ async def worker_block(
                 kind=req.kind,
                 summary=req.summary,
                 metadata=req.metadata,
+            )
+        )
+    )
+
+
+@router.post("/api/task-worker/current/reflect", status_code=201)
+async def worker_reflect(
+    req: ReflectRequest,
+    identity: tuple[str, str, str] = Depends(_worker_headers),
+    _: str = Depends(verify_token),
+):
+    task_id, run_id, session_id = identity
+    return _dict(
+        await _run(
+            _get_manager().submit_retrospective(
+                task_id,
+                run_id,
+                session_id,
+                memory_pointer=req.memory_pointer,
+                claude_md_note=req.claude_md_note,
+                skill_candidate_ids=req.skill_candidate_ids,
+                nothing_note=req.nothing_note,
             )
         )
     )

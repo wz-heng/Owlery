@@ -30,17 +30,55 @@ This rule exists because past sessions repeatedly took the shortcut
 and then had to be told to go back and do the real thing. Skip the
 shortcut. Do the real thing the first time.
 
+## Retrospective Discipline (Experience Consolidation)
+
+Owlery mechanizes "a retrospective must happen" for Task Board work
+(`docs/plans/experience-consolidation.md`): a worker's `complete` on a
+**non-clean-pass** run (a retry, a prior blocked/failed/interrupted attempt
+on the same task, or `verdict="fail"`) is refused by the `tasks` MCP server
+until it has called `reflect` — a self-authored triage into exactly one of
+three channels: your own agent memory (a judgment call specific to you),
+a CLAUDE.md nomination (a rule everyone working in this repo should know —
+edit this file and land it through the normal branch+PR flow, same as any
+other change), or a skill candidate (`skills` MCP server's `propose` — a
+repeatable multi-step process, reviewed by a human via the pending-candidate
+queue before it ever lands on disk). `reflect` also accepts a bare
+`nothing_note` when reflection genuinely finds nothing new. A clean first
+pass skips the gate entirely — do not add one.
+
+**This mechanism has no terminal hook to attach to for a standing agent**
+(there is no Task Board run wrapping an ordinary chat session). If you are
+a standing agent (not a one-shot Task Board worker) and you just walked a
+multi-step external workflow to completion for the first time — with any
+real friction along the way — stop before ending your turn and ask
+yourself: *will I walk this path again?* If yes, codify it on the spot,
+right now, in this same turn: a skill candidate if it is a repeatable
+procedure, or a note in your own memory if it is a judgment call specific
+to you. Do not wait to be asked, and do not defer it to "later" — later is
+a fresh session with no memory of the friction you just hit.
+
+**Delegations do not have this gate** — only Task Board `complete` does.
+`experience-consolidation.md` §3.2 permits narrowing to Task Board alone
+when a delegation-side gate isn't proportionate, provided the narrowing is
+written down; this is that note. A delegation's terminal turn is delivered
+by `_inject_terminal` (`server/delegations.py`), which has no equivalent
+"was this a clean pass" signal to gate on today. If delegation retries
+start showing the same repeated-mistake pattern Task Board attempts did,
+revisit this rather than bolting a gate on blind.
+
 ## After Every Code Change
 
-Run all four. They total well under two minutes — there is no cheap
-tier to fall back to, so don't skip one on the grounds that a change
-"only touched the frontend".
+Run all four. There is no cheap tier to fall back to, so don't skip one
+on the grounds that a change "only touched the frontend".
 
-1. **Backend unit**: `.venv/bin/pytest tests/ -v` (1426)
-2. **Frontend unit**: `cd web && bun run test` (279)
+1. **Backend unit**: `.venv/bin/pytest tests/ -v` (1564)
+2. **Frontend unit**: `cd web && bun run test` (345)
 3. **TypeScript**: `cd web && npx tsc --noEmit`
-4. **E2E**: `cd web && bun run test:e2e` (76, ~2 min, Playwright auto-starts
-   servers)
+4. **E2E**: `cd web && bun run test:e2e` (84, ~4 min, Playwright auto-starts
+   servers). Runs with `workers: 1` — every spec shares one backend/DB for
+   the whole run, and a couple of specs (e.g. task-board.spec.ts's first
+   test) assert on truly global state, so serial execution is load-bearing,
+   not a knob to bump back up for speed.
 
 **Zero test failures are acceptable.** All tests must pass before
 committing. If a test fails, investigate and fix it — never ignore, skip,
@@ -57,9 +95,9 @@ Almost none, by design (`docs/plans/e2e-slim.md`). A fake CLI on PATH emits
 canned output through the real spawn → stream-json → MCP path; only the
 model is canned.
 
-- **E2E**: 3 of the 76 burn real quota — claude chat, codex chat, 2-hop
+- **E2E**: 3 of the 84 burn real quota — claude chat, codex chat, 2-hop
   delegation. They opt in by marking their working dir via `realCliDir()`;
-  everything else gets the fake. `bun run test:e2e:fast` (73, ~1.4 min) skips
+  everything else gets the fake. `bun run test:e2e:fast` (81, ~3 min) skips
   them via `--grep-invert @llm` — fine while iterating, but run the full
   suite before committing.
 - **Backend**: `test_*_real.py` auto-skip unless their CLI is on PATH.
@@ -106,7 +144,7 @@ environment.
 
 What each suite covers; detail lives in the linked plan docs.
 
-**Backend unit** (pytest, 1426) — config, models, session manager, REST API,
+**Backend unit** (pytest, 1564) — config, models, session manager, REST API,
 DB persistence (credential split, refresh-error codes), JSONL parser/writer,
 CLI handoff/pull, import API, schedules CRUD + scheduler (interval + cron),
 NL `/schedule` parsing, Feishu bridge (fail-closed allowlist, card-value
@@ -117,22 +155,27 @@ OAuth registry, agents • harness layer
 (`agent-collaboration.md`) • usage tracking (`usage-tracking.md`) •
 Octopus→Owlery migration (`rename-owlery.md` §3) • durable Task Board and
 Git-worktree delivery state/CAS/recovery (`task-board.md`,
-`task-git-delivery.md`).
+`task-git-delivery.md`) • experience consolidation: retrospective gate,
+skill candidate registry + review queue, use_count tracking
+(`experience-consolidation.md`).
 
-**Frontend unit** (vitest, 279) — zustand store, `useWebSocket`, BgTaskChip,
+**Frontend unit** (vitest, 345) — zustand store, `useWebSocket`, BgTaskChip,
 FileViewerDialog, SlashCommandMenu, delegation cards, fork dialog +
 deferred-fork helper, CredentialList, ResearchCard, UsageDialog, `readStored`
 localStorage rename migration, Task Board state/event reconciliation and Git
-delivery controls.
+delivery controls, SkillCandidatesPage.
 
-**E2E** (Playwright, 76) — login, session CRUD, chat (send / Enter /
+**E2E** (Playwright, 84) — login, session CRUD, chat (send / Enter /
 disabled-while-running / AskUserQuestion / resume), WS reconnect, mobile
 layout, CLI handoff/pull + roundtrip, schedules, archived sessions, message
 queue + Esc interrupt, virtualized chat, OAuth + Codex device-code sign-in,
 credential override, agents rail/settings, connectors, `/research`,
 `/rewind` + deferred fork, usage page, cross-turn `mcp__bg__run` + spill
-pointer, `/showme`, Task Board worker completion, and Git-worktree
-accept/commit/push/teardown. Plus 6 Feishu-bridge tests under their own config.
+pointer, `/showme`, Task Board worker completion, Git-worktree
+accept/commit/push/teardown, and the experience-consolidation touchstone
+(non-clean-pass gate → retrospective → skill candidate → human review →
+direct reuse, `task-retrospective.spec.ts`). Plus 6 Feishu-bridge tests
+under their own config.
 
 ## Project Structure
 

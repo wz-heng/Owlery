@@ -290,6 +290,11 @@ def complete_task(
     report it via ``verdict="fail"`` (or ``block``) and stop there. Do not
     create a fix/follow-up task yourself; opening new work in response to a
     failure is the orchestrator's or user's call, not yours.
+
+    If this run was not a clean first pass (a retry, a prior blocked/failed
+    run on this task, or ``verdict="fail"`` here), this call is refused with
+    ``retrospective_required`` until you call ``reflect`` at least once for
+    this run (experience-consolidation.md §3.2/§3.3).
     """
     error = _worker_only("complete")
     if error:
@@ -305,6 +310,62 @@ def complete_task(
         body["verdict"] = verdict
     code, data = _call("POST", "/api/task-worker/current/complete", body=body)
     return _render(code, data, action="complete task")
+
+
+@mcp.tool(name="reflect")
+def reflect_task(
+    memory_pointer: str | None = None,
+    claude_md_note: str | None = None,
+    skill_candidate_ids: list[str] | None = None,
+    nothing_note: str | None = None,
+) -> str:
+    """File this run's retrospective triage (experience-consolidation.md §3.3)
+    into exactly one of three channels — call this BEFORE `complete` when a
+    run was not a clean first pass (a retry, a prior blocked/failed run on
+    this task, or `verdict="fail"`); `complete` refuses with
+    `retrospective_required` until this has been called once for the run.
+
+    Triage each lesson into the channel it belongs to, then pass the
+    matching argument (more than one may apply). Two of the three are gated
+    by a real artifact, not by this call's text alone — a DB string is not a
+    retrospective:
+
+    - ``memory_pointer``: a judgment call specific to you. FIRST write it
+      yourself as a real file in your own memory directory (the one named in
+      your long-term-memory instructions), the way you'd write any other
+      memory — then pass that file's path RELATIVE to your memory directory
+      here. This call is checked to prove the file actually exists and is
+      non-empty; text passed here without a file behind it is rejected.
+    - ``claude_md_note``: a rule every agent working in this repo should
+      know. FIRST commit the CLAUDE.md edit on this run's own branch (the
+      normal branch+PR flow — no separate approval queue), THEN describe it
+      here. This call is checked to prove that commit actually exists on
+      this run's branch; a description with no real diff behind it is
+      rejected.
+    - ``skill_candidate_ids``: ids returned by the `skills` MCP server's
+      `propose`, for any repeatable multi-step process worth codifying —
+      call `propose` first, then pass its id(s) here.
+    - ``nothing_note``: reflection genuinely found nothing new to capture —
+      state why, don't just leave every field empty.
+
+    A clean first pass never needs this call — do not call it pre-emptively.
+    """
+    error = _worker_only("reflect")
+    if error:
+        return error
+    if not (memory_pointer or claude_md_note or skill_candidate_ids or nothing_note):
+        return (
+            "Error: at least one of memory_pointer/claude_md_note/"
+            "skill_candidate_ids/nothing_note is required."
+        )
+    body: dict[str, Any] = {
+        "memory_pointer": memory_pointer,
+        "claude_md_note": claude_md_note,
+        "skill_candidate_ids": skill_candidate_ids or [],
+        "nothing_note": nothing_note,
+    }
+    code, data = _call("POST", "/api/task-worker/current/reflect", body=body)
+    return _render(code, data, action="file retrospective")
 
 
 @mcp.tool(name="block")

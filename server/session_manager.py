@@ -314,6 +314,10 @@ class SessionManager:
         # no park machinery is wired (unit tests with a bare manager), and a
         # usage-limit failure just surfaces as-is, as it did before this feature.
         self._parked_turns: Any = None
+        # Likewise — the SkillRegistry (experience-consolidation.md §3.4/§5).
+        # None means no use_count tracking (unit tests with a bare manager);
+        # a `Skill` tool_use is simply not attributed to any candidate.
+        self._skill_registry: Any = None
         # Injections remain `pending` on disk while merely accepted into an
         # in-memory turn queue.  This set prevents the same pending outbox row
         # from being queued twice in one process; a restart clears it and
@@ -337,6 +341,9 @@ class SessionManager:
 
     def set_parked_turn_runner(self, runner: Any) -> None:
         self._parked_turns = runner
+
+    def set_skill_registry(self, registry: Any) -> None:
+        self._skill_registry = registry
 
     def set_deploy_admission_gate(self, gate: DeployAdmissionGate) -> None:
         """Wire the process-wide deploy work-admission gate at boot."""
@@ -2583,6 +2590,15 @@ class SessionManager:
             agent.get("credential_id") if agent else None
         )
         connectors = await self._load_connectors(agent)
+        # Real skill discovery (experience-consolidation.md §3.4, Snape
+        # review point 1): resolve once per turn, not per recovery-loop
+        # iteration — the working dir doesn't change mid-turn, and this is
+        # the only part of the wiring that spawns a subprocess.
+        skills_plugin_dir: str | None = None
+        if session.agent_id and self._skill_registry is not None:
+            skills_plugin_dir = await self._skill_registry.resolve_plugin_dir(
+                agent_id=session.agent_id, working_dir=session.working_dir
+            )
         current_prompt = prompt
         recovery_attempts = 0
         transient_attempts = 0
@@ -2595,7 +2611,9 @@ class SessionManager:
         resume_at_turn_start = session.claude_session_id
 
         while True:
-            backend = self._make_run(session, agent, connectors)
+            backend = self._make_run(
+                session, agent, connectors, skills_plugin_dir=skills_plugin_dir
+            )
             session._backend = backend
             saw_result = False
             saw_tool_use = False
@@ -2650,6 +2668,44 @@ class SessionManager:
 
                     if event.type == "tool_use":
                         saw_tool_use = True
+                        # Skill usage tracking (experience-consolidation.md
+                        # §3.4/§5): the CLI's own native `Skill` tool_use is
+                        # the ground truth for "this skill was actually
+                        # invoked" — best-effort, never blocks the turn. The
+                        # native tool's exact input key isn't documented
+                        # anywhere we have on hand, so this checks the
+                        # plausible candidates rather than betting on one;
+                        # confirm against a real transcript and trim this to
+                        # the actual key once observed.
+                        if event.tool_name == "Skill" and self._skill_registry is not None:
+                            tool_input = event.tool_input or {}
+                            slug = None
+                            for key in ("skill", "name", "skill_name", "command"):
+                                value = tool_input.get(key)
+                                if isinstance(value, str) and value:
+                                    slug = value
+                                    break
+                            if slug:
+                                # Scope by (agent, repository) — the exact
+                                # identity a `--plugin-dir` was built from
+                                # (skill_registry.resolve_plugin_dir) — so
+                                # use_count attributes to the candidate this
+                                # session actually has loaded, not whichever
+                                # same-slug candidate from a different agent
+                                # or repository happened to be approved most
+                                # recently (Snape review point 2).
+                                usage_repository: str | None = None
+                                try:
+                                    usage_repository = await self._skill_registry.resolve_repository(
+                                        session.working_dir
+                                    )
+                                except Exception:
+                                    pass
+                                await self._skill_registry.record_usage(
+                                    slug,
+                                    agent_id=session.agent_id,
+                                    repository=usage_repository,
+                                )
                     if event.type == "text" and event.content and event.content.strip():
                         saw_text = True
 
@@ -2984,12 +3040,16 @@ class SessionManager:
         session: Session,
         agent: dict[str, Any] | None = None,
         connectors: list[tuple[Any, Any]] | None = None,
+        *,
+        skills_plugin_dir: str | None = None,
     ) -> HarnessRun:
         """Build the per-turn run for a session via its harness. Single seam
         the run loop calls (and tests monkeypatch); dispatches on
         `session.backend` through the registry — no kind branching here."""
         return get_harness(session.backend).create_run(
-            self._run_config(session, agent, connectors)
+            self._run_config(
+                session, agent, connectors, skills_plugin_dir=skills_plugin_dir
+            )
         )
 
     def _run_config(
@@ -2997,6 +3057,8 @@ class SessionManager:
         session: Session,
         agent: dict[str, Any] | None = None,
         connectors: list[tuple[Any, Any]] | None = None,
+        *,
+        skills_plugin_dir: str | None = None,
     ) -> RunConfig:
         """Build the per-turn RunConfig from the (freshly-loaded) agent. The
         agent supplies the system prompt, model, built-in MCP set, and tool
@@ -3060,6 +3122,7 @@ class SessionManager:
             task_id=session.task_id,
             task_run_id=session.task_run_id,
             task_worker_prompt=task_worker_prompt,
+            skills_plugin_dir=skills_plugin_dir,
         )
 
     # Refresh the access_token if it expires within this many seconds. A

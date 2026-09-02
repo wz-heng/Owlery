@@ -227,7 +227,7 @@ async def test_send_message_hands_backend_pointer_for_huge_prompt(
             async def stop(self):
                 pass
 
-        mgr._make_run = lambda s, agent=None, connectors=None: RecordingBackend()  # type: ignore[method-assign,assignment]
+        mgr._make_run = lambda s, agent=None, connectors=None, **_kw: RecordingBackend()  # type: ignore[method-assign,assignment]
 
         huge = "Q" * (LARGE_PROMPT_THRESHOLD_BYTES + 50_000)
         async for _ in mgr.send_message(session.id, huge):

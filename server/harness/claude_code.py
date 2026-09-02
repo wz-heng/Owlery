@@ -239,6 +239,11 @@ def build_turn_argv(ctx: TurnContext) -> tuple[list[str], dict[str, Any]]:
         argv += ["--model", ctx.model]
     if ctx.resume_id:
         argv += ["--resume", ctx.resume_id]
+    if ctx.skills_plugin_dir:
+        # Real skill discovery (experience-consolidation.md §3.4): loads this
+        # session's approved skills through Claude Code's own native
+        # plugin-skill mechanism — for this session only, no repo mutation.
+        argv += ["--plugin-dir", ctx.skills_plugin_dir]
     argv += ["--", ctx.prompt]
 
     env = os.environ.copy()

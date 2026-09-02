@@ -18,7 +18,16 @@ from ..deploy_admission import DeployAdmissionClosedError
 from ..model_routing import ModelBackendError, validate_model_for_backend
 from .delivery import DeliveryCoordinator, delivery_coordinator
 from .deploy_quiesce import DeployQuiesce
-from .models import DeliveryRecord, RunRecord, TaskBoardError, TaskConflictError, TaskRecord
+from .models import (
+    DeliveryRecord,
+    RetrospectiveRecord,
+    RunRecord,
+    TaskBoardError,
+    TaskConflictError,
+    TaskRecord,
+    TaskRetrospectiveRequiredError,
+    TaskValidationError,
+)
 from .prompts import render_assignment_prompt
 from .repository import TaskRepository, task_repository
 from . import workspaces as ws
@@ -566,6 +575,28 @@ class TaskBoardManager:
         verdict: str | None = None,
     ) -> dict[str, Any]:
         task, run = await self._validate_worker(task_id, run_id, session_id)
+        # Experience consolidation gate (experience-consolidation.md §3.2):
+        # a non-clean-pass run may not `complete` until the worker has filed
+        # a retrospective for THIS run. A clean first pass skips the gate
+        # entirely — no history to retrospect, and forcing one every time
+        # would just breed reflection fatigue.
+        if await self.repo.is_non_clean_pass(task_id, run_id, verdict=verdict):
+            if not await self.repo.has_retrospective(run_id):
+                raise TaskRetrospectiveRequiredError(
+                    "this run was not a clean first pass (a retry, a prior "
+                    "blocked/failed/interrupted run, or verdict='fail') — call "
+                    "`reflect` first: (1) a judgment call specific to you goes "
+                    "to your own memory — write the memory file yourself with "
+                    "your normal file-write tools, then pass its path as "
+                    "`memory_pointer`; (2) a rule everyone should know becomes "
+                    "a CLAUDE.md edit committed on this run's own branch (a "
+                    "real diff, delivered via the normal PR path), referenced "
+                    "by `claude_md_note`; (3) a repeatable multi-step process "
+                    "becomes a skill candidate via the `skills` MCP server's "
+                    "`propose`. If none apply, pass `nothing_note` explaining "
+                    "why there's nothing to add. Then retry `complete`.",
+                    current=task,
+                )
         # Preserve prep metadata (the git base branch/commit) under the worker's
         # declared metadata and the terminal git inspection (B1).
         terminal_metadata = dict(run.metadata or {})
@@ -626,6 +657,109 @@ class TaskBoardManager:
             session._auto_archive_requested = True
         await self.publish_task_update(task_id)
         return {"task": task.to_dict(), "run": final.to_dict()}
+
+    async def submit_retrospective(
+        self,
+        task_id: str,
+        run_id: str,
+        session_id: str,
+        *,
+        memory_pointer: str | None = None,
+        claude_md_note: str | None = None,
+        skill_candidate_ids: list[str] | None = None,
+        nothing_note: str | None = None,
+    ) -> dict[str, Any]:
+        """File the worker's own three-way triage for this run
+        (experience-consolidation.md §3.3) — a precondition for `complete`
+        on a non-clean-pass run, but callable any time a worker wants to
+        record one early.
+
+        `memory_pointer` and `claude_md_note`, when set, are gated by a real
+        artifact rather than accepted as free text (Snape review point 3 —
+        a DB string alone is checkbox theater, not a written retrospective):
+        see `_verify_memory_pointer` / `_verify_claude_md_artifact`."""
+        task, run = await self._validate_worker(task_id, run_id, session_id)
+        memory_pointer = (memory_pointer or "").strip() or None
+        claude_md_note = (claude_md_note or "").strip() or None
+        if memory_pointer:
+            await self._verify_memory_pointer(run, memory_pointer)
+        if claude_md_note:
+            await self._verify_claude_md_artifact(run)
+        record: RetrospectiveRecord = await self.repo.create_retrospective(
+            task_id,
+            run_id,
+            agent_id=run.agent_id,
+            memory_pointer=memory_pointer,
+            claude_md_note=claude_md_note,
+            skill_candidate_ids=skill_candidate_ids,
+            nothing_note=nothing_note,
+        )
+        return record.to_dict()
+
+    async def _verify_memory_pointer(self, run: RunRecord, pointer: str) -> None:
+        """`memory_pointer` must name a file the worker already wrote for
+        real under its own agent's memory dir — the gate records a pointer
+        to that file, never the note's substantive content."""
+        if not run.agent_id:
+            raise TaskValidationError(
+                "memory_pointer requires this run to have an owning agent"
+            )
+        from .. import agent_memory
+
+        try:
+            path = agent_memory.resolve_memory_pointer(run.agent_id, pointer)
+        except ValueError as exc:
+            raise TaskValidationError(str(exc)) from exc
+        if not path.is_file() or not path.read_text().strip():
+            raise TaskValidationError(
+                f"memory_pointer {pointer!r} does not name an existing, "
+                "non-empty file under this agent's memory directory — write "
+                "the memory file first with your normal file-write tools, "
+                "then pass its path here. A pointer is not a substitute for "
+                "actually writing the memory."
+            )
+
+    async def _verify_claude_md_artifact(self, run: RunRecord) -> None:
+        """`claude_md_note` is only accepted alongside a real, already
+        committed CLAUDE.md diff on the run's own branch — the note text
+        nominates, the commit is the human-auditable candidate artifact a
+        PR review actually looks at (there is no separate CLAUDE.md
+        candidate queue; landing is the normal branch+PR flow)."""
+        if run.workspace_mode != "git_worktree":
+            raise TaskValidationError(
+                "claude_md_note requires a git_worktree run so the "
+                "nomination can land as a real, auditable commit on the "
+                f"run's own branch (this run used workspace_mode={run.workspace_mode!r})"
+            )
+        base_head = ((run.metadata or {}).get("prepared") or {}).get("base_head")
+        if not base_head:
+            raise TaskValidationError(
+                "claude_md_note requires this run's prepared base_head, "
+                "which is missing from its metadata"
+            )
+        rc, out, err = await ws._git(
+            "diff", "--name-only", base_head, "HEAD", cwd=run.workspace_path
+        )
+        if rc:
+            raise TaskValidationError(
+                f"could not inspect this run's CLAUDE.md diff: {err}"
+            )
+        changed = out.splitlines()
+        # Root CLAUDE.md ONLY — not `docs/CLAUDE.md` or any other nested
+        # file (Snape review). experience-consolidation.md §3.3 point 2
+        # frames this channel as "a rule every agent working in this repo
+        # should know", and CLAUDE.md.md's own §2 table calls the ROOT
+        # CLAUDE.md the "全员(随 repo 加载)" carrier — a nested file isn't
+        # that carrier and must not satisfy this gate.
+        if "CLAUDE.md" not in changed:
+            raise TaskValidationError(
+                "claude_md_note requires an actual CLAUDE.md edit committed "
+                "on this run's own branch — a real, auditable diff to the "
+                "repo's ROOT CLAUDE.md specifically (not a nested "
+                "docs/CLAUDE.md or similar), not just this note's text. "
+                "Commit the CLAUDE.md change on this branch, then call "
+                "reflect() again."
+            )
 
     async def create_worker_task(
         self, task_id: str, run_id: str, session_id: str, **create: Any

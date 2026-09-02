@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { IconBrain, IconClipboardList, IconLoader2, IconMenu2 } from "@tabler/icons-react";
+import { IconBrain, IconClipboardList, IconLoader2, IconMenu2, IconSparkles } from "@tabler/icons-react";
 import { AccountDropdown } from "./components/AccountDropdown";
 import { AgentList } from "./components/AgentList";
 import { AgentSettings } from "./components/AgentSettings";
@@ -15,6 +15,7 @@ import { OwleryLogo } from "./components/OwleryLogo";
 import { ScheduleList } from "./components/ScheduleList";
 import { SchedulesDialog } from "./components/SchedulesDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
+import { SkillCandidatesPage } from "./components/SkillCandidatesPage";
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
 import { Label } from "./components/ui/label";
@@ -121,7 +122,7 @@ function AuthenticatedApp({
   const [schedulesOpen, setSchedulesOpen] = useState(false);
   const [archivedOpen, setArchivedOpen] = useState(false);
   const [usageOpen, setUsageOpen] = useState(false);
-  const [mainSurface, setMainSurface] = useState<"chat" | "tasks" | "memory">("chat");
+  const [mainSurface, setMainSurface] = useState<"chat" | "tasks" | "memory" | "skills">("chat");
   const setActiveSessionId = useSessionStore((s) => s.setActiveSessionId);
 
   const signOut = () => {
@@ -230,6 +231,25 @@ function AuthenticatedApp({
             <IconBrain size={17} />
             <span>Memory</span>
           </button>
+          {/* Skill candidates is the human-review queue for experience
+           * consolidation (experience-consolidation.md §3.4/§5) — same rail
+           * weight as Memory/Task Board, not buried in settings, since
+           * approving/rejecting is a work action a reviewer does regularly. */}
+          <button
+            type="button"
+            className={`mt-1 flex h-9 w-full items-center gap-2 rounded-lg px-3 text-left text-sm transition-colors ${
+              mainSurface === "skills"
+                ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                : "text-sidebar-foreground/75 hover:bg-sidebar-accent/70 hover:text-sidebar-foreground"
+            }`}
+            onClick={() => {
+              setMainSurface("skills");
+              setSidebarOpen(false);
+            }}
+          >
+            <IconSparkles size={17} />
+            <span>Skill candidates</span>
+          </button>
           {/* Schedules is a hot, glanceable work surface — same rail weight
            * as Task Board, not an infra row (sidebar-hierarchy.md §2-3). */}
           <ScheduleList onOpen={() => setSchedulesOpen(true)} />
@@ -274,6 +294,8 @@ function AuthenticatedApp({
             }}
             onToggleSidebar={() => setSidebarOpen(!sidebarOpen)}
           />
+        ) : mainSurface === "skills" ? (
+          <SkillCandidatesPage onToggleSidebar={() => setSidebarOpen(!sidebarOpen)} />
         ) : (
           <ChatView
             sendMessage={sendMessage}

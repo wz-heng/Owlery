@@ -23,9 +23,10 @@ const API = `${window.location.origin}/api/agents`;
 // (DEFAULT_MCP_SERVERS in server/models.py + the agents.mcp_servers column in
 // server/database.py). `ask_agent` = agent-to-agent delegation
 // (agent-collaboration.md §5.1); `research` = native deep research
-// (native-deep-research.md §7). Both were long missing here, so new agents
-// defaulted without a delegation channel and the UI offered no way to add one.
-const BUILTIN_MCP = ["ask", "bg", "ask_agent", "research", "tasks"] as const;
+// (native-deep-research.md §7). `skills` = skill candidate proposal
+// (experience-consolidation.md §3.3/§3.4). Missing entries here mean new
+// agents default without that channel and the UI offers no way to add one.
+const BUILTIN_MCP = ["ask", "bg", "ask_agent", "research", "tasks", "skills"] as const;
 
 interface Props {
   open: boolean;

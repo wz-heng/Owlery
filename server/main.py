@@ -29,10 +29,11 @@ from .legacy_rename import migrate_legacy_state, rewrite_legacy_paths
 from .notifiers import notifier_manager
 from .agent_manager import AgentManager
 from .connector_manager import ConnectorManager
-from .routers import agents, attachments, bg_tasks as bg_tasks_router, budgets as budgets_router, connectors, credentials, delegations as delegations_router, files, memory as memory_router, notifiers, questions, research as research_router, schedules, sessions, task_boards as task_boards_router, usage as usage_router, ws
+from .routers import agents, attachments, bg_tasks as bg_tasks_router, budgets as budgets_router, connectors, credentials, delegations as delegations_router, files, memory as memory_router, notifiers, questions, research as research_router, schedules, sessions, skills as skills_router, task_boards as task_boards_router, usage as usage_router, ws
 from .parked_turns import ParkedTurnRunner
 from .scheduler import ScheduleRunner
 from .session_manager import session_manager
+from .skill_registry import skill_registry
 from .task_board import task_repository
 from .task_board import workspaces as task_workspaces
 from .task_board.manager import task_board_manager
@@ -96,6 +97,8 @@ async def lifespan(app: FastAPI):
     task_board_manager.bind(session_mgr=session_manager, db=db)
     task_boards_router.set_manager(task_board_manager)
     app.state.task_board_manager = task_board_manager
+    skill_registry.bind(db=db, session_mgr=session_manager)
+    session_manager.set_skill_registry(skill_registry)
 
     # Initialize bridge manager
     bridge_manager = BridgeManager(session_manager, db)
@@ -317,6 +320,7 @@ app.include_router(credentials.router)
 app.include_router(connectors.router)
 app.include_router(connectors.agent_router)
 app.include_router(notifiers.router)
+app.include_router(skills_router.router)
 app.include_router(ws.router)
 
 

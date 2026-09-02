@@ -1098,7 +1098,7 @@ async def test_run_backend_translates_events_end_to_end(manager):
             pass
 
     # Patch the factory so _run_backend uses our scripted backend
-    def fake_factory(s, agent=None, connectors=None):
+    def fake_factory(s, agent=None, connectors=None, **_kw):
         return ScriptedBackend()
 
     manager._make_run = fake_factory  # type: ignore[method-assign]
@@ -1186,7 +1186,7 @@ async def test_run_backend_auto_respawns_on_premature_exit_after_tool(manager):
         ]),
     ])
 
-    manager._make_run = lambda s, agent=None, connectors=None: next(backends_iter)  # type: ignore[method-assign,assignment]
+    manager._make_run = lambda s, agent=None, connectors=None, **_kw: next(backends_iter)  # type: ignore[method-assign,assignment]
 
     ws_msgs: list[dict[str, Any]] = [m async for m in manager._run_backend(session, "go")]
     types = [m["type"] for m in ws_msgs]
@@ -1250,7 +1250,7 @@ async def test_run_backend_bounds_recovery_to_single_retry(manager):
         async def stop(self):
             pass
 
-    manager._make_run = lambda s, agent=None, connectors=None: AlwaysFlakyBackend()  # type: ignore[method-assign,assignment]
+    manager._make_run = lambda s, agent=None, connectors=None, **_kw: AlwaysFlakyBackend()  # type: ignore[method-assign,assignment]
 
     ws_msgs: list[dict[str, Any]] = [m async for m in manager._run_backend(session, "go")]
 
@@ -1304,7 +1304,7 @@ async def test_run_backend_does_not_respawn_on_clean_exit(manager):
         async def stop(self):
             pass
 
-    manager._make_run = lambda s, agent=None, connectors=None: CleanBackend()  # type: ignore[method-assign,assignment]
+    manager._make_run = lambda s, agent=None, connectors=None, **_kw: CleanBackend()  # type: ignore[method-assign,assignment]
 
     _ = [m async for m in manager._run_backend(session, "go")]
     assert invocations == ["go"]  # exactly one — no retry
@@ -1335,10 +1335,82 @@ async def test_run_backend_does_not_respawn_when_no_tool_use(manager):
         async def stop(self):
             pass
 
-    manager._make_run = lambda s, agent=None, connectors=None: CrashEarlyBackend()  # type: ignore[method-assign,assignment]
+    manager._make_run = lambda s, agent=None, connectors=None, **_kw: CrashEarlyBackend()  # type: ignore[method-assign,assignment]
 
     _ = [m async for m in manager._run_backend(session, "go")]
     assert invocations == ["go"]  # no retry — not the bug we recover from
+
+
+@pytest.mark.asyncio
+async def test_run_backend_records_skill_usage_on_native_skill_tool_use(manager):
+    """experience-consolidation.md §3.4/§5: a native `Skill` tool_use is the
+    ground truth for "this skill was actually invoked" — the hook must fire
+    with the slug and must not touch the registry for ordinary tool_use."""
+    from unittest.mock import AsyncMock
+
+    from server.harness import HarnessEvent
+
+    session = await _new(manager, "InvokesSkill")
+    registry = AsyncMock()
+    registry.resolve_repository.return_value = "/resolved/repo"
+    manager.set_skill_registry(registry)
+
+    class SkillBackend:
+        async def start(self, prompt, working_dir, resume_id=None, credential=None):
+            pass
+
+        def stream(self):
+            async def _gen():
+                yield HarnessEvent(
+                    type="tool_use", tool_name="Bash", tool_input={"command": "ls"},
+                    tool_use_id="t1",
+                )
+                yield HarnessEvent(
+                    type="tool_use", tool_name="Skill",
+                    tool_input={"skill": "hermes-pr-flow"}, tool_use_id="t2",
+                )
+                yield HarnessEvent(type="result", session_id="sid", num_turns=1)
+            return _gen()
+
+        async def stop(self):
+            pass
+
+    manager._make_run = lambda s, agent=None, connectors=None, **_kw: SkillBackend()  # type: ignore[method-assign,assignment]
+
+    _ = [m async for m in manager._run_backend(session, "go")]
+    registry.record_usage.assert_awaited_once_with(
+        "hermes-pr-flow", agent_id=session.agent_id, repository="/resolved/repo"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_backend_skill_usage_hook_is_a_noop_without_a_bound_registry(manager):
+    """No registry bound (bare manager, e.g. most unit tests) — a `Skill`
+    tool_use must not raise."""
+    from server.harness import HarnessEvent
+
+    session = await _new(manager, "InvokesSkillNoRegistry")
+
+    class SkillBackend:
+        async def start(self, prompt, working_dir, resume_id=None, credential=None):
+            pass
+
+        def stream(self):
+            async def _gen():
+                yield HarnessEvent(
+                    type="tool_use", tool_name="Skill",
+                    tool_input={"skill": "hermes-pr-flow"}, tool_use_id="t1",
+                )
+                yield HarnessEvent(type="result", session_id="sid", num_turns=1)
+            return _gen()
+
+        async def stop(self):
+            pass
+
+    manager._make_run = lambda s, agent=None, connectors=None, **_kw: SkillBackend()  # type: ignore[method-assign,assignment]
+
+    events = [m async for m in manager._run_backend(session, "go")]
+    assert events  # completed without raising
 
 
 # ---------------------------------------------------------------------------
@@ -1369,7 +1441,7 @@ async def test_run_backend_records_harness_exit_reason_completed(manager):
         async def stop(self):
             pass
 
-    manager._make_run = lambda s, agent=None, connectors=None: CleanBackend()  # type: ignore[method-assign,assignment]
+    manager._make_run = lambda s, agent=None, connectors=None, **_kw: CleanBackend()  # type: ignore[method-assign,assignment]
 
     _ = [m async for m in manager._run_backend(session, "go")]
 
@@ -1414,7 +1486,7 @@ async def test_run_backend_records_harness_exit_reason_process_error(manager):
         async def stop(self):
             pass
 
-    manager._make_run = lambda s, agent=None, connectors=None: CrashBackend()  # type: ignore[method-assign,assignment]
+    manager._make_run = lambda s, agent=None, connectors=None, **_kw: CrashBackend()  # type: ignore[method-assign,assignment]
 
     _ = [m async for m in manager._run_backend(session, "go")]
 
@@ -1445,7 +1517,7 @@ async def test_run_backend_records_harness_exit_reason_start_failed(manager):
         async def stop(self):
             pass
 
-    manager._make_run = lambda s, agent=None, connectors=None: ExplodingBackend()  # type: ignore[method-assign,assignment]
+    manager._make_run = lambda s, agent=None, connectors=None, **_kw: ExplodingBackend()  # type: ignore[method-assign,assignment]
 
     with pytest.raises(FileNotFoundError):
         _ = [m async for m in manager._run_backend(session, "go")]
@@ -1481,7 +1553,7 @@ async def test_run_backend_records_harness_exit_reason_process_error_when_stream
         async def stop(self):
             pass
 
-    manager._make_run = lambda s, agent=None, connectors=None: ExplodesMidStreamBackend()  # type: ignore[method-assign,assignment]
+    manager._make_run = lambda s, agent=None, connectors=None, **_kw: ExplodesMidStreamBackend()  # type: ignore[method-assign,assignment]
 
     with pytest.raises(RuntimeError):
         _ = [m async for m in manager._run_backend(session, "go")]
@@ -1581,7 +1653,7 @@ async def test_run_backend_kills_subprocess_and_records_harness_exit(manager, tm
     session = await _new(manager, "KillSubprocess", working_dir=str(tmp_path))
     holder: dict[str, Any] = {}
 
-    def fake_factory(s, agent=None, connectors=None):
+    def fake_factory(s, agent=None, connectors=None, **_kw):
         run = Harness(profile).create_run(RunConfig())
         holder["run"] = run
         return run
