@@ -2711,7 +2711,23 @@ class SessionManager:
                             for key in ("skill", "name", "skill_name", "command"):
                                 value = tool_input.get(key)
                                 if isinstance(value, str) and value:
-                                    slug = value
+                                    # Confirmed against a real spawn
+                                    # (2026-09-02, experience-consolidation-
+                                    # v2.md §5 touchstone C follow-up): a
+                                    # plugin-provided Skill is ALWAYS
+                                    # namespaced "<plugin-name>:<slug>" —
+                                    # unconditionally, even with a single
+                                    # `--plugin-dir` and no collision, not
+                                    # only when two plugins share a slug.
+                                    # Owlery's own plugin names
+                                    # (`owlery-skills-<...>`,
+                                    # _materialize_plugin) never contain
+                                    # ':', so the trailing segment after the
+                                    # last ':' reliably recovers the bare
+                                    # slug the DB stores, whether or not
+                                    # this particular value happens to
+                                    # carry a namespace prefix.
+                                    slug = value.rsplit(":", 1)[-1]
                                     break
                             if slug:
                                 # Scope by (agent, repository) — the exact

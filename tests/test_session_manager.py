@@ -1390,6 +1390,56 @@ async def test_run_backend_records_skill_usage_on_native_skill_tool_use(manager)
 
 
 @pytest.mark.asyncio
+async def test_run_backend_extracts_the_bare_slug_from_a_namespaced_skill_value(manager):
+    """Confirmed against a REAL `claude` spawn (2026-09-02, experience-
+    consolidation-v2.md §5 touchstone C follow-up): a plugin-provided
+    `Skill` tool_use ALWAYS carries a namespaced "<plugin-name>:<slug>"
+    value — unconditionally, even with a single --plugin-dir and no
+    collision, not only when two plugin dirs share a slug. Before this fix,
+    record_usage() was called with the full namespaced string, which could
+    never match a DB row keyed by the bare slug — use_count/invocation
+    tracking had silently never worked for any real Claude session."""
+    from unittest.mock import AsyncMock
+
+    from server.harness import HarnessEvent
+
+    session = await _new(manager, "InvokesNamespacedSkill")
+    registry = AsyncMock()
+    registry.resolve_repository.return_value = "/resolved/repo"
+    manager.set_skill_registry(registry)
+
+    class SkillBackend:
+        async def start(self, prompt, working_dir, resume_id=None, credential=None):
+            pass
+
+        def stream(self):
+            async def _gen():
+                yield HarnessEvent(
+                    type="tool_use", tool_name="Skill",
+                    tool_input={"skill": "owlery-skills-a1b2c3d4e5f6a1b2:hermes-pr-flow"},
+                    tool_use_id="t1",
+                )
+                yield HarnessEvent(type="result", session_id="sid", num_turns=1)
+            return _gen()
+
+        async def stop(self):
+            pass
+
+    manager._make_run = lambda s, agent=None, connectors=None, **_kw: SkillBackend()  # type: ignore[method-assign,assignment]
+
+    _ = [m async for m in manager._run_backend(session, "go")]
+    registry.record_usage.assert_awaited_once_with(
+        "hermes-pr-flow",  # the bare slug, not the namespaced value
+        agent_id=session.agent_id,
+        repository="/resolved/repo",
+        session_id=session.id,
+        task_id=session.task_id,
+        run_id=session.task_run_id,
+        backend=session.backend,
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_backend_syncs_codex_skills_for_a_codex_session_with_a_credential(
     manager,
 ):
