@@ -573,34 +573,65 @@ class TaskBoardManager:
         metadata: Mapping[str, Any] | None = None,
         artifacts: list[dict[str, str]] | None = None,
         verdict: str | None = None,
+        reusable_outcome: bool = False,
     ) -> dict[str, Any]:
         task, run = await self._validate_worker(task_id, run_id, session_id)
-        # Experience consolidation gate (experience-consolidation.md §3.2):
-        # a non-clean-pass run may not `complete` until the worker has filed
-        # a retrospective for THIS run. A clean first pass skips the gate
+        # Experience consolidation gate (experience-consolidation.md §3.2): a
+        # non-clean-pass run may not `complete` until the worker has filed a
+        # retrospective for THIS run. A clean first pass skips the gate
         # entirely — no history to retrospect, and forcing one every time
-        # would just breed reflection fatigue.
-        if await self.repo.is_non_clean_pass(task_id, run_id, verdict=verdict):
-            if not await self.repo.has_retrospective(run_id):
-                raise TaskRetrospectiveRequiredError(
+        # would just breed reflection fatigue. This trigger condition is
+        # UNCHANGED by v2's clean-pass entry point below (experience-
+        # consolidation-v2.md §3①, "强制复盘触发条件一个字不改").
+        non_clean_pass = await self.repo.is_non_clean_pass(
+            task_id, run_id, verdict=verdict
+        )
+        # Clean-pass voluntary entry (experience-consolidation-v2.md §3①): a
+        # worker who just walked a clean run may self-report it as worth
+        # distilling while still holding full context — `reusable_outcome`
+        # is a purely voluntary self-report (defaults False, no machine
+        # judgment of "novel/complex"), but ONCE a worker asserts it, the
+        # ask is the same as a non-clean-pass run's: file the retrospective
+        # first. Retrying with `reusable_outcome=False` always un-gates a
+        # genuinely clean pass — this can never trap a worker who changes
+        # their mind.
+        if (non_clean_pass or reusable_outcome) and not await self.repo.has_retrospective(
+            run_id
+        ):
+            if non_clean_pass:
+                reason = (
                     "this run was not a clean first pass (a retry, a prior "
-                    "blocked/failed/interrupted run, or verdict='fail') — call "
-                    "`reflect` first: (1) a judgment call specific to you goes "
-                    "to your own memory — write the memory file yourself with "
-                    "your normal file-write tools, then pass its path as "
-                    "`memory_pointer`; (2) a rule everyone should know becomes "
-                    "a CLAUDE.md edit committed on this run's own branch (a "
-                    "real diff, delivered via the normal PR path), referenced "
-                    "by `claude_md_note`; (3) a repeatable multi-step process "
-                    "becomes a skill candidate via the `skills` MCP server's "
-                    "`propose`. If none apply, pass `nothing_note` explaining "
-                    "why there's nothing to add. Then retry `complete`.",
-                    current=task,
+                    "blocked/failed/interrupted run, or verdict='fail')"
                 )
+            else:
+                reason = (
+                    "you flagged this clean-pass run as having a reusable "
+                    "outcome (reusable_outcome=True) — that voluntary signal "
+                    "asks for the same retrospective a non-clean-pass run "
+                    "requires; retry with reusable_outcome=False instead if "
+                    "you've changed your mind and there's nothing to capture"
+                )
+            raise TaskRetrospectiveRequiredError(
+                f"{reason} — call `reflect` first: (1) a judgment call "
+                "specific to you goes to your own memory — write the memory "
+                "file yourself with your normal file-write tools, then pass "
+                "its path as `memory_pointer`; (2) a rule everyone should "
+                "know becomes a CLAUDE.md edit committed on this run's own "
+                "branch (a real diff, delivered via the normal PR path), "
+                "referenced by `claude_md_note`; (3) a repeatable multi-step "
+                "process becomes a skill candidate via the `skills` MCP "
+                "server's `propose`. If none apply, pass `nothing_note` "
+                "explaining why there's nothing to add. Then retry `complete`.",
+                current=task,
+            )
         # Preserve prep metadata (the git base branch/commit) under the worker's
         # declared metadata and the terminal git inspection (B1).
         terminal_metadata = dict(run.metadata or {})
         terminal_metadata.update(dict(metadata or {}))
+        # Recorded regardless of outcome (even False) so the evidence chain
+        # (experience-consolidation-v2.md §3②) can show whether a candidate
+        # traces back to a self-nominated clean pass.
+        terminal_metadata["reusable_outcome"] = bool(reusable_outcome)
         if run.workspace_mode == "git_worktree":
             terminal_metadata["git"] = await inspect_git_workspace(run.workspace_path)
         captured = await capture_artifacts(

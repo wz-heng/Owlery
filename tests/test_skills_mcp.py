@@ -98,6 +98,56 @@ def test_propose_includes_task_context_inside_a_worker_run(monkeypatch):
     assert captured["body"]["run_id"] == "run-1"
 
 
+def test_propose_defaults_scope_and_passes_bundle_files(monkeypatch):
+    _set_env(monkeypatch)
+    captured: dict = {}
+
+    class R:
+        status_code = 201
+
+        def json(self):
+            return {"id": "cand-1"}
+
+    def fake_request(method, url, json=None, params=None, headers=None, timeout=None, trust_env=None):  # noqa: ARG001
+        captured["body"] = json
+        return R()
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    _call(
+        "propose", slug="s", title="t", description="d",
+        body_markdown="body", rationale="r",
+        bundle_files={"scripts/run.sh": "#!/bin/sh\necho hi\n"},
+    )
+    assert captured["body"]["scope"] == "agent+repo"
+    assert captured["body"]["bundle_files"] == {"scripts/run.sh": "#!/bin/sh\necho hi\n"}
+
+
+def test_propose_passes_agent_global_scope(monkeypatch):
+    _set_env(monkeypatch)
+    captured: dict = {}
+
+    class R:
+        status_code = 201
+
+        def json(self):
+            return {"id": "cand-1"}
+
+    def fake_request(method, url, json=None, params=None, headers=None, timeout=None, trust_env=None):  # noqa: ARG001
+        captured["body"] = json
+        return R()
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    _call(
+        "propose", slug="s", title="t", description="d",
+        body_markdown="body", rationale="r", scope="agent-global",
+    )
+    assert captured["body"]["scope"] == "agent-global"
+
+
 def test_propose_surfaces_a_validation_error(monkeypatch):
     _set_env(monkeypatch)
 

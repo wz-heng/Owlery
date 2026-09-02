@@ -82,13 +82,15 @@ def _render(status: int, payload: Any, *, action: str) -> str:
 @mcp.tool(name="propose")
 def propose(
     slug: str, title: str, description: str, body_markdown: str, rationale: str,
+    scope: str = "agent+repo", bundle_files: dict[str, str] | None = None,
 ) -> str:
     """Propose a skill candidate for human review (experience-consolidation.md
     §3.3 point 3: "a repeatable multi-step process becomes a skill candidate").
 
     Landing does NOT happen here — this only files a `pending` row a human
-    reviews via the web UI (approve/reject + diff), same shape as hermes'
-    `/skills pending`. Nothing changes on disk until a human approves it.
+    reviews via the web UI (approve/reject + diff + file tree), same shape
+    as hermes' `/skills pending`. Nothing changes on disk until a human
+    approves it.
 
     Args:
         slug: lowercase-kebab-case identifier, e.g. "hermes-pr-flow". Reusing
@@ -100,6 +102,16 @@ def propose(
         body_markdown: the full SKILL.md content (YAML frontmatter + body).
         rationale: why this is worth keeping — what went wrong or took too
             long the first time, and why it'll recur.
+        scope: "agent+repo" (default — visible only in the repository you're
+            proposing from) or "agent-global" (visible in every repository
+            this agent works in, no repo fingerprint). The reviewer can
+            change this on approve (experience-consolidation-v2.md §3③).
+        bundle_files: optional `{relative_path: content}` map of extra files
+            (scripts/templates/examples/tests) alongside SKILL.md — read
+            their content yourself (you're in the room and already have it)
+            and pass it here; there is no separate file-upload step. Paths
+            must be relative and may not escape the skill directory or reuse
+            the reserved name `SKILL.md`.
     """
     ctx = _context()
     if ctx is None:
@@ -108,6 +120,7 @@ def propose(
     body: dict[str, Any] = {
         "slug": slug, "title": title, "description": description,
         "body_markdown": body_markdown, "rationale": rationale,
+        "scope": scope, "bundle_files": bundle_files or None,
     }
     task_id = os.environ.get("OWLERY_TASK_ID")
     run_id = os.environ.get("OWLERY_TASK_RUN_ID")

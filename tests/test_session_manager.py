@@ -1379,7 +1379,62 @@ async def test_run_backend_records_skill_usage_on_native_skill_tool_use(manager)
 
     _ = [m async for m in manager._run_backend(session, "go")]
     registry.record_usage.assert_awaited_once_with(
-        "hermes-pr-flow", agent_id=session.agent_id, repository="/resolved/repo"
+        "hermes-pr-flow",
+        agent_id=session.agent_id,
+        repository="/resolved/repo",
+        session_id=session.id,
+        task_id=session.task_id,
+        run_id=session.task_run_id,
+        backend=session.backend,
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_backend_syncs_codex_skills_for_a_codex_session_with_a_credential(
+    manager,
+):
+    """experience-consolidation-v2.md §3④: a Codex session with a resolved,
+    directory-backed credential must have its Codex-materialized skills
+    synced into that credential's real CODEX_HOME before the turn spawns —
+    the live per-turn projection Codex's own event stream has no equivalent
+    hook for."""
+    from unittest.mock import AsyncMock
+
+    from server.codex_login import codex_home_for
+    from server.harness import HarnessEvent
+
+    cid = await _bind_credential(manager, "codex", secret="/tmp/home")
+    home = codex_home_for(cid)
+    os.makedirs(home, exist_ok=True)
+    with open(os.path.join(home, "auth.json"), "w") as f:
+        f.write("{}")
+
+    agent = await manager.db.get_default_agent()
+    session = await manager.create_session(
+        agent["id"], "CodexSkills", None, credential_id=cid, backend="codex"
+    )
+    registry = AsyncMock()
+    registry.resolve_plugin_dir.return_value = []
+    manager.set_skill_registry(registry)
+
+    class Backend:
+        async def start(self, prompt, working_dir, resume_id=None, credential=None):
+            pass
+
+        def stream(self):
+            async def _gen():
+                yield HarnessEvent(type="result", session_id="sid", num_turns=1)
+            return _gen()
+
+        async def stop(self):
+            pass
+
+    manager._make_run = lambda s, agent=None, connectors=None, **_kw: Backend()  # type: ignore[method-assign,assignment]
+
+    _ = [m async for m in manager._run_backend(session, "go")]
+
+    registry.sync_codex_skills_dir.assert_awaited_once_with(
+        agent_id=session.agent_id, working_dir=session.working_dir, codex_home=home
     )
 
 

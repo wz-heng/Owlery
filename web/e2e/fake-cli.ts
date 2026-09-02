@@ -27,8 +27,14 @@ export type FakeOp =
   | { t: "ask"; questions: unknown[] }
   /** Call `mcp__bg__run` over real MCP, then end the turn. */
   | { t: "bg"; command: string; description?: string }
-  /** Complete the current durable Task Board run over the real tasks MCP. */
-  | { t: "task_complete"; summary: string }
+  /**
+   * Complete the current durable Task Board run over the real tasks MCP.
+   * `reusable_outcome`, when set, exercises the clean-pass voluntary
+   * retrospective entry (experience-consolidation-v2.md §3①) — `true` on a
+   * clean pass with no prior `task_reflect` op must fail exactly like a
+   * non-clean pass would.
+   */
+  | { t: "task_complete"; summary: string; reusable_outcome?: boolean }
   /** Block the current durable Task Board run over the real tasks MCP. */
   | { t: "task_block"; reason: string; kind?: string }
   /**
@@ -57,7 +63,10 @@ export type FakeOp =
     }
   /**
    * Propose a skill candidate for human review over the real skills MCP
-   * (experience-consolidation.md §3.4).
+   * (experience-consolidation.md §3.4, experience-consolidation-v2.md §3③).
+   * `scope` defaults server-side to "agent+repo"; `bundle_files` is an
+   * optional `{relative_path: content}` map of extra files alongside
+   * SKILL.md.
    */
   | {
       t: "skill_propose";
@@ -66,6 +75,8 @@ export type FakeOp =
       description: string;
       body_markdown: string;
       rationale: string;
+      scope?: "agent-global" | "agent+repo";
+      bundle_files?: Record<string, string>;
     }
   /**
    * Read the REAL `--plugin-dir` argv this fake-CLI process was actually

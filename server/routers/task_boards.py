@@ -361,6 +361,9 @@ class CompleteRequest(BaseModel):
     # Review/acceptance gate (task-board-gaps.md §3.1): optional, so ordinary
     # (non-review) worker tasks keep completing exactly as before.
     verdict: str | None = None
+    # Clean-pass voluntary retrospective entry (experience-consolidation-v2.md
+    # §3①): defaults False, so ordinary clean-pass completion is unaffected.
+    reusable_outcome: bool = False
 
     @model_validator(mode="after")
     def validate_verdict(self):
@@ -1175,6 +1178,7 @@ async def worker_complete(
                 metadata=req.metadata,
                 artifacts=[item.model_dump() for item in req.artifacts],
                 verdict=req.verdict,
+                reusable_outcome=req.reusable_outcome,
             )
         )
     )

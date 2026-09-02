@@ -2594,11 +2594,30 @@ class SessionManager:
         # review point 1): resolve once per turn, not per recovery-loop
         # iteration — the working dir doesn't change mid-turn, and this is
         # the only part of the wiring that spawns a subprocess.
-        skills_plugin_dir: str | None = None
+        skills_plugin_dirs: list[str] = []
         if session.agent_id and self._skill_registry is not None:
-            skills_plugin_dir = await self._skill_registry.resolve_plugin_dir(
+            skills_plugin_dirs = await self._skill_registry.resolve_plugin_dir(
                 agent_id=session.agent_id, working_dir=session.working_dir
             )
+            # Codex activation adapter (experience-consolidation-v2.md §3④):
+            # unlike Claude's --plugin-dir, Codex has no per-turn "extra
+            # skill directory" flag reachable from `codex exec`, so this
+            # syncs real files into the resolved credential's own
+            # $CODEX_HOME/skills instead. Only when a credential with a real
+            # home_dir is resolved — host-default auth (no credential) means
+            # Codex's own ~/.codex is out of Owlery's controlled footprint,
+            # and writing skills there would leak into the user's real,
+            # personal Codex config.
+            if (
+                session.backend == "codex"
+                and credential is not None
+                and credential.home_dir
+            ):
+                await self._skill_registry.sync_codex_skills_dir(
+                    agent_id=session.agent_id,
+                    working_dir=session.working_dir,
+                    codex_home=credential.home_dir,
+                )
         current_prompt = prompt
         recovery_attempts = 0
         transient_attempts = 0
@@ -2612,7 +2631,7 @@ class SessionManager:
 
         while True:
             backend = self._make_run(
-                session, agent, connectors, skills_plugin_dir=skills_plugin_dir
+                session, agent, connectors, skills_plugin_dirs=skills_plugin_dirs
             )
             session._backend = backend
             saw_result = False
@@ -2676,7 +2695,16 @@ class SessionManager:
                         # anywhere we have on hand, so this checks the
                         # plausible candidates rather than betting on one;
                         # confirm against a real transcript and trim this to
-                        # the actual key once observed.
+                        # the actual key once observed. Claude-only by
+                        # construction: Codex's event stream (harness/
+                        # codex.py's CodexEventParser) never emits a
+                        # tool_name of "Skill", so this never fires for a
+                        # Codex turn — exactly the "don't fabricate Codex
+                        # usage data" requirement
+                        # (experience-consolidation-v2.md §3④): Codex
+                        # use_count/invocation tracking stays uncounted
+                        # (best-effort) until a real equivalent event is
+                        # observed and confirmed.
                         if event.tool_name == "Skill" and self._skill_registry is not None:
                             tool_input = event.tool_input or {}
                             slug = None
@@ -2705,6 +2733,10 @@ class SessionManager:
                                     slug,
                                     agent_id=session.agent_id,
                                     repository=usage_repository,
+                                    session_id=session.id,
+                                    task_id=session.task_id,
+                                    run_id=session.task_run_id,
+                                    backend=session.backend,
                                 )
                     if event.type == "text" and event.content and event.content.strip():
                         saw_text = True
@@ -3041,14 +3073,14 @@ class SessionManager:
         agent: dict[str, Any] | None = None,
         connectors: list[tuple[Any, Any]] | None = None,
         *,
-        skills_plugin_dir: str | None = None,
+        skills_plugin_dirs: list[str] | None = None,
     ) -> HarnessRun:
         """Build the per-turn run for a session via its harness. Single seam
         the run loop calls (and tests monkeypatch); dispatches on
         `session.backend` through the registry — no kind branching here."""
         return get_harness(session.backend).create_run(
             self._run_config(
-                session, agent, connectors, skills_plugin_dir=skills_plugin_dir
+                session, agent, connectors, skills_plugin_dirs=skills_plugin_dirs
             )
         )
 
@@ -3058,7 +3090,7 @@ class SessionManager:
         agent: dict[str, Any] | None = None,
         connectors: list[tuple[Any, Any]] | None = None,
         *,
-        skills_plugin_dir: str | None = None,
+        skills_plugin_dirs: list[str] | None = None,
     ) -> RunConfig:
         """Build the per-turn RunConfig from the (freshly-loaded) agent. The
         agent supplies the system prompt, model, built-in MCP set, and tool
@@ -3122,7 +3154,7 @@ class SessionManager:
             task_id=session.task_id,
             task_run_id=session.task_run_id,
             task_worker_prompt=task_worker_prompt,
-            skills_plugin_dir=skills_plugin_dir,
+            skills_plugin_dirs=skills_plugin_dirs or [],
         )
 
     # Refresh the access_token if it expires within this many seconds. A

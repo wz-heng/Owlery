@@ -731,11 +731,47 @@ CREATE TABLE IF NOT EXISTS skill_candidates (
     landed_commit TEXT,
     use_count INTEGER NOT NULL DEFAULT 0,
     last_used_at TEXT,
+    -- experience-consolidation-v2.md §3③: 'agent-global' (no repo fingerprint,
+    -- every session for this agent loads it) or 'agent+repo' (current
+    -- behavior, scoped to `repository`). Chosen at propose time, reviewer may
+    -- override it on approve.
+    scope TEXT NOT NULL DEFAULT 'agent+repo' CHECK (scope IN ('agent-global', 'agent+repo')),
+    -- §3③ bundle: JSON {relative_path: content} for files alongside SKILL.md
+    -- (scripts/templates/examples/tests). NULL/absent = no bundle files.
+    bundle_files TEXT,
+    -- §3② evidence chain: static lint computed at propose time (frontmatter
+    -- validity, slug conflicts, bundle file references) — informational,
+    -- never blocks; shown on the review page.
+    lint_results TEXT,
+    -- §3④: JSON list of backend kinds ('claude' | 'codex') this candidate was
+    -- actually materialized for on approve — what really got double-landed,
+    -- not a proposer-declared target.
+    materialized_backends TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS skill_candidates_status ON skill_candidates(status, created_at);
 CREATE INDEX IF NOT EXISTS skill_candidates_slug ON skill_candidates(slug, status);
+
+-- Skill invocation log (experience-consolidation-v2.md §3⑤): one row per
+-- real skill use, naming the consuming run/session — the natural extension
+-- of the use_count/last_used aggregate already on skill_candidates (v1 T-B's
+-- (agent, repository) scoping fix lives on the same lookup this feeds). To
+-- the foreign key and a display list, no further: no aggregation, no rate,
+-- no threshold (§4 "不做" — no effectiveness-metrics layer).
+CREATE TABLE IF NOT EXISTS skill_invocations (
+    id TEXT PRIMARY KEY,
+    candidate_id TEXT NOT NULL REFERENCES skill_candidates(id) ON DELETE CASCADE,
+    agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+    repository TEXT,
+    session_id TEXT,
+    task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+    run_id TEXT REFERENCES task_runs(id) ON DELETE SET NULL,
+    backend TEXT,                       -- 'claude-code' | 'codex', best-effort
+    used_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS skill_invocations_candidate
+  ON skill_invocations(candidate_id, used_at DESC);
 
 -- Git delivery closure for git_worktree runs (task-git-delivery.md §11). One
 -- durable delivery per completed worktree run records the fate of its branch;
@@ -1007,6 +1043,26 @@ class Database:
             )
         except Exception:
             pass
+
+        # Skill candidate bundle/scope/lint/materialization columns
+        # (experience-consolidation-v2.md §3②③④). DEFAULTs backfill every
+        # pre-existing candidate to 'agent+repo' scope with no bundle/lint/
+        # materialization data — matches exactly what those rows already
+        # behaved as before this migration. New DBs get them from _SCHEMA;
+        # this catch-up covers candidates created before v2 landed.
+        for ddl in (
+            "ALTER TABLE skill_candidates ADD COLUMN "
+            "scope TEXT NOT NULL DEFAULT 'agent+repo'",
+            "ALTER TABLE skill_candidates ADD COLUMN bundle_files TEXT",
+            "ALTER TABLE skill_candidates ADD COLUMN lint_results TEXT",
+            "ALTER TABLE skill_candidates ADD COLUMN materialized_backends TEXT",
+        ):
+            try:
+                await self._conn.execute(ddl)
+            except aiosqlite.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    logger.error("skill candidate migration failed: %s (%s)", ddl, exc)
+                    raise
 
         # Git delivery closure (task-git-delivery.md §18). Additive board
         # settings; DEFAULTs backfill existing boards to the pre-delivery
@@ -3619,7 +3675,8 @@ class Database:
         "id, slug, title, description, body_markdown, repository, rationale, "
         "status, proposed_by_agent_id, proposed_by_session_id, task_id, run_id, "
         "reviewed_at, review_note, landed_path, landed_branch, landed_commit, "
-        "use_count, last_used_at, created_at, updated_at"
+        "use_count, last_used_at, scope, bundle_files, lint_results, "
+        "materialized_backends, created_at, updated_at"
     )
 
     @staticmethod
@@ -3644,8 +3701,12 @@ class Database:
             "landed_commit": row[16],
             "use_count": row[17],
             "last_used_at": row[18],
-            "created_at": row[19],
-            "updated_at": row[20],
+            "scope": row[19],
+            "bundle_files": json.loads(row[20]) if row[20] else None,
+            "lint_results": json.loads(row[21]) if row[21] else None,
+            "materialized_backends": json.loads(row[22]) if row[22] else None,
+            "created_at": row[23],
+            "updated_at": row[24],
         }
 
     async def create_skill_candidate(
@@ -3662,6 +3723,9 @@ class Database:
         proposed_by_session_id: str | None,
         task_id: str | None,
         run_id: str | None,
+        scope: str,
+        bundle_files: dict[str, str] | None,
+        lint_results: dict[str, Any] | None,
         created_at: str,
     ) -> dict[str, Any]:
         await self._ensure_connected()
@@ -3669,12 +3733,15 @@ class Database:
             "INSERT INTO skill_candidates "
             "(id, slug, title, description, body_markdown, repository, rationale, "
             "status, proposed_by_agent_id, proposed_by_session_id, task_id, run_id, "
-            "use_count, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, 0, ?, ?)",
+            "use_count, scope, bundle_files, lint_results, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)",
             (
                 candidate_id, slug, title, description, body_markdown, repository,
                 rationale, proposed_by_agent_id, proposed_by_session_id, task_id,
-                run_id, created_at, created_at,
+                run_id, scope,
+                json.dumps(bundle_files) if bundle_files else None,
+                json.dumps(lint_results) if lint_results else None,
+                created_at, created_at,
             ),
         )
         await self._conn.commit()
@@ -3720,13 +3787,17 @@ class Database:
         last_used tracking accrues on (there is no separate skills table).
 
         `agent_id`/`repository`, when given, scope the lookup to the
-        candidate proposed by that agent for that repository — without this,
-        two different repositories (or agents) independently landing a skill
-        under the same slug collide and whichever was approved most recently
-        wins the lookup regardless of which one a given session actually has
-        loaded (Snape review, experience-consolidation.md). Callers that
-        genuinely want the newest approved candidate across all scopes (e.g.
-        the review-queue diff view before a scope is known) may omit both."""
+        candidate proposed by that agent for that repository OR to an
+        `agent-global` candidate from that same agent (experience-
+        consolidation-v2.md §3③ — a global candidate has no repository to
+        match, so it must be reachable from every repository that agent
+        works in) — without this, two different repositories (or agents)
+        independently landing a skill under the same slug collide and
+        whichever was approved most recently wins the lookup regardless of
+        which one a given session actually has loaded (Snape review,
+        experience-consolidation.md). Callers that genuinely want the newest
+        approved candidate across all scopes (e.g. the review-queue diff view
+        before a scope is known) may omit both."""
         await self._ensure_connected()
         query = (
             f"SELECT {self._SKILL_CANDIDATE_COLS} FROM skill_candidates "
@@ -3737,7 +3808,7 @@ class Database:
             query += " AND proposed_by_agent_id = ?"
             params.append(agent_id)
         if repository is not None:
-            query += " AND repository = ?"
+            query += " AND (repository = ? OR scope = 'agent-global')"
             params.append(repository)
         query += " ORDER BY updated_at DESC LIMIT 1"
         cursor = await self._conn.execute(query, params)
@@ -3751,18 +3822,27 @@ class Database:
         status: str,
         review_note: str | None,
         reviewed_at: str,
+        scope: str | None = None,
         landed_path: str | None = None,
         landed_branch: str | None = None,
         landed_commit: str | None = None,
+        materialized_backends: list[str] | None = None,
     ) -> dict[str, Any] | None:
         await self._ensure_connected()
+        if scope is not None:
+            await self._conn.execute(
+                "UPDATE skill_candidates SET scope = ? WHERE id = ?",
+                (scope, candidate_id),
+            )
         await self._conn.execute(
             "UPDATE skill_candidates SET status = ?, review_note = ?, "
             "reviewed_at = ?, landed_path = ?, landed_branch = ?, landed_commit = ?, "
-            "updated_at = ? WHERE id = ?",
+            "materialized_backends = ?, updated_at = ? WHERE id = ?",
             (
                 status, review_note, reviewed_at, landed_path, landed_branch,
-                landed_commit, reviewed_at, candidate_id,
+                landed_commit,
+                json.dumps(materialized_backends) if materialized_backends else None,
+                reviewed_at, candidate_id,
             ),
         )
         await self._conn.commit()
@@ -3778,6 +3858,111 @@ class Database:
             (used_at, candidate_id),
         )
         await self._conn.commit()
+
+    async def skill_candidates_with_slug_exist(
+        self, slug: str, *, exclude_id: str | None = None
+    ) -> bool:
+        """Whether a pending/approved candidate already claims `slug` — the
+        §3② "slug 冲突" static-lint check, informational only (reusing an
+        approved slug is a legitimate replacement proposal; this just
+        surfaces it on the review page rather than silently hiding it)."""
+        await self._ensure_connected()
+        query = (
+            "SELECT 1 FROM skill_candidates "
+            "WHERE slug = ? AND status IN ('pending', 'approved')"
+        )
+        params: list[Any] = [slug]
+        if exclude_id is not None:
+            query += " AND id != ?"
+            params.append(exclude_id)
+        query += " LIMIT 1"
+        cursor = await self._conn.execute(query, params)
+        return (await cursor.fetchone()) is not None
+
+    async def create_skill_invocation(
+        self,
+        *,
+        invocation_id: str,
+        candidate_id: str,
+        agent_id: str | None,
+        repository: str | None,
+        session_id: str | None,
+        task_id: str | None,
+        run_id: str | None,
+        backend: str | None,
+        used_at: str,
+    ) -> None:
+        await self._ensure_connected()
+        await self._conn.execute(
+            "INSERT INTO skill_invocations "
+            "(id, candidate_id, agent_id, repository, session_id, task_id, "
+            "run_id, backend, used_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                invocation_id, candidate_id, agent_id, repository, session_id,
+                task_id, run_id, backend, used_at,
+            ),
+        )
+        await self._conn.commit()
+
+    async def list_skill_invocations(
+        self, candidate_id: str, *, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            "SELECT id, candidate_id, agent_id, repository, session_id, task_id, "
+            "run_id, backend, used_at FROM skill_invocations "
+            "WHERE candidate_id = ? ORDER BY used_at DESC LIMIT ?",
+            (candidate_id, limit),
+        )
+        rows = await cursor.fetchall()
+        return [
+            {
+                "id": r[0], "candidate_id": r[1], "agent_id": r[2],
+                "repository": r[3], "session_id": r[4], "task_id": r[5],
+                "run_id": r[6], "backend": r[7], "used_at": r[8],
+            }
+            for r in rows
+        ]
+
+    # --- Minimal read-only summaries for the skill review-page evidence
+    # chain (experience-consolidation-v2.md §3②) — tasks/task_runs/sessions
+    # already live in this same DB file under their own owning modules
+    # (task_board.repository, session_manager); these are read-only lookups
+    # a skill candidate's stored task_id/run_id/proposed_by_session_id can
+    # resolve to a human-meaningful label without pulling in those modules.
+
+    async def get_task_summary(self, task_id: str) -> dict[str, Any] | None:
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            "SELECT id, board_id, title, status FROM tasks WHERE id = ?",
+            (task_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {"id": row[0], "board_id": row[1], "title": row[2], "status": row[3]}
+
+    async def get_run_summary(self, run_id: str) -> dict[str, Any] | None:
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            "SELECT id, task_id, attempt_no, state FROM task_runs WHERE id = ?",
+            (run_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {"id": row[0], "task_id": row[1], "attempt_no": row[2], "state": row[3]}
+
+    async def get_session_summary(self, session_id: str) -> dict[str, Any] | None:
+        await self._ensure_connected()
+        cursor = await self._conn.execute(
+            "SELECT id, backend, archived FROM sessions WHERE id = ?",
+            (session_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {"id": row[0], "backend": row[1], "archived": bool(row[2])}
 
     # --- Per-round agent delegation execution ledger ---
 

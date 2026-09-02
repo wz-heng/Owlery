@@ -22,6 +22,7 @@ import { Label } from "./components/ui/label";
 import { useViewportHeight } from "./hooks/useViewportHeight";
 import { useWebSocket } from "./hooks/useWebSocket";
 import { useSessionStore } from "./stores/sessionStore";
+import { useTaskStore } from "./stores/taskStore";
 import { TaskBoardPage } from "./components/tasks";
 
 function App() {
@@ -295,7 +296,17 @@ function AuthenticatedApp({
             onToggleSidebar={() => setSidebarOpen(!sidebarOpen)}
           />
         ) : mainSurface === "skills" ? (
-          <SkillCandidatesPage onToggleSidebar={() => setSidebarOpen(!sidebarOpen)} />
+          <SkillCandidatesPage
+            onToggleSidebar={() => setSidebarOpen(!sidebarOpen)}
+            onOpenSession={(sessionId) => {
+              setActiveSessionId(sessionId);
+              setMainSurface("chat");
+            }}
+            onOpenTask={(taskId) => {
+              useTaskStore.getState().selectTask(taskId);
+              setMainSurface("tasks");
+            }}
+          />
         ) : (
           <ChatView
             sendMessage={sendMessage}

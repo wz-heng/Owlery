@@ -392,6 +392,8 @@ def run_ops(ops: list[dict], parsed: dict, state: dict) -> None:
         elif kind == "task_complete":
             tool_use_id = f"toolu_fake_task_complete_{index}"
             arguments = {"summary": op["summary"], "metadata": {"e2e": True}}
+            if "reusable_outcome" in op:
+                arguments["reusable_outcome"] = op["reusable_outcome"]
             _emit_tool_use(tool_use_id, "mcp__tasks__complete", arguments)
             completed = call_mcp_tool(mcp_servers, "tasks", "complete", arguments)
             _emit_tool_result(tool_use_id, completed)
@@ -443,6 +445,10 @@ def run_ops(ops: list[dict], parsed: dict, state: dict) -> None:
                 "body_markdown": op["body_markdown"],
                 "rationale": op["rationale"],
             }
+            if "scope" in op:
+                arguments["scope"] = op["scope"]
+            if "bundle_files" in op:
+                arguments["bundle_files"] = op["bundle_files"]
             _emit_tool_use(tool_use_id, "mcp__skills__propose", arguments)
             proposed = call_mcp_tool(mcp_servers, "skills", "propose", arguments)
             _emit_tool_result(tool_use_id, proposed)

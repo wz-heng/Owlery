@@ -197,7 +197,7 @@ async def test_worker_complete_uses_only_trusted_headers(client):
             ("task-1", "run-1", "session-1"),
             {
                 "summary": "Done", "metadata": {"tests": "green"}, "artifacts": [],
-                "verdict": None,
+                "verdict": None, "reusable_outcome": False,
             },
         )
     ]
