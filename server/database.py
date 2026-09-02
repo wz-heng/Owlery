@@ -747,6 +747,15 @@ CREATE TABLE IF NOT EXISTS skill_candidates (
     -- actually materialized for on approve — what really got double-landed,
     -- not a proposer-declared target.
     materialized_backends TEXT,
+    -- Set when a LATER same-(agent, slug, repository) approval relocated
+    -- this row's materialized copy to a different scope/location (Snape
+    -- review: `status='approved'` alone is a historical fact — it stays
+    -- true forever — but "is this the version actually loadable right now"
+    -- can change after the fact when a same-repo replacement supersedes it;
+    -- without this, get_latest_approved_skill_by_slug would keep returning
+    -- a row whose files were already removed from disk). NULL = still the
+    -- active landed version.
+    superseded_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -1056,6 +1065,7 @@ class Database:
             "ALTER TABLE skill_candidates ADD COLUMN bundle_files TEXT",
             "ALTER TABLE skill_candidates ADD COLUMN lint_results TEXT",
             "ALTER TABLE skill_candidates ADD COLUMN materialized_backends TEXT",
+            "ALTER TABLE skill_candidates ADD COLUMN superseded_at TEXT",
         ):
             try:
                 await self._conn.execute(ddl)
@@ -3676,7 +3686,7 @@ class Database:
         "status, proposed_by_agent_id, proposed_by_session_id, task_id, run_id, "
         "reviewed_at, review_note, landed_path, landed_branch, landed_commit, "
         "use_count, last_used_at, scope, bundle_files, lint_results, "
-        "materialized_backends, created_at, updated_at"
+        "materialized_backends, superseded_at, created_at, updated_at"
     )
 
     @staticmethod
@@ -3705,8 +3715,9 @@ class Database:
             "bundle_files": json.loads(row[20]) if row[20] else None,
             "lint_results": json.loads(row[21]) if row[21] else None,
             "materialized_backends": json.loads(row[22]) if row[22] else None,
-            "created_at": row[23],
-            "updated_at": row[24],
+            "superseded_at": row[23],
+            "created_at": row[24],
+            "updated_at": row[25],
         }
 
     async def create_skill_candidate(
@@ -3805,11 +3816,16 @@ class Database:
         recently — matching `sync_codex_skills_dir`'s own "repo-scoped wins
         over global" precedence (Snape review: an unqualified
         `ORDER BY updated_at` could attribute a real invocation to the
-        candidate that ISN'T actually the one loaded/discovered)."""
+        candidate that ISN'T actually the one loaded/discovered).
+
+        Excludes superseded rows (`superseded_at IS NOT NULL`, Snape review)
+        — a row a later same-repository approval relocated is no longer the
+        active landed version, even though `status='approved'` stays true
+        forever as the historical fact that it once was."""
         await self._ensure_connected()
         query = (
             f"SELECT {self._SKILL_CANDIDATE_COLS} FROM skill_candidates "
-            "WHERE slug = ? AND status = 'approved'"
+            "WHERE slug = ? AND status = 'approved' AND superseded_at IS NULL"
         )
         params: list[Any] = [slug]
         if agent_id is not None:
@@ -3868,6 +3884,19 @@ class Database:
         )
         await self._conn.commit()
         return await self.get_skill_candidate(candidate_id)
+
+    async def mark_skill_candidate_superseded(
+        self, candidate_id: str, *, superseded_at: str
+    ) -> None:
+        """A later same-(agent, slug, repository) approval relocated this
+        row's materialized copy elsewhere — exclude it from
+        `get_latest_approved_skill_by_slug` from now on (Snape review)."""
+        await self._ensure_connected()
+        await self._conn.execute(
+            "UPDATE skill_candidates SET superseded_at = ? WHERE id = ?",
+            (superseded_at, candidate_id),
+        )
+        await self._conn.commit()
 
     async def record_skill_candidate_usage(
         self, candidate_id: str, *, used_at: str

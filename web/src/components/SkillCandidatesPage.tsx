@@ -368,6 +368,13 @@ export function SkillCandidatesPage({
 
               {selected.status === "approved" && (
                 <section className="rounded-lg border border-ink-300 bg-card p-3 text-xs">
+                  {selected.superseded_at && (
+                    <div className="mb-2 rounded-md border border-amber-300 bg-amber-50 px-2 py-1 text-amber-800">
+                      Superseded {new Date(selected.superseded_at).toLocaleString()} — a
+                      later approval relocated this skill; this copy is no longer the
+                      active landed version.
+                    </div>
+                  )}
                   <div>landed at <code>{selected.landed_path}</code></div>
                   <div>branch <code>{selected.landed_branch}</code></div>
                   <div>use count: {selected.use_count}</div>

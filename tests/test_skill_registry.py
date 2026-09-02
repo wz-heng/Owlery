@@ -688,9 +688,9 @@ async def test_replacement_with_a_different_scope_removes_the_old_location(regis
     skill forever, and resolve_plugin_dir would surface both."""
     from server.skill_registry import agent_codex_skills_dir, agent_skills_plugin_dir
 
-    reg, _db, repo, agent_id = registry
+    reg, db, repo, agent_id = registry
     first = await _propose(reg)  # agent+repo (default)
-    await reg.approve(first["id"])
+    approved_first = await reg.approve(first["id"])
     repository = await reg.resolve_repository(str(repo))
     repo_plugin_skill = (
         agent_skills_plugin_dir(agent_id, repository) / "skills" / "hermes-pr-flow"
@@ -700,12 +700,24 @@ async def test_replacement_with_a_different_scope_removes_the_old_location(regis
     assert repo_codex_skill.is_dir()
 
     replacement = await _propose(reg, scope="agent-global")
-    await reg.approve(replacement["id"])
+    approved_replacement = await reg.approve(replacement["id"])
 
     assert not repo_plugin_skill.exists()
     assert not repo_codex_skill.exists()
     dirs = await reg.resolve_plugin_dir(agent_id=agent_id, working_dir=str(repo))
     assert len(dirs) == 1  # only the new agent-global location
+
+    # Snape review: the old row's `status` stays 'approved' (historical
+    # fact) but it's excluded from "latest approved" lookups now that its
+    # materialized copy is gone — otherwise record_usage()/diff() would
+    # keep pointing at a candidate that isn't actually loadable anymore.
+    stale = await db.get_skill_candidate(approved_first["id"])
+    assert stale["status"] == "approved"
+    assert stale["superseded_at"] is not None
+    winner = await db.get_latest_approved_skill_by_slug(
+        "hermes-pr-flow", agent_id=agent_id, repository=repository
+    )
+    assert winner["id"] == approved_replacement["id"]
 
 
 @pytest.mark.asyncio
@@ -755,6 +767,68 @@ async def test_independent_same_slug_candidates_in_different_repos_survive_each_
         await reg.approve(cand_b["id"])
 
         assert skill_a.is_dir()  # untouched by repo b's independent approval
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_repo_scoped_approval_never_supersedes_an_unrelated_repos_global_candidate(
+    tmp_path,
+):
+    """Snape review (second-round blocker): a global candidate proposed from
+    repo A must survive a LATER repo-scoped approval for the same slug from
+    a DIFFERENT repo B — repo B's approval may shadow the global skill for
+    repo B's OWN view, but it must never delete/supersede the global
+    candidate itself, or repo C (never touched by either approval) would
+    silently lose a skill it never asked to change."""
+    repo_a = tmp_path / "repo-a"
+    repo_b = tmp_path / "repo-b"
+    repo_c = tmp_path / "repo-c"
+    for repo in (repo_a, repo_b, repo_c):
+        repo.mkdir()
+        _git(repo, "init", "-q")
+        _git(repo, "config", "user.name", "Test")
+        _git(repo, "config", "user.email", "test@example.com")
+        (repo / "README.md").write_text("base\n")
+        _git(repo, "add", "README.md")
+        _git(repo, "commit", "-q", "-m", "base")
+
+    db = Database(str(tmp_path / "db.sqlite"))
+    await db.initialize()
+    agent = await db.get_default_agent()
+    session_mgr = SimpleNamespace(
+        sessions={
+            "session-a": SimpleNamespace(agent_id=agent["id"], working_dir=str(repo_a)),
+            "session-b": SimpleNamespace(agent_id=agent["id"], working_dir=str(repo_b)),
+        }
+    )
+    reg = SkillRegistry()
+    reg.bind(db=db, session_mgr=session_mgr)
+    try:
+        global_candidate = await reg.propose(
+            session_id="session-a", slug="hermes-pr-flow", title="Global",
+            description=_DESCRIPTION, body_markdown=SKILL_BODY, rationale="global",
+            scope="agent-global",
+        )
+        approved_global = await reg.approve(global_candidate["id"])
+
+        repo_b_candidate = await reg.propose(
+            session_id="session-b", slug="hermes-pr-flow", title="Repo B override",
+            description=_DESCRIPTION, body_markdown=SKILL_BODY, rationale="repo b",
+        )
+        await reg.approve(repo_b_candidate["id"])
+
+        fresh_global = await db.get_skill_candidate(approved_global["id"])
+        assert fresh_global["superseded_at"] is None  # untouched — different repository
+
+        # Repo C never touched either approval — it must still see the
+        # global skill via the ordinary global ∪ repo lookup.
+        dirs_c = await reg.resolve_plugin_dir(agent_id=agent["id"], working_dir=str(repo_c))
+        assert len(dirs_c) == 1
+
+        # Repo B sees its OWN repo-scoped version (shadowing), not deleted.
+        dirs_b = await reg.resolve_plugin_dir(agent_id=agent["id"], working_dir=str(repo_b))
+        assert len(dirs_b) == 2  # both the global dir and repo b's own dir exist
     finally:
         await db.close()
 
@@ -880,6 +954,32 @@ async def test_sync_codex_skills_dir_never_overwrites_a_same_slug_user_file(regi
 
 
 @pytest.mark.asyncio
+async def test_sync_codex_skills_dir_rejects_a_spoofed_marker(registry, tmp_path):
+    """Snape review (second round): presence-only ownership (an empty
+    `.owlery-owned` file) is a predictable filename something else sharing
+    the real credential-owned directory could pre-plant to defeat the
+    check. Ownership must be proven by marker CONTENT (a per-agent secret
+    token kept outside CODEX_HOME), not just presence."""
+    reg, _db, repo, agent_id = registry
+
+    codex_home = tmp_path / "codex-home"
+    spoofed_dir = codex_home / "skills" / "hermes-pr-flow"
+    spoofed_dir.mkdir(parents=True)
+    (spoofed_dir / "SKILL.md").write_text(
+        "---\nname: hermes-pr-flow\ndescription: spoofed\n---\n\nNot really Owlery's.\n"
+    )
+    (spoofed_dir / ".owlery-owned").write_text("")  # presence, but wrong/no token
+
+    candidate = await _propose(reg)
+    await reg.approve(candidate["id"])
+    await reg.sync_codex_skills_dir(
+        agent_id=agent_id, working_dir=str(repo), codex_home=str(codex_home)
+    )
+
+    assert "spoofed" in (spoofed_dir / "SKILL.md").read_text()  # left alone
+
+
+@pytest.mark.asyncio
 async def test_sync_codex_skills_dir_only_removes_owlery_owned_stale_dirs(registry, tmp_path):
     """A corrupted/tampered manifest listing a slug Owlery never actually
     marked as owned must not cause that directory to be deleted on the next
@@ -982,23 +1082,60 @@ async def test_diff_surfaces_invocation_history_for_an_approved_candidate(regist
 
 
 @pytest.mark.asyncio
-async def test_repo_scoped_candidate_wins_attribution_over_a_newer_global_one(registry):
+async def test_repo_scoped_candidate_wins_attribution_over_a_newer_global_one(tmp_path):
     """Snape review: sync_codex_skills_dir has repo-scoped candidates win
     over agent-global on a slug collision (more specific wins) — the
     lookup use_count/invocation attribution relies on
     (get_latest_approved_skill_by_slug) must rank the same way, or a real
     invocation gets attributed to the candidate that ISN'T actually the one
-    loaded, even when the global one happens to be more recently updated."""
-    reg, _db, repo, agent_id = registry
-    repo_candidate = await _propose(reg)  # agent+repo, approved first
-    approved_repo = await reg.approve(repo_candidate["id"])
+    loaded, even when the global one happens to be more recently updated.
 
-    global_candidate = await _propose(reg, scope="agent-global")
-    approved_global = await reg.approve(global_candidate["id"])
-    assert approved_global["updated_at"] >= approved_repo["updated_at"]
+    The global candidate here is proposed from a DIFFERENT repository than
+    the repo-scoped one specifically so approving it does NOT supersede the
+    repo-scoped candidate (supersession only fires within the SAME
+    proposing repository — see test_replacement_with_a_different_scope_
+    removes_the_old_location for that case) — this test is exercising the
+    priority tie-break between two genuinely independently-active
+    candidates, not a replacement."""
+    repo_a = tmp_path / "repo-a"
+    repo_b = tmp_path / "repo-b"
+    for repo in (repo_a, repo_b):
+        repo.mkdir()
+        _git(repo, "init", "-q")
+        _git(repo, "config", "user.name", "Test")
+        _git(repo, "config", "user.email", "test@example.com")
+        (repo / "README.md").write_text("base\n")
+        _git(repo, "add", "README.md")
+        _git(repo, "commit", "-q", "-m", "base")
 
-    repository = await reg.resolve_repository(str(repo))
-    winner = await reg.db.get_latest_approved_skill_by_slug(
-        "hermes-pr-flow", agent_id=agent_id, repository=repository
-    )
-    assert winner["id"] == approved_repo["id"]
+    db = Database(str(tmp_path / "db.sqlite"))
+    await db.initialize()
+    agent = await db.get_default_agent()
+    session_a = SimpleNamespace(agent_id=agent["id"], working_dir=str(repo_a))
+    session_b = SimpleNamespace(agent_id=agent["id"], working_dir=str(repo_b))
+    session_mgr = SimpleNamespace(sessions={"session-a": session_a, "session-b": session_b})
+    reg = SkillRegistry()
+    reg.bind(db=db, session_mgr=session_mgr)
+    try:
+        repo_candidate = await reg.propose(
+            session_id="session-a", slug="hermes-pr-flow", title="Repo-scoped",
+            description=_DESCRIPTION, body_markdown=SKILL_BODY, rationale="repo a",
+        )
+        approved_repo = await reg.approve(repo_candidate["id"])
+
+        global_candidate = await reg.propose(
+            session_id="session-b", slug="hermes-pr-flow", title="Global",
+            description=_DESCRIPTION, body_markdown=SKILL_BODY, rationale="repo b",
+            scope="agent-global",
+        )
+        approved_global = await reg.approve(global_candidate["id"])
+        assert approved_global["updated_at"] >= approved_repo["updated_at"]
+        assert approved_repo["superseded_at"] is None  # different repos: not superseded
+
+        repository_a = await reg.resolve_repository(str(repo_a))
+        winner = await db.get_latest_approved_skill_by_slug(
+            "hermes-pr-flow", agent_id=agent["id"], repository=repository_a
+        )
+        assert winner["id"] == approved_repo["id"]
+    finally:
+        await db.close()

@@ -44,6 +44,7 @@ function candidate(overrides: Partial<SkillCandidate> = {}): SkillCandidate {
       issues: [],
     },
     materialized_backends: null,
+    superseded_at: null,
     created_at: "2026-09-01T00:00:00Z",
     updated_at: "2026-09-01T00:00:00Z",
     ...overrides,
@@ -263,6 +264,26 @@ describe("SkillCandidatesPage", () => {
     await screen.findByRole("heading", { name: "Hermes PR flow" });
     expect(screen.getByText("claude")).toBeTruthy();
     expect(screen.getByText("codex")).toBeTruthy();
+  });
+
+  it("shows a superseded notice for an approved candidate a later approval relocated", async () => {
+    store.pending = [];
+    store.approved = [
+      candidate({
+        id: "cand-2", status: "approved",
+        superseded_at: "2026-09-02T00:00:00Z",
+      }),
+    ];
+    await act(async () => {
+      render(<SkillCandidatesPage />);
+    });
+    await screen.findByText("No pending candidates.");
+    const approvedTab = screen.getByRole("tab", { name: "approved" });
+    await act(async () => {
+      fireEvent.click(approvedTab);
+    });
+    await screen.findByRole("heading", { name: "Hermes PR flow" });
+    expect(screen.getByText(/Superseded/)).toBeTruthy();
   });
 
   it("reject is disabled until a note is entered, then POSTs it", async () => {

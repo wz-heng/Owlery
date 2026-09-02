@@ -39,6 +39,11 @@ export interface SkillCandidate {
   bundle_files: Record<string, string> | null;
   lint_results: SkillLintResults | null;
   materialized_backends: string[] | null;
+  // Set when a LATER same-repository approval relocated this row's
+  // materialized copy to a different scope/location — `status` stays
+  // 'approved' forever (historical fact), but this row is no longer the
+  // active landed version (Snape review).
+  superseded_at: string | null;
   created_at: string;
   updated_at: string;
 }

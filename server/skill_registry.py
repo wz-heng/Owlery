@@ -456,22 +456,29 @@ class SkillRegistry:
         final_scope = _validate_scope(scope) if scope else candidate["scope"]
         bundle_files = candidate.get("bundle_files")
 
-        # Supersession cleanup (Snape review): find whatever candidate is
-        # CURRENTLY the active landed view of this slug for this repository
-        # (the exact same (repository OR agent-global) lookup diff()/
-        # record_usage() use, so an independent same-slug candidate approved
-        # for a DIFFERENT repository is structurally excluded — it can never
-        # be `prior` here). If this approval's final location differs from
-        # where `prior` actually lives, remove prior's stale materialized
-        # copy — otherwise a scope change (or a global<->repo relocation)
-        # would leave the OLD location serving a version this approval was
-        # meant to replace, forever.
+        # Supersession (Snape review, two rounds): find whatever candidate
+        # this REPOSITORY currently sees as the active landed view of this
+        # slug (repository OR agent-global — the same lookup diff()/
+        # record_usage() use). Only actually supersede it when `prior` was
+        # ALSO proposed from this exact repository — i.e. it's the same
+        # proposing context choosing a new location for "its" skill, not an
+        # unrelated global candidate some OTHER repository's session
+        # happens to also see via the OR-fallback. Without this repository
+        # check, approving a repo-scoped candidate for repo B would delete
+        # an agent-global skill proposed from repo A — silently breaking it
+        # for repos C/D/... that never touched B's approval at all (Snape's
+        # second-round blocker). A prior that legitimately belongs to this
+        # same repository, once its materialized copy moves to a different
+        # location, is marked `superseded_at` so `get_latest_approved_skill_
+        # by_slug` stops returning a row whose files are already gone —
+        # `status='approved'` alone is a historical fact that must stay
+        # true, but "is this the active version" can change afterward.
         if candidate["proposed_by_agent_id"]:
             prior = await self.db.get_latest_approved_skill_by_slug(
                 candidate["slug"], agent_id=candidate["proposed_by_agent_id"],
                 repository=candidate["repository"],
             )
-            if prior is not None:
+            if prior is not None and prior["repository"] == candidate["repository"]:
                 prior_key = (
                     "_global" if prior["scope"] == "agent-global"
                     else _repo_fingerprint(prior["repository"])
@@ -484,6 +491,9 @@ class SkillRegistry:
                     self._remove_materialized(
                         candidate["proposed_by_agent_id"], prior["repository"],
                         prior["scope"], candidate["slug"],
+                    )
+                    await self.db.mark_skill_candidate_superseded(
+                        prior["id"], superseded_at=_now_iso()
                     )
 
         landed = await self._land(
@@ -675,6 +685,26 @@ class SkillRegistry:
             path.write_text(file_content)
         return skill_dir
 
+    @staticmethod
+    def _agent_codex_sync_token(agent_id: str) -> str:
+        """A per-agent secret Owlery keeps OUTSIDE `$CODEX_HOME` (under its
+        own already-trusted `agents_dir`) and writes into the CONTENT of
+        every `.owlery-owned` marker it creates there. Ownership is proven
+        by content match, not just file presence — a predictable, empty
+        marker filename could otherwise be pre-planted by some other
+        process sharing that same real, credential-owned directory, tricking
+        a future sync into treating a directory it doesn't actually own as
+        safe to delete/overwrite (Snape review)."""
+        token_path = agent_skills_plugin_root(agent_id) / ".codex-sync-token"
+        if token_path.is_file():
+            token = token_path.read_text().strip()
+            if token:
+                return token
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        token = uuid.uuid4().hex
+        token_path.write_text(token)
+        return token
+
     async def resolve_plugin_dir(
         self, *, agent_id: str, working_dir: str
     ) -> list[str]:
@@ -725,19 +755,20 @@ class SkillRegistry:
         turns forever after the first sync.
 
         Every directory this method creates gets an `.owlery-owned` marker
-        file, and it will only ever overwrite or delete a slug directory that
-        already carries that marker (Snape review: a bare slug-name manifest
-        is not enough — it protects against removing a DIFFERENT slug the
-        user owns, but not against clobbering a user's own skill that
-        happens to share a slug Owlery also wants to land, since the naive
-        version would `rmtree` + `copytree` over it unconditionally). A
-        sidecar manifest (`.owlery-manifest.json`) is still used to know
-        which slugs to consider for removal on the NEXT sync, but the marker
-        check — not manifest membership — is what actually gates a
-        destructive filesystem op; a corrupted/tampered manifest can at worst
-        cause a stale Owlery-owned dir to survive an extra sync, never cause
-        a non-Owlery dir to be touched. Manifest slugs (and desired slugs)
-        are also filtered through `_SLUG_RE` before ever being joined into a
+        file whose CONTENT is a per-agent secret token kept outside
+        `$CODEX_HOME` (`_agent_codex_sync_token`) — it will only ever
+        overwrite or delete a slug directory whose marker content matches
+        that token (Snape review, two rounds: a bare slug-name manifest only
+        protects a DIFFERENT slug the user owns, and even a presence-only
+        marker is a predictable empty filename something else sharing that
+        real directory could pre-plant to defeat the check). A sidecar
+        manifest (`.owlery-manifest.json`) is still used to know which slugs
+        to consider for removal on the NEXT sync, but the marker check — not
+        manifest membership — is what actually gates a destructive
+        filesystem op; a corrupted/tampered manifest can at worst cause a
+        stale Owlery-owned dir to survive an extra sync, never cause a
+        non-Owlery dir to be touched. Manifest slugs (and desired slugs) are
+        also filtered through `_SLUG_RE` before ever being joined into a
         path, so a malformed manifest entry can't smuggle a `..` segment.
 
         Never raises: a sync failure must not block the turn it would have
@@ -780,8 +811,14 @@ class SkillRegistry:
             if not desired and not previous:
                 return  # nothing to do, and nothing Owlery-managed to clean up
 
+            token = self._agent_codex_sync_token(agent_id)
+
             def _owned(dest: Path) -> bool:
-                return (dest / _OWLERY_OWNED_MARKER).is_file()
+                marker = dest / _OWLERY_OWNED_MARKER
+                try:
+                    return marker.is_file() and marker.read_text().strip() == token
+                except OSError:
+                    return False
 
             target.mkdir(parents=True, exist_ok=True)
             for stale_slug in set(previous) - set(desired):
@@ -804,7 +841,7 @@ class SkillRegistry:
                     continue
                 shutil.rmtree(dest, ignore_errors=True)
                 shutil.copytree(source_dir, dest)
-                (dest / _OWLERY_OWNED_MARKER).write_text("")
+                (dest / _OWLERY_OWNED_MARKER).write_text(token)
                 managed.append(slug)
             manifest_path.write_text(json.dumps({"slugs": sorted(managed)}))
         except Exception:
