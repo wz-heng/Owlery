@@ -773,7 +773,7 @@ CREATE TABLE IF NOT EXISTS skill_invocations (
     candidate_id TEXT NOT NULL REFERENCES skill_candidates(id) ON DELETE CASCADE,
     agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
     repository TEXT,
-    session_id TEXT,
+    session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
     task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
     run_id TEXT REFERENCES task_runs(id) ON DELETE SET NULL,
     backend TEXT,                       -- 'claude-code' | 'codex', best-effort
@@ -1359,6 +1359,63 @@ class Database:
             await self._conn.execute("PRAGMA user_version = 3")
 
         await self._migrate_task_verdict_and_cancelled_status()
+        await self._migrate_skill_invocations_session_fk()
+
+    async def _migrate_skill_invocations_session_fk(self) -> None:
+        """``skill_invocations.session_id`` was a bare TEXT column with no FK
+        to ``sessions`` (Snape's T-B review, experience-consolidation-v2.md
+        §3⑤) — a deleted session left its invocation rows pointing at a dead
+        id forever, instead of the ``ON DELETE SET NULL`` behavior every
+        other "which session did this" column in this schema gets. SQLite
+        cannot ALTER a column to add a REFERENCES clause, so a DB created
+        before this migration needs the table rebuilt; new DBs get the FK
+        straight from ``_SCHEMA``.
+
+        Guarded on the live table's own DDL text so it runs exactly once,
+        and a no-op when the table is absent. Nothing references
+        ``skill_invocations`` by foreign key, so the drop-and-rename is safe
+        with foreign_keys ON, as with ``_migrate_delivery_op_kinds``. Every
+        other column's FK (candidate_id/agent_id/task_id/run_id) already
+        existed pre-migration and is copied unchanged; only ``session_id``
+        needs reconciling — a value naming a session that no longer exists
+        would violate the new FK on INSERT, so it is nulled during the copy,
+        which is exactly the ``ON DELETE SET NULL`` outcome that session's
+        own deletion should already have produced."""
+        cur = await self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='skill_invocations'"
+        )
+        row = await cur.fetchone()
+        if row is None or "REFERENCES sessions" in (row[0] or ""):
+            return
+        await self._conn.execute("DROP TABLE IF EXISTS skill_invocations__new")
+        await self._conn.executescript(
+            """
+            CREATE TABLE skill_invocations__new (
+                id TEXT PRIMARY KEY,
+                candidate_id TEXT NOT NULL REFERENCES skill_candidates(id) ON DELETE CASCADE,
+                agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+                repository TEXT,
+                session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+                task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+                run_id TEXT REFERENCES task_runs(id) ON DELETE SET NULL,
+                backend TEXT,
+                used_at TEXT NOT NULL
+            );
+            INSERT INTO skill_invocations__new
+                (id, candidate_id, agent_id, repository, session_id, task_id,
+                 run_id, backend, used_at)
+                SELECT id, candidate_id, agent_id, repository,
+                       CASE WHEN session_id IS NOT NULL
+                                AND session_id NOT IN (SELECT id FROM sessions)
+                            THEN NULL ELSE session_id END,
+                       task_id, run_id, backend, used_at
+                FROM skill_invocations;
+            DROP TABLE skill_invocations;
+            ALTER TABLE skill_invocations__new RENAME TO skill_invocations;
+            CREATE INDEX IF NOT EXISTS skill_invocations_candidate
+              ON skill_invocations(candidate_id, used_at DESC);
+            """
+        )
 
     async def _backfill_builtin_mcp_servers(self, names: tuple[str, ...]) -> None:
         cursor = await self._conn.execute("SELECT id, mcp_servers FROM agents")
@@ -3793,6 +3850,7 @@ class Database:
         *,
         agent_id: str | None = None,
         repository: str | None = None,
+        scope: str | None = None,
     ) -> dict[str, Any] | None:
         """The current landed skill for `slug`, if any — the row use_count/
         last_used tracking accrues on (there is no separate skills table).
@@ -3818,11 +3876,27 @@ class Database:
         `ORDER BY updated_at` could attribute a real invocation to the
         candidate that ISN'T actually the one loaded/discovered).
 
+        `scope`, when given, replaces that (repository OR agent-global)
+        heuristic with an EXACT scope match and no priority tie-break
+        (T-B review round 2: namespace→scope misattribution). A real `Skill`
+        tool_use's plugin namespace already encodes exactly which one was
+        loaded — `_global` for `agent-global`, a specific repository's
+        fingerprint for `agent+repo` — so a caller that has parsed that
+        namespace knows the true scope outright and must not fall through
+        to the ambiguous heuristic, which could resolve to a DIFFERENT
+        same-slug candidate (e.g. a real `agent-global` invocation getting
+        attributed to an `agent+repo` candidate that merely wins the
+        heuristic's repo-scoped-first tie-break). `scope='agent+repo'`
+        still requires `repository`; without one, no candidate can be
+        identified and this returns `None` rather than guessing.
+
         Excludes superseded rows (`superseded_at IS NOT NULL`, Snape review)
         — a row a later same-repository approval relocated is no longer the
         active landed version, even though `status='approved'` stays true
         forever as the historical fact that it once was."""
         await self._ensure_connected()
+        if scope == "agent+repo" and repository is None:
+            return None
         query = (
             f"SELECT {self._SKILL_CANDIDATE_COLS} FROM skill_candidates "
             "WHERE slug = ? AND status = 'approved' AND superseded_at IS NULL"
@@ -3832,7 +3906,13 @@ class Database:
             query += " AND proposed_by_agent_id = ?"
             params.append(agent_id)
         order_by = "updated_at DESC"
-        if repository is not None:
+        if scope is not None:
+            query += " AND scope = ?"
+            params.append(scope)
+            if scope == "agent+repo":
+                query += " AND repository = ?"
+                params.append(repository)
+        elif repository is not None:
             query += " AND (repository = ? OR scope = 'agent-global')"
             params.append(repository)
             # An 'agent-global' row still has SOME `repository` value stored

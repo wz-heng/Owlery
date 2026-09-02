@@ -1184,3 +1184,114 @@ async def test_repo_scoped_candidate_wins_attribution_over_a_newer_global_one(tm
         assert winner["id"] == approved_repo["id"]
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_record_usage_with_an_explicit_scope_overrides_the_repo_wins_heuristic(
+    tmp_path,
+):
+    """T-B review round 2 (blocker): a real `Skill` tool_use's plugin
+    namespace names an EXACT scope ('_global' vs a specific repository's
+    fingerprint) — session_manager.py derives that and passes it through as
+    `scope`. Without it, `record_usage`/`get_latest_approved_skill_by_slug`
+    fall back to the ambiguous (repository OR agent-global) heuristic tested
+    above, which always ranks the repo-scoped candidate first on a
+    collision — so a real `agent-global` invocation would get its
+    use_count/invocation misattributed to the repo-scoped candidate instead,
+    even though the repo-scoped one was never the one actually loaded.
+    Passing `scope='agent-global'` explicitly must attribute correctly
+    despite that same collision.
+
+    The two candidates are proposed from DIFFERENT repositories — same as
+    test_repo_scoped_candidate_wins_attribution_over_a_newer_global_one
+    above — specifically so approving the global one does NOT supersede the
+    repo-scoped one (supersession only fires within the SAME proposing
+    repository); this test exercises the attribution tie-break between two
+    genuinely independently-active candidates, not a replacement."""
+    repo_a = tmp_path / "repo-a"
+    repo_b = tmp_path / "repo-b"
+    for repo in (repo_a, repo_b):
+        repo.mkdir()
+        _git(repo, "init", "-q")
+        _git(repo, "config", "user.name", "Test")
+        _git(repo, "config", "user.email", "test@example.com")
+        (repo / "README.md").write_text("base\n")
+        _git(repo, "add", "README.md")
+        _git(repo, "commit", "-q", "-m", "base")
+
+    db = Database(str(tmp_path / "db.sqlite"))
+    await db.initialize()
+    agent = await db.get_default_agent()
+    session_mgr = SimpleNamespace(
+        sessions={
+            "session-a": SimpleNamespace(agent_id=agent["id"], working_dir=str(repo_a)),
+            "session-b": SimpleNamespace(agent_id=agent["id"], working_dir=str(repo_b)),
+        }
+    )
+    # A real `sessions` row too — record_usage's invocation log now carries a
+    # real FK to it (T-B review round 2 §should), so a session_id with no
+    # backing row would fail the INSERT.
+    await db.save_session(
+        "session-a", "Test", str(repo_a), "2026-01-01T00:00:00+00:00",
+        agent_id=agent["id"],
+    )
+    reg = SkillRegistry()
+    reg.bind(db=db, session_mgr=session_mgr)
+    try:
+        repo_candidate = await reg.propose(
+            session_id="session-a", slug="hermes-pr-flow", title="Repo-scoped",
+            description=_DESCRIPTION, body_markdown=SKILL_BODY, rationale="repo",
+        )
+        approved_repo = await reg.approve(repo_candidate["id"])
+
+        global_candidate = await reg.propose(
+            session_id="session-b", slug="hermes-pr-flow", title="Global",
+            description=_DESCRIPTION, body_markdown=SKILL_BODY, rationale="global",
+            scope="agent-global",
+        )
+        approved_global = await reg.approve(global_candidate["id"])
+        # Different repositories: not a replacement — both stay independently
+        # active.
+        assert (await db.get_skill_candidate(approved_repo["id"]))["superseded_at"] is None
+
+        repository_a = await reg.resolve_repository(str(repo_a))
+
+        # Without a scope, the ambiguous heuristic ranks the repo-scoped
+        # candidate first (matching the collision test above) — confirming
+        # this fixture really does reproduce the collision this test guards
+        # against, not something the fix would trivially pass anyway.
+        ambiguous = await db.get_latest_approved_skill_by_slug(
+            "hermes-pr-flow", agent_id=agent["id"], repository=repository_a
+        )
+        assert ambiguous["id"] == approved_repo["id"]
+
+        await reg.record_usage(
+            "hermes-pr-flow", agent_id=agent["id"], repository=repository_a,
+            scope="agent-global", session_id="session-a",
+        )
+        fresh_global = await db.get_skill_candidate(approved_global["id"])
+        fresh_repo = await db.get_skill_candidate(approved_repo["id"])
+        assert fresh_global["use_count"] == 1
+        assert fresh_repo["use_count"] == 0
+
+        invocations = await db.list_skill_invocations(approved_global["id"])
+        assert len(invocations) == 1
+        assert await db.list_skill_invocations(approved_repo["id"]) == []
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_get_latest_approved_skill_by_slug_agent_repo_scope_requires_repository():
+    """`scope='agent+repo'` with no `repository` cannot identify a candidate
+    — must return `None` rather than guessing (e.g. by silently matching
+    every repository's row)."""
+    db = Database(":memory:")
+    await db.initialize()
+    try:
+        result = await db.get_latest_approved_skill_by_slug(
+            "hermes-pr-flow", scope="agent+repo"
+        )
+        assert result is None
+    finally:
+        await db.close()

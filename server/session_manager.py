@@ -2709,6 +2709,7 @@ class SessionManager:
                         if event.tool_name == "Skill" and self._skill_registry is not None:
                             tool_input = event.tool_input or {}
                             slug = None
+                            usage_scope: str | None = None
                             for key in ("skill", "name", "skill_name", "command"):
                                 value = tool_input.get(key)
                                 if not isinstance(value, str) or not value:
@@ -2731,13 +2732,35 @@ class SessionManager:
                                 # every namespace unconditionally would
                                 # misattribute that use to it (Snape
                                 # review). A bare value with no ':' (the
-                                # fake-CLI/legacy shape) is trusted as-is.
+                                # fake-CLI/legacy shape) is trusted as-is,
+                                # with no scope info to extract from it.
                                 if ":" in value:
                                     namespace, _, bare = value.partition(":")
-                                    if namespace.startswith(
-                                        skill_registry_module.OWLERY_PLUGIN_NAME_PREFIX
-                                    ):
+                                    prefix = skill_registry_module.OWLERY_PLUGIN_NAME_PREFIX
+                                    if namespace.startswith(prefix):
                                         slug = bare
+                                        # The plugin name IS
+                                        # f"{prefix}{plugin_dir.name}"
+                                        # (_materialize_plugin) — plugin_dir.name
+                                        # is either the literal "_global" (an
+                                        # `agent-global` --plugin-dir) or a
+                                        # specific repository's fingerprint (an
+                                        # `agent+repo` one). This namespace is
+                                        # thus an EXACT record of which scope
+                                        # was actually loaded for this turn — T-B
+                                        # review round 2 (blocker): discarding it
+                                        # and falling back to record_usage's
+                                        # (repository OR agent-global) heuristic
+                                        # let a real `owlery-skills-_global:X`
+                                        # invocation get misattributed to a
+                                        # same-slug `agent+repo` candidate that
+                                        # merely wins that heuristic's
+                                        # repo-scoped-first tie-break.
+                                        location_key = namespace[len(prefix):]
+                                        usage_scope = (
+                                            "agent-global" if location_key == "_global"
+                                            else "agent+repo"
+                                        )
                                     # else: a non-Owlery plugin's skill —
                                     # never attribute usage to an Owlery
                                     # candidate that merely shares its bare
@@ -2746,14 +2769,15 @@ class SessionManager:
                                     slug = value
                                 break
                             if slug:
-                                # Scope by (agent, repository) — the exact
-                                # identity a `--plugin-dir` was built from
-                                # (skill_registry.resolve_plugin_dir) — so
-                                # use_count attributes to the candidate this
-                                # session actually has loaded, not whichever
-                                # same-slug candidate from a different agent
-                                # or repository happened to be approved most
-                                # recently (Snape review point 2).
+                                # Scope by (agent, repository[, scope]) — the
+                                # exact identity a `--plugin-dir` was built
+                                # from (skill_registry.resolve_plugin_dir) —
+                                # so use_count attributes to the candidate
+                                # this session actually has loaded, not
+                                # whichever same-slug candidate from a
+                                # different agent or repository happened to
+                                # be approved most recently (Snape review
+                                # point 2).
                                 usage_repository: str | None = None
                                 try:
                                     usage_repository = await self._skill_registry.resolve_repository(
@@ -2765,6 +2789,7 @@ class SessionManager:
                                     slug,
                                     agent_id=session.agent_id,
                                     repository=usage_repository,
+                                    scope=usage_scope,
                                     session_id=session.id,
                                     task_id=session.task_id,
                                     run_id=session.task_run_id,

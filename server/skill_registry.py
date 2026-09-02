@@ -574,6 +574,7 @@ class SkillRegistry:
         *,
         agent_id: str | None = None,
         repository: str | None = None,
+        scope: str | None = None,
         session_id: str | None = None,
         task_id: str | None = None,
         run_id: str | None = None,
@@ -588,15 +589,21 @@ class SkillRegistry:
         without them, two independently-landed same-slug skills (different
         repos, or different agents) collide and use_count gets attributed to
         whichever was approved most recently instead of the one that was
-        really invoked. `session_id`/`task_id`/`run_id`/`backend` are purely
-        additive — the invocation log they feed
-        (experience-consolidation-v2.md §3⑤) is a foreign key and a display
-        list only, never aggregated into a rate or threshold (§4 "不做")."""
+        really invoked. `scope`, when the caller already knows it (T-B
+        review round 2: namespace→scope misattribution), pins the lookup to
+        an exact scope match instead of `get_latest_approved_skill_by_slug`'s
+        (repository OR agent-global) heuristic — a real `agent-global`
+        invocation must never fall through to that heuristic and collide
+        with an `agent+repo` candidate at the same slug for the same
+        agent+repository. `session_id`/`task_id`/`run_id`/`backend` are
+        purely additive — the invocation log they feed (experience-
+        consolidation-v2.md §3⑤) is a foreign key and a display list only,
+        never aggregated into a rate or threshold (§4 "不做")."""
         if self.db is None:
             return
         try:
             candidate = await self.db.get_latest_approved_skill_by_slug(
-                slug, agent_id=agent_id, repository=repository
+                slug, agent_id=agent_id, repository=repository, scope=scope
             )
             if candidate is None:
                 return
