@@ -32,6 +32,7 @@ from .harness import (
     get_harness,
 )
 from . import fork_helpers
+from . import skill_registry as skill_registry_module
 from .budgets import (
     BudgetExceededError,
     BudgetStatus,
@@ -2710,25 +2711,40 @@ class SessionManager:
                             slug = None
                             for key in ("skill", "name", "skill_name", "command"):
                                 value = tool_input.get(key)
-                                if isinstance(value, str) and value:
-                                    # Confirmed against a real spawn
-                                    # (2026-09-02, experience-consolidation-
-                                    # v2.md §5 touchstone C follow-up): a
-                                    # plugin-provided Skill is ALWAYS
-                                    # namespaced "<plugin-name>:<slug>" —
-                                    # unconditionally, even with a single
-                                    # `--plugin-dir` and no collision, not
-                                    # only when two plugins share a slug.
-                                    # Owlery's own plugin names
-                                    # (`owlery-skills-<...>`,
-                                    # _materialize_plugin) never contain
-                                    # ':', so the trailing segment after the
-                                    # last ':' reliably recovers the bare
-                                    # slug the DB stores, whether or not
-                                    # this particular value happens to
-                                    # carry a namespace prefix.
-                                    slug = value.rsplit(":", 1)[-1]
-                                    break
+                                if not isinstance(value, str) or not value:
+                                    continue
+                                # Confirmed against a real spawn (2026-09-02,
+                                # experience-consolidation-v2.md §5
+                                # touchstone C follow-up): a plugin-provided
+                                # Skill is ALWAYS namespaced
+                                # "<plugin-name>:<slug>" — unconditionally,
+                                # even with a single `--plugin-dir` and no
+                                # collision, not only when two plugins share
+                                # a slug. Only trust that namespace when it's
+                                # OWLERY'S OWN plugin prefix
+                                # (skill_registry.OWLERY_PLUGIN_NAME_PREFIX,
+                                # set by _materialize_plugin) — an unrelated
+                                # user-installed plugin could report
+                                # "some-plugin:hermes-pr-flow" for a
+                                # same-named skill that has nothing to do
+                                # with an Owlery candidate, and stripping
+                                # every namespace unconditionally would
+                                # misattribute that use to it (Snape
+                                # review). A bare value with no ':' (the
+                                # fake-CLI/legacy shape) is trusted as-is.
+                                if ":" in value:
+                                    namespace, _, bare = value.partition(":")
+                                    if namespace.startswith(
+                                        skill_registry_module.OWLERY_PLUGIN_NAME_PREFIX
+                                    ):
+                                        slug = bare
+                                    # else: a non-Owlery plugin's skill —
+                                    # never attribute usage to an Owlery
+                                    # candidate that merely shares its bare
+                                    # slug.
+                                else:
+                                    slug = value
+                                break
                             if slug:
                                 # Scope by (agent, repository) — the exact
                                 # identity a `--plugin-dir` was built from

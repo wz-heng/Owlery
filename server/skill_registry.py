@@ -78,6 +78,15 @@ _BUNDLE_REF_RE = re.compile(
 
 _RESERVED_BUNDLE_PATH = "SKILL.md"
 
+# Every Owlery-materialized Claude plugin is named with this prefix
+# (_materialize_plugin) — a real Skill tool_use reports
+# "<plugin-name>:<slug>" (confirmed against a real spawn, 2026-09-02), and
+# session_manager.py's use_count extraction checks this prefix before
+# trusting the namespace belongs to Owlery, so an unrelated user-installed
+# plugin's same-named skill can never be misattributed to an Owlery
+# candidate (Snape review).
+OWLERY_PLUGIN_NAME_PREFIX = "owlery-skills-"
+
 # Written into every Codex-canonical skill dir sync_codex_skills_dir lands —
 # the ownership check that gates a destructive rmtree/overwrite there (never
 # manifest membership alone; see that method's docstring).
@@ -629,7 +638,7 @@ class SkillRegistry:
             manifest.write_text(
                 json.dumps(
                     {
-                        "name": f"owlery-skills-{plugin_dir.name}",
+                        "name": f"{OWLERY_PLUGIN_NAME_PREFIX}{plugin_dir.name}",
                         "description": (
                             "Owlery-approved skill candidates for this agent, "
                             "landed via the human review queue."

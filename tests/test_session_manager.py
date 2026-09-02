@@ -1440,6 +1440,45 @@ async def test_run_backend_extracts_the_bare_slug_from_a_namespaced_skill_value(
 
 
 @pytest.mark.asyncio
+async def test_run_backend_never_attributes_a_non_owlery_plugins_skill(manager):
+    """Snape review: stripping every namespace unconditionally would let an
+    unrelated, user-installed plugin's same-named skill (e.g.
+    "some-plugin:hermes-pr-flow") get attributed to an Owlery-approved
+    candidate that merely shares the bare slug. Only a namespace starting
+    with Owlery's own plugin prefix is trusted."""
+    from unittest.mock import AsyncMock
+
+    from server.harness import HarnessEvent
+
+    session = await _new(manager, "InvokesForeignSkill")
+    registry = AsyncMock()
+    registry.resolve_repository.return_value = "/resolved/repo"
+    manager.set_skill_registry(registry)
+
+    class SkillBackend:
+        async def start(self, prompt, working_dir, resume_id=None, credential=None):
+            pass
+
+        def stream(self):
+            async def _gen():
+                yield HarnessEvent(
+                    type="tool_use", tool_name="Skill",
+                    tool_input={"skill": "some-other-plugin:hermes-pr-flow"},
+                    tool_use_id="t1",
+                )
+                yield HarnessEvent(type="result", session_id="sid", num_turns=1)
+            return _gen()
+
+        async def stop(self):
+            pass
+
+    manager._make_run = lambda s, agent=None, connectors=None, **_kw: SkillBackend()  # type: ignore[method-assign,assignment]
+
+    _ = [m async for m in manager._run_backend(session, "go")]
+    registry.record_usage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_run_backend_syncs_codex_skills_for_a_codex_session_with_a_credential(
     manager,
 ):
