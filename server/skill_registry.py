@@ -456,7 +456,7 @@ class SkillRegistry:
         final_scope = _validate_scope(scope) if scope else candidate["scope"]
         bundle_files = candidate.get("bundle_files")
 
-        # Supersession (Snape review, two rounds): find whatever candidate
+        # Supersession (Snape review, three rounds): find whatever candidate
         # this REPOSITORY currently sees as the active landed view of this
         # slug (repository OR agent-global — the same lookup diff()/
         # record_usage() use). Only actually supersede it when `prior` was
@@ -466,13 +466,18 @@ class SkillRegistry:
         # happens to also see via the OR-fallback. Without this repository
         # check, approving a repo-scoped candidate for repo B would delete
         # an agent-global skill proposed from repo A — silently breaking it
-        # for repos C/D/... that never touched B's approval at all (Snape's
-        # second-round blocker). A prior that legitimately belongs to this
-        # same repository, once its materialized copy moves to a different
-        # location, is marked `superseded_at` so `get_latest_approved_skill_
-        # by_slug` stops returning a row whose files are already gone —
-        # `status='approved'` alone is a historical fact that must stay
-        # true, but "is this the active version" can change afterward.
+        # for repos C/D/... that never touched B's approval at all.
+        #
+        # This lookup is READ-ONLY — it only decides WHETHER a supersession
+        # is needed. Acting on it (removing prior's materialized copy,
+        # marking its row superseded) is deferred until after `_land()` and
+        # both materialize calls below have all succeeded: those are the
+        # failure-prone steps (a `_land()` no-op — nothing to commit — is a
+        # real, reachable path), and if any of them raises, the prior
+        # candidate's active skill must still be fully intact and its DB row
+        # still active, so a failed `approve()` can simply be retried
+        # without having already torn down the thing it was replacing.
+        prior_to_supersede: dict[str, Any] | None = None
         if candidate["proposed_by_agent_id"]:
             prior = await self.db.get_latest_approved_skill_by_slug(
                 candidate["slug"], agent_id=candidate["proposed_by_agent_id"],
@@ -488,13 +493,7 @@ class SkillRegistry:
                     else _repo_fingerprint(candidate["repository"])
                 )
                 if prior_key != new_key:
-                    self._remove_materialized(
-                        candidate["proposed_by_agent_id"], prior["repository"],
-                        prior["scope"], candidate["slug"],
-                    )
-                    await self.db.mark_skill_candidate_superseded(
-                        prior["id"], superseded_at=_now_iso()
-                    )
+                    prior_to_supersede = prior
 
         landed = await self._land(
             candidate["repository"], candidate["slug"], candidate["body_markdown"],
@@ -520,6 +519,16 @@ class SkillRegistry:
                 bundle_files=bundle_files,
             )
             materialized_backends.append("codex")
+
+        if prior_to_supersede is not None:
+            self._remove_materialized(
+                candidate["proposed_by_agent_id"], prior_to_supersede["repository"],
+                prior_to_supersede["scope"], candidate["slug"],
+            )
+            await self.db.mark_skill_candidate_superseded(
+                prior_to_supersede["id"], superseded_at=_now_iso()
+            )
+
         result = await self.db.review_skill_candidate(
             candidate_id,
             status="approved",

@@ -721,6 +721,51 @@ async def test_replacement_with_a_different_scope_removes_the_old_location(regis
 
 
 @pytest.mark.asyncio
+async def test_a_failed_land_leaves_the_prior_active_skill_untouched(registry, monkeypatch):
+    """Snape review (round 3): supersession must not tear down the OLD
+    active skill until the NEW candidate has actually landed — otherwise a
+    `_land()` failure (e.g. the real no-op path: nothing changed on disk)
+    leaves NEITHER version active. The prior's materialized copy and its
+    DB row's active status must survive a failed approve() untouched, so
+    the operator can simply retry."""
+    from server.skill_registry import agent_codex_skills_dir, agent_skills_plugin_dir
+
+    reg, db, repo, agent_id = registry
+    first = await _propose(reg)  # agent+repo (default)
+    approved_first = await reg.approve(first["id"])
+    repository = await reg.resolve_repository(str(repo))
+    repo_plugin_skill = (
+        agent_skills_plugin_dir(agent_id, repository) / "skills" / "hermes-pr-flow"
+    )
+    repo_codex_skill = agent_codex_skills_dir(agent_id, repository) / "hermes-pr-flow"
+    assert repo_plugin_skill.is_dir()
+    assert repo_codex_skill.is_dir()
+
+    replacement = await _propose(reg, scope="agent-global")
+
+    async def _boom(*_args, **_kwargs):
+        raise SkillValidationError("simulated _land failure")
+
+    monkeypatch.setattr(reg, "_land", _boom)
+    with pytest.raises(SkillValidationError, match="simulated _land failure"):
+        await reg.approve(replacement["id"])
+
+    # The prior's materialized copy is still there...
+    assert repo_plugin_skill.is_dir()
+    assert repo_codex_skill.is_dir()
+    # ...and its DB row is still the active one.
+    stale = await db.get_skill_candidate(approved_first["id"])
+    assert stale["superseded_at"] is None
+    winner = await db.get_latest_approved_skill_by_slug(
+        "hermes-pr-flow", agent_id=agent_id, repository=repository
+    )
+    assert winner["id"] == approved_first["id"]
+    # The replacement never got approved either — safe to retry.
+    fresh_replacement = await reg.get_candidate(replacement["id"])
+    assert fresh_replacement["status"] == "pending"
+
+
+@pytest.mark.asyncio
 async def test_independent_same_slug_candidates_in_different_repos_survive_each_others_approval(
     tmp_path,
 ):
