@@ -73,6 +73,55 @@ async def test_clean_first_pass_completes_without_a_retrospective(task_runtime):
 
 
 @pytest.mark.asyncio
+async def test_reusable_outcome_on_a_clean_pass_requires_a_retrospective_first(
+    task_runtime,
+):
+    """experience-consolidation-v2.md §3①: a clean-pass worker MAY
+    voluntarily self-report the run as worth distilling — doing so asks for
+    the same retrospective a non-clean-pass run requires, without touching
+    the trigger condition for non-clean passes at all."""
+    db, repo, sessions, manager, root = task_runtime
+    _board, task = await _ready_task(db, repo, root)
+    _current, run = await _dispatch(manager, sessions, repo, task)
+
+    with pytest.raises(TaskRetrospectiveRequiredError):
+        await manager.complete_worker(
+            task.id, run.id, run.session_id,
+            summary="Done on the first try, and it's worth capturing.",
+            reusable_outcome=True,
+        )
+    # A clean pass with the default False still completes without a gate.
+    assert not await repo.is_non_clean_pass(task.id, run.id)
+
+    await manager.submit_retrospective(
+        task.id, run.id, run.session_id,
+        nothing_note="Actually walked this a hundred times before, nothing new.",
+    )
+    result = await manager.complete_worker(
+        task.id, run.id, run.session_id,
+        summary="Done on the first try, and it's worth capturing.",
+        reusable_outcome=True,
+    )
+    assert result["task"]["status"] == "done"
+    assert result["run"]["metadata"]["reusable_outcome"] is True
+
+
+@pytest.mark.asyncio
+async def test_reusable_outcome_false_never_gates_a_clean_pass(task_runtime):
+    db, repo, sessions, manager, root = task_runtime
+    _board, task = await _ready_task(db, repo, root)
+    _current, run = await _dispatch(manager, sessions, repo, task)
+
+    result = await manager.complete_worker(
+        task.id, run.id, run.session_id, summary="Done on the first try.",
+        reusable_outcome=False,
+    )
+    assert result["task"]["status"] == "done"
+    assert not await repo.has_retrospective(run.id)
+    assert result["run"]["metadata"]["reusable_outcome"] is False
+
+
+@pytest.mark.asyncio
 async def test_a_retry_after_a_block_refuses_to_complete_without_reflecting(task_runtime):
     db, repo, sessions, manager, root = task_runtime
     _board, task = await _ready_task(db, repo, root)
@@ -192,6 +241,57 @@ async def test_reflect_records_skill_candidate_ids(task_runtime):
         task.id, run.id, run.session_id, skill_candidate_ids=["candidate-1"],
     )
     assert result["skill_candidate_ids"] == ["candidate-1"]
+
+
+@pytest.mark.asyncio
+async def test_record_usage_logs_a_real_task_and_run_on_the_invocation(task_runtime):
+    """experience-consolidation-v2.md §3⑤: skill_invocations.task_id/run_id
+    are real foreign keys — this proves record_usage works against a
+    GENUINE dispatched task/run pairing (task_board's own repo/db), not
+    just a shape check with fabricated ids."""
+    from server.skill_registry import SkillRegistry
+
+    db, repo, sessions, manager, root = task_runtime
+    _board, task = await _ready_task(db, repo, root)
+    _current, run = await _dispatch(manager, sessions, repo, task)
+
+    reg = SkillRegistry()
+    reg.bind(db=db, session_mgr=sessions)
+    candidate = await db.create_skill_candidate(
+        candidate_id="cand-real-fk",
+        slug="real-fk-flow",
+        title="Real FK flow",
+        description="d",
+        body_markdown="---\nname: real-fk-flow\ndescription: d\n---\nBody.\n",
+        repository=str(root),
+        rationale="r",
+        proposed_by_agent_id=run.agent_id,
+        proposed_by_session_id=run.session_id,
+        task_id=None,
+        run_id=None,
+        scope="agent+repo",
+        bundle_files=None,
+        lint_results=None,
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    await db.review_skill_candidate(
+        candidate["id"], status="approved", review_note=None,
+        reviewed_at="2026-01-01T00:00:00+00:00",
+    )
+
+    await reg.record_usage(
+        "real-fk-flow",
+        agent_id=run.agent_id,
+        session_id=run.session_id,
+        task_id=task.id,
+        run_id=run.id,
+        backend="claude-code",
+    )
+
+    invocations = await db.list_skill_invocations(candidate["id"])
+    assert len(invocations) == 1
+    assert invocations[0]["task_id"] == task.id
+    assert invocations[0]["run_id"] == run.id
 
 
 @pytest.mark.asyncio

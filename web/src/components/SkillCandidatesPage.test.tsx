@@ -1,8 +1,10 @@
 /**
  * Renderer tests for SkillCandidatesPage — the human review queue for
- * experience consolidation (experience-consolidation.md §3.4/§5). Covers
- * the pending -> diff -> approve/reject shape: a pending candidate is
- * listed, its diff loads, approve/reject POST and refresh the list.
+ * experience consolidation (experience-consolidation.md §3.4/§5,
+ * experience-consolidation-v2.md §3②). Covers the pending -> diff ->
+ * approve/reject shape and the v2 evidence chain: task/run/session links,
+ * lint results, a per-file diff over the bundle, invocation history, and
+ * the reviewer's scope override on approve.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -10,7 +12,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 
 import { SkillCandidatesPage } from "./SkillCandidatesPage";
 import { useSessionStore } from "../stores/sessionStore";
-import type { SkillCandidate } from "../api/skills";
+import type { SkillCandidate, SkillCandidateDetail } from "../api/skills";
 
 function candidate(overrides: Partial<SkillCandidate> = {}): SkillCandidate {
   return {
@@ -33,9 +35,33 @@ function candidate(overrides: Partial<SkillCandidate> = {}): SkillCandidate {
     landed_commit: null,
     use_count: 0,
     last_used_at: null,
+    scope: "agent+repo",
+    bundle_files: null,
+    lint_results: {
+      frontmatter_valid: true,
+      slug_conflict: false,
+      bundle_refs_valid: true,
+      issues: [],
+    },
+    materialized_backends: null,
+    superseded_at: null,
     created_at: "2026-09-01T00:00:00Z",
     updated_at: "2026-09-01T00:00:00Z",
     ...overrides,
+  };
+}
+
+function detailFor(c: SkillCandidate): SkillCandidateDetail {
+  return {
+    candidate: c,
+    diff: "+new line\n",
+    file_diffs: { "SKILL.md": "+new line\n" },
+    task: c.task_id ? { id: c.task_id, board_id: "board-1", title: "Ship the thing", status: "done" } : null,
+    run: c.run_id ? { id: c.run_id, task_id: c.task_id ?? "", attempt_no: 1, state: "completed" } : null,
+    session: c.proposed_by_session_id
+      ? { id: c.proposed_by_session_id, backend: "claude-code", archived: false }
+      : null,
+    invocations: [],
   };
 }
 
@@ -61,15 +87,22 @@ beforeEach(() => {
       const all = [...store.pending, ...store.approved, ...store.rejected];
       const found = all.find((c) => c.id === id) ?? candidate({ id });
       return new Response(
-        JSON.stringify({ candidate: found, diff: "+new line\n" }),
+        JSON.stringify(detailFor(found)),
         { status: 200, headers: { "content-type": "application/json" } }
       );
     }
     const approveMatch = u.pathname.match(/^\/api\/skills\/candidates\/([^/]+)\/approve$/);
     if (approveMatch && method === "POST") {
       const id = approveMatch[1];
+      const body = JSON.parse((init?.body as string) ?? "{}");
       store.pending = store.pending.filter((c) => c.id !== id);
-      const approved = candidate({ id, status: "approved", landed_path: ".claude/skills/hermes-pr-flow/SKILL.md" });
+      const approved = candidate({
+        id,
+        status: "approved",
+        landed_path: ".claude/skills/hermes-pr-flow/SKILL.md",
+        scope: body.scope ?? "agent+repo",
+        materialized_backends: ["claude", "codex"],
+      });
       store.approved = [...store.approved, approved];
       return new Response(JSON.stringify(approved), {
         status: 200, headers: { "content-type": "application/json" },
@@ -107,6 +140,97 @@ describe("SkillCandidatesPage", () => {
     expect(screen.getByText(/Walked this once/)).toBeTruthy();
   });
 
+  it("shows the evidence chain: task, run, session, and lint results", async () => {
+    await act(async () => {
+      render(<SkillCandidatesPage />);
+    });
+    await screen.findByRole("heading", { name: "Hermes PR flow" });
+    await screen.findByText(/Ship the thing/);
+    expect(screen.getByText(/attempt 1/)).toBeTruthy();
+    expect(screen.getByText("claude-code")).toBeTruthy();
+    expect(screen.getByText(/frontmatter: valid/)).toBeTruthy();
+    expect(screen.getByText(/slug conflict: no/)).toBeTruthy();
+  });
+
+  it("surfaces lint issues when bundle refs are dangling", async () => {
+    store.pending = [
+      candidate({
+        lint_results: {
+          frontmatter_valid: true,
+          slug_conflict: true,
+          bundle_refs_valid: false,
+          issues: ["body_markdown references 'scripts/run.sh', which is not in bundle_files"],
+        },
+      }),
+    ];
+    await act(async () => {
+      render(<SkillCandidatesPage />);
+    });
+    await screen.findByRole("heading", { name: "Hermes PR flow" });
+    expect(screen.getByText(/slug conflict: yes/)).toBeTruthy();
+    expect(screen.getByText(/not in bundle_files/)).toBeTruthy();
+  });
+
+  it("renders a file tab per bundle file and switches the diff shown", async () => {
+    const withBundle = candidate({
+      bundle_files: { "scripts/run.sh": "#!/bin/sh\necho hi\n" },
+    });
+    store.pending = [withBundle];
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      const u = new URL(url);
+      if (u.pathname === "/api/skills/candidates" && method === "GET") {
+        return new Response(JSON.stringify([withBundle]), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }
+      if (u.pathname === `/api/skills/candidates/${withBundle.id}` && method === "GET") {
+        const detail = detailFor(withBundle);
+        detail.file_diffs = {
+          "SKILL.md": "+skill diff\n",
+          "scripts/run.sh": "+script diff\n",
+        };
+        detail.diff = detail.file_diffs["SKILL.md"];
+        return new Response(JSON.stringify(detail), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    await act(async () => {
+      render(<SkillCandidatesPage />);
+    });
+    await screen.findByRole("heading", { name: "Hermes PR flow" });
+    await waitFor(() => expect(screen.getByText(/skill diff/)).toBeTruthy());
+
+    const fileTab = screen.getByRole("tab", { name: "scripts/run.sh" });
+    await act(async () => {
+      fireEvent.click(fileTab);
+    });
+    await waitFor(() => expect(screen.getByText(/script diff/)).toBeTruthy());
+  });
+
+  it("approving posts the selected scope override", async () => {
+    await act(async () => {
+      render(<SkillCandidatesPage />);
+    });
+    await screen.findByRole("heading", { name: "Hermes PR flow" });
+    const scopeSelect = screen.getByLabelText("Land as");
+    fireEvent.change(scopeSelect, { target: { value: "agent-global" } });
+
+    const approveBtn = await screen.findByRole("button", { name: "Approve" });
+    await act(async () => {
+      fireEvent.click(approveBtn);
+    });
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([u]) => String(u).endsWith("/approve"));
+      expect(call).toBeTruthy();
+      const body = JSON.parse((call![1] as RequestInit).body as string);
+      expect(body.scope).toBe("agent-global");
+    });
+  });
+
   it("approving a pending candidate removes it from the pending list", async () => {
     await act(async () => {
       render(<SkillCandidatesPage />);
@@ -122,6 +246,44 @@ describe("SkillCandidatesPage", () => {
       ).toBe(true)
     );
     await waitFor(() => expect(screen.queryByText("Hermes PR flow")).toBeNull());
+  });
+
+  it("shows materialized backend badges for an approved candidate", async () => {
+    store.pending = [];
+    store.approved = [
+      candidate({ id: "cand-2", status: "approved", materialized_backends: ["claude", "codex"] }),
+    ];
+    await act(async () => {
+      render(<SkillCandidatesPage />);
+    });
+    await screen.findByText("No pending candidates.");
+    const approvedTab = screen.getByRole("tab", { name: "approved" });
+    await act(async () => {
+      fireEvent.click(approvedTab);
+    });
+    await screen.findByRole("heading", { name: "Hermes PR flow" });
+    expect(screen.getByText("claude")).toBeTruthy();
+    expect(screen.getByText("codex")).toBeTruthy();
+  });
+
+  it("shows a superseded notice for an approved candidate a later approval relocated", async () => {
+    store.pending = [];
+    store.approved = [
+      candidate({
+        id: "cand-2", status: "approved",
+        superseded_at: "2026-09-02T00:00:00Z",
+      }),
+    ];
+    await act(async () => {
+      render(<SkillCandidatesPage />);
+    });
+    await screen.findByText("No pending candidates.");
+    const approvedTab = screen.getByRole("tab", { name: "approved" });
+    await act(async () => {
+      fireEvent.click(approvedTab);
+    });
+    await screen.findByRole("heading", { name: "Hermes PR flow" });
+    expect(screen.getByText(/Superseded/)).toBeTruthy();
   });
 
   it("reject is disabled until a note is entered, then POSTs it", async () => {
@@ -159,5 +321,18 @@ describe("SkillCandidatesPage", () => {
       fireEvent.click(approvedTab);
     });
     await screen.findByText(/used 3×/);
+  });
+
+  it("clicking the task link calls onOpenTask", async () => {
+    const onOpenTask = vi.fn();
+    await act(async () => {
+      render(<SkillCandidatesPage onOpenTask={onOpenTask} />);
+    });
+    await screen.findByRole("heading", { name: "Hermes PR flow" });
+    const taskLink = await screen.findByText(/Ship the thing/);
+    await act(async () => {
+      fireEvent.click(taskLink);
+    });
+    expect(onOpenTask).toHaveBeenCalledWith("task-1");
   });
 });

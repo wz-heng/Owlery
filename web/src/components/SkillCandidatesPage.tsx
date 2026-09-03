@@ -4,22 +4,36 @@ import { IconCheck, IconMenu2, IconRefresh, IconX } from "@tabler/icons-react";
 import {
   skillsApi,
   type SkillCandidate,
+  type SkillCandidateDetail,
+  type SkillCandidateScope,
   type SkillCandidateStatus,
 } from "../api/skills";
 import { useSessionStore } from "../stores/sessionStore";
 
 interface SkillCandidatesPageProps {
   onToggleSidebar?: () => void;
+  onOpenSession?: (sessionId: string) => void;
+  onOpenTask?: (taskId: string) => void;
 }
 
 const STATUS_TABS: SkillCandidateStatus[] = ["pending", "approved", "rejected"];
+const SCOPE_LABEL: Record<SkillCandidateScope, string> = {
+  "agent-global": "agent-global",
+  "agent+repo": "agent + repo",
+};
 
-/** Skill candidate review queue (experience-consolidation.md §3.4/§5): the
- * hermes-style pending -> diff -> approve/reject shape. A candidate an agent
- * proposed via the `skills` MCP server's `propose` tool sits here until a
- * human reviews it — nothing lands on disk before that (§4: "no
- * auto-generated skill takes effect"). */
-export function SkillCandidatesPage({ onToggleSidebar }: SkillCandidatesPageProps) {
+/** Skill candidate review queue (experience-consolidation.md §3.4/§5,
+ * experience-consolidation-v2.md §3②). A candidate an agent proposed via the
+ * `skills` MCP server's `propose` tool sits here until a human reviews it —
+ * nothing lands on disk before that (§4: "no auto-generated skill takes
+ * effect"). The detail pane is the full evidence chain: source task/run/
+ * session, static lint, a per-file diff over the whole bundle (not just
+ * SKILL.md), and — for an approved candidate — its invocation history. */
+export function SkillCandidatesPage({
+  onToggleSidebar,
+  onOpenSession,
+  onOpenTask,
+}: SkillCandidatesPageProps) {
   const token = useSessionStore((s) => s.token);
 
   const [statusFilter, setStatusFilter] = useState<SkillCandidateStatus>("pending");
@@ -29,9 +43,11 @@ export function SkillCandidatesPage({ onToggleSidebar }: SkillCandidatesPageProp
   const [refreshTick, setRefreshTick] = useState(0);
 
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [diff, setDiff] = useState<string | null>(null);
+  const [detail, setDetail] = useState<SkillCandidateDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [activeFile, setActiveFile] = useState("SKILL.md");
 
+  const [approveScope, setApproveScope] = useState<SkillCandidateScope>("agent+repo");
   const [rejectNote, setRejectNote] = useState("");
   const [actionError, setActionError] = useState<string | null>(null);
   const [acting, setActing] = useState(false);
@@ -67,18 +83,21 @@ export function SkillCandidatesPage({ onToggleSidebar }: SkillCandidatesPageProp
 
   useEffect(() => {
     if (!token || !selectedId) {
-      setDiff(null);
+      setDetail(null);
       return;
     }
     let cancelled = false;
     setDetailLoading(true);
     skillsApi
       .getCandidate(token, selectedId)
-      .then((detail) => {
-        if (!cancelled) setDiff(detail.diff);
+      .then((d) => {
+        if (cancelled) return;
+        setDetail(d);
+        setActiveFile("SKILL.md");
+        setApproveScope(d.candidate.scope);
       })
       .catch(() => {
-        if (!cancelled) setDiff(null);
+        if (!cancelled) setDetail(null);
       })
       .finally(() => {
         if (!cancelled) setDetailLoading(false);
@@ -95,14 +114,14 @@ export function SkillCandidatesPage({ onToggleSidebar }: SkillCandidatesPageProp
     setActing(true);
     setActionError(null);
     try {
-      await skillsApi.approve(token, selected.id);
+      await skillsApi.approve(token, selected.id, undefined, approveScope);
       refresh();
     } catch {
       setActionError("Failed to approve this candidate.");
     } finally {
       setActing(false);
     }
-  }, [token, selected, refresh]);
+  }, [token, selected, approveScope, refresh]);
 
   const reject = useCallback(async () => {
     if (!token || !selected || !rejectNote.trim()) return;
@@ -118,6 +137,9 @@ export function SkillCandidatesPage({ onToggleSidebar }: SkillCandidatesPageProp
       setActing(false);
     }
   }, [token, selected, rejectNote, refresh]);
+
+  const fileNames = detail ? Object.keys(detail.file_diffs).sort() : [];
+  const activeDiff = detail?.file_diffs[activeFile] ?? detail?.diff ?? "";
 
   return (
     <main className="skill-candidates-page flex h-full min-h-0 flex-1 flex-col overflow-hidden bg-background">
@@ -172,7 +194,7 @@ export function SkillCandidatesPage({ onToggleSidebar }: SkillCandidatesPageProp
       )}
 
       <div className="flex flex-1 min-h-0">
-        <div className="w-72 shrink-0 overflow-y-auto border-r border-ink-300 p-1.5">
+        <div className="skill-candidate-list w-72 shrink-0 overflow-y-auto border-r border-ink-300 p-1.5">
           {candidates.length === 0 && !loading ? (
             <p className="p-3 text-xs text-muted-foreground">No {statusFilter} candidates.</p>
           ) : (
@@ -189,7 +211,9 @@ export function SkillCandidatesPage({ onToggleSidebar }: SkillCandidatesPageProp
                 onClick={() => setSelectedId(candidate.id)}
               >
                 <div className="truncate text-sm font-medium">{candidate.title}</div>
-                <div className="truncate text-xs text-muted-foreground">{candidate.slug}</div>
+                <div className="truncate text-xs text-muted-foreground">
+                  {candidate.slug} · {SCOPE_LABEL[candidate.scope]}
+                </div>
                 {candidate.status === "approved" && (
                   <div className="mt-0.5 text-[11px] text-muted-foreground">
                     used {candidate.use_count}×
@@ -209,9 +233,91 @@ export function SkillCandidatesPage({ onToggleSidebar }: SkillCandidatesPageProp
               <div>
                 <h2 className="font-serif text-lg font-semibold">{selected.title}</h2>
                 <p className="mt-0.5 text-xs text-muted-foreground">
-                  slug: {selected.slug} · repository: {selected.repository}
+                  slug: {selected.slug} · repository: {selected.repository} · scope:{" "}
+                  {SCOPE_LABEL[selected.scope]}
                 </p>
+                {selected.materialized_backends && selected.materialized_backends.length > 0 && (
+                  <div className="mt-1.5 flex gap-1.5">
+                    {selected.materialized_backends.map((backend) => (
+                      <span
+                        key={backend}
+                        className="inline-flex items-center rounded-full border border-ink-300 bg-card px-2 py-0.5 text-[11px] text-muted-foreground"
+                      >
+                        {backend}
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
+
+              <section
+                className="rounded-lg border border-ink-300 bg-card p-3 text-xs"
+                aria-label="Evidence chain"
+              >
+                <h3 className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                  Evidence
+                </h3>
+                <div className="flex flex-wrap gap-x-4 gap-y-1">
+                  <span>
+                    task:{" "}
+                    {detail?.task ? (
+                      <button
+                        type="button"
+                        className="text-primary-700 underline hover:no-underline disabled:cursor-default disabled:text-foreground disabled:no-underline"
+                        onClick={() => onOpenTask?.(detail.task!.id)}
+                        disabled={!onOpenTask}
+                      >
+                        {detail.task.title} ({detail.task.status})
+                      </button>
+                    ) : (
+                      "—"
+                    )}
+                  </span>
+                  <span>
+                    run:{" "}
+                    {detail?.run
+                      ? `attempt ${detail.run.attempt_no} (${detail.run.state})`
+                      : "—"}
+                  </span>
+                  <span>
+                    session:{" "}
+                    {detail?.session ? (
+                      <button
+                        type="button"
+                        className="text-primary-700 underline hover:no-underline disabled:cursor-default disabled:text-foreground disabled:no-underline"
+                        onClick={() => onOpenSession?.(detail.session!.id)}
+                        disabled={!onOpenSession}
+                      >
+                        {detail.session.backend}
+                      </button>
+                    ) : (
+                      "—"
+                    )}
+                  </span>
+                </div>
+                {selected.lint_results && (
+                  <div className="mt-2 border-t border-ink-300 pt-2">
+                    <div className="flex flex-wrap gap-x-4 gap-y-1">
+                      <span>
+                        frontmatter: {selected.lint_results.frontmatter_valid ? "valid" : "invalid"}
+                      </span>
+                      <span>
+                        slug conflict: {selected.lint_results.slug_conflict ? "yes" : "no"}
+                      </span>
+                      <span>
+                        bundle refs: {selected.lint_results.bundle_refs_valid ? "valid" : "invalid"}
+                      </span>
+                    </div>
+                    {selected.lint_results.issues.length > 0 && (
+                      <ul className="mt-1 list-inside list-disc text-amber-700">
+                        {selected.lint_results.issues.map((issue) => (
+                          <li key={issue}>{issue}</li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
+              </section>
 
               <section>
                 <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
@@ -229,22 +335,73 @@ export function SkillCandidatesPage({ onToggleSidebar }: SkillCandidatesPageProp
 
               <section>
                 <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                  Diff
+                  Files
                 </h3>
+                {fileNames.length > 1 && (
+                  <div className="mt-1.5 flex flex-wrap gap-1" role="tablist" aria-label="File tree">
+                    {fileNames.map((name) => (
+                      <button
+                        key={name}
+                        type="button"
+                        role="tab"
+                        aria-selected={activeFile === name}
+                        className={`inline-flex h-7 items-center rounded-md border px-2 text-[11px] font-mono transition-colors ${
+                          activeFile === name
+                            ? "border-primary-700 bg-primary-700 text-white"
+                            : "border-ink-300 bg-card text-muted-foreground hover:bg-ink-100"
+                        }`}
+                        onClick={() => setActiveFile(name)}
+                      >
+                        {name}
+                      </button>
+                    ))}
+                  </div>
+                )}
                 {detailLoading ? (
                   <p className="mt-1 text-xs text-muted-foreground">Loading…</p>
                 ) : (
                   <pre className="mt-1 max-h-96 overflow-auto rounded-lg border border-ink-300 bg-card p-3 text-xs whitespace-pre-wrap">
-                    {diff || "(no diff)"}
+                    {activeDiff || "(no diff)"}
                   </pre>
                 )}
               </section>
 
               {selected.status === "approved" && (
                 <section className="rounded-lg border border-ink-300 bg-card p-3 text-xs">
+                  {selected.superseded_at && (
+                    <div className="mb-2 rounded-md border border-amber-300 bg-amber-50 px-2 py-1 text-amber-800">
+                      Superseded {new Date(selected.superseded_at).toLocaleString()} — a
+                      later approval relocated this skill; this copy is no longer the
+                      active landed version.
+                    </div>
+                  )}
                   <div>landed at <code>{selected.landed_path}</code></div>
                   <div>branch <code>{selected.landed_branch}</code></div>
                   <div>use count: {selected.use_count}</div>
+                  {detail && detail.invocations.length > 0 && (
+                    <div className="mt-2 border-t border-ink-300 pt-2">
+                      <div className="mb-1 font-medium text-muted-foreground">Invocation history</div>
+                      <ul className="space-y-0.5">
+                        {detail.invocations.map((inv) => (
+                          <li key={inv.id} className="flex flex-wrap gap-x-2">
+                            <span>{new Date(inv.used_at).toLocaleString()}</span>
+                            {inv.backend && <span>· {inv.backend}</span>}
+                            {inv.run_id && <span>· run {inv.run_id}</span>}
+                            {inv.task_id && (
+                              <button
+                                type="button"
+                                className="text-primary-700 underline hover:no-underline disabled:cursor-default disabled:text-foreground disabled:no-underline"
+                                onClick={() => onOpenTask?.(inv.task_id!)}
+                                disabled={!onOpenTask}
+                              >
+                                open task
+                              </button>
+                            )}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
                 </section>
               )}
               {selected.status === "rejected" && selected.review_note && (
@@ -262,6 +419,20 @@ export function SkillCandidatesPage({ onToggleSidebar }: SkillCandidatesPageProp
 
               {selected.status === "pending" && (
                 <div className="flex flex-col gap-2 border-t border-ink-300 pt-3">
+                  <div className="flex items-center gap-2">
+                    <label htmlFor="skill-approve-scope" className="text-xs text-muted-foreground">
+                      Land as
+                    </label>
+                    <select
+                      id="skill-approve-scope"
+                      className="h-8 rounded-lg border border-ink-300 bg-card px-2 text-xs outline-none focus:border-primary"
+                      value={approveScope}
+                      onChange={(e) => setApproveScope(e.target.value as SkillCandidateScope)}
+                    >
+                      <option value="agent+repo">agent + repo</option>
+                      <option value="agent-global">agent-global</option>
+                    </select>
+                  </div>
                   <div className="flex items-center gap-2">
                     <button
                       type="button"

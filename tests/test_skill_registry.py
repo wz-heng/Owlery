@@ -47,6 +47,13 @@ async def registry(tmp_path: Path):
 
     session = SimpleNamespace(agent_id=agent["id"], working_dir=str(repo))
     session_mgr = SimpleNamespace(sessions={"session-1": session})
+    # A real DB row too — the evidence-chain lookup (get_session_summary)
+    # reads the `sessions` table, distinct from the in-memory session_mgr
+    # dict the propose()/record_usage() live-session lookups use.
+    await db.save_session(
+        "session-1", "Test session", str(repo), "2026-01-01T00:00:00+00:00",
+        agent_id=agent["id"],
+    )
 
     reg = SkillRegistry()
     reg.bind(db=db, session_mgr=session_mgr)
@@ -80,6 +87,12 @@ async def test_propose_creates_pending_candidate(registry):
     assert candidate["use_count"] == 0
     assert candidate["proposed_by_agent_id"] == agent_id
     assert candidate["proposed_by_session_id"] == "session-1"
+    assert candidate["scope"] == "agent+repo"
+    assert candidate["bundle_files"] is None
+    assert candidate["lint_results"]["frontmatter_valid"] is True
+    assert candidate["lint_results"]["slug_conflict"] is False
+    assert candidate["lint_results"]["bundle_refs_valid"] is True
+    assert candidate["lint_results"]["issues"] == []
 
 
 @pytest.mark.asyncio
@@ -227,6 +240,7 @@ async def test_approve_lands_file_on_a_new_branch_without_pushing(registry):
     assert approved["landed_path"] == ".claude/skills/hermes-pr-flow/SKILL.md"
     assert approved["landed_branch"]
     assert approved["landed_commit"]
+    assert approved["materialized_backends"] == ["claude", "codex"]
 
     branches = subprocess.run(
         ["git", "branch", "--list", approved["landed_branch"]],
@@ -289,6 +303,10 @@ async def test_diff_against_empty_baseline_for_new_slug(registry):
     assert result["candidate"]["id"] == candidate["id"]
     assert "/dev/null" in result["diff"]
     assert "hermes-pr-flow" in result["diff"]
+    assert result["file_diffs"] == {"SKILL.md": result["diff"]}
+    assert result["task"] is None
+    assert result["run"] is None
+    assert result["invocations"] == []
 
 
 @pytest.mark.asyncio
@@ -300,6 +318,14 @@ async def test_diff_against_landed_baseline_after_approval(registry):
     result = await reg.diff(replacement["id"])
     assert "/dev/null" not in result["diff"]
     assert "Extra line." in result["diff"]
+
+
+@pytest.mark.asyncio
+async def test_diff_includes_session_summary(registry):
+    reg, db, _repo, _agent_id = registry
+    candidate = await _propose(reg)
+    result = await reg.diff(candidate["id"])
+    assert result["session"]["id"] == "session-1"
 
 
 @pytest.mark.asyncio
@@ -358,9 +384,9 @@ async def test_approve_materializes_a_real_plugin_file_for_the_agent(registry):
 
 
 @pytest.mark.asyncio
-async def test_resolve_plugin_dir_none_before_any_approval(registry):
+async def test_resolve_plugin_dir_empty_before_any_approval(registry):
     reg, _db, repo, agent_id = registry
-    assert await reg.resolve_plugin_dir(agent_id=agent_id, working_dir=str(repo)) is None
+    assert await reg.resolve_plugin_dir(agent_id=agent_id, working_dir=str(repo)) == []
 
 
 @pytest.mark.asyncio
@@ -369,13 +395,13 @@ async def test_resolve_plugin_dir_returns_the_landed_dir_after_approval(registry
     candidate = await _propose(reg)
     await reg.approve(candidate["id"])
 
-    plugin_dir = await reg.resolve_plugin_dir(agent_id=agent_id, working_dir=str(repo))
-    assert plugin_dir is not None
-    assert (Path(plugin_dir) / "skills" / "hermes-pr-flow" / "SKILL.md").is_file()
+    plugin_dirs = await reg.resolve_plugin_dir(agent_id=agent_id, working_dir=str(repo))
+    assert len(plugin_dirs) == 1
+    assert (Path(plugin_dirs[0]) / "skills" / "hermes-pr-flow" / "SKILL.md").is_file()
 
 
 @pytest.mark.asyncio
-async def test_resolve_plugin_dir_none_for_a_different_repository(registry, tmp_path):
+async def test_resolve_plugin_dir_empty_for_a_different_repository(registry, tmp_path):
     """A skill landed for one repository must not silently show up in a
     different repository's session — no merge action ever moves it there."""
     reg, _db, repo, agent_id = registry
@@ -393,7 +419,7 @@ async def test_resolve_plugin_dir_none_for_a_different_repository(registry, tmp_
 
     assert (
         await reg.resolve_plugin_dir(agent_id=agent_id, working_dir=str(other_repo))
-        is None
+        == []
     )
 
 
@@ -463,3 +489,809 @@ async def test_get_candidate_not_found(registry):
     reg, _db, _repo, _agent_id = registry
     with pytest.raises(SkillNotFoundError):
         await reg.get_candidate("missing")
+
+
+# --- v2 §3③: bundle files + dual scope -------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_propose_with_bundle_files_stores_them(registry):
+    reg, _db, _repo, _agent_id = registry
+    candidate = await _propose(
+        reg,
+        body_markdown=SKILL_BODY + "\nSee scripts/run.sh.\n",
+        bundle_files={"scripts/run.sh": "#!/bin/sh\necho hi\n"},
+    )
+    assert candidate["bundle_files"] == {"scripts/run.sh": "#!/bin/sh\necho hi\n"}
+    assert candidate["lint_results"]["bundle_refs_valid"] is True
+
+
+@pytest.mark.asyncio
+async def test_propose_lints_a_dangling_bundle_reference(registry):
+    """A path referenced in body_markdown but missing from bundle_files is
+    surfaced as an issue — informational only, never blocks propose()."""
+    reg, _db, _repo, _agent_id = registry
+    candidate = await _propose(
+        reg, body_markdown=SKILL_BODY + "\nSee scripts/run.sh.\n",
+    )
+    assert candidate["status"] == "pending"  # not blocked
+    assert candidate["lint_results"]["bundle_refs_valid"] is False
+    assert any("scripts/run.sh" in issue for issue in candidate["lint_results"]["issues"])
+
+
+@pytest.mark.asyncio
+async def test_propose_lints_a_slug_conflict(registry):
+    reg, _db, _repo, _agent_id = registry
+    await _propose(reg, slug="dup-skill")
+    second = await _propose(reg, slug="dup-skill")
+    assert second["lint_results"]["slug_conflict"] is True
+
+
+@pytest.mark.asyncio
+async def test_propose_rejects_a_bundle_path_that_escapes_the_skill_dir(registry):
+    reg, _db, _repo, _agent_id = registry
+    with pytest.raises(SkillValidationError):
+        await _propose(reg, bundle_files={"../escape.sh": "x"})
+    with pytest.raises(SkillValidationError):
+        await _propose(reg, bundle_files={"/etc/passwd": "x"})
+
+
+@pytest.mark.asyncio
+async def test_propose_rejects_skill_md_as_a_bundle_key(registry):
+    reg, _db, _repo, _agent_id = registry
+    with pytest.raises(SkillValidationError):
+        await _propose(reg, bundle_files={"SKILL.md": "x"})
+
+
+@pytest.mark.asyncio
+async def test_propose_rejects_unknown_scope(registry):
+    reg, _db, _repo, _agent_id = registry
+    with pytest.raises(SkillValidationError):
+        await _propose(reg, scope="not-a-real-scope")
+
+
+@pytest.mark.asyncio
+async def test_approve_materializes_bundle_files_alongside_skill_md(registry):
+    from server.skill_registry import agent_skills_plugin_dir
+
+    reg, _db, repo, agent_id = registry
+    candidate = await _propose(
+        reg, bundle_files={"scripts/run.sh": "#!/bin/sh\necho hi\n"},
+    )
+    approved = await reg.approve(candidate["id"])
+
+    repository = await reg.resolve_repository(str(repo))
+    plugin_dir = agent_skills_plugin_dir(agent_id, repository)
+    script = plugin_dir / "skills" / "hermes-pr-flow" / "scripts" / "run.sh"
+    assert script.is_file()
+    assert script.read_text() == "#!/bin/sh\necho hi\n"
+
+    landed = subprocess.run(
+        [
+            "git", "show",
+            f"{approved['landed_branch']}:.claude/skills/hermes-pr-flow/scripts/run.sh",
+        ],
+        cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout
+    assert landed == "#!/bin/sh\necho hi\n"
+
+
+@pytest.mark.asyncio
+async def test_agent_global_scope_lands_in_a_cross_repo_directory(registry):
+    from server.skill_registry import agent_skills_plugin_dir
+
+    reg, _db, repo, agent_id = registry
+    candidate = await _propose(reg, scope="agent-global")
+    approved = await reg.approve(candidate["id"])
+    assert approved["scope"] == "agent-global"
+
+    global_dir = agent_skills_plugin_dir(agent_id, scope="agent-global")
+    assert (global_dir / "skills" / "hermes-pr-flow" / "SKILL.md").is_file()
+
+
+@pytest.mark.asyncio
+async def test_agent_global_skill_resolves_in_a_different_repository(registry, tmp_path):
+    """Touchstone B (experience-consolidation-v2.md §5): an approved
+    agent-global candidate must be loadable from a DIFFERENT repository."""
+    reg, _db, repo, agent_id = registry
+    candidate = await _propose(reg, scope="agent-global")
+    await reg.approve(candidate["id"])
+
+    other_repo = tmp_path / "other-repo"
+    other_repo.mkdir()
+    _git(other_repo, "init", "-q")
+    _git(other_repo, "config", "user.name", "Test")
+    _git(other_repo, "config", "user.email", "test@example.com")
+    (other_repo / "README.md").write_text("base\n")
+    _git(other_repo, "add", "README.md")
+    _git(other_repo, "commit", "-q", "-m", "base")
+
+    dirs = await reg.resolve_plugin_dir(agent_id=agent_id, working_dir=str(other_repo))
+    assert len(dirs) == 1
+    assert (Path(dirs[0]) / "skills" / "hermes-pr-flow" / "SKILL.md").is_file()
+
+
+@pytest.mark.asyncio
+async def test_resolve_plugin_dir_returns_both_global_and_repo_scoped(registry):
+    reg, _db, repo, agent_id = registry
+    global_candidate = await _propose(reg, slug="global-skill", scope="agent-global")
+    await reg.approve(global_candidate["id"])
+    repo_candidate = await _propose(reg, slug="repo-skill")
+    await reg.approve(repo_candidate["id"])
+
+    dirs = await reg.resolve_plugin_dir(agent_id=agent_id, working_dir=str(repo))
+    assert len(dirs) == 2
+
+
+@pytest.mark.asyncio
+async def test_approve_can_override_scope_at_review_time(registry):
+    """Reviewer choice wins over the proposer's default
+    (experience-consolidation-v2.md §3③: "提名时选定,人审可改")."""
+    from server.skill_registry import agent_skills_plugin_dir
+
+    reg, _db, repo, agent_id = registry
+    candidate = await _propose(reg)  # defaults to agent+repo
+    approved = await reg.approve(candidate["id"], scope="agent-global")
+    assert approved["scope"] == "agent-global"
+
+    global_dir = agent_skills_plugin_dir(agent_id, scope="agent-global")
+    assert (global_dir / "skills" / "hermes-pr-flow" / "SKILL.md").is_file()
+    repository = await reg.resolve_repository(str(repo))
+    repo_dir = agent_skills_plugin_dir(agent_id, repository)
+    assert not (repo_dir / "skills" / "hermes-pr-flow").exists()
+
+
+@pytest.mark.asyncio
+async def test_replacement_approval_removes_stale_bundle_files(registry):
+    """Snape review: a replacement candidate that DROPS a bundle file a
+    prior approval landed must not leave that file behind in any of the
+    three materialized copies (git land, Claude plugin dir, Codex
+    canonical store) — otherwise the review-page diff (which shows the
+    file removed) disagrees with what's actually still loadable."""
+    from server.skill_registry import agent_codex_skills_dir, agent_skills_plugin_dir
+
+    reg, _db, repo, agent_id = registry
+    first = await _propose(reg, bundle_files={"scripts/old.sh": "old\n"})
+    await reg.approve(first["id"])
+
+    repository = await reg.resolve_repository(str(repo))
+    plugin_script = (
+        agent_skills_plugin_dir(agent_id, repository)
+        / "skills" / "hermes-pr-flow" / "scripts" / "old.sh"
+    )
+    codex_script = (
+        agent_codex_skills_dir(agent_id, repository) / "hermes-pr-flow" / "scripts" / "old.sh"
+    )
+    assert plugin_script.is_file()
+    assert codex_script.is_file()
+
+    replacement = await _propose(reg, body_markdown=SKILL_BODY + "\nNo bundle now.\n")
+    approved_replacement = await reg.approve(replacement["id"])
+
+    assert not plugin_script.exists()
+    assert not codex_script.exists()
+    # Branch names carry a random candidate-id suffix, not a chronological
+    # one — use the branch approve() actually returned, not a `git branch
+    # --list` sort order that has no relation to creation time.
+    landed_files = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", approved_replacement["landed_branch"]],
+        cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout
+    assert "scripts/old.sh" not in landed_files
+
+
+@pytest.mark.asyncio
+async def test_replacement_with_a_different_scope_removes_the_old_location(registry):
+    """Snape review: approving a same-slug replacement at a DIFFERENT scope
+    than the currently-active approved candidate must remove the stale copy
+    at the OLD location — otherwise both locations serve a version of the
+    skill forever, and resolve_plugin_dir would surface both."""
+    from server.skill_registry import agent_codex_skills_dir, agent_skills_plugin_dir
+
+    reg, db, repo, agent_id = registry
+    first = await _propose(reg)  # agent+repo (default)
+    approved_first = await reg.approve(first["id"])
+    repository = await reg.resolve_repository(str(repo))
+    repo_plugin_skill = (
+        agent_skills_plugin_dir(agent_id, repository) / "skills" / "hermes-pr-flow"
+    )
+    repo_codex_skill = agent_codex_skills_dir(agent_id, repository) / "hermes-pr-flow"
+    assert repo_plugin_skill.is_dir()
+    assert repo_codex_skill.is_dir()
+
+    replacement = await _propose(reg, scope="agent-global")
+    approved_replacement = await reg.approve(replacement["id"])
+
+    assert not repo_plugin_skill.exists()
+    assert not repo_codex_skill.exists()
+    dirs = await reg.resolve_plugin_dir(agent_id=agent_id, working_dir=str(repo))
+    assert len(dirs) == 1  # only the new agent-global location
+
+    # Snape review: the old row's `status` stays 'approved' (historical
+    # fact) but it's excluded from "latest approved" lookups now that its
+    # materialized copy is gone — otherwise record_usage()/diff() would
+    # keep pointing at a candidate that isn't actually loadable anymore.
+    stale = await db.get_skill_candidate(approved_first["id"])
+    assert stale["status"] == "approved"
+    assert stale["superseded_at"] is not None
+    winner = await db.get_latest_approved_skill_by_slug(
+        "hermes-pr-flow", agent_id=agent_id, repository=repository
+    )
+    assert winner["id"] == approved_replacement["id"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_land_leaves_the_prior_active_skill_untouched(registry, monkeypatch):
+    """Snape review (round 3): supersession must not tear down the OLD
+    active skill until the NEW candidate has actually landed — otherwise a
+    `_land()` failure (e.g. the real no-op path: nothing changed on disk)
+    leaves NEITHER version active. The prior's materialized copy and its
+    DB row's active status must survive a failed approve() untouched, so
+    the operator can simply retry."""
+    from server.skill_registry import agent_codex_skills_dir, agent_skills_plugin_dir
+
+    reg, db, repo, agent_id = registry
+    first = await _propose(reg)  # agent+repo (default)
+    approved_first = await reg.approve(first["id"])
+    repository = await reg.resolve_repository(str(repo))
+    repo_plugin_skill = (
+        agent_skills_plugin_dir(agent_id, repository) / "skills" / "hermes-pr-flow"
+    )
+    repo_codex_skill = agent_codex_skills_dir(agent_id, repository) / "hermes-pr-flow"
+    assert repo_plugin_skill.is_dir()
+    assert repo_codex_skill.is_dir()
+
+    replacement = await _propose(reg, scope="agent-global")
+
+    async def _boom(*_args, **_kwargs):
+        raise SkillValidationError("simulated _land failure")
+
+    monkeypatch.setattr(reg, "_land", _boom)
+    with pytest.raises(SkillValidationError, match="simulated _land failure"):
+        await reg.approve(replacement["id"])
+
+    # The prior's materialized copy is still there...
+    assert repo_plugin_skill.is_dir()
+    assert repo_codex_skill.is_dir()
+    # ...and its DB row is still the active one.
+    stale = await db.get_skill_candidate(approved_first["id"])
+    assert stale["superseded_at"] is None
+    winner = await db.get_latest_approved_skill_by_slug(
+        "hermes-pr-flow", agent_id=agent_id, repository=repository
+    )
+    assert winner["id"] == approved_first["id"]
+    # The replacement never got approved either — safe to retry.
+    fresh_replacement = await reg.get_candidate(replacement["id"])
+    assert fresh_replacement["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_independent_same_slug_candidates_in_different_repos_survive_each_others_approval(
+    tmp_path,
+):
+    """The supersession cleanup must NOT fire across genuinely independent
+    repositories — two repos legitimately land their own 'agent+repo'
+    candidate under the same slug (v1 T-B's own coexistence guarantee,
+    test_record_usage_scoped_by_repository_two_repos_same_slug); approving
+    repo B's candidate must not delete repo A's materialized copy."""
+    from server.skill_registry import agent_skills_plugin_dir
+
+    repo_a = tmp_path / "repo-a"
+    repo_b = tmp_path / "repo-b"
+    for repo in (repo_a, repo_b):
+        repo.mkdir()
+        _git(repo, "init", "-q")
+        _git(repo, "config", "user.name", "Test")
+        _git(repo, "config", "user.email", "test@example.com")
+        (repo / "README.md").write_text("base\n")
+        _git(repo, "add", "README.md")
+        _git(repo, "commit", "-q", "-m", "base")
+
+    db = Database(str(tmp_path / "db.sqlite"))
+    await db.initialize()
+    agent = await db.get_default_agent()
+    session_a = SimpleNamespace(agent_id=agent["id"], working_dir=str(repo_a))
+    session_b = SimpleNamespace(agent_id=agent["id"], working_dir=str(repo_b))
+    session_mgr = SimpleNamespace(sessions={"session-a": session_a, "session-b": session_b})
+    reg = SkillRegistry()
+    reg.bind(db=db, session_mgr=session_mgr)
+    try:
+        cand_a = await reg.propose(
+            session_id="session-a", slug="hermes-pr-flow", title="A",
+            description=_DESCRIPTION, body_markdown=SKILL_BODY, rationale="repo a",
+        )
+        await reg.approve(cand_a["id"])
+        repository_a = await reg.resolve_repository(str(repo_a))
+        skill_a = agent_skills_plugin_dir(agent["id"], repository_a) / "skills" / "hermes-pr-flow"
+        assert skill_a.is_dir()
+
+        cand_b = await reg.propose(
+            session_id="session-b", slug="hermes-pr-flow", title="B",
+            description=_DESCRIPTION, body_markdown=SKILL_BODY, rationale="repo b",
+        )
+        await reg.approve(cand_b["id"])
+
+        assert skill_a.is_dir()  # untouched by repo b's independent approval
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_repo_scoped_approval_never_supersedes_an_unrelated_repos_global_candidate(
+    tmp_path,
+):
+    """Snape review (second-round blocker): a global candidate proposed from
+    repo A must survive a LATER repo-scoped approval for the same slug from
+    a DIFFERENT repo B — repo B's approval may shadow the global skill for
+    repo B's OWN view, but it must never delete/supersede the global
+    candidate itself, or repo C (never touched by either approval) would
+    silently lose a skill it never asked to change."""
+    repo_a = tmp_path / "repo-a"
+    repo_b = tmp_path / "repo-b"
+    repo_c = tmp_path / "repo-c"
+    for repo in (repo_a, repo_b, repo_c):
+        repo.mkdir()
+        _git(repo, "init", "-q")
+        _git(repo, "config", "user.name", "Test")
+        _git(repo, "config", "user.email", "test@example.com")
+        (repo / "README.md").write_text("base\n")
+        _git(repo, "add", "README.md")
+        _git(repo, "commit", "-q", "-m", "base")
+
+    db = Database(str(tmp_path / "db.sqlite"))
+    await db.initialize()
+    agent = await db.get_default_agent()
+    session_mgr = SimpleNamespace(
+        sessions={
+            "session-a": SimpleNamespace(agent_id=agent["id"], working_dir=str(repo_a)),
+            "session-b": SimpleNamespace(agent_id=agent["id"], working_dir=str(repo_b)),
+        }
+    )
+    reg = SkillRegistry()
+    reg.bind(db=db, session_mgr=session_mgr)
+    try:
+        global_candidate = await reg.propose(
+            session_id="session-a", slug="hermes-pr-flow", title="Global",
+            description=_DESCRIPTION, body_markdown=SKILL_BODY, rationale="global",
+            scope="agent-global",
+        )
+        approved_global = await reg.approve(global_candidate["id"])
+
+        repo_b_candidate = await reg.propose(
+            session_id="session-b", slug="hermes-pr-flow", title="Repo B override",
+            description=_DESCRIPTION, body_markdown=SKILL_BODY, rationale="repo b",
+        )
+        await reg.approve(repo_b_candidate["id"])
+
+        fresh_global = await db.get_skill_candidate(approved_global["id"])
+        assert fresh_global["superseded_at"] is None  # untouched — different repository
+
+        # Repo C never touched either approval — it must still see the
+        # global skill via the ordinary global ∪ repo lookup.
+        dirs_c = await reg.resolve_plugin_dir(agent_id=agent["id"], working_dir=str(repo_c))
+        assert len(dirs_c) == 1
+
+        # Repo B sees its OWN repo-scoped version (shadowing), not deleted.
+        dirs_b = await reg.resolve_plugin_dir(agent_id=agent["id"], working_dir=str(repo_b))
+        assert len(dirs_b) == 2  # both the global dir and repo b's own dir exist
+    finally:
+        await db.close()
+
+
+# --- v2 §3④: Codex activation adapter --------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_approve_materializes_a_codex_canonical_copy(registry):
+    from server.skill_registry import agent_codex_skills_dir
+
+    reg, _db, repo, agent_id = registry
+    candidate = await _propose(
+        reg, bundle_files={"scripts/run.sh": "#!/bin/sh\necho hi\n"},
+    )
+    approved = await reg.approve(candidate["id"])
+    assert "codex" in approved["materialized_backends"]
+
+    repository = await reg.resolve_repository(str(repo))
+    codex_dir = agent_codex_skills_dir(agent_id, repository)
+    assert (codex_dir / "hermes-pr-flow" / "SKILL.md").is_file()
+    assert (codex_dir / "hermes-pr-flow" / "scripts" / "run.sh").is_file()
+
+
+@pytest.mark.asyncio
+async def test_sync_codex_skills_dir_projects_into_codex_home(registry, tmp_path):
+    reg, _db, repo, agent_id = registry
+    candidate = await _propose(reg)
+    await reg.approve(candidate["id"])
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    await reg.sync_codex_skills_dir(
+        agent_id=agent_id, working_dir=str(repo), codex_home=str(codex_home)
+    )
+
+    skill_file = codex_home / "skills" / "hermes-pr-flow" / "SKILL.md"
+    assert skill_file.is_file()
+    assert skill_file.read_text() == candidate["body_markdown"]
+    manifest = json.loads((codex_home / "skills" / ".owlery-manifest.json").read_text())
+    assert manifest["slugs"] == ["hermes-pr-flow"]
+
+
+@pytest.mark.asyncio
+async def test_sync_codex_skills_dir_removes_stale_managed_entries(registry, tmp_path):
+    """Switching from a repo with a landed skill to one with none must not
+    leave the old repo's skill visible forever — Codex has no per-turn
+    directory-selection flag, so the sync itself must clean up."""
+    reg, _db, repo, agent_id = registry
+    candidate = await _propose(reg)
+    await reg.approve(candidate["id"])
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    await reg.sync_codex_skills_dir(
+        agent_id=agent_id, working_dir=str(repo), codex_home=str(codex_home)
+    )
+    assert (codex_home / "skills" / "hermes-pr-flow").is_dir()
+
+    other_repo = tmp_path / "other-repo"
+    other_repo.mkdir()
+    _git(other_repo, "init", "-q")
+    _git(other_repo, "config", "user.name", "Test")
+    _git(other_repo, "config", "user.email", "test@example.com")
+    (other_repo / "README.md").write_text("base\n")
+    _git(other_repo, "add", "README.md")
+    _git(other_repo, "commit", "-q", "-m", "base")
+
+    await reg.sync_codex_skills_dir(
+        agent_id=agent_id, working_dir=str(other_repo), codex_home=str(codex_home)
+    )
+    assert not (codex_home / "skills" / "hermes-pr-flow").exists()
+
+
+@pytest.mark.asyncio
+async def test_sync_codex_skills_dir_leaves_a_users_own_file_alone(registry, tmp_path):
+    """A slug Owlery never managed (a user's own personal skill dropped into
+    the same real, credential-owned directory) must survive a sync."""
+    reg, _db, repo, agent_id = registry
+
+    codex_home = tmp_path / "codex-home"
+    (codex_home / "skills" / "my-own-skill").mkdir(parents=True)
+    (codex_home / "skills" / "my-own-skill" / "SKILL.md").write_text(
+        "---\nname: my-own-skill\ndescription: mine\n---\n\nBody.\n"
+    )
+
+    candidate = await _propose(reg)
+    await reg.approve(candidate["id"])
+    await reg.sync_codex_skills_dir(
+        agent_id=agent_id, working_dir=str(repo), codex_home=str(codex_home)
+    )
+
+    assert (codex_home / "skills" / "my-own-skill" / "SKILL.md").is_file()
+    assert (codex_home / "skills" / "hermes-pr-flow" / "SKILL.md").is_file()
+
+
+@pytest.mark.asyncio
+async def test_sync_codex_skills_dir_never_overwrites_a_same_slug_user_file(registry, tmp_path):
+    """Snape review: the OLD (bare slug-list) manifest only protected a
+    DIFFERENT slug's user file — a user's own skill sharing the SAME slug
+    Owlery wants to land would have been silently clobbered by the naive
+    rmtree+copytree. The ownership marker must refuse that instead."""
+    reg, _db, repo, agent_id = registry
+
+    codex_home = tmp_path / "codex-home"
+    user_dir = codex_home / "skills" / "hermes-pr-flow"
+    user_dir.mkdir(parents=True)
+    (user_dir / "SKILL.md").write_text(
+        "---\nname: hermes-pr-flow\ndescription: not owlery's\n---\n\nMine.\n"
+    )
+
+    candidate = await _propose(reg)
+    await reg.approve(candidate["id"])
+    await reg.sync_codex_skills_dir(
+        agent_id=agent_id, working_dir=str(repo), codex_home=str(codex_home)
+    )
+
+    # The user's own file at the SAME slug survives untouched.
+    assert "not owlery's" in (user_dir / "SKILL.md").read_text()
+    # The manifest must not claim ownership of a slug it didn't actually land.
+    manifest = json.loads((codex_home / "skills" / ".owlery-manifest.json").read_text())
+    assert "hermes-pr-flow" not in manifest["slugs"]
+
+
+@pytest.mark.asyncio
+async def test_sync_codex_skills_dir_rejects_a_spoofed_marker(registry, tmp_path):
+    """Snape review (second round): presence-only ownership (an empty
+    `.owlery-owned` file) is a predictable filename something else sharing
+    the real credential-owned directory could pre-plant to defeat the
+    check. Ownership must be proven by marker CONTENT (a per-agent secret
+    token kept outside CODEX_HOME), not just presence."""
+    reg, _db, repo, agent_id = registry
+
+    codex_home = tmp_path / "codex-home"
+    spoofed_dir = codex_home / "skills" / "hermes-pr-flow"
+    spoofed_dir.mkdir(parents=True)
+    (spoofed_dir / "SKILL.md").write_text(
+        "---\nname: hermes-pr-flow\ndescription: spoofed\n---\n\nNot really Owlery's.\n"
+    )
+    (spoofed_dir / ".owlery-owned").write_text("")  # presence, but wrong/no token
+
+    candidate = await _propose(reg)
+    await reg.approve(candidate["id"])
+    await reg.sync_codex_skills_dir(
+        agent_id=agent_id, working_dir=str(repo), codex_home=str(codex_home)
+    )
+
+    assert "spoofed" in (spoofed_dir / "SKILL.md").read_text()  # left alone
+
+
+@pytest.mark.asyncio
+async def test_sync_codex_skills_dir_only_removes_owlery_owned_stale_dirs(registry, tmp_path):
+    """A corrupted/tampered manifest listing a slug Owlery never actually
+    marked as owned must not cause that directory to be deleted on the next
+    sync (the stale-removal loop, not just the write loop, must check the
+    ownership marker)."""
+    reg, _db, repo, agent_id = registry
+
+    codex_home = tmp_path / "codex-home"
+    candidate = await _propose(reg, slug="temp-skill")
+    await reg.approve(candidate["id"])
+    await reg.sync_codex_skills_dir(
+        agent_id=agent_id, working_dir=str(repo), codex_home=str(codex_home)
+    )
+    assert (codex_home / "skills" / "temp-skill").is_dir()
+
+    # Simulate a corrupted manifest naming an unowned, user-created dir.
+    user_dir = codex_home / "skills" / "unowned-user-skill"
+    user_dir.mkdir(parents=True)
+    (user_dir / "SKILL.md").write_text("mine\n")
+    (codex_home / "skills" / ".owlery-manifest.json").write_text(
+        json.dumps({"slugs": ["temp-skill", "unowned-user-skill"]})
+    )
+
+    # A repo with nothing approved — the sync now wants an EMPTY desired
+    # set, which would try to remove every "previous" slug including the
+    # tampered entry.
+    other_repo = repo.parent / "other-repo-for-manifest-test"
+    other_repo.mkdir()
+    _git(other_repo, "init", "-q")
+    _git(other_repo, "config", "user.name", "Test")
+    _git(other_repo, "config", "user.email", "test@example.com")
+    (other_repo / "README.md").write_text("base\n")
+    _git(other_repo, "add", "README.md")
+    _git(other_repo, "commit", "-q", "-m", "base")
+
+    await reg.sync_codex_skills_dir(
+        agent_id=agent_id, working_dir=str(other_repo), codex_home=str(codex_home)
+    )
+
+    assert not (codex_home / "skills" / "temp-skill").exists()  # real, owned → removed
+    assert user_dir.is_dir()  # unowned → survives despite being manifest-listed
+
+
+@pytest.mark.asyncio
+async def test_sync_codex_skills_dir_never_raises_on_bad_codex_home(registry):
+    reg, _db, repo, agent_id = registry
+    candidate = await _propose(reg)
+    await reg.approve(candidate["id"])
+    # A file where a directory is expected — write attempts fail loudly if
+    # not caught.
+    import tempfile
+
+    with tempfile.NamedTemporaryFile() as f:
+        await reg.sync_codex_skills_dir(
+            agent_id=agent_id, working_dir=str(repo), codex_home=f.name
+        )  # must not raise
+
+
+# --- v2 §3⑤: invocation log with a run/session foreign key -----------------
+
+
+@pytest.mark.asyncio
+async def test_record_usage_logs_an_invocation_with_session_and_backend(registry):
+    """task_id/run_id are real foreign keys (skill_invocations references
+    tasks/task_runs) — a genuine task/run pairing is covered by
+    test_experience_consolidation.py's
+    test_record_usage_logs_a_real_task_and_run_on_the_invocation, which has
+    a real dispatched run to reference. This one covers the ordinary
+    (non-task-board) session case, where task_id/run_id are legitimately
+    None."""
+    reg, db, _repo, agent_id = registry
+    candidate = await _propose(reg)
+    await reg.approve(candidate["id"])
+
+    await reg.record_usage(
+        "hermes-pr-flow",
+        agent_id=agent_id,
+        session_id="session-1",
+        backend="claude-code",
+    )
+
+    invocations = await db.list_skill_invocations(candidate["id"])
+    assert len(invocations) == 1
+    assert invocations[0]["session_id"] == "session-1"
+    assert invocations[0]["task_id"] is None
+    assert invocations[0]["run_id"] is None
+    assert invocations[0]["backend"] == "claude-code"
+
+
+@pytest.mark.asyncio
+async def test_diff_surfaces_invocation_history_for_an_approved_candidate(registry):
+    reg, _db, _repo, agent_id = registry
+    candidate = await _propose(reg)
+    await reg.approve(candidate["id"])
+    await reg.record_usage("hermes-pr-flow", agent_id=agent_id, session_id="session-1")
+
+    result = await reg.diff(candidate["id"])
+    assert len(result["invocations"]) == 1
+    assert result["invocations"][0]["session_id"] == "session-1"
+
+
+@pytest.mark.asyncio
+async def test_repo_scoped_candidate_wins_attribution_over_a_newer_global_one(tmp_path):
+    """Snape review: sync_codex_skills_dir has repo-scoped candidates win
+    over agent-global on a slug collision (more specific wins) — the
+    lookup use_count/invocation attribution relies on
+    (get_latest_approved_skill_by_slug) must rank the same way, or a real
+    invocation gets attributed to the candidate that ISN'T actually the one
+    loaded, even when the global one happens to be more recently updated.
+
+    The global candidate here is proposed from a DIFFERENT repository than
+    the repo-scoped one specifically so approving it does NOT supersede the
+    repo-scoped candidate (supersession only fires within the SAME
+    proposing repository — see test_replacement_with_a_different_scope_
+    removes_the_old_location for that case) — this test is exercising the
+    priority tie-break between two genuinely independently-active
+    candidates, not a replacement."""
+    repo_a = tmp_path / "repo-a"
+    repo_b = tmp_path / "repo-b"
+    for repo in (repo_a, repo_b):
+        repo.mkdir()
+        _git(repo, "init", "-q")
+        _git(repo, "config", "user.name", "Test")
+        _git(repo, "config", "user.email", "test@example.com")
+        (repo / "README.md").write_text("base\n")
+        _git(repo, "add", "README.md")
+        _git(repo, "commit", "-q", "-m", "base")
+
+    db = Database(str(tmp_path / "db.sqlite"))
+    await db.initialize()
+    agent = await db.get_default_agent()
+    session_a = SimpleNamespace(agent_id=agent["id"], working_dir=str(repo_a))
+    session_b = SimpleNamespace(agent_id=agent["id"], working_dir=str(repo_b))
+    session_mgr = SimpleNamespace(sessions={"session-a": session_a, "session-b": session_b})
+    reg = SkillRegistry()
+    reg.bind(db=db, session_mgr=session_mgr)
+    try:
+        repo_candidate = await reg.propose(
+            session_id="session-a", slug="hermes-pr-flow", title="Repo-scoped",
+            description=_DESCRIPTION, body_markdown=SKILL_BODY, rationale="repo a",
+        )
+        approved_repo = await reg.approve(repo_candidate["id"])
+
+        global_candidate = await reg.propose(
+            session_id="session-b", slug="hermes-pr-flow", title="Global",
+            description=_DESCRIPTION, body_markdown=SKILL_BODY, rationale="repo b",
+            scope="agent-global",
+        )
+        approved_global = await reg.approve(global_candidate["id"])
+        assert approved_global["updated_at"] >= approved_repo["updated_at"]
+        assert approved_repo["superseded_at"] is None  # different repos: not superseded
+
+        repository_a = await reg.resolve_repository(str(repo_a))
+        winner = await db.get_latest_approved_skill_by_slug(
+            "hermes-pr-flow", agent_id=agent["id"], repository=repository_a
+        )
+        assert winner["id"] == approved_repo["id"]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_record_usage_with_an_explicit_scope_overrides_the_repo_wins_heuristic(
+    tmp_path,
+):
+    """T-B review round 2 (blocker): a real `Skill` tool_use's plugin
+    namespace names an EXACT scope ('_global' vs a specific repository's
+    fingerprint) — session_manager.py derives that and passes it through as
+    `scope`. Without it, `record_usage`/`get_latest_approved_skill_by_slug`
+    fall back to the ambiguous (repository OR agent-global) heuristic tested
+    above, which always ranks the repo-scoped candidate first on a
+    collision — so a real `agent-global` invocation would get its
+    use_count/invocation misattributed to the repo-scoped candidate instead,
+    even though the repo-scoped one was never the one actually loaded.
+    Passing `scope='agent-global'` explicitly must attribute correctly
+    despite that same collision.
+
+    The two candidates are proposed from DIFFERENT repositories — same as
+    test_repo_scoped_candidate_wins_attribution_over_a_newer_global_one
+    above — specifically so approving the global one does NOT supersede the
+    repo-scoped one (supersession only fires within the SAME proposing
+    repository); this test exercises the attribution tie-break between two
+    genuinely independently-active candidates, not a replacement."""
+    repo_a = tmp_path / "repo-a"
+    repo_b = tmp_path / "repo-b"
+    for repo in (repo_a, repo_b):
+        repo.mkdir()
+        _git(repo, "init", "-q")
+        _git(repo, "config", "user.name", "Test")
+        _git(repo, "config", "user.email", "test@example.com")
+        (repo / "README.md").write_text("base\n")
+        _git(repo, "add", "README.md")
+        _git(repo, "commit", "-q", "-m", "base")
+
+    db = Database(str(tmp_path / "db.sqlite"))
+    await db.initialize()
+    agent = await db.get_default_agent()
+    session_mgr = SimpleNamespace(
+        sessions={
+            "session-a": SimpleNamespace(agent_id=agent["id"], working_dir=str(repo_a)),
+            "session-b": SimpleNamespace(agent_id=agent["id"], working_dir=str(repo_b)),
+        }
+    )
+    # A real `sessions` row too — record_usage's invocation log now carries a
+    # real FK to it (T-B review round 2 §should), so a session_id with no
+    # backing row would fail the INSERT.
+    await db.save_session(
+        "session-a", "Test", str(repo_a), "2026-01-01T00:00:00+00:00",
+        agent_id=agent["id"],
+    )
+    reg = SkillRegistry()
+    reg.bind(db=db, session_mgr=session_mgr)
+    try:
+        repo_candidate = await reg.propose(
+            session_id="session-a", slug="hermes-pr-flow", title="Repo-scoped",
+            description=_DESCRIPTION, body_markdown=SKILL_BODY, rationale="repo",
+        )
+        approved_repo = await reg.approve(repo_candidate["id"])
+
+        global_candidate = await reg.propose(
+            session_id="session-b", slug="hermes-pr-flow", title="Global",
+            description=_DESCRIPTION, body_markdown=SKILL_BODY, rationale="global",
+            scope="agent-global",
+        )
+        approved_global = await reg.approve(global_candidate["id"])
+        # Different repositories: not a replacement — both stay independently
+        # active.
+        assert (await db.get_skill_candidate(approved_repo["id"]))["superseded_at"] is None
+
+        repository_a = await reg.resolve_repository(str(repo_a))
+
+        # Without a scope, the ambiguous heuristic ranks the repo-scoped
+        # candidate first (matching the collision test above) — confirming
+        # this fixture really does reproduce the collision this test guards
+        # against, not something the fix would trivially pass anyway.
+        ambiguous = await db.get_latest_approved_skill_by_slug(
+            "hermes-pr-flow", agent_id=agent["id"], repository=repository_a
+        )
+        assert ambiguous["id"] == approved_repo["id"]
+
+        await reg.record_usage(
+            "hermes-pr-flow", agent_id=agent["id"], repository=repository_a,
+            scope="agent-global", session_id="session-a",
+        )
+        fresh_global = await db.get_skill_candidate(approved_global["id"])
+        fresh_repo = await db.get_skill_candidate(approved_repo["id"])
+        assert fresh_global["use_count"] == 1
+        assert fresh_repo["use_count"] == 0
+
+        invocations = await db.list_skill_invocations(approved_global["id"])
+        assert len(invocations) == 1
+        assert await db.list_skill_invocations(approved_repo["id"]) == []
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_get_latest_approved_skill_by_slug_agent_repo_scope_requires_repository():
+    """`scope='agent+repo'` with no `repository` cannot identify a candidate
+    — must return `None` rather than guessing (e.g. by silently matching
+    every repository's row)."""
+    db = Database(":memory:")
+    await db.initialize()
+    try:
+        result = await db.get_latest_approved_skill_by_slug(
+            "hermes-pr-flow", scope="agent+repo"
+        )
+        assert result is None
+    finally:
+        await db.close()

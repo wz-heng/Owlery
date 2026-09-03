@@ -276,6 +276,7 @@ def complete_task(
     metadata: dict[str, Any] | None = None,
     artifacts: list[dict[str, Any]] | None = None,
     verdict: str | None = None,
+    reusable_outcome: bool = False,
 ) -> str:
     """Complete the owning run with a structured handoff and artifacts.
 
@@ -295,6 +296,17 @@ def complete_task(
     run on this task, or ``verdict="fail"`` here), this call is refused with
     ``retrospective_required`` until you call ``reflect`` at least once for
     this run (experience-consolidation.md §3.2/§3.3).
+
+    ``reusable_outcome``: purely voluntary self-report, off by default — set
+    it True on a CLEAN pass when you judge the flow you just walked is novel
+    or complex enough to be worth distilling into a skill/memory/CLAUDE.md
+    note while you still hold full context (experience-consolidation-v2.md
+    §3①). Setting it True asks for the same thing a non-clean pass requires:
+    call ``reflect`` first (right here, in THIS run — never delegate the
+    write-up to a fresh agent that has to re-read your history), then retry
+    `complete`. This never changes what makes a pass "non-clean"; it only
+    adds a self-service door into the same retrospective flow. If you
+    change your mind, retry with `reusable_outcome=False` (or omit it).
     """
     error = _worker_only("complete")
     if error:
@@ -305,6 +317,7 @@ def complete_task(
         "summary": summary.strip(),
         "metadata": metadata or {},
         "artifacts": artifacts or [],
+        "reusable_outcome": bool(reusable_outcome),
     }
     if verdict is not None:
         body["verdict"] = verdict

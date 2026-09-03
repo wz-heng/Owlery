@@ -24,7 +24,7 @@ from server.harness.profile import OneShotContext, TurnContext
 def _assemble_ctx(
     *, prompt, wd, resume, credential, model=None, mcp_servers=None,
     tool_allow=None, tool_deny=None, persona=None, session_id=None, connectors=(),
-    web_research=False,
+    web_research=False, skills_plugin_dirs=None,
 ) -> TurnContext:
     abs_wd = str(Path(wd).resolve())
     cb = assembly.build_callback_env(session_id)
@@ -34,7 +34,27 @@ def _assemble_ctx(
         prompt=prompt, working_dir=abs_wd, resume_id=resume, system_prompt=sysp,
         model=model, tool_allow=tool_allow, tool_deny=tool_deny,
         mcp_servers=entries, credential=credential, web_research=web_research,
+        skills_plugin_dirs=skills_plugin_dirs or [],
     )
+
+
+def test_turn_argv_renders_a_repeatable_plugin_dir_flag_per_scope(tmp_path):
+    """experience-consolidation-v2.md §3③: both agent-global and agent+repo
+    scoped plugin dirs load together via Claude's repeatable --plugin-dir."""
+    ctx = _assemble_ctx(
+        prompt="p", wd=str(tmp_path), resume=None, credential=None,
+        skills_plugin_dirs=["/skills/global", "/skills/repo-a"],
+    )
+    argv, _ = build_turn_argv(ctx)
+    indices = [i for i, a in enumerate(argv) if a == "--plugin-dir"]
+    assert len(indices) == 2
+    assert [argv[i + 1] for i in indices] == ["/skills/global", "/skills/repo-a"]
+
+
+def test_turn_argv_omits_plugin_dir_when_nothing_landed(tmp_path):
+    ctx = _assemble_ctx(prompt="p", wd=str(tmp_path), resume=None, credential=None)
+    argv, _ = build_turn_argv(ctx)
+    assert "--plugin-dir" not in argv
 
 
 def test_turn_argv_web_research_denies_destructive_tools(tmp_path):

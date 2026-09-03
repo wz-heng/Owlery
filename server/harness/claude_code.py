@@ -239,11 +239,14 @@ def build_turn_argv(ctx: TurnContext) -> tuple[list[str], dict[str, Any]]:
         argv += ["--model", ctx.model]
     if ctx.resume_id:
         argv += ["--resume", ctx.resume_id]
-    if ctx.skills_plugin_dir:
-        # Real skill discovery (experience-consolidation.md §3.4): loads this
-        # session's approved skills through Claude Code's own native
-        # plugin-skill mechanism — for this session only, no repo mutation.
-        argv += ["--plugin-dir", ctx.skills_plugin_dir]
+    for plugin_dir in ctx.skills_plugin_dirs:
+        # Real skill discovery (experience-consolidation.md §3.4,
+        # experience-consolidation-v2.md §3③): loads this session's approved
+        # skills through Claude Code's own native, repeatable `--plugin-dir`
+        # mechanism — for this session only, no repo mutation. Up to two
+        # flags (agent-global and/or agent+repo), both loaded together when
+        # both have content.
+        argv += ["--plugin-dir", plugin_dir]
     argv += ["--", ctx.prompt]
 
     env = os.environ.copy()

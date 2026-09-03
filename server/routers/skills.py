@@ -40,10 +40,19 @@ class ProposeRequest(BaseModel):
     rationale: str = Field(min_length=1)
     task_id: str | None = None
     run_id: str | None = None
+    scope: str = "agent+repo"
+    bundle_files: dict[str, str] | None = None
 
 
 class ReviewRequest(BaseModel):
     review_note: str | None = None
+
+
+class ApproveRequest(BaseModel):
+    review_note: str | None = None
+    # Reviewer override of the proposer's chosen scope (experience-
+    # consolidation-v2.md §3③: "提名时选定,人审可改").
+    scope: str | None = None
 
 
 @router.post("/api/sessions/{session_id}/skills/candidates", status_code=201)
@@ -60,6 +69,8 @@ async def propose_candidate(
             rationale=req.rationale,
             task_id=req.task_id,
             run_id=req.run_id,
+            scope=req.scope,
+            bundle_files=req.bundle_files,
         )
     )
 
@@ -80,10 +91,12 @@ async def get_candidate(
 
 @router.post("/api/skills/candidates/{candidate_id}/approve")
 async def approve_candidate(
-    candidate_id: str, req: ReviewRequest, _: str = Depends(verify_token)
+    candidate_id: str, req: ApproveRequest, _: str = Depends(verify_token)
 ) -> dict[str, Any]:
     return await _run(
-        skill_registry.approve(candidate_id, review_note=req.review_note)
+        skill_registry.approve(
+            candidate_id, review_note=req.review_note, scope=req.scope
+        )
     )
 
 

@@ -102,9 +102,29 @@ def test_worker_complete_never_accepts_model_identity(monkeypatch):
         "summary": "Shipped",
         "metadata": {"tests": "green"},
         "artifacts": [{"path": "report.md", "name": "Report"}],
+        "reusable_outcome": False,
     }
     assert "task_id" not in captured["json"]
     assert "run_id" not in captured["json"]
+
+
+def test_worker_complete_forwards_reusable_outcome(monkeypatch):
+    """experience-consolidation-v2.md §3①: the clean-pass voluntary entry —
+    `reusable_outcome` always rides the call (default False), never a bare
+    verdict-style opt-in field, since `complete`'s gate needs to see it even
+    when the worker didn't think to set it."""
+    _base_env(monkeypatch, worker=True)
+    captured = {}
+
+    def fake_request(method, url, **kwargs):
+        captured.update(method=method, url=url, **kwargs)
+        return _Response(payload={"state": "completed"})
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    _call("complete_task", summary="Clean pass, worth keeping", reusable_outcome=True)
+    assert captured["json"]["reusable_outcome"] is True
 
 
 def test_worker_reflect_posts_triage_to_the_scoped_route(monkeypatch):

@@ -32,6 +32,7 @@ from .harness import (
     get_harness,
 )
 from . import fork_helpers
+from . import skill_registry as skill_registry_module
 from .budgets import (
     BudgetExceededError,
     BudgetStatus,
@@ -2594,11 +2595,30 @@ class SessionManager:
         # review point 1): resolve once per turn, not per recovery-loop
         # iteration — the working dir doesn't change mid-turn, and this is
         # the only part of the wiring that spawns a subprocess.
-        skills_plugin_dir: str | None = None
+        skills_plugin_dirs: list[str] = []
         if session.agent_id and self._skill_registry is not None:
-            skills_plugin_dir = await self._skill_registry.resolve_plugin_dir(
+            skills_plugin_dirs = await self._skill_registry.resolve_plugin_dir(
                 agent_id=session.agent_id, working_dir=session.working_dir
             )
+            # Codex activation adapter (experience-consolidation-v2.md §3④):
+            # unlike Claude's --plugin-dir, Codex has no per-turn "extra
+            # skill directory" flag reachable from `codex exec`, so this
+            # syncs real files into the resolved credential's own
+            # $CODEX_HOME/skills instead. Only when a credential with a real
+            # home_dir is resolved — host-default auth (no credential) means
+            # Codex's own ~/.codex is out of Owlery's controlled footprint,
+            # and writing skills there would leak into the user's real,
+            # personal Codex config.
+            if (
+                session.backend == "codex"
+                and credential is not None
+                and credential.home_dir
+            ):
+                await self._skill_registry.sync_codex_skills_dir(
+                    agent_id=session.agent_id,
+                    working_dir=session.working_dir,
+                    codex_home=credential.home_dir,
+                )
         current_prompt = prompt
         recovery_attempts = 0
         transient_attempts = 0
@@ -2612,7 +2632,7 @@ class SessionManager:
 
         while True:
             backend = self._make_run(
-                session, agent, connectors, skills_plugin_dir=skills_plugin_dir
+                session, agent, connectors, skills_plugin_dirs=skills_plugin_dirs
             )
             session._backend = backend
             saw_result = False
@@ -2676,24 +2696,88 @@ class SessionManager:
                         # anywhere we have on hand, so this checks the
                         # plausible candidates rather than betting on one;
                         # confirm against a real transcript and trim this to
-                        # the actual key once observed.
+                        # the actual key once observed. Claude-only by
+                        # construction: Codex's event stream (harness/
+                        # codex.py's CodexEventParser) never emits a
+                        # tool_name of "Skill", so this never fires for a
+                        # Codex turn — exactly the "don't fabricate Codex
+                        # usage data" requirement
+                        # (experience-consolidation-v2.md §3④): Codex
+                        # use_count/invocation tracking stays uncounted
+                        # (best-effort) until a real equivalent event is
+                        # observed and confirmed.
                         if event.tool_name == "Skill" and self._skill_registry is not None:
                             tool_input = event.tool_input or {}
                             slug = None
+                            usage_scope: str | None = None
                             for key in ("skill", "name", "skill_name", "command"):
                                 value = tool_input.get(key)
-                                if isinstance(value, str) and value:
+                                if not isinstance(value, str) or not value:
+                                    continue
+                                # Confirmed against a real spawn (2026-09-02,
+                                # experience-consolidation-v2.md §5
+                                # touchstone C follow-up): a plugin-provided
+                                # Skill is ALWAYS namespaced
+                                # "<plugin-name>:<slug>" — unconditionally,
+                                # even with a single `--plugin-dir` and no
+                                # collision, not only when two plugins share
+                                # a slug. Only trust that namespace when it's
+                                # OWLERY'S OWN plugin prefix
+                                # (skill_registry.OWLERY_PLUGIN_NAME_PREFIX,
+                                # set by _materialize_plugin) — an unrelated
+                                # user-installed plugin could report
+                                # "some-plugin:hermes-pr-flow" for a
+                                # same-named skill that has nothing to do
+                                # with an Owlery candidate, and stripping
+                                # every namespace unconditionally would
+                                # misattribute that use to it (Snape
+                                # review). A bare value with no ':' (the
+                                # fake-CLI/legacy shape) is trusted as-is,
+                                # with no scope info to extract from it.
+                                if ":" in value:
+                                    namespace, _, bare = value.partition(":")
+                                    prefix = skill_registry_module.OWLERY_PLUGIN_NAME_PREFIX
+                                    if namespace.startswith(prefix):
+                                        slug = bare
+                                        # The plugin name IS
+                                        # f"{prefix}{plugin_dir.name}"
+                                        # (_materialize_plugin) — plugin_dir.name
+                                        # is either the literal "_global" (an
+                                        # `agent-global` --plugin-dir) or a
+                                        # specific repository's fingerprint (an
+                                        # `agent+repo` one). This namespace is
+                                        # thus an EXACT record of which scope
+                                        # was actually loaded for this turn — T-B
+                                        # review round 2 (blocker): discarding it
+                                        # and falling back to record_usage's
+                                        # (repository OR agent-global) heuristic
+                                        # let a real `owlery-skills-_global:X`
+                                        # invocation get misattributed to a
+                                        # same-slug `agent+repo` candidate that
+                                        # merely wins that heuristic's
+                                        # repo-scoped-first tie-break.
+                                        location_key = namespace[len(prefix):]
+                                        usage_scope = (
+                                            "agent-global" if location_key == "_global"
+                                            else "agent+repo"
+                                        )
+                                    # else: a non-Owlery plugin's skill —
+                                    # never attribute usage to an Owlery
+                                    # candidate that merely shares its bare
+                                    # slug.
+                                else:
                                     slug = value
-                                    break
+                                break
                             if slug:
-                                # Scope by (agent, repository) — the exact
-                                # identity a `--plugin-dir` was built from
-                                # (skill_registry.resolve_plugin_dir) — so
-                                # use_count attributes to the candidate this
-                                # session actually has loaded, not whichever
-                                # same-slug candidate from a different agent
-                                # or repository happened to be approved most
-                                # recently (Snape review point 2).
+                                # Scope by (agent, repository[, scope]) — the
+                                # exact identity a `--plugin-dir` was built
+                                # from (skill_registry.resolve_plugin_dir) —
+                                # so use_count attributes to the candidate
+                                # this session actually has loaded, not
+                                # whichever same-slug candidate from a
+                                # different agent or repository happened to
+                                # be approved most recently (Snape review
+                                # point 2).
                                 usage_repository: str | None = None
                                 try:
                                     usage_repository = await self._skill_registry.resolve_repository(
@@ -2705,6 +2789,11 @@ class SessionManager:
                                     slug,
                                     agent_id=session.agent_id,
                                     repository=usage_repository,
+                                    scope=usage_scope,
+                                    session_id=session.id,
+                                    task_id=session.task_id,
+                                    run_id=session.task_run_id,
+                                    backend=session.backend,
                                 )
                     if event.type == "text" and event.content and event.content.strip():
                         saw_text = True
@@ -3041,14 +3130,14 @@ class SessionManager:
         agent: dict[str, Any] | None = None,
         connectors: list[tuple[Any, Any]] | None = None,
         *,
-        skills_plugin_dir: str | None = None,
+        skills_plugin_dirs: list[str] | None = None,
     ) -> HarnessRun:
         """Build the per-turn run for a session via its harness. Single seam
         the run loop calls (and tests monkeypatch); dispatches on
         `session.backend` through the registry — no kind branching here."""
         return get_harness(session.backend).create_run(
             self._run_config(
-                session, agent, connectors, skills_plugin_dir=skills_plugin_dir
+                session, agent, connectors, skills_plugin_dirs=skills_plugin_dirs
             )
         )
 
@@ -3058,7 +3147,7 @@ class SessionManager:
         agent: dict[str, Any] | None = None,
         connectors: list[tuple[Any, Any]] | None = None,
         *,
-        skills_plugin_dir: str | None = None,
+        skills_plugin_dirs: list[str] | None = None,
     ) -> RunConfig:
         """Build the per-turn RunConfig from the (freshly-loaded) agent. The
         agent supplies the system prompt, model, built-in MCP set, and tool
@@ -3122,7 +3211,7 @@ class SessionManager:
             task_id=session.task_id,
             task_run_id=session.task_run_id,
             task_worker_prompt=task_worker_prompt,
-            skills_plugin_dir=skills_plugin_dir,
+            skills_plugin_dirs=skills_plugin_dirs or [],
         )
 
     # Refresh the access_token if it expires within this many seconds. A
@@ -3161,24 +3250,59 @@ class SessionManager:
         missing/needs_reconnect, or it can't be resolved — the caller then runs
         with whatever auth the CLI finds on its own. `context` labels log lines.
 
-        - ``home_dir`` (Codex): the credential is directory-backed; its dir is
-          deterministic (`<codex_home_dir>/<credential_id>/`), so we resolve it
-          with no DB read and require a completed login (auth.json present).
+        - ``home_dir`` (Codex): the credential is directory-backed
+          (`<codex_home_dir>/<credential_id>/`) and requires a completed login
+          (auth.json present). `cred_id` MUST name a real `backend_credentials`
+          row with `backend='codex'` — unlike the historical "no DB read"
+          shortcut, this is now checked before `codex_home_for` ever computes
+          a path: `sessions.py`'s `_check_credential_backend` tolerates a
+          missing row (resolved later, by design), so a session can otherwise
+          carry an attacker-chosen `credential_id` (e.g. a path-traversal
+          string) all the way to this resolver with nothing upstream having
+          validated it — and `sync_codex_skills_dir`
+          (experience-consolidation-v2.md §3④) turns a wrongly-resolved
+          `home_dir` into a real filesystem WRITE, not just a misdirected
+          read (Snape review).
         - ``env_secret`` (Claude): decrypt the secret; refresh an OAuth bundle
           if near expiry, else use the long-lived key as-is.
 
         `require_auth=False` resolves the credential only for locating on-disk
-        artifacts (e.g. fork transcript copy/cleanup), NOT for making API calls:
-        a directory-backed credential returns its home dir even with a
+        artifacts (e.g. fork transcript copy/cleanup — by design this must
+        still work after the DB row itself is gone, since the rollout can
+        outlive the credential that created it), NOT for making API calls: a
+        directory-backed credential returns its home dir even with a
         missing/revoked `auth.json` (the rollout still lives there and must be
         cleaned up — Vera review), and a secret-backed credential returns None
-        (its transcripts aren't keyed by credential, so no home to locate)."""
+        (its transcripts aren't keyed by credential, so no home to locate).
+
+        `require_auth=True` (the default, and what every real turn-spawning
+        path uses — `_resolve_credential` never passes `require_auth`) DOES
+        require a real `backend_credentials` row for `home_dir` style, unlike
+        the historical "no DB read" shortcut: `sessions.py`'s
+        `_check_credential_backend` tolerates a missing row (resolved later,
+        by design), so a session can otherwise carry an attacker-chosen
+        `credential_id` (e.g. a path-traversal string) all the way to this
+        resolver with nothing upstream having validated it — and
+        `sync_codex_skills_dir` (experience-consolidation-v2.md §3④) turns a
+        wrongly-resolved `home_dir` into a real filesystem WRITE, not just a
+        misdirected read (Snape review)."""
         if not cred_id:
             return None
 
         if style == "home_dir":
             from .codex_login import codex_home_for
 
+            if require_auth:
+                if self.db is None:
+                    return None
+                row = await self.db.get_credential(cred_id)
+                if row is None or row["backend"] != "codex":
+                    logger.warning(
+                        "%s references a missing or non-codex credential %s; "
+                        "running without a directory-backed auth override",
+                        context or "caller", cred_id,
+                    )
+                    return None
             home = codex_home_for(cred_id)
             if require_auth and not os.path.exists(os.path.join(home, "auth.json")):
                 return None  # inherit the host default ~/.codex (option A)

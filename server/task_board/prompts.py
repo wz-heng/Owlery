@@ -39,6 +39,16 @@ Rules:
     `block` and stop. Opening a fix/follow-up task in response is the
     orchestrator's or user's call, never the worker's; creating one anyway
     produces duplicate, uncoordinated cards.
+11. A non-clean-pass run (a retry, a prior blocked/failed/interrupted run,
+    or `verdict="fail"`) cannot `complete` until you call `reflect` at
+    least once for THIS run. On a genuinely CLEAN pass you may also — purely
+    voluntarily, never required — judge that the flow you just walked was
+    novel or complex enough to be worth distilling while you still hold
+    full context: call `reflect` (skills `propose` for a repeatable
+    process, a memory write for a judgment call, a CLAUDE.md diff for a
+    rule everyone should know) yourself, right here, then pass
+    `complete(reusable_outcome=True)`. Never delegate this write-up to a
+    fresh agent — it would have to re-read your history from scratch.
 """
 
 

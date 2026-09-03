@@ -1379,7 +1379,203 @@ async def test_run_backend_records_skill_usage_on_native_skill_tool_use(manager)
 
     _ = [m async for m in manager._run_backend(session, "go")]
     registry.record_usage.assert_awaited_once_with(
-        "hermes-pr-flow", agent_id=session.agent_id, repository="/resolved/repo"
+        "hermes-pr-flow",
+        agent_id=session.agent_id,
+        repository="/resolved/repo",
+        scope=None,  # bare fake-CLI/legacy value carries no namespace to derive a scope from
+        session_id=session.id,
+        task_id=session.task_id,
+        run_id=session.task_run_id,
+        backend=session.backend,
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_backend_extracts_the_bare_slug_from_a_namespaced_skill_value(manager):
+    """Confirmed against a REAL `claude` spawn (2026-09-02, experience-
+    consolidation-v2.md §5 touchstone C follow-up): a plugin-provided
+    `Skill` tool_use ALWAYS carries a namespaced "<plugin-name>:<slug>"
+    value — unconditionally, even with a single --plugin-dir and no
+    collision, not only when two plugin dirs share a slug. Before this fix,
+    record_usage() was called with the full namespaced string, which could
+    never match a DB row keyed by the bare slug — use_count/invocation
+    tracking had silently never worked for any real Claude session."""
+    from unittest.mock import AsyncMock
+
+    from server.harness import HarnessEvent
+
+    session = await _new(manager, "InvokesNamespacedSkill")
+    registry = AsyncMock()
+    registry.resolve_repository.return_value = "/resolved/repo"
+    manager.set_skill_registry(registry)
+
+    class SkillBackend:
+        async def start(self, prompt, working_dir, resume_id=None, credential=None):
+            pass
+
+        def stream(self):
+            async def _gen():
+                yield HarnessEvent(
+                    type="tool_use", tool_name="Skill",
+                    tool_input={"skill": "owlery-skills-a1b2c3d4e5f6a1b2:hermes-pr-flow"},
+                    tool_use_id="t1",
+                )
+                yield HarnessEvent(type="result", session_id="sid", num_turns=1)
+            return _gen()
+
+        async def stop(self):
+            pass
+
+    manager._make_run = lambda s, agent=None, connectors=None, **_kw: SkillBackend()  # type: ignore[method-assign,assignment]
+
+    _ = [m async for m in manager._run_backend(session, "go")]
+    registry.record_usage.assert_awaited_once_with(
+        "hermes-pr-flow",  # the bare slug, not the namespaced value
+        agent_id=session.agent_id,
+        repository="/resolved/repo",
+        scope="agent+repo",  # namespace suffix is a repo fingerprint, not "_global"
+        session_id=session.id,
+        task_id=session.task_id,
+        run_id=session.task_run_id,
+        backend=session.backend,
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_backend_attributes_a_global_namespaced_skill_to_the_global_scope(manager):
+    """T-B review round 2 (blocker): the plugin namespace for an
+    `agent-global` --plugin-dir is literally `owlery-skills-_global`
+    (agent_skills_plugin_dir's `_global` location key) — this must resolve
+    to `scope='agent-global'`, not the `agent+repo` scope a bare repository
+    fingerprint namespace would produce, or a real global invocation could
+    get attributed to a same-slug repo-scoped candidate instead (the exact
+    misattribution this scope threading exists to prevent)."""
+    from unittest.mock import AsyncMock
+
+    from server.harness import HarnessEvent
+
+    session = await _new(manager, "InvokesGlobalNamespacedSkill")
+    registry = AsyncMock()
+    registry.resolve_repository.return_value = "/resolved/repo"
+    manager.set_skill_registry(registry)
+
+    class SkillBackend:
+        async def start(self, prompt, working_dir, resume_id=None, credential=None):
+            pass
+
+        def stream(self):
+            async def _gen():
+                yield HarnessEvent(
+                    type="tool_use", tool_name="Skill",
+                    tool_input={"skill": "owlery-skills-_global:hermes-pr-flow"},
+                    tool_use_id="t1",
+                )
+                yield HarnessEvent(type="result", session_id="sid", num_turns=1)
+            return _gen()
+
+        async def stop(self):
+            pass
+
+    manager._make_run = lambda s, agent=None, connectors=None, **_kw: SkillBackend()  # type: ignore[method-assign,assignment]
+
+    _ = [m async for m in manager._run_backend(session, "go")]
+    registry.record_usage.assert_awaited_once_with(
+        "hermes-pr-flow",
+        agent_id=session.agent_id,
+        repository="/resolved/repo",
+        scope="agent-global",
+        session_id=session.id,
+        task_id=session.task_id,
+        run_id=session.task_run_id,
+        backend=session.backend,
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_backend_never_attributes_a_non_owlery_plugins_skill(manager):
+    """Snape review: stripping every namespace unconditionally would let an
+    unrelated, user-installed plugin's same-named skill (e.g.
+    "some-plugin:hermes-pr-flow") get attributed to an Owlery-approved
+    candidate that merely shares the bare slug. Only a namespace starting
+    with Owlery's own plugin prefix is trusted."""
+    from unittest.mock import AsyncMock
+
+    from server.harness import HarnessEvent
+
+    session = await _new(manager, "InvokesForeignSkill")
+    registry = AsyncMock()
+    registry.resolve_repository.return_value = "/resolved/repo"
+    manager.set_skill_registry(registry)
+
+    class SkillBackend:
+        async def start(self, prompt, working_dir, resume_id=None, credential=None):
+            pass
+
+        def stream(self):
+            async def _gen():
+                yield HarnessEvent(
+                    type="tool_use", tool_name="Skill",
+                    tool_input={"skill": "some-other-plugin:hermes-pr-flow"},
+                    tool_use_id="t1",
+                )
+                yield HarnessEvent(type="result", session_id="sid", num_turns=1)
+            return _gen()
+
+        async def stop(self):
+            pass
+
+    manager._make_run = lambda s, agent=None, connectors=None, **_kw: SkillBackend()  # type: ignore[method-assign,assignment]
+
+    _ = [m async for m in manager._run_backend(session, "go")]
+    registry.record_usage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_backend_syncs_codex_skills_for_a_codex_session_with_a_credential(
+    manager,
+):
+    """experience-consolidation-v2.md §3④: a Codex session with a resolved,
+    directory-backed credential must have its Codex-materialized skills
+    synced into that credential's real CODEX_HOME before the turn spawns —
+    the live per-turn projection Codex's own event stream has no equivalent
+    hook for."""
+    from unittest.mock import AsyncMock
+
+    from server.codex_login import codex_home_for
+    from server.harness import HarnessEvent
+
+    cid = await _bind_credential(manager, "codex", secret="/tmp/home")
+    home = codex_home_for(cid)
+    os.makedirs(home, exist_ok=True)
+    with open(os.path.join(home, "auth.json"), "w") as f:
+        f.write("{}")
+
+    agent = await manager.db.get_default_agent()
+    session = await manager.create_session(
+        agent["id"], "CodexSkills", None, credential_id=cid, backend="codex"
+    )
+    registry = AsyncMock()
+    registry.resolve_plugin_dir.return_value = []
+    manager.set_skill_registry(registry)
+
+    class Backend:
+        async def start(self, prompt, working_dir, resume_id=None, credential=None):
+            pass
+
+        def stream(self):
+            async def _gen():
+                yield HarnessEvent(type="result", session_id="sid", num_turns=1)
+            return _gen()
+
+        async def stop(self):
+            pass
+
+    manager._make_run = lambda s, agent=None, connectors=None, **_kw: Backend()  # type: ignore[method-assign,assignment]
+
+    _ = [m async for m in manager._run_backend(session, "go")]
+
+    registry.sync_codex_skills_dir.assert_awaited_once_with(
+        agent_id=session.agent_id, working_dir=session.working_dir, codex_home=home
     )
 
 
