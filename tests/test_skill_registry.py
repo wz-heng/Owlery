@@ -329,6 +329,75 @@ async def test_diff_includes_session_summary(registry):
 
 
 @pytest.mark.asyncio
+async def test_diff_on_a_pending_replacement_shows_the_prior_version_invocations(registry):
+    """The review-page evidence chain must show usage history on a PENDING
+    revision candidate too, not just an approved one: `record_usage`
+    always attributes a real invocation to whichever candidate is
+    CURRENTLY `get_latest_approved_skill_by_slug` for this (slug, scope,
+    agent) lineage — a not-yet-approved replacement's own id never appears
+    in `skill_invocations`, so filtering by its exact `candidate_id` (the
+    old behavior) always returned empty, hiding exactly the evidence a
+    reviewer needs to judge a replacement. Querying by lineage instead
+    surfaces the PRIOR candidate's invocations here."""
+    reg, _db, _repo, agent_id = registry
+    original = await _propose(reg)
+    await reg.approve(original["id"])
+    await reg.record_usage(
+        "hermes-pr-flow", agent_id=agent_id, session_id="session-1",
+    )
+
+    replacement = await _propose(reg, body_markdown=SKILL_BODY + "\nExtra line.\n")
+    result = await reg.diff(replacement["id"])
+    assert result["candidate"]["status"] == "pending"
+    assert len(result["invocations"]) == 1
+    assert result["invocations"][0]["candidate_id"] == original["id"]
+
+
+@pytest.mark.asyncio
+async def test_diff_on_a_cross_scope_replacement_still_shows_the_priors_invocations(registry):
+    """Snape review: `diff()` resolves its `landed` baseline via
+    `get_latest_approved_skill_by_slug`'s ambiguous repo-scoped-wins-else-
+    global heuristic (no explicit `scope` is passed there) — so a
+    same-slug replacement PROPOSED at a different scope than its actual
+    prior (here: an `agent-global` original, an `agent+repo` pending
+    replacement) must still resolve the invocation lineage against the
+    PRIOR's real scope, not the replacement's own proposed scope, or the
+    prior's usage history silently vanishes from the review page."""
+    reg, _db, _repo, agent_id = registry
+    original = await _propose(reg, scope="agent-global")
+    await reg.approve(original["id"])
+    await reg.record_usage(
+        "hermes-pr-flow", agent_id=agent_id, scope="agent-global",
+        session_id="session-1",
+    )
+
+    replacement = await _propose(reg)  # defaults to agent+repo
+    assert replacement["scope"] == "agent+repo"
+    result = await reg.diff(replacement["id"])
+    assert len(result["invocations"]) == 1
+    assert result["invocations"][0]["candidate_id"] == original["id"]
+
+
+@pytest.mark.asyncio
+async def test_diff_on_a_repo_to_global_replacement_still_shows_the_priors_invocations(registry):
+    """The reverse direction of the cross-scope case above: an `agent+repo`
+    original, replaced by an `agent-global` pending candidate."""
+    reg, _db, repo, agent_id = registry
+    original = await _propose(reg)  # defaults to agent+repo
+    await reg.approve(original["id"])
+    repository = await reg.resolve_repository(str(repo))
+    await reg.record_usage(
+        "hermes-pr-flow", agent_id=agent_id, repository=repository,
+        scope="agent+repo", session_id="session-1",
+    )
+
+    replacement = await _propose(reg, scope="agent-global")
+    result = await reg.diff(replacement["id"])
+    assert len(result["invocations"]) == 1
+    assert result["invocations"][0]["candidate_id"] == original["id"]
+
+
+@pytest.mark.asyncio
 async def test_list_candidates_filters_by_status(registry):
     reg, _db, _repo, _agent_id = registry
     a = await _propose(reg, slug="skill-a")
@@ -678,6 +747,60 @@ async def test_replacement_approval_removes_stale_bundle_files(registry):
         cwd=repo, check=True, capture_output=True, text=True,
     ).stdout
     assert "scripts/old.sh" not in landed_files
+
+
+@pytest.mark.asyncio
+async def test_approve_lands_even_when_the_target_repo_gitignores_claude_dir(registry):
+    """Production incident: a target repo whose `.gitignore` excludes
+    `.claude/` (Owlery's own repo does, at line 13) made every approval
+    422 with "would not change anything on disk" — `commit_all`'s plain
+    `git add -A` respects `.gitignore`, so a brand-new, entirely-ignored
+    `.claude/skills/<slug>/` directory staged nothing, `git status
+    --porcelain` (checked BEFORE that add) already looked clean, and
+    `_land` mistook a real new landing for a no-op. `_land` must force
+    past that — but ONLY for the exact files it just wrote, never the
+    whole `.claude/` tree, and the resulting commit must contain nothing
+    else. Covers both the single-file and the v2 bundle-file path."""
+    reg, _db, repo, _agent_id = registry
+    (repo / ".gitignore").write_text(".claude/\n")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-q", "-m", "ignore .claude")
+
+    candidate = await _propose(
+        reg, bundle_files={"scripts/run.sh": "#!/bin/sh\necho hi\n"},
+    )
+    approved = await reg.approve(candidate["id"])
+    assert approved["status"] == "approved"
+    assert approved["landed_commit"]
+
+    changed = subprocess.run(
+        [
+            "git", "diff", "--name-only",
+            f"{approved['landed_commit']}^", approved["landed_commit"],
+        ],
+        cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert sorted(changed) == [
+        ".claude/skills/hermes-pr-flow/SKILL.md",
+        ".claude/skills/hermes-pr-flow/scripts/run.sh",
+    ]
+
+    skill_md = subprocess.run(
+        [
+            "git", "show",
+            f"{approved['landed_branch']}:.claude/skills/hermes-pr-flow/SKILL.md",
+        ],
+        cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout
+    assert skill_md == SKILL_BODY
+    script = subprocess.run(
+        [
+            "git", "show",
+            f"{approved['landed_branch']}:.claude/skills/hermes-pr-flow/scripts/run.sh",
+        ],
+        cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout
+    assert script == "#!/bin/sh\necho hi\n"
 
 
 @pytest.mark.asyncio

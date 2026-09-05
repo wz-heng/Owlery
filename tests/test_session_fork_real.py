@@ -57,8 +57,8 @@ async def _bootstrap(tmp_path, monkeypatch):
     # the only source of context.
     _orig_run_config = mgr._run_config
 
-    def _no_mem(session, agent=None, connectors=None):
-        cfg = _orig_run_config(session, agent, connectors)
+    def _no_mem(session, agent=None, connectors=None, **kwargs):
+        cfg = _orig_run_config(session, agent, connectors, **kwargs)
         cfg.memory_dir = None
         return cfg
 

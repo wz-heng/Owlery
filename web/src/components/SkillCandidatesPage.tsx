@@ -116,8 +116,10 @@ export function SkillCandidatesPage({
     try {
       await skillsApi.approve(token, selected.id, undefined, approveScope);
       refresh();
-    } catch {
-      setActionError("Failed to approve this candidate.");
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : "Failed to approve this candidate."
+      );
     } finally {
       setActing(false);
     }
@@ -131,8 +133,10 @@ export function SkillCandidatesPage({
       await skillsApi.reject(token, selected.id, rejectNote.trim());
       setRejectNote("");
       refresh();
-    } catch {
-      setActionError("Failed to reject this candidate.");
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : "Failed to reject this candidate."
+      );
     } finally {
       setActing(false);
     }
@@ -378,30 +382,33 @@ export function SkillCandidatesPage({
                   <div>landed at <code>{selected.landed_path}</code></div>
                   <div>branch <code>{selected.landed_branch}</code></div>
                   <div>use count: {selected.use_count}</div>
-                  {detail && detail.invocations.length > 0 && (
-                    <div className="mt-2 border-t border-ink-300 pt-2">
-                      <div className="mb-1 font-medium text-muted-foreground">Invocation history</div>
-                      <ul className="space-y-0.5">
-                        {detail.invocations.map((inv) => (
-                          <li key={inv.id} className="flex flex-wrap gap-x-2">
-                            <span>{new Date(inv.used_at).toLocaleString()}</span>
-                            {inv.backend && <span>· {inv.backend}</span>}
-                            {inv.run_id && <span>· run {inv.run_id}</span>}
-                            {inv.task_id && (
-                              <button
-                                type="button"
-                                className="text-primary-700 underline hover:no-underline disabled:cursor-default disabled:text-foreground disabled:no-underline"
-                                onClick={() => onOpenTask?.(inv.task_id!)}
-                                disabled={!onOpenTask}
-                              >
-                                open task
-                              </button>
-                            )}
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  )}
+                </section>
+              )}
+              {detail && detail.invocations.length > 0 && (
+                <section className="rounded-lg border border-ink-300 bg-card p-3 text-xs">
+                  <div className="mb-1 font-medium text-muted-foreground">
+                    Invocation history
+                    {selected.status !== "approved" && " (prior version)"}
+                  </div>
+                  <ul className="space-y-0.5">
+                    {detail.invocations.map((inv) => (
+                      <li key={inv.id} className="flex flex-wrap gap-x-2">
+                        <span>{new Date(inv.used_at).toLocaleString()}</span>
+                        {inv.backend && <span>· {inv.backend}</span>}
+                        {inv.run_id && <span>· run {inv.run_id}</span>}
+                        {inv.task_id && (
+                          <button
+                            type="button"
+                            className="text-primary-700 underline hover:no-underline disabled:cursor-default disabled:text-foreground disabled:no-underline"
+                            onClick={() => onOpenTask?.(inv.task_id!)}
+                            disabled={!onOpenTask}
+                          >
+                            open task
+                          </button>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
                 </section>
               )}
               {selected.status === "rejected" && selected.review_note && (

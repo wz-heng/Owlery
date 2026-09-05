@@ -556,6 +556,54 @@ async def commit_all(
     return {"head": await resolve_head(worktree), "committed": True}
 
 
+async def commit_paths(
+    worktree: str,
+    pathspec: str,
+    *,
+    author_name: str,
+    author_email: str,
+    message: str,
+) -> dict[str, Any]:
+    """Stage every add/modify/delete under ONE pathspec — forcing past
+    `.gitignore` — and create ONE owned commit; no-op if nothing changed.
+
+    Unlike `commit_all`, a plain cleanliness check can't tell us whether
+    there's anything to commit here: an ignored new file (e.g. the target
+    repo's own `.claude/` entry, which the Owlery repo itself has) never
+    shows up as untracked in `git status --porcelain`, so checking that
+    BEFORE staging would always see a "clean" tree and short-circuit
+    before `-f` ever gets a chance to force it in — stage first, then look
+    at what actually landed in the index. `-A` (not a bare `add <path>`)
+    still needs to run so a file the caller removed from disk before
+    calling this — a bundle file a replacement candidate dropped — stages
+    as a deletion too; scoping it to `pathspec` keeps that reconciliation
+    bounded to exactly the directory the caller owns, never the whole
+    repository.
+
+    The no-op check and the commit itself are ALSO scoped to `pathspec`
+    (Snape review): the caller is trusted to hand this a fresh, otherwise-
+    untouched worktree today, but bounding every step to `pathspec` — not
+    just the initial `add` — means a future caller that reuses this helper
+    on a worktree with unrelated staged changes still can't have those
+    swept into this commit.
+    """
+    rc, _, err = await _git("add", "-A", "-f", "--", pathspec, cwd=worktree)
+    if rc:
+        raise WorkspaceError(err or f"Unable to stage {pathspec!r}")
+    rc, _, _ = await _git("diff", "--cached", "--quiet", "--", pathspec, cwd=worktree)
+    if rc == 0:
+        return {"head": await resolve_head(worktree), "committed": False}
+    rc, _, err = await _git(
+        "-c", f"user.name={author_name}",
+        "-c", f"user.email={author_email}",
+        "commit", "-m", message, "--", pathspec,
+        cwd=worktree,
+    )
+    if rc:
+        raise WorkspaceError(err or "Unable to create delivery commit")
+    return {"head": await resolve_head(worktree), "committed": True}
+
+
 async def remote_url(repo: str, remote: str) -> str | None:
     rc, url, _ = await _git("remote", "get-url", remote, cwd=repo)
     if rc or not url:

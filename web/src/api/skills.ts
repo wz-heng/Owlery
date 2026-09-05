@@ -102,6 +102,23 @@ async function getJson<T>(token: string, path: string): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+/** The skills router (`server/routers/skills.py`) raises
+ * `HTTPException(code, {"code": ..., "message": ...})`, which FastAPI wraps
+ * as `{"detail": {"code": ..., "message": ...}}` — pull that message out so
+ * a validation failure (e.g. "approving this candidate would not change
+ * anything on disk") reaches the reviewer instead of a bare status code. */
+async function extractErrorMessage(res: Response): Promise<string> {
+  try {
+    const body = await res.json();
+    const detail = body?.detail;
+    if (typeof detail === "string") return detail;
+    if (detail && typeof detail.message === "string") return detail.message;
+  } catch {
+    // Body wasn't JSON, or didn't have this shape — fall through.
+  }
+  return `HTTP ${res.status}`;
+}
+
 async function postJson<T>(
   token: string, path: string, body: unknown
 ): Promise<T> {
@@ -110,7 +127,7 @@ async function postJson<T>(
     headers: { ...authHeaders(token), "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw new Error(await extractErrorMessage(res));
   return res.json() as Promise<T>;
 }
 

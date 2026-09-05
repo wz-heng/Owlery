@@ -439,7 +439,23 @@ class SkillRegistry:
             if candidate["proposed_by_session_id"]
             else None
         )
-        invocations = await self.db.list_skill_invocations(candidate_id)
+        # Use `landed`'s own (scope, agent, repository) identity, not the
+        # pending candidate's — `landed` was resolved above via the
+        # ambiguous repo-scoped-wins-else-global heuristic (no explicit
+        # `scope` passed), so a same-slug replacement proposed at a
+        # DIFFERENT scope than its actual prior (e.g. an `agent-global`
+        # prior with an `agent+repo` replacement pending) would otherwise
+        # query the invocation lineage under the WRONG scope and silently
+        # hide the prior's usage history (Snape review). Falls back to the
+        # candidate's own identity only when there's no prior to inherit
+        # from (a brand-new slug — invocations are empty either way).
+        lineage_source = landed if landed is not None else candidate
+        invocations = await self.db.list_skill_invocations_for_lineage(
+            slug=candidate["slug"],
+            scope=lineage_source["scope"],
+            agent_id=lineage_source["proposed_by_agent_id"],
+            repository=lineage_source["repository"],
+        )
 
         return {
             "candidate": candidate,
@@ -908,8 +924,18 @@ class SkillRegistry:
                 path = skill_dir / relpath
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(file_content)
-            result = await ws.commit_all(
+            # `commit_all`'s plain `git add -A` respects the TARGET repo's
+            # `.gitignore` — a repo that (like Owlery's own) ignores
+            # `.claude/` would stage nothing, so `commit_all` sees a "clean"
+            # tree and reports `committed=False`, which the caller then
+            # turns into a 422 even though the landing worktree genuinely
+            # has new content on disk. `commit_paths` forces past that,
+            # scoped to exactly the directory this call wrote — never the
+            # whole `.claude/` tree, and never a file this landing didn't
+            # touch.
+            result = await ws.commit_paths(
                 scratch,
+                f".claude/skills/{slug}",
                 author_name="Owlery Skill Registry",
                 author_email="owlery-skills@localhost",
                 message=f"skill: land candidate {slug} ({candidate_id})",
