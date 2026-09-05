@@ -4054,6 +4054,60 @@ class Database:
             for r in rows
         ]
 
+    async def list_skill_invocations_for_lineage(
+        self,
+        *,
+        slug: str,
+        scope: str,
+        agent_id: str | None,
+        repository: str,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """All invocations recorded against ANY candidate sharing this
+        lineage — (slug, scope, agent), plus an exact repository match for
+        `scope='agent+repo'` (an `agent-global` candidate has no repository
+        dimension, mirroring `get_latest_approved_skill_by_slug`'s own
+        scoping).
+
+        A pending replacement candidate has never itself been invoked — its
+        own id never appears in `skill_invocations`, since `record_usage`
+        always attributes a real invocation to whichever candidate is
+        CURRENTLY `get_latest_approved_skill_by_slug` for this lineage, not
+        to a not-yet-approved row — but a reviewer deciding whether to
+        approve it needs the PRIOR version's usage history, which is
+        recorded against that prior candidate's id. Joining on lineage
+        instead of filtering by one exact `candidate_id` surfaces that
+        history for every status, not just `approved`."""
+        await self._ensure_connected()
+        query = (
+            "SELECT si.id, si.candidate_id, si.agent_id, si.repository, "
+            "si.session_id, si.task_id, si.run_id, si.backend, si.used_at "
+            "FROM skill_invocations si "
+            "JOIN skill_candidates sc ON sc.id = si.candidate_id "
+            "WHERE sc.slug = ? AND sc.scope = ?"
+        )
+        params: list[Any] = [slug, scope]
+        if agent_id is not None:
+            query += " AND sc.proposed_by_agent_id = ?"
+            params.append(agent_id)
+        else:
+            query += " AND sc.proposed_by_agent_id IS NULL"
+        if scope == "agent+repo":
+            query += " AND sc.repository = ?"
+            params.append(repository)
+        query += " ORDER BY si.used_at DESC LIMIT ?"
+        params.append(limit)
+        cursor = await self._conn.execute(query, params)
+        rows = await cursor.fetchall()
+        return [
+            {
+                "id": r[0], "candidate_id": r[1], "agent_id": r[2],
+                "repository": r[3], "session_id": r[4], "task_id": r[5],
+                "run_id": r[6], "backend": r[7], "used_at": r[8],
+            }
+            for r in rows
+        ]
+
     # --- Minimal read-only summaries for the skill review-page evidence
     # chain (experience-consolidation-v2.md §3②) — tasks/task_runs/sessions
     # already live in this same DB file under their own owning modules

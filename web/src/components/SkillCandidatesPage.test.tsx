@@ -12,7 +12,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 
 import { SkillCandidatesPage } from "./SkillCandidatesPage";
 import { useSessionStore } from "../stores/sessionStore";
-import type { SkillCandidate, SkillCandidateDetail } from "../api/skills";
+import type { SkillCandidate, SkillCandidateDetail, SkillInvocation } from "../api/skills";
 
 function candidate(overrides: Partial<SkillCandidate> = {}): SkillCandidate {
   return {
@@ -51,7 +51,9 @@ function candidate(overrides: Partial<SkillCandidate> = {}): SkillCandidate {
   };
 }
 
-function detailFor(c: SkillCandidate): SkillCandidateDetail {
+function detailFor(
+  c: SkillCandidate, invocations: SkillInvocation[] = []
+): SkillCandidateDetail {
   return {
     candidate: c,
     diff: "+new line\n",
@@ -61,7 +63,7 @@ function detailFor(c: SkillCandidate): SkillCandidateDetail {
     session: c.proposed_by_session_id
       ? { id: c.proposed_by_session_id, backend: "claude-code", archived: false }
       : null,
-    invocations: [],
+    invocations,
   };
 }
 
@@ -321,6 +323,128 @@ describe("SkillCandidatesPage", () => {
       fireEvent.click(approvedTab);
     });
     await screen.findByText(/used 3×/);
+  });
+
+  it("shows invocation history for an approved candidate", async () => {
+    store.pending = [];
+    store.approved = [candidate({ id: "cand-2", status: "approved", use_count: 1 })];
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      const u = new URL(url);
+      if (u.pathname === "/api/skills/candidates" && method === "GET") {
+        const status = (u.searchParams.get("status") ?? "pending") as
+          | "pending" | "approved" | "rejected";
+        return new Response(JSON.stringify(store[status] ?? []), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }
+      if (u.pathname === "/api/skills/candidates/cand-2" && method === "GET") {
+        const detail = detailFor(store.approved[0], [
+          {
+            id: "inv-1", candidate_id: "cand-2", agent_id: "agent-1",
+            repository: "/repo", session_id: "session-1", task_id: "task-9",
+            run_id: "run-9", backend: "claude-code",
+            used_at: "2026-09-03T00:00:00Z",
+          },
+        ]);
+        return new Response(JSON.stringify(detail), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    });
+    await act(async () => {
+      render(<SkillCandidatesPage />);
+    });
+    await screen.findByText("No pending candidates.");
+    const approvedTab = screen.getByRole("tab", { name: "approved" });
+    await act(async () => {
+      fireEvent.click(approvedTab);
+    });
+    await screen.findByRole("heading", { name: "Hermes PR flow" });
+    await screen.findByText("Invocation history");
+    expect(screen.getByText(/run run-9/)).toBeTruthy();
+  });
+
+  it("shows the prior version's invocation history for a PENDING replacement candidate", async () => {
+    // The regression this guards: `list_skill_invocations` used to filter
+    // by the pending candidate's own id, which never has invocations of
+    // its own (it's never been approved/loaded yet) — the review-page
+    // detail now joins on lineage (slug+scope+agent) instead, so a
+    // reviewer deciding on a REPLACEMENT sees the version it would replace
+    // actually got used.
+    const pending = candidate({ id: "cand-3", status: "pending" });
+    store.pending = [pending];
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      const u = new URL(url);
+      if (u.pathname === "/api/skills/candidates" && method === "GET") {
+        return new Response(JSON.stringify([pending]), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }
+      if (u.pathname === "/api/skills/candidates/cand-3" && method === "GET") {
+        const detail = detailFor(pending, [
+          {
+            id: "inv-old", candidate_id: "cand-1", agent_id: "agent-1",
+            repository: "/repo", session_id: "session-1", task_id: null,
+            run_id: "run-old", backend: "claude-code",
+            used_at: "2026-08-01T00:00:00Z",
+          },
+        ]);
+        return new Response(JSON.stringify(detail), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    });
+    await act(async () => {
+      render(<SkillCandidatesPage />);
+    });
+    await screen.findByRole("heading", { name: "Hermes PR flow" });
+    await screen.findByText(/Invocation history/);
+    expect(screen.getByText(/\(prior version\)/)).toBeTruthy();
+    expect(screen.getByText(/run run-old/)).toBeTruthy();
+    // Not approved — the landed-path/branch/use-count block must stay hidden.
+    expect(screen.queryByText(/landed at/)).toBeNull();
+  });
+
+  it("surfaces the server's error message when approve fails", async () => {
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      const u = new URL(url);
+      if (u.pathname === "/api/skills/candidates" && method === "GET") {
+        return new Response(JSON.stringify(store.pending), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }
+      if (u.pathname === "/api/skills/candidates/cand-1" && method === "GET") {
+        return new Response(JSON.stringify(detailFor(candidate())), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }
+      if (u.pathname === "/api/skills/candidates/cand-1/approve" && method === "POST") {
+        return new Response(
+          JSON.stringify({
+            detail: {
+              code: "validation",
+              message: "approving this candidate would not change anything on disk",
+            },
+          }),
+          { status: 422, headers: { "content-type": "application/json" } }
+        );
+      }
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    });
+    await act(async () => {
+      render(<SkillCandidatesPage />);
+    });
+    await screen.findByRole("heading", { name: "Hermes PR flow" });
+    const approveBtn = await screen.findByRole("button", { name: "Approve" });
+    await act(async () => {
+      fireEvent.click(approveBtn);
+    });
+    await screen.findByText(/would not change anything on disk/);
   });
 
   it("clicking the task link calls onOpenTask", async () => {
