@@ -579,17 +579,24 @@ async def commit_paths(
     as a deletion too; scoping it to `pathspec` keeps that reconciliation
     bounded to exactly the directory the caller owns, never the whole
     repository.
+
+    The no-op check and the commit itself are ALSO scoped to `pathspec`
+    (Snape review): the caller is trusted to hand this a fresh, otherwise-
+    untouched worktree today, but bounding every step to `pathspec` — not
+    just the initial `add` — means a future caller that reuses this helper
+    on a worktree with unrelated staged changes still can't have those
+    swept into this commit.
     """
     rc, _, err = await _git("add", "-A", "-f", "--", pathspec, cwd=worktree)
     if rc:
         raise WorkspaceError(err or f"Unable to stage {pathspec!r}")
-    rc, _, _ = await _git("diff", "--cached", "--quiet", cwd=worktree)
+    rc, _, _ = await _git("diff", "--cached", "--quiet", "--", pathspec, cwd=worktree)
     if rc == 0:
         return {"head": await resolve_head(worktree), "committed": False}
     rc, _, err = await _git(
         "-c", f"user.name={author_name}",
         "-c", f"user.email={author_email}",
-        "commit", "-m", message,
+        "commit", "-m", message, "--", pathspec,
         cwd=worktree,
     )
     if rc:

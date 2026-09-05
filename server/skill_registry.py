@@ -439,11 +439,22 @@ class SkillRegistry:
             if candidate["proposed_by_session_id"]
             else None
         )
+        # Use `landed`'s own (scope, agent, repository) identity, not the
+        # pending candidate's — `landed` was resolved above via the
+        # ambiguous repo-scoped-wins-else-global heuristic (no explicit
+        # `scope` passed), so a same-slug replacement proposed at a
+        # DIFFERENT scope than its actual prior (e.g. an `agent-global`
+        # prior with an `agent+repo` replacement pending) would otherwise
+        # query the invocation lineage under the WRONG scope and silently
+        # hide the prior's usage history (Snape review). Falls back to the
+        # candidate's own identity only when there's no prior to inherit
+        # from (a brand-new slug — invocations are empty either way).
+        lineage_source = landed if landed is not None else candidate
         invocations = await self.db.list_skill_invocations_for_lineage(
             slug=candidate["slug"],
-            scope=candidate["scope"],
-            agent_id=candidate["proposed_by_agent_id"],
-            repository=candidate["repository"],
+            scope=lineage_source["scope"],
+            agent_id=lineage_source["proposed_by_agent_id"],
+            repository=lineage_source["repository"],
         )
 
         return {

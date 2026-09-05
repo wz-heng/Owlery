@@ -354,6 +354,50 @@ async def test_diff_on_a_pending_replacement_shows_the_prior_version_invocations
 
 
 @pytest.mark.asyncio
+async def test_diff_on_a_cross_scope_replacement_still_shows_the_priors_invocations(registry):
+    """Snape review: `diff()` resolves its `landed` baseline via
+    `get_latest_approved_skill_by_slug`'s ambiguous repo-scoped-wins-else-
+    global heuristic (no explicit `scope` is passed there) — so a
+    same-slug replacement PROPOSED at a different scope than its actual
+    prior (here: an `agent-global` original, an `agent+repo` pending
+    replacement) must still resolve the invocation lineage against the
+    PRIOR's real scope, not the replacement's own proposed scope, or the
+    prior's usage history silently vanishes from the review page."""
+    reg, _db, _repo, agent_id = registry
+    original = await _propose(reg, scope="agent-global")
+    await reg.approve(original["id"])
+    await reg.record_usage(
+        "hermes-pr-flow", agent_id=agent_id, scope="agent-global",
+        session_id="session-1",
+    )
+
+    replacement = await _propose(reg)  # defaults to agent+repo
+    assert replacement["scope"] == "agent+repo"
+    result = await reg.diff(replacement["id"])
+    assert len(result["invocations"]) == 1
+    assert result["invocations"][0]["candidate_id"] == original["id"]
+
+
+@pytest.mark.asyncio
+async def test_diff_on_a_repo_to_global_replacement_still_shows_the_priors_invocations(registry):
+    """The reverse direction of the cross-scope case above: an `agent+repo`
+    original, replaced by an `agent-global` pending candidate."""
+    reg, _db, repo, agent_id = registry
+    original = await _propose(reg)  # defaults to agent+repo
+    await reg.approve(original["id"])
+    repository = await reg.resolve_repository(str(repo))
+    await reg.record_usage(
+        "hermes-pr-flow", agent_id=agent_id, repository=repository,
+        scope="agent+repo", session_id="session-1",
+    )
+
+    replacement = await _propose(reg, scope="agent-global")
+    result = await reg.diff(replacement["id"])
+    assert len(result["invocations"]) == 1
+    assert result["invocations"][0]["candidate_id"] == original["id"]
+
+
+@pytest.mark.asyncio
 async def test_list_candidates_filters_by_status(registry):
     reg, _db, _repo, _agent_id = registry
     a = await _propose(reg, slug="skill-a")
