@@ -217,7 +217,7 @@ get it until the user adds it — same policy as other built-ins.
 
 ```json
 {
-  "agent_name": "vera",
+  "agent_name": "snape",
   "request": "review the latest commit on the dashboard branch",
   "files": ["web/src/components/Dashboard.tsx"]    // optional
 }
@@ -317,7 +317,7 @@ event kind:
 - `result` (terminal) → finalise. Build the injection string:
 
   ```
-  [agent-reply:vera delegation=ab12cd34ef56]
+  [agent-reply:snape delegation=ab12cd34ef56]
   <joined captured_text>
   ```
 
@@ -415,7 +415,7 @@ races (`server/delegations.py:256`, `server/delegations.py:310`,
 `server/delegations.py:749`).
 
 The parent gets an injected
-`[agent-error:vera delegation=… reason=cancelled]`. Descendant
+`[agent-error:snape delegation=… reason=cancelled]`. Descendant
 terminal turns are delivered to their immediate parents before the
 root cancellation is injected upward, so the one-hop invariant remains
 true while the chain unwinds.
@@ -556,7 +556,7 @@ Two consequences worth surfacing:
 
 Both fall out of the existing per-agent wiring:
 
-- Snape's child session has `agent_id=vera.id`, so
+- Snape's child session has `agent_id=snape.id`, so
   `_make_run_config()` reads Snape's memory dir, credentials, system
   prompt, MCP set. No special-case code.
 - Dobby's memory dir is never touched by Snape's session, and vice

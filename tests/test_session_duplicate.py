@@ -344,7 +344,7 @@ async def test_duplicate_route_exposes_full_copy_flag(client, tmp_path, monkeypa
     assert detail["fork_is_full_copy"] is False
 
 
-# ----------------------------------------------------- replay-cutoff (Vera #1)
+# ----------------------------------------------------- replay-cutoff
 
 
 @pytest.mark.asyncio
@@ -366,7 +366,7 @@ async def test_duplicate_replay_cutoff_covers_full_history(manager, tmp_path, mo
     assert [m["seq"] for m in replayed] == [0, 1, 2, 3, 4, 5]
 
 
-# ------------------------------------------------ copy/cleanup leaks (Vera #3/#4)
+# ------------------------------------------------ copy/cleanup leaks
 
 
 @pytest.mark.asyncio
@@ -463,7 +463,7 @@ async def test_recover_removes_abandoned_fork_copy_dir(manager, tmp_path, monkey
 async def test_resolve_credential_require_auth_false(manager, tmp_path, monkeypatch):
     # For artifact cleanup/copy we need the Codex home dir even when auth.json is
     # absent/revoked (the rollout still lives there); a secret-backed (Claude)
-    # credential has no per-credential store, so it resolves to None (Vera).
+    # credential has no per-credential store, so it resolves to None.
     from server.codex_login import codex_home_for
 
     cid = "cred-xyz"
@@ -497,7 +497,7 @@ def test_is_fork_copy_dir(monkeypatch, tmp_path):
 async def test_full_copy_marker_survives_first_turn_cleanup(manager, tmp_path, monkeypatch):
     # `fork_metadata` is cleared once the fork's first turn produces a result,
     # but the durable `full_copy` identity MUST persist so the UI keeps treating
-    # it as a copy-dir fork rather than a rewind (Vera review).
+    # it as a copy-dir fork rather than a rewind.
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     repo = _repo(tmp_path)
     parent = await _seed_parent(manager, repo)

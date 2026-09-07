@@ -70,7 +70,7 @@ describe("ResearchCard", () => {
   it("ignores a partial upsert for an unknown id (no malformed card)", () => {
     // A progress/completed event arriving without a prior research_started
     // (missed after reconnect / in a 2nd tab) must NOT create a card with no
-    // question/status (Vera review).
+    // question/status.
     useSessionStore.getState().upsertResearch("s1", { id: "ghost", phase: "verify" });
     render(<ResearchCard sessionId="s1" />);
     expect(screen.queryByText(/Verifying claims/)).toBeNull();

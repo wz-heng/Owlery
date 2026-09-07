@@ -1192,8 +1192,8 @@ export function ChatView({
     for (const sid of Object.keys(pendingForksMap)) {
       if (forksInFlight.current.has(sid)) continue;
       // Honor an in-progress backoff: while a retry timer is pending, an
-      // unrelated re-render must NOT jump the cooldown and POST early (Vera
-      // review). The timer's own callback re-runs this effect when it elapses.
+      // unrelated re-render must NOT jump the cooldown and POST early. The
+      // timer's own callback re-runs this effect when it elapses.
       if (forkRetryTimers.current.has(sid)) continue;
       const sess = sessions.find((s) => s.id === sid);
       if (!sess) {
@@ -1216,7 +1216,7 @@ export function ChatView({
           if (result === "retry") {
             // The intent may have been cleared (e.g. /reset or /archive) while
             // this in-flight POST was resolving — don't schedule a retry for a
-            // fork nobody's waiting on (Vera review nit).
+            // fork nobody's waiting on.
             if (!useSessionStore.getState().pendingForks[sid]) {
               clearForkBackoff(sid);
               return;

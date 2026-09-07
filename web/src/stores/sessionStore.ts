@@ -557,7 +557,7 @@ export const useSessionStore = create<SessionStore>((set) => ({
         // snapshot). A bare progress/completed/failed patch for an unknown id
         // (missed `research_started` after reconnect or in a 2nd tab) would
         // render a card with no question/status — skip it; the /research
-        // snapshot fetch on session load seeds those properly (Vera review).
+        // snapshot fetch on session load seeds those properly.
         if (!job.question || !job.status) return {};
         return { research: { ...s.research, [sessionId]: [...current, job as ResearchJob] } };
       }

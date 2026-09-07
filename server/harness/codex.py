@@ -535,7 +535,7 @@ def _rollout_meta_id(p: "Path") -> "str | None":
 def _find_rollout(sessions_dir: "Path", resume_id: str) -> "Path | None":
     """Locate the rollout whose `session_meta.id` == resume_id. The filename
     usually embeds the id, but since this also drives DELETION we CONFIRM against
-    session_meta before returning a match (Vera review) — never delete on a mere
+    session_meta before returning a match — never delete on a mere
     filename-substring hit."""
     if not sessions_dir.is_dir():
         return None
@@ -575,7 +575,7 @@ async def _fork_copy(
 
     dest = src.parent / f"rollout-fork-{new_resume_id}.jsonl"
     # Temp + atomic rename so a crash mid-copy can't leave a half-written
-    # rollout that later looks resumable (Vera review).
+    # rollout that later looks resumable.
     tmp = dest.with_suffix(".jsonl.tmp")
     try:
         with src.open() as fin, tmp.open("w") as fout:
@@ -617,7 +617,7 @@ async def _fork_cleanup(
     # rollout-fork-<id>.jsonl) directly — NOT the read-based `_find_rollout`,
     # whose session_meta read could fail and make a present-but-unreadable
     # rollout look absent, so cleanup "succeeds" and the row is deleted, leaking
-    # it (Vera review). A name match needs no read.
+    # it. A name match needs no read.
     if not sessions.is_dir():
         return
     for copied in sessions.rglob(f"rollout-fork-{resume_id_hint}.jsonl"):

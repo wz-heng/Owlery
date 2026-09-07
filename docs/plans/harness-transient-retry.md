@@ -43,8 +43,8 @@ Mirrors the auth work (no `if backend ==` outside `server/harness/`):
 
 Patterns are specific server-reliability phrases ("overloaded", "internal
 server error", "service unavailable", "bad gateway", "529", "connection
-reset", "timed out", "stream error", …), chosen narrow after Vera's note
-that broad tokens (a bare "unauthorized") cause false positives.
+reset", "timed out", "stream error", …), chosen narrow because broad tokens
+(a bare "unauthorized") cause false positives.
 
 **Server-side throttle vs. the user's usage limit.** Anthropic emits a
 server-side throttle as "Server is temporarily limiting requests (**not your
@@ -88,7 +88,7 @@ reserved for the clean no-output case.
 The backoff `sleep` is a normal `await` inside the turn, so a user interrupt
 cancels it like any in-flight turn.
 
-**Resume-id preservation (Vera review).** A failed no-output attempt can still
+**Resume-id preservation.** A failed no-output attempt can still
 emit `session_started` and mutate `session.claude_session_id`. Left alone, the
 retry would become `--resume <failed-id> -- <original prompt>` — not the
 original invocation, risking a duplicated prompt or a resumed dead partial

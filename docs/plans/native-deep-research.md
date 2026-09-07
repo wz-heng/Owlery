@@ -99,14 +99,14 @@ Owlery `HarnessRun` turn (the same engine a chat turn uses), run in a
 throwaway scratch context — not the user's session. Owlery reads the turn's
 final text (JSON findings) and discards the sub-turn.
 
-- **A dedicated leaf executor, NOT delegation child sessions** (Vera). Reusing
+- **A dedicated leaf executor, NOT delegation child sessions.** Reusing
   delegations would drag in session persistence, child archival, broadcast
   capture, parent-chain/cycle rules, follow-up semantics and user-visible
   collaboration — all wrong for a stateless leaf. Instead a small leaf executor
   resolves the agent's credential/model once, runs a throwaway `HarnessRun`,
   captures the final assistant text, and returns structured `{text, cost,
   error}`.
-- **The leaf does NOT inherit the session's `RunConfig`** (Vera). `_run_config`
+- **The leaf does NOT inherit the session's `RunConfig`.** `_run_config`
   normally composes the agent's MCP set, connectors, memory dir, persona and
   tool policy (`session_manager.py:2082`), and `HarnessRun._make_context`
   always layers in the tools prompt + selected MCP servers (`run.py:171`). A
@@ -119,7 +119,7 @@ final text (JSON findings) and discards the sub-turn.
 - **No provider, no API key, no extractor lib, no scraping** on our side —
   those are exactly the "way harder than it looks" problems we're declining to
   own. We inherit whatever quality/freshness the harness's web tools give.
-- **Capability gate — a `WebCapability` object, not just a tuple** (Vera). A
+- **Capability gate — a `WebCapability` object, not just a tuple.** A
   tuple of tool names under-specifies it. The profile declares a small
   `WebCapability`: the web tool name(s); how to ENABLE web (codex needs
   `-c tools.web_search=true`; claude needs nothing); whether tool restrictions
@@ -157,7 +157,7 @@ A module singleton bound in `main.py`'s lifespan (mirrors `bg_task_manager`
   (we hold their `HarnessRun`s) and fetch tasks — no orphans (contrast the CLI
   Workflow, whose nested `claude` processes orphaned on interrupt).
 - Persists to a `research_jobs` table, with **completion and delivery tracked
-  separately** (Vera): `status`/`phase`/`completed_at` AND `injection_status`/
+  separately**: `status`/`phase`/`completed_at` AND `injection_status`/
   `injected_at`/`delivery_error`/`report_path`. Because the report is delivered
   by queuing a `start_message` injection (§7), a job can be `completed` while
   its report still sits behind an active user turn — the card/DB must show
@@ -202,7 +202,7 @@ A module singleton bound in `main.py`'s lifespan (mirrors `bg_task_manager`
 
 ## 8. Limits & safety
 
-A per-job semaphore (~4–6) is necessary but **not sufficient** (Vera): add a
+A per-job semaphore (~4–6) is necessary but **not sufficient**: add a
 **global** concurrency budget across ALL research jobs (else N sessions each
 start 6 leaves and exhaust the box) and a max-concurrent-jobs cap. Plus
 phase-level caps: max findings per angle, max claims entering K-vote verify,
@@ -222,7 +222,7 @@ the harness's concern, not ours.
 - Capability gate: a backend with no `web_tool_names` makes deep research
   return the clear unavailable message.
 - Manager/routes/MCP tool: like the delegations/bg suites.
-- Prerequisite coverage (Vera): codex `build_turn_argv` web-enablement +
+- Prerequisite coverage: codex `build_turn_argv` web-enablement +
   tool-restriction rendering; leaf-config isolation (no inherited
   MCP/connectors/memory); process-group reaping for `HarnessRun` *and*
   `run_oneshot`; global (cross-job) concurrency cap; queued terminal injection

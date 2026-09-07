@@ -16,16 +16,16 @@
  * run real without the child needing to be marked.
  *
  * What this spec covers end-to-end:
- *   1. A real LLM call to `mcp__ask_agent__ask` spawns Vera's child
+ *   1. A real LLM call to `mcp__ask_agent__ask` spawns Hedwig's child
  *      session, the request card renders inline with the tool_use, and
  *      transitions running → replied.
- *   2. Vera's reply lands as a `[agent-reply:Vera delegation=…]` turn
+ *   2. Hedwig's reply lands as a `[agent-reply:Hedwig delegation=…]` turn
  *      injection in Owl's chat, rendered as an
  *      `AgentDelegationEventCard`.
- *   3. The "Open Vera's session" link navigates to the child session,
+ *   3. The "Open Hedwig's session" link navigates to the child session,
  *      and the "Delegated from Owl" banner appears on the child
  *      header.
- *   4. Once terminal delivery succeeds, Vera's child is auto-archived
+ *   4. Once terminal delivery succeeds, Hedwig's child is auto-archived
  *      and appears in the Archived sessions manager rather than the
  *      live sidebar.
  */
@@ -109,7 +109,7 @@ async function ensureAgent(
     data: {
       name,
       model: "haiku",
-      // Be permissive: the system prompt nudges Vera to reply tersely
+      // Be permissive: the system prompt nudges Hedwig to reply tersely
       // so the reply-injection assertion has a stable target string.
       system_prompt:
         "You are a terse assistant. Reply only with what the caller " +
@@ -167,7 +167,7 @@ test.describe("Agent-to-agent delegation @llm", () => {
     await expect(page.locator(".chat-header h3")).toHaveText("Delegation E2E");
 
     // Force the model to invoke `mcp__ask_agent__ask` directly. The
-    // request to Vera asks for the exact sentinel so the [agent-reply]
+    // request to Hedwig asks for the exact sentinel so the [agent-reply]
     // injection has a stable string to assert against.
     const prompt =
       "Use the `mcp__ask_agent__ask` tool RIGHT NOW with " +
@@ -187,7 +187,7 @@ test.describe("Agent-to-agent delegation @llm", () => {
     await expect(requestCard).toBeVisible({ timeout: 120_000 });
     await expect(requestCard).toContainText(/Asked E2E DelegTarget/i);
 
-    // 2. The request card transitions to "replied" once Vera's
+    // 2. The request card transitions to "replied" once Hedwig's
     //    [agent-reply] turn injection lands. Match by data attribute
     //    so we don't depend on the badge label text.
     await expect(requestCard).toHaveAttribute(

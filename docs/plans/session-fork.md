@@ -41,7 +41,7 @@ throwaway copy of the project without disturbing the original.
 - **Parent untouched**: NOT archived. The fork has `forked_from_session_id` set
   (lineage → nests under the parent in the sidebar). `fork_after_seq` stays set
   to the last copied seq — it doubles as the HISTORY_REPLAY cutoff, so nulling
-  it would make the first backend turn replay zero context (Vera review). The
+  it would make the first backend turn replay zero context. The
   UI instead suppresses the "@msg" badge / renders "full copy of the working
   dir" via a `fork_is_full_copy` flag derived from `fork_metadata.full_copy`.
 
@@ -54,7 +54,7 @@ throwaway copy of the project without disturbing the original.
      queue, approval, delegation), claim `_forking`.
   2. snapshot the transcript (`load_messages` + `last_seq`) AFTER claiming the
      guard — earlier risks a fast turn copying a post-turn dir against a
-     pre-turn message list (Vera review).
+     pre-turn message list.
   3. `copytree` parent.working_dir → dest, in `asyncio.to_thread` (it can be
      large/slow); `rmtree` a partial dest on failure.
   4. `create_fork_session(fork_after_seq = last_seq, working_dir = dest, …)` —

@@ -271,8 +271,8 @@ class Harness:
             raise HarnessOneshotError("timeout", "one-shot call timed out")
         except asyncio.CancelledError:
             # Job cancelled (or the job-level wait_for expired) while we were in
-            # communicate() — reap the group too, else the CLI orphans (Vera
-            # review). Best-effort wait, then propagate the cancellation.
+            # communicate() — reap the group too, else the CLI orphans.
+            # Best-effort wait, then propagate the cancellation.
             _reap()
             try:
                 await asyncio.wait_for(proc.wait(), timeout=2.0)

@@ -527,7 +527,7 @@ async def _fork_copy(
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / f"{new_resume_id}.jsonl"
     # Write to a temp file then atomically rename, so a crash mid-copy can't
-    # leave a half-written transcript that later looks resumable (Vera review).
+    # leave a half-written transcript that later looks resumable.
     tmp = dest.with_suffix(".jsonl.tmp")
     try:
         with src.open() as fin, tmp.open("w") as fout:
@@ -574,7 +574,7 @@ async def _fork_cleanup(
     except OSError:
         # RE-RAISE: callers (compensation / startup sweep) treat a returning
         # cleanup as success and then delete the DB row, which would strand this
-        # transcript forever. Surfacing keeps the row for a later retry (Vera).
+        # transcript forever. Surfacing keeps the row for a later retry.
         logger.exception("fork %s: failed to remove copied transcript %s", fork_id, f)
         raise
 

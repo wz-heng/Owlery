@@ -50,7 +50,7 @@ Phone / Browser / Feishu
   the background **across turns** (the result arrives as a follow-up turn), and
   recurring scheduled prompts run per agent into fresh, auto-archiving sessions.
 - **Agent-to-agent collaboration** — One agent can delegate to another by
-  name: "ask Vera to review this file" spawns Vera in her own session
+  name: "ask Hedwig to review this file" spawns Hedwig in her own session
   under her own agent config (credentials, memory, tools, even a different
   backend — `claude-code` agent can delegate to a `codex` agent), and her
   reply lands back in the caller's session as a follow-up turn. The
@@ -58,22 +58,22 @@ Phone / Browser / Feishu
   - **The principal-chain rule.** Every session has exactly one *caller*
     (the human for root sessions, the parent agent's session for
     delegations). Questions and replies always travel one hop — to the
-    caller. If Vera doesn't know something, she asks her caller; if the
+    caller. If Hedwig doesn't know something, she asks her caller; if the
     caller is another agent and *it* doesn't know, it asks *its* caller;
     only the top of the chain (the human) ever sees a question that
     propagated all the way up.
   - **Async by default**, like background tasks. The model calls
     `mcp__ask_agent__ask`, gets a `delegation_id` immediately, ends its
-    turn; the reply (`[agent-reply:Vera …]`) arrives as a new turn when
-    Vera finishes. Multiple delegations in flight at once give you
+    turn; the reply (`[agent-reply:Hedwig …]`) arrives as a new turn when
+    Hedwig finishes. Multiple delegations in flight at once give you
     parallel fan-out for free.
   - **Same-session follow-ups** for iteration. Calling `ask` again with a
     prior `delegation_id` continues that child session, so the delegated
     agent keeps her own transcript for review rounds instead of starting
     cold.
-  - **Cascade-cancel + nested chains.** Octo → Vera → Pete is supported
-    (depth-3 cap with cycle detection); cancelling Vera also cancels
-    Pete. Chat UI renders three card types — the in-flight delegation,
+  - **Cascade-cancel + nested chains.** Errol → Hedwig → Pigwidgeon is
+    supported (depth-3 cap with cycle detection); cancelling Hedwig also
+    cancels Pigwidgeon. Chat UI renders three card types — the in-flight delegation,
     the reply when it lands, and a question that travelled back to you
     — and the sidebar surfaces hidden delegation sessions on demand.
   - Design: [`docs/plans/agent-collaboration.md`](docs/plans/agent-collaboration.md).
@@ -137,7 +137,7 @@ cd web && bun install && bun run build && cd ..
 owlery serve
 ```
 
-Open `http://localhost:8000`, enter your token, pick the default **Octo** agent,
+Open `http://localhost:8000`, enter your token, pick the default **Owl** agent,
 create a session, and start chatting. For phone access, `owlery serve --tunnel`
 gives you a public HTTPS URL.
 

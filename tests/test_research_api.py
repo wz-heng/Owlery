@@ -188,7 +188,7 @@ async def test_research_requires_auth(client):
 @pytest.mark.asyncio
 async def test_cancel_wrong_session_404_does_not_cancel(client, monkeypatch):
     """A cancel scoped to the WRONG session must 404 WITHOUT cancelling the
-    real job (Vera review — verify ownership before mutating)."""
+    real job (verify ownership before mutating)."""
     import asyncio as _asyncio
 
     from server.research.orchestrator import ResearchReport

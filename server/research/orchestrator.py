@@ -66,7 +66,7 @@ class ResearchReport:
     # WEB leaves report cost (Claude `result.total_cost_usd`); the tool-free
     # reasoning leaves go through `run_oneshot`, which returns only text, so
     # scope/synthesis cost is NOT included. Codex reports no USD at all → often
-    # None. Treat as a partial lower bound, not a total (Vera review).
+    # None. Treat as a partial lower bound, not a total.
     cost: float | None = None
     # Same boundary, in tokens: the sum of per-WEB-leaf normalized usage
     # (usage-tracking.md §4). None when no leaf reported any.

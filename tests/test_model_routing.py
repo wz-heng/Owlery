@@ -241,10 +241,10 @@ async def test_start_delegation_passes_model_to_child(db, monkeypatch):
 
     monkeypatch.setattr(m, "start_message", _noop_start_message)
     octo = await db.get_default_agent()
-    await AgentManager(db).create_agent(name="Vera", backend="claude-code")
+    await AgentManager(db).create_agent(name="Hedwig", backend="claude-code")
     parent = await m.create_session(agent_id=octo["id"], name="p", working_dir="/tmp")
     rec = await dm.start_delegation(
-        parent_session_id=parent.id, agent_name="vera", request="r",
+        parent_session_id=parent.id, agent_name="hedwig", request="r",
         model="claude-opus-4",
     )
     child = m.get_session(rec.delegation_id)

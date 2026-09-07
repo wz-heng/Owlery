@@ -150,7 +150,7 @@ def ask_agent(
             snippets, spell out goals. For mode 2 (continuation), say
             only what's NEW — the original brief and the previous
             reply are already in the other agent's transcript.
-        name: The other agent's display name (e.g. "Vera",
+        name: The other agent's display name (e.g. "Hedwig",
             "Researcher"). Required for mode 1. Case-insensitive;
             ambiguous matches are rejected.
         delegation_id: The id from an earlier reply (`[agent-reply:…

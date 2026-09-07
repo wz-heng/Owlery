@@ -216,7 +216,7 @@ artifact = await harness.prepare_fork(
 
 **One additional method on the Harness contract** — backend-specific
 artifact cleanup, so SessionManager's startup recovery doesn't need to
-know each backend's on-disk shape (Vera round-6 fresh SHOULD-FIX #1):
+know each backend's on-disk shape:
 
 ```python
 # Harness (engine)
@@ -308,8 +308,8 @@ in **different channels** for sound reasons:
    used when `session.fork_needs_replay=True`. This is
    **transcript content** — what was previously said in the
    conversation. It does **not** belong in
-   `developer_instructions`, for two reasons (both BLOCKING-found
-   by Vera in round 1):
+   `developer_instructions`, for two reasons (both identified as
+   blockers in round 1):
    - **Durability.** `developer_instructions` is re-sent every
      turn (`assembly.py:143`), not persisted by the CLI across
      resume. A block dropped in there for turn 1 only is lost
@@ -341,7 +341,7 @@ produces. No caller above them knows the difference.
 
 New nullable columns on `sessions` (six, per the round-6 split
 of metadata into ephemeral vs durable + the round-5 three-state
-lifecycle — Vera round-8 NIT corrected the stale "two columns"
+lifecycle — corrected from the stale "two columns"
 heading):
 
 ```sql
@@ -358,8 +358,7 @@ fork_metadata          TEXT     -- EPHEMERAL JSON payload built at
                                 -- the fork survives restart (round-1 F9).
                                 -- CLEARED after first successful result.
 fork_revert_record     TEXT     -- DURABLE JSON record of the safe-revert
-                                -- outcome (Vera round-6 fresh SHOULD-FIX
-                                -- #2 — split off from fork_metadata so the
+                                -- outcome (split off from fork_metadata so the
                                 -- stash ref §5.6.3 promised as a durable
                                 -- anchor survives past first-turn clear).
                                 -- {ran, files, stash_ref, status,
@@ -385,7 +384,7 @@ All six NULL/FALSE for non-fork sessions. Indexed on
 
 `Session` dataclass gains the same six fields. **`SessionInfo`
 (WebSocket/REST contract) exposes exactly five fork-related
-fields** (Vera round-7 fresh SHOULD-FIX #1 — earlier drafts
+fields** (earlier drafts
 listed inconsistent sets):
 - `canFork: bool` (capability flag from harness profile)
 - `forkedFromSessionId: string | null`
@@ -439,15 +438,15 @@ Backend (`SessionManager.fork_session`):
 1. **Validate the target.** `S` exists, is not archived under
    cancellation. The message at `seq=M` exists in `S` and is a
    `role="user"` message — **this load happens for every M,
-   including M=0** (Vera round-3 fresh BLOCKING). It supplies
+   including M=0**. It supplies
    the prefilled-prompt text and the git anchor for safe-revert.
    Compute `fork_after_seq = M - 1` (so `M=0` yields `-1`, the
    "no messages copied" marker for step 5). The picker only
    surfaces user messages, but the route validates defensively
    against non-user targets.
 
-   **M=0 is NOT a "no side effects to disclose" shortcut**
-   (Vera round-3): rewinding to before the very first user
+   **M=0 is NOT a "no side effects to disclose" shortcut**:
+   rewinding to before the very first user
    message means the *entire* original conversation is past
    the fork point, so steps 4 (classify), 6 (`prepare_fork`),
    and 8 (safe-revert) all run normally with `from_seq = M = 0`.
@@ -460,7 +459,7 @@ Backend (`SessionManager.fork_session`):
    send_message path.
 2. **Acquire `parent._lock` and set `S._forking = True`.** v1
    only forks against quiescent parents, and the lock claim
-   from round 1 needs concrete teeth (Vera round-2 carryover F6):
+   from round 1 needs concrete teeth:
    `start_message()` sets `_active_task` without acquiring
    `session._lock` today
    (`session_manager.py:697` / `:849`), so a bare lock check
@@ -472,7 +471,7 @@ Backend (`SessionManager.fork_session`):
      active task / queued message / pending approval / active
      delegation (delegation check:
      `DelegationManager.has_active_delegation_for_parent(S.id)` —
-     concrete API name, Vera round-2 fresh F5), sets
+     concrete API name), sets
      `_forking = True`, then releases the lock for the long-running
      steps below. Clears `_forking` in a `finally` so it's
      released on any failure.
@@ -485,14 +484,14 @@ Backend (`SessionManager.fork_session`):
    (returns 409 — see Phase 2). In v1 both backends return
    `True`, so this is forward-compat only.
 4. **Compute the side-effect summary** (`classify_side_effects`,
-   §5.6.1) over parent rows with `seq >= M` (Vera round-1 F8 +
-   round-2 F8: queries `bg_tasks` directly for live state).
+   §5.6.1) over parent rows with `seq >= M` (queries `bg_tasks`
+   directly for live state).
    The result populates the §5.6.2 popover.
-5. **DB-only transaction (Vera round-2 fresh BLOCKING #2 — single
+5. **DB-only transaction (single
    transaction CANNOT span JSONL writes or git operations; SQLite
    rollback won't undo filesystem state).**
-   **Pre-mint the backend resume_id BEFORE the INSERT**
-   (Vera round-5 fresh SHOULD-FIX #2): for Claude, generate a
+   **Pre-mint the backend resume_id BEFORE the INSERT**:
+   for Claude, generate a
    fresh `uuid4()` we'll later use as the synthesized JSONL's
    final name. The pre-minted id is stored in the sessions row
    in this step's INSERT, so startup recovery can locate the
@@ -503,8 +502,7 @@ Backend (`SessionManager.fork_session`):
    1. INSERT the `sessions` row with `origin="fork"`,
       `forked_from_session_id=S`,
       `fork_after_seq=M-1` (or `-1` for `M=0`),
-      **`fork_status='initializing'`** (Vera round-4 SHOULD-FIX
-      #2 + round-5 lifecycle correction — the crash-recovery
+      **`fork_status='initializing'`** (the crash-recovery
       marker; promoted to `'reverting'` or `'ready'` in step 7
       depending on whether revert was requested, then to
       `'ready'` after step 8 lands),
@@ -519,8 +517,8 @@ Backend (`SessionManager.fork_session`):
    2. INSERT-SELECT messages from `S` where `seq <= fork_after_seq`
       (skipped entirely for `M=0`). Attachment metadata comes
       along in the JSON blob; **the underlying attachment files
-      are NOT copied or symlinked at fork-create time** (Vera
-      round-3 SHOULD-FIX #2 — symlinks would be FS state inside
+      are NOT copied or symlinked at fork-create time** (symlinks
+      would be FS state inside
       a "DB-only" transaction, exactly the contradiction the
       saga rewrite was supposed to eliminate). Instead, the
       attachment resolver at read time falls back from
@@ -555,8 +553,7 @@ Backend (`SessionManager.fork_session`):
      atomic rename guarantees the CLI never sees a partial file.
    - **Codex:** no-op — returns
      `ForkArtifact(resume_id=None, needs_replay=True)`.
-   On exception, compensate in **this exact order** (Vera
-   round-8 fresh SHOULD-FIX — the row holds the
+   On exception, compensate in **this exact order** (the row holds the
    `resume_id_hint` / `fork_id` anchors the cleanup hook needs;
    deleting it first would orphan any artifact prepare_fork
    wrote):
@@ -571,12 +568,12 @@ Backend (`SessionManager.fork_session`):
       propagate the original prepare_fork error.
 
    Backend-agnostic surface — SessionManager never knows
-   "Claude's temp file is at <path>" (Vera round-7 PARTIAL #4).
+   "Claude's temp file is at <path>".
    UPDATE the sessions row with
    `<resume-handle field>=artifact.resume_id` (Codex sets this
    to NULL since needs_replay is True) and
    `fork_needs_replay=artifact.needs_replay`.
-7. **Stamp `fork_metadata` (Vera round-1 F9, round-6 ephemeral
+7. **Stamp `fork_metadata` (round-6 ephemeral
    split).** Compose the JSON payload now — **EPHEMERAL fields
    only**, since `fork_metadata` gets cleared after first
    turn: prefilled prompt text (parent's message at `seq=M`
@@ -584,28 +581,25 @@ Backend (`SessionManager.fork_session`):
    the side-effect summary from step 4, the §5.6.4 rendered
    first-turn note, and `fork_label`. The revert outcome
    (`ran`, `files`, `stash_ref`, `status`) lives in
-   `fork_revert_record`, NOT here (Vera round-7 PARTIAL #5 —
-   earlier draft had revert placeholders inside
+   `fork_revert_record`, NOT here (earlier draft had revert placeholders inside
    `fork_metadata`; that contradicts the round-6 split). UPDATE
    the sessions row with `fork_metadata`. **Promote
    `fork_status`:**
    - If `revert_files=False`: directly `'ready'` (nothing left
      to do — the fork is fully durable).
-   - If `revert_files=True`: `'reverting'` (Vera round-5
-     SHOULD-FIX: we need a marker that survives a crash during
+   - If `revert_files=True`: `'reverting'` (we need a marker
+     that survives a crash during
      git ops). Promotion to `'ready'` happens at the end of
      step 8.
-8. **Safe-revert is a SEPARATE post-create step (Vera round-2
-   fresh BLOCKING #2).** If `revert_files=True`, run
+8. **Safe-revert is a SEPARATE post-create step.** If `revert_files=True`, run
    `_safe_revert_files` AFTER step 7. The outcome lands in
-   **`fork_revert_record`** (the durable revert slot — Vera
-   round-6 fresh SHOULD-FIX #2; NOT inside `fork_metadata`,
+   **`fork_revert_record`** (the durable revert slot — NOT
+   inside `fork_metadata`,
    which gets cleared after the first turn) as
    `{"ran": bool, "files": [...], "stash_ref": "stash@{0}" | null,
    "status": "completed" | "refused" | "failed" | "unknown_post_crash",
    "refused_reason": "..." | null, "error": "..." | null}` (the
-   canonical enum is defined in §5.6.5 — Vera round-7
-   SHOULD-FIX #2). **After the UPDATE is durable**, promote
+   canonical enum is defined in §5.6.5). **After the UPDATE is durable**, promote
    `fork_status` from `'reverting'` to
    `'ready'`. If the preflight refuses, the fork still exists;
    the popover response surfaces the reason. If the git ops
@@ -625,12 +619,11 @@ Backend (`SessionManager.fork_session`):
   Wrapping happens in `SessionManager.send_message` and is
   **dispatch-only: the wrapped prompt goes to the backend, the
   raw user text is persisted to the Owlery DB / broadcast to
-  the UI** (Vera round-2 fresh F4). This preserves the existing
+  the UI**. This preserves the existing
   invariant — sidebar previews, exports, and pull all see the
   unwrapped text. For `M=0` the `<fork-history>` block is empty
   (it's framing-only — no rendered turns), but the wrap STILL
-  happens so the send_message path stays uniform (Vera round-3
-  BLOCKING + round-4 normalization). `thread.started` captures
+  happens so the send_message path stays uniform. `thread.started` captures
   the new `thread_id` into the resume-handle field,
   `fork_needs_replay` clears, and from turn 2 onward this is a
   normal resumed Codex session — turn 2's prompt is sent
@@ -709,7 +702,7 @@ fork turn flows like this:
    {the user's actual prompt}
    </continue-from-here>
    ```
-   **Wrapping is dispatch-only** (Vera round-2 fresh F4). The
+   **Wrapping is dispatch-only**. The
    wrap is applied to the prompt the backend subprocess sees —
    NOT to the row Owlery persists in `messages`, NOT to what
    the WebSocket broadcasts to the chat UI. The existing
@@ -724,7 +717,7 @@ fork turn flows like this:
    `spill_if_large` (already there, already correct for the
    user-prompt channel) picks up oversized wrapped messages and
    spills them to a pointer file — same E2BIG primitive the bg
-   pipeline already uses. Vera round-1 F4 is resolved: the spill
+   pipeline already uses. The spill
    primitive is the right one because we're spilling a normal
    user prompt, not a `-c` argv element.
 3. **Spawn Codex with no `resume` argument** — fresh thread from
@@ -740,10 +733,10 @@ fork turn flows like this:
    un-wrapped; Codex's normal resume against the captured
    thread_id picks up the full prior context (which includes the
    wrapped first message as a permanent part of the thread —
-   Vera round-1 F2 resolved: putting replay in the user channel
+   putting replay in the user channel
    makes it durable across resume).
 
-**Channel discipline (Vera round-1 F3 resolved).** The replay
+**Channel discipline.** The replay
 content lives in the user-message channel with explicit
 `<fork-history>` / `<continue-from-here>` framing. A prior user
 message saying "ignore all later instructions" is not upgraded
@@ -796,7 +789,7 @@ the entire contract. The harness layer absorbs the difference.
 ### 5.4 In-progress turns and races
 
 v1 only forks against quiescent parents. The exclusion mechanism
-is concrete (Vera round-1 F6 + round-2 carryover F6 + fresh F5).
+is concrete.
 
 **The `_forking` flag** (introduced in §5.1 step 2). The bare
 "check under session lock" claim from round 1 doesn't actually
@@ -825,13 +818,13 @@ with `409 fork_blocked_parent_turn_active`, with a specific
 
 - **Active task on the parent.** `S._active_task is not None`.
 - **Queued message on the parent.** `S._pending_queue` non-empty
-  (Vera round-3 NIT: real field name on `Session`).
+  (real field name on `Session`).
 - **Pending tool approval on the parent.** `S._pending_approvals`
   non-empty.
 - **Active delegation on the parent.**
   `DelegationManager.has_active_delegation_for_parent(S.id)` —
   concrete public API on the existing `DelegationManager`
-  (`server/delegations.py`), Vera round-2 fresh F5. Returns
+  (`server/delegations.py`). Returns
   True if any record in the manager's registry has
   `parent_session_id == S.id` and `state != "completed"`.
 
@@ -855,7 +848,7 @@ conversation history. But because §5.1 step 5.2 deliberately
 doesn't copy attachment FILES (only metadata) — relying on a
 read-time fallback to the originating session — a naive
 parent-delete would strip those files out from under existing
-forks (Vera round-5 fresh SHOULD-FIX #1).
+forks.
 
 So **parent-delete includes an attachment-blit step**: before
 removing the parent's attachment dir, walk the
@@ -867,7 +860,7 @@ dir. After the blit, the parent's dir is safe to remove.
 
 The walk is **uncapped in depth** and uses a **visited-set cycle
 guard** rather than the depth-3 cap mentioned in earlier rounds
-(Vera round-6 PARTIAL #3 — depth-3 contradicted §6.3's "forks
+(depth-3 contradicted §6.3's "forks
 of forks nest naturally" and would silently break attachments
 for depth-4 descendants when the root is deleted). The
 delegation depth-3 rule serves a different purpose
@@ -900,8 +893,8 @@ classes:
 
 | Class | Source | Examples | Reversible? |
 |---|---|---|---|
-| **File edits** | `messages.tool_name` + `tool_input` | `Edit`, `Write`, `NotebookEdit`, `Bash` with simple `>` / `mv` / `rm` patterns | **Yes** under strict preflight (§5.6.3). Bash regex is best-effort — it will miss writes via `python build.py` etc. and will overcount harmless `>>` redirects; documented as best-effort disclosure, not authoritative tracking (Vera round-1 F8). |
-| **Background tasks** | **`bg_tasks` table directly** (Vera round-1 F8) | `mcp__bg__run` invocations — including ones still in `running` state at fork-request time. | **No** by us — they belong to the parent's session. We disclose them with live state (running / done / interrupted) and let the user cancel on the parent if they want. |
+| **File edits** | `messages.tool_name` + `tool_input` | `Edit`, `Write`, `NotebookEdit`, `Bash` with simple `>` / `mv` / `rm` patterns | **Yes** under strict preflight (§5.6.3). Bash regex is best-effort — it will miss writes via `python build.py` etc. and will overcount harmless `>>` redirects; documented as best-effort disclosure, not authoritative tracking. |
+| **Background tasks** | **`bg_tasks` table directly** | `mcp__bg__run` invocations — including ones still in `running` state at fork-request time. | **No** by us — they belong to the parent's session. We disclose them with live state (running / done / interrupted) and let the user cancel on the parent if they want. |
 | **Irreversible tool calls** | `messages.tool_name` (everything else) | Bash that ran a command; connector tool calls (`mcp__<connector>__*` — classified as irreversible by default, the conservative choice); DB migrations; sent messages. | **No**. Pure disclosure. Per-tool reversibility plugins (where a connector could declare an undo payload) are explicitly deferred to §10. |
 
 Why the classifier reads two sources, not one: `messages.tool_name`
@@ -911,8 +904,7 @@ live state so the user sees "test:e2e still running" not "test:e2e
 invoked once at seq 14". File-edit grouping deduplicates by path
 (`auth.py` modified across three turns → one row).
 
-**Attribution path (Vera round-2 carryover F8 + round-3
-correction).** The `bg_tasks` table doesn't carry a `seq`
+**Attribution path.** The `bg_tasks` table doesn't carry a `seq`
 column — we need an explicit join to scope live tasks to
 "spawned in `seq >= M`". Also the bg `task_id` does NOT live in
 the `tool_use` row — `tool_use` carries the call's arguments,
@@ -973,7 +965,7 @@ in §5.6.3.
 
 #### 5.6.3 The one revert we offer: file edits via git
 
-The preflight is intentionally strict (Vera round-1 F5 + F7).
+The preflight is intentionally strict.
 The plan's revert can only credibly claim "restore the working
 tree to its fork-point state" when the fork-point state is
 something `git checkout HEAD` will actually reproduce — which
@@ -982,8 +974,7 @@ requires the tree was **clean at the fork point**. Otherwise
 user intended to keep, including dirty edits the human had in
 flight before the fork.
 
-**The anchor row is M itself, not M-1** (Vera round-2 fresh
-BLOCKING #1). The branch point is the working-tree state at the
+**The anchor row is M itself, not M-1**. The branch point is the working-tree state at the
 moment user message M started executing. Since
 `session_manager.send_message()` records the user message at
 turn-start (`session_manager.py:882`), that row's captured git
@@ -994,8 +985,8 @@ the preflight falsely pass. So per-turn capture writes
 `git_head` and `git_status_clean` onto the user-message row at
 its insert time; the preflight reads from that same row.
 
-**`M=0` is treated exactly like any other M for this preflight**
-(Vera round-3 BLOCKING correction): the seq=0 user-message row
+**`M=0` is treated exactly like any other M for this preflight**:
+the seq=0 user-message row
 has captured `git_head` and `git_status_clean` at its insert
 time, so the revert is available iff those checks pass. The
 entire original conversation is "past the fork point" — there's
@@ -1014,8 +1005,7 @@ M including M=0):
 4. The current working tree's dirty paths are a **subset of the
    set of file paths the agent's tools touched** in `seq >= M`
    (the rewound message's turn onward). We cannot distinguish
-   human edits from agent edits to the same file (Vera round-1
-   F7); this check is intentionally conservative — if anything
+   human edits from agent edits to the same file; this check is intentionally conservative — if anything
    is dirty that doesn't match a known agent-touched path, we
    refuse the revert. (A real human-vs-agent attribution would
    require pre/post-tool blob hashing — deferred to §10.)
@@ -1030,7 +1020,7 @@ git checkout HEAD -- <files>
 
 The stash is named so the user can `git stash pop` later if they
 change their mind. The stash ref is captured into
-**`fork_revert_record`** (Vera round-7 PARTIAL #5 — the durable
+**`fork_revert_record`** (the durable
 slot from the round-6 split, NOT the ephemeral `fork_metadata`
 which gets cleared after first turn) so a future "undo my fork
 revert" affordance has a stable anchor. The §5.6.4 first-turn
@@ -1071,14 +1061,13 @@ note is dropped from subsequent turns.
 
 Both the §5.6.4 first-turn note and the prefilled-prompt text are
 needed **before** the fork's first turn fires, and they have to
-survive a server restart in that window. (Vera round-1 F9: if the
+survive a server restart in that window. (If the
 server restarts after fork-creation but before first turn, naively
 recomputing the side-effect summary would yield different bg-task
 states and lose the revert details.)
 
 So fork-creation persists state in **two distinct slots** on the
-fork's `sessions` row (Vera round-6 fresh SHOULD-FIX #2 —
-earlier draft put everything in `fork_metadata` and cleared the
+fork's `sessions` row (earlier draft put everything in `fork_metadata` and cleared the
 whole blob after first turn, which would have lost the stash
 ref that §5.6.3 promised was a durable anchor for any future
 "undo this fork's revert" affordance):
@@ -1105,8 +1094,7 @@ ref that §5.6.3 promised was a durable anchor for any future
      "error": null | "git checkout failed: <stderr>"
    }
    ```
-   The **status enum is canonical** (Vera round-7 fresh
-   SHOULD-FIX #2 — earlier drafts split inconsistently across
+   The **status enum is canonical** (earlier drafts split inconsistently across
    §5.6.5 and the §8 test bullet):
    - `'completed'` — preflight passed and git ops ran
      successfully.
@@ -1138,16 +1126,15 @@ forever as the anchor §5.6.3 promised.
   `python build.py` that wrote a file gets binned as
   "irreversible Bash", which is correct disclosure-wise even
   though it understates the file change. Best-effort, documented
-  as such (Vera round-1 F7/F8).
-- **Fork-creation does no FS work for attachments** (Vera
-  round-3 SHOULD-FIX): no symlink, no copy. Attachments are
+  as such.
+- **Fork-creation does no FS work for attachments**: no symlink, no copy. Attachments are
   resolved at read time by walking `forked_from_session_id`.
   Note this is specifically about *creation* — fork-delete
   cleanup still removes the fork's OWN accumulated files
   (attachments uploaded post-fork, large-prompt spill files,
   Claude's synthesized JSONL for `NATIVE_TRANSCRIPT` forks)
-  per the existing session-delete behavior (Vera round-4 NIT
-  — "fork-delete is purely DB row removal" was too broad).
+  per the existing session-delete behavior
+  ("fork-delete is purely DB row removal" was too broad).
 
 #### 5.6.7 Crash recovery for incomplete forks
 
@@ -1156,14 +1143,13 @@ The §5.1 saga commits the DB row in step 5 BEFORE `prepare_fork`
 stamped (step 7), and BEFORE safe-revert runs (step 8). A crash
 in any of those windows leaves the fork in a recoverable but
 intermediate state. The `fork_status` column has **three values**
-that map to the three distinct recovery actions (Vera round-5
-SHOULD-FIX — the round-4 two-state model treated revert-crash
+that map to the three distinct recovery actions (the round-4 two-state model treated revert-crash
 as `'ready'`, silently losing the post-crash unknown-disk-state):
 
 | `fork_status` | Meaning | Startup recovery action |
 |---|---|---|
-| `'initializing'` | Crashed before step 7 stamped `fork_metadata`. No resume artifact or metadata; possibly an orphan resume artifact on disk. | **PURGE in this exact order** (Vera round-8 fresh SHOULD-FIX — the row holds the `resume_id_hint` / `fork_id` anchors the cleanup hook needs): (1) Call `harness.cleanup_incomplete_fork_artifacts(working_dir, resume_id_hint, fork_id)` — for Claude it removes `<cwd>/<resume_id>.jsonl` and `<cwd>/.<fork_id>.tmp` at exact paths; for Codex it's a no-op (Vera round-6 fresh SHOULD-FIX #1). If cleanup fails, **leave the row as `'initializing'`** and log — next boot will retry idempotently. (2) Only after cleanup succeeds, delete the row + its copied messages. The user re-creates the fork. |
-| `'reverting'` | Step 7 completed (fork is durable) but step 8's git ops were in progress when crash happened. Working tree state is unknown — git stash may or may not exist; checkout may or may not have run. | **FINALIZE.** Do NOT purge — the fork DB state is valid. Set `fork_revert_record.status = "unknown_post_crash"` (the **durable** revert slot — Vera round-6 fresh SHOULD-FIX #2; NOT inside `fork_metadata`, which gets cleared after first turn) with a note instructing the user to manually inspect `git status` and `git stash list` for `owlery: pre-fork stash <fork_id>`. Promote `fork_status` to `'ready'`. The fork is then usable; the revert outcome is surfaced as "interrupted — check working tree." |
+| `'initializing'` | Crashed before step 7 stamped `fork_metadata`. No resume artifact or metadata; possibly an orphan resume artifact on disk. | **PURGE in this exact order** (the row holds the `resume_id_hint` / `fork_id` anchors the cleanup hook needs): (1) Call `harness.cleanup_incomplete_fork_artifacts(working_dir, resume_id_hint, fork_id)` — for Claude it removes `<cwd>/<resume_id>.jsonl` and `<cwd>/.<fork_id>.tmp` at exact paths; for Codex it's a no-op. If cleanup fails, **leave the row as `'initializing'`** and log — next boot will retry idempotently. (2) Only after cleanup succeeds, delete the row + its copied messages. The user re-creates the fork. |
+| `'reverting'` | Step 7 completed (fork is durable) but step 8's git ops were in progress when crash happened. Working tree state is unknown — git stash may or may not exist; checkout may or may not have run. | **FINALIZE.** Do NOT purge — the fork DB state is valid. Set `fork_revert_record.status = "unknown_post_crash"` (the **durable** revert slot — NOT inside `fork_metadata`, which gets cleared after first turn) with a note instructing the user to manually inspect `git status` and `git stash list` for `owlery: pre-fork stash <fork_id>`. Promote `fork_status` to `'ready'`. The fork is then usable; the revert outcome is surfaced as "interrupted — check working tree." |
 | `'ready'` | Fork fully durable. | No-op. |
 
 The startup sweep runs ONE query and dispatches on `fork_status`:
@@ -1305,16 +1291,15 @@ Five phases, each ends with the full verification suite green.
   `forked_from_session_id`.
 - DB migration on `messages`: add nullable `git_head TEXT` and
   `git_status_clean BOOLEAN` — both captured at turn-start so
-  §5.6.3's safe-revert preflight has the data it needs (Vera
-  round-1 F5).
+  §5.6.3's safe-revert preflight has the data it needs.
 - Extend `Session` dataclass + `SessionInfo` REST/WS contract +
   `contracts.ts` regen. `SessionInfo` exposes **exactly five**
-  fork-related fields per §4 (Vera round-7 fresh SHOULD-FIX #1):
+  fork-related fields per §4:
   `canFork`, `forkedFromSessionId`, `forkAfterSeq`,
   `forkPrefilledPrompt`, `forkRevertRecord`. `fork_status` /
   `fork_needs_replay` / raw `fork_metadata` are server-internal.
 - Origin enum gains `"fork"`. (Note: current default is `"user"`
-  — Vera round-1 F12 NIT — keep `_AUTO_ARCHIVE_ORIGINS` /
+  — keep `_AUTO_ARCHIVE_ORIGINS` /
   `_AUTO_ARCHIVE_ELIGIBLE` aligned: `"fork"` does NOT auto-archive.)
 
 ### Phase 2 — Harness contract + SessionManager.fork_session + REST route
@@ -1354,7 +1339,7 @@ Five phases, each ends with the full verification suite green.
   `cleanup_incomplete_fork_artifacts` is a no-op (no on-disk
   artifacts for HISTORY_REPLAY).
 - **Replay-block wrapping in `send_message` (NOT in `assembly.py`).**
-  Vera round-1 F2/F3/F4 all hinge on this: the replay block must
+  The replay block must
   live in the user-message channel, not `developer_instructions`.
   Add `wrap_for_fork_replay(prompt, parent_messages) -> str`
   helper. `SessionManager.send_message` calls it when
@@ -1425,8 +1410,7 @@ Five phases, each ends with the full verification suite green.
   `SessionManager.startup`, scan
   `sessions WHERE origin='fork' AND fork_status IN
   ('initializing', 'reverting')`:
-  - `'initializing'`: PURGE in this exact order (Vera round-8
-    fresh SHOULD-FIX — anchors live on the row):
+  - `'initializing'`: PURGE in this exact order (anchors live on the row):
     (1) call `harness.cleanup_incomplete_fork_artifacts(...)`
         so backend-specific path cleanup stays in the harness
         (round-6 fresh SHOULD-FIX #1); on cleanup failure
@@ -1439,8 +1423,8 @@ Five phases, each ends with the full verification suite green.
     user-readable note, promote `fork_status='ready'`. Do NOT
     purge.
   Idempotent — safe to run on every boot.
-- **`classify_side_effects(parent_id, from_seq)`** helper
-  (Vera round-1 F8): reads `messages.tool_name` / `tool_input`
+- **`classify_side_effects(parent_id, from_seq)`** helper: reads
+  `messages.tool_name` / `tool_input`
   AND queries `bg_tasks` directly for live state. Connector tool
   classification: any `mcp__<connector>__*` tool is classified
   irreversible by default (conservative). Bash regex is documented
@@ -1471,7 +1455,7 @@ Five phases, each ends with the full verification suite green.
   a sibling that runs the classifier + revert-preflight without
   committing anything.
 - **`SessionInfo` gains exactly five fork-related fields** (per
-  §4 + Phase 1 — Vera round-7 fresh SHOULD-FIX #1): `canFork:
+  §4 + Phase 1): `canFork:
   bool`, `forkedFromSessionId`, `forkAfterSeq`,
   `forkPrefilledPrompt: string | null` (read from
   `fork_metadata.prefilled_prompt` while non-null), and
@@ -1484,8 +1468,7 @@ Five phases, each ends with the full verification suite green.
     `seq < M`, leaves `_message_count = M` so next msg gets `seq = M`
   - refuse-on-live-parent-work: every refusal case (active task,
     queued message, pending approval, active delegation)
-  - **saga / compensation** (Vera round-2 BLOCKING #2 + round-6
-    harness-hook + round-8 ordering): `prepare_fork` exception
+  - **saga / compensation**: `prepare_fork` exception
     path calls
     `harness.cleanup_incomplete_fork_artifacts` FIRST to remove
     any partial backend-specific files (Claude's temp + final
@@ -1499,8 +1482,7 @@ Five phases, each ends with the full verification suite green.
     back the fork — the failure is recorded into
     `fork_revert_record.status='failed'` (durable slot, round-6
     split) and surfaced in the response
-  - **`_forking` flag blocks `start_message()`** (Vera round-2
-    carryover F6 + round-3 PARTIAL): TWO race tests —
+  - **`_forking` flag blocks `start_message()`**: TWO race tests —
     (a) `start_message()` entering AFTER `_forking=True` is set
     must refuse with the "session busy" path; (b)
     `start_message()` that started its lock-acquire BEFORE the
@@ -1509,15 +1491,13 @@ Five phases, each ends with the full verification suite green.
     fork's `finally` clears `_forking` even on `prepare_fork`
     exception
   - **`DelegationManager.has_active_delegation_for_parent`** is
-    the API actually called by the live-work check (Vera round-2
-    fresh F5)
+    the API actually called by the live-work check
   - `fork_metadata` is persisted before the response returns and
     survives a simulated restart-before-first-turn (F9)
-  - **Saga crash recovery** (Vera round-4 SHOULD-FIX #2 +
-    round-5 three-state refinement): THREE recovery paths
+  - **Saga crash recovery**: THREE recovery paths
     exercised:
     (a) `fork_status='initializing'` row — startup PURGES it
-    in this exact order (Vera round-8 fresh SHOULD-FIX):
+    in this exact order:
     (1) call `harness.cleanup_incomplete_fork_artifacts(
     working_dir, resume_id, fork_id)` — for Claude removes
     `<cwd>/<resume_id>.jsonl` AND `<cwd>/.<fork_id>.tmp` at
@@ -1533,22 +1513,19 @@ Five phases, each ends with the full verification suite green.
     SHOULD-FIX);
     (c) `fork_status='ready'` row — sweep NO-OPs
   - `classify_side_effects` over all three bins; **bg_tasks
-    live-state path** with the explicit join (Vera round-2
-    carryover F8 + round-3 correction): find `tool_use` rows
+    live-state path** with the explicit join: find `tool_use` rows
     with `tool_name='mcp__bg__run'` and `seq >= M`, match to
     their `tool_result` rows by `tool_use_id`, parse `task_id`
     from the result content, join to `bg_tasks.status`
   - safe-revert under every preflight outcome — **anchored on
-    message M's `git_status_clean` / `git_head`, not M-1's**
-    (Vera round-2 fresh BLOCKING #1): clean=True + HEAD match +
+    message M's `git_status_clean` / `git_head`, not M-1's**:
+    clean=True + HEAD match +
     only-agent-dirty (revert runs); clean=False at M (refused);
     HEAD-moved (refused); unknown-dirty (refused); non-git
-    (refused); **M=0 follows the SAME rules** (Vera round-5
-    correction — earlier "unavailable by design" was wrong;
+    (refused); **M=0 follows the SAME rules** (earlier "unavailable by design" was wrong;
     the seq=0 row's git anchor is what's checked, with the
     rest of the session classified as past the fork point)
-  - **`M=0` fork** (Vera round-2 fresh F3 + round-3 BLOCKING
-    correction + round-5 normalization): loads `seq=0` for
+  - **`M=0` fork**: loads `seq=0` for
     prefill text + git anchor; creates a fork with NO copied
     messages and `_message_count=0`; classifier runs over
     `seq >= 0` (the entire original session is past the fork
@@ -1557,7 +1534,7 @@ Five phases, each ends with the full verification suite green.
     and the wrapping path runs uniformly with an empty
     `<fork-history>` block (round-5 — earlier "fork_needs_replay=False
     for M=0" wording was wrong)
-  - **Dispatch-only wrapping** (Vera round-2 fresh F4): when
+  - **Dispatch-only wrapping**: when
     Codex first-turn fires, the row inserted into `messages` for
     the user message carries the raw text; only the prompt the
     subprocess receives is wrapped; an immediate
@@ -1603,8 +1580,8 @@ Five phases, each ends with the full verification suite green.
   Send a new prompt on the fork. Assert: (1) the new turn references
   context from before user msg #2 but not from user msg #2's
   original turn or later, (2) Claude actually resumes from the
-  synthesized JSONL (verified by real-CLI run completing — Vera
-  round-1 F11: this replaces the byte-equivalence-with-pull claim
+  synthesized JSONL (verified by real-CLI run completing —
+  this replaces the byte-equivalence-with-pull claim
   with behavior verification, since `jsonl_writer` regenerates IDs
   and timestamps).
 - **Real-CLI Codex** (gated on `codex` in PATH): same shape —
@@ -1616,9 +1593,8 @@ Five phases, each ends with the full verification suite green.
   `thread.started` after the first turn, (4) turn 2 in the fork
   spawns with `resume <captured_thread_id>` and the prompt is NOT
   wrapped with the `<fork-history>` block — verifying durability
-  across native resume (Vera round-1 F2).
-- **Real-CLI Codex spilled-replay durability** (Vera round-2
-  fresh F6; gated on `codex` in PATH): create a parent session
+  across native resume.
+- **Real-CLI Codex spilled-replay durability** (gated on `codex` in PATH): create a parent session
   long enough that the wrapped first-turn prompt exceeds
   `LARGE_PROMPT_THRESHOLD_BYTES` and `spill_if_large` writes a
   pointer file instead. Fork, send turn 1, assert the model
@@ -1655,15 +1631,13 @@ Five phases, each ends with the full verification suite green.
   `fork_needs_replay=True` with empty `<fork-history>`;
   prefilled prompt is the parent's original first user
   message; classifier runs over `seq >= 0`; revert preflight
-  anchors on `seq=0`'s git state — Vera round-5 normalization);
+  anchors on `seq=0`'s git state);
   refuse when parent has live work (active task / queued msg /
   pending approval / active delegation, with the right
   structured 409); **attachment metadata copies but FS files
-  do NOT** (Vera round-3 fix + round-5 wording correction —
-  earlier "copy-attachments" implied FS copy); **parent-delete
+  do NOT** (earlier "copy-attachments" implied FS copy); **parent-delete
   blits referenced attachment files into descendant forks
-  before removing the parent dir** (Vera round-5 fresh
-  SHOULD-FIX #1);
+  before removing the parent dir**;
   fork-of-fork; reject `rewind_to_msg_seq < 0`; reject
   non-user-message targets; reject `rewind_to_msg_seq` greater
   than parent's last seq; SQL transaction atomicity (failed
@@ -1672,8 +1646,7 @@ Five phases, each ends with the full verification suite green.
   `forked_from_session_id` / `fork_after_seq` / `fork_metadata` /
   **`fork_revert_record`** (round-7 NIT — the durable revert
   slot survives unarchive alongside the ephemeral metadata);
-  **`fork_metadata` survives a simulated restart-before-first-turn
-  (Vera round-1 F9)**.
+  **`fork_metadata` survives a simulated restart-before-first-turn**.
 - **Replay-prompt wrapping (`test_send_message_fork_replay.py`):**
   Pi-style smoke — `send_message` wraps the user prompt when
   `session.fork_needs_replay=True` using the §5.3.2 framing
@@ -1687,18 +1660,18 @@ Five phases, each ends with the full verification suite green.
   with each tool class (`Edit`, `Bash > file`, `mcp__bg__run`,
   connector tools, etc.) and asserts they bin correctly. Also
   asserts the classifier reads `bg_tasks` for live run state,
-  not `messages.tool_name` (Vera round-1 F8 explicit guard).
+  not `messages.tool_name` (explicit guard).
 - **Safe-revert preflight:** unit tests cover all five outcomes
   — clean tree at fork-point + HEAD-unchanged + only-agent-dirty
   (revert runs); fork-point tree NOT clean (refused, reason
   string matches); HEAD-moved (refused); unknown-dirty files
   (refused); non-git dir (refused). Each asserts the fork still
-  creates and only the revert is skipped (Vera round-1 F5, F7).
+  creates and only the revert is skipped.
 - **JSONL synthesis behavior (NOT byte-equivalence):** unit
   test asserts the synthesized file parses round-trip and
   reproduces the same logical message sequence; the real-CLI
   test (Phase 5) is the authoritative resume-compatibility
-  check. (Vera round-1 F11: byte-equality is overclaimed —
+  check. (Byte-equality is overclaimed —
   `jsonl_writer` regenerates UUIDs/timestamps and drops
   unsupported message types.)
 - **Origin enum:** the auto-archive idle hook does NOT auto-archive
@@ -1725,11 +1698,11 @@ Five phases, each ends with the full verification suite green.
    **before** this message". The fork opens with that message's
    text pre-filled in the chat input, fully editable. Retry is
    the dominant use case; the minority "branch to explore" still
-   works by clearing the prefill. (Vera round-1 F1.)
+   works by clearing the prefill.
 2. **Fork copies `seq < M`, not `seq ≤ M`.** The rewound user
    message itself is NOT copied — it lives in the prefilled
    input, where the user re-issues it. `fork_after_seq = M - 1`.
-3. **The CALLER pre-mints the resume handle** (Vera round-5/6).
+3. **The CALLER pre-mints the resume handle.**
    `SessionManager.fork_session` generates `uuid.uuid4()` and
    passes it as `resume_id_hint` to `harness.prepare_fork`.
    `NATIVE_TRANSCRIPT` backends (Claude) use the hint as the
@@ -1763,7 +1736,7 @@ Five phases, each ends with the full verification suite green.
    disturbing callers. The frontend gates on the `canFork` flag
    plumbed onto `SessionInfo`, never on `session.backend`.
 8. **Replay lives in the user-message channel, not
-   `developer_instructions`.** Vera round-1 F2/F3/F4. Putting
+   `developer_instructions`.** Putting
    replay in the system addendum loses it across resume,
    upgrades transcript text to developer-channel priority (a
    prompt-injection vector), and doesn't compose with the
@@ -1773,16 +1746,16 @@ Five phases, each ends with the full verification suite green.
    rewinds memory, not the world. v1 *shows* every side effect
    the agent caused from the rewound turn onward; v1 *reverts*
    only file edits, and only when the strict §5.6.3 preflight
-   passes — including the clean-tree-at-fork-point check (Vera
-   round-1 F5). Everything else — Bash, sent messages, DB writes,
+   passes — including the clean-tree-at-fork-point check.
+   Everything else — Bash, sent messages, DB writes,
    external API calls, bg tasks — is disclosed and left in
    place. The fork's first turn gets a system-context note via
    `developer_instructions` (framing, not transcript) so the
    model knows the world has moved on.
-10. **Refuse fork on live parent work** (Vera round-1 F6). v1
+10. **Refuse fork on live parent work.** v1
     only forks against quiescent parents. Mid-active-turn fork
     is its own design problem — deferred.
-11. **Fork state persists before first turn** (Vera round-1 F9).
+11. **Fork state persists before first turn.**
     `fork_metadata` JSON column on the `sessions` row carries the
     prefilled prompt, side-effect summary, and revert result.
     Cleared after first `result`. The fork survives server
