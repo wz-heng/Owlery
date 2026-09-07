@@ -769,7 +769,7 @@ async def test_nested_chain_intermediate_stays_alive_while_grandchild_runs(
     reply would land on a missing session. With the fix, Hedwig stays
     alive until her OWN terminal event fires.
 
-    Hedwig caught the round-2 version of this test using
+    The round-2 version of this test used
     ``_noop_start_message``, which silently absorbed missing-parent
     injections and therefore couldn't observe the original bug. This
     revision uses a fake that mirrors the real ``start_message``'s
@@ -834,8 +834,8 @@ async def test_nested_chain_intermediate_stays_alive_while_grandchild_runs(
     # fix in place, "delegation" is NOT in _AUTO_ARCHIVE_ORIGINS so
     # this is a no-op; if a future change re-adds it (the original
     # bug), Hedwig gets archived here and Pigwidgeon's reply below fails.
-    # Hedwig flagged that the test relied on an adjacent test to catch
-    # this directly; this in-place hook makes the nested-chain test
+    # The test used to rely on an adjacent test to catch this
+    # directly; this in-place hook makes the nested-chain test
     # self-sufficient at proving the whole bug.
     if hedwig_sess.origin in mgr._AUTO_ARCHIVE_ORIGINS:
         await mgr.auto_archive_scheduled_session(hedwig_sess.id)
@@ -1586,7 +1586,7 @@ async def test_follow_up_rejects_empty_request(dm, mgr, db, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_route_follow_up_requires_live_parent(client, monkeypatch):
-    """Hedwig-round-5 finding: a follow-up from a parent session that's
+    """A follow-up from a parent session that's
     no longer in the live sessions map (archived / deleted between
     rounds) must 404 — otherwise the manager would round-reset the
     record and start the child, then silently drop the terminal
@@ -1733,7 +1733,7 @@ async def test_cancel_cascades_to_descendants(dm, mgr, db, monkeypatch):
 async def test_cancel_delegation_single_inject_under_interrupt_broadcast(
     dm, mgr, db, monkeypatch
 ):
-    """The bug Hedwig caught: cancel_delegation() calls interrupt()
+    """The bug: cancel_delegation() calls interrupt()
     which broadcasts an `error` event before returning; without the
     state-flip-first dance, `_on_broadcast` would catch that error,
     finalize the record as `failed`, and inject `[agent-error
@@ -2135,8 +2135,8 @@ async def test_question_request_routed_to_parent(dm, mgr, db, monkeypatch):
     assert "main UI" in prompt
     assert "single-choice" in prompt
     # The injection names the actual MCP tool the parent's model
-    # should call (`mcp__ask_agent__answer`). Hedwig caught a
-    # version of this prompt that referenced
+    # should call (`mcp__ask_agent__answer`). A prior version of
+    # this prompt referenced
     # `mcp__ask_agent__answer_agent_question` — a tool that
     # doesn't exist (the Python function name leaked into the
     # prompt). Guard the regression in both directions.

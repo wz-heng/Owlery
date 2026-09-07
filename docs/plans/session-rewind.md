@@ -308,8 +308,8 @@ in **different channels** for sound reasons:
    used when `session.fork_needs_replay=True`. This is
    **transcript content** — what was previously said in the
    conversation. It does **not** belong in
-   `developer_instructions`, for two reasons (both BLOCKING-found
-   in round 1):
+   `developer_instructions`, for two reasons (both identified as
+   blockers in round 1):
    - **Durability.** `developer_instructions` is re-sent every
      turn (`assembly.py:143`), not persisted by the CLI across
      resume. A block dropped in there for turn 1 only is lost
