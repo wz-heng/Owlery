@@ -2,7 +2,7 @@
 
 Auto-skipped when the relevant binary (`claude` or `codex`) isn't on
 PATH. Each test sets up an in-memory DB, two or more freshly-created
-agents (Octo / Vera / Pete), boots SessionManager + DelegationManager
+agents (Octo / Hedwig / Pigwidgeon), boots SessionManager + DelegationManager
 without the FastAPI HTTP layer, then exercises a real delegation
 chain end-to-end.
 
@@ -114,9 +114,9 @@ async def _wait_for(
 @pytest.mark.skipif(not HAS_CLAUDE, reason="claude CLI not on PATH")
 @pytest.mark.asyncio
 async def test_real_two_hop_claude_to_claude(tmp_path, monkeypatch):
-    """Octo (claude-code) delegates to Vera (claude-code). Vera's
+    """Octo (claude-code) delegates to Hedwig (claude-code). Hedwig's
     reply ends up injected into Octo's session as
-    `[agent-reply:Vera delegation=… ]` carrying her assistant text."""
+    `[agent-reply:Hedwig delegation=… ]` carrying her assistant text."""
     db, mgr, dm, am, wd = await _bootstrap(tmp_path, monkeypatch)
     try:
         # The seeded default agent is "Owl" (the oldest live agent) —
@@ -124,7 +124,7 @@ async def test_real_two_hop_claude_to_claude(tmp_path, monkeypatch):
         # colliding on the unique name index.
         octo = await db.get_default_agent()
         assert octo is not None
-        await am.create_agent(name="Vera", model="haiku", backend="claude-code")
+        await am.create_agent(name="Hedwig", model="haiku", backend="claude-code")
         octo_sess = await mgr.create_session(
             agent_id=octo["id"], name="octo", working_dir=wd
         )
@@ -133,7 +133,7 @@ async def test_real_two_hop_claude_to_claude(tmp_path, monkeypatch):
 
         await dm.start_delegation(
             parent_session_id=octo_sess.id,
-            agent_name="Vera",
+            agent_name="Hedwig",
             request=(
                 "Reply with exactly the four characters: PONG. "
                 "Do not call any tools. Do not say anything else."
@@ -143,7 +143,7 @@ async def test_real_two_hop_claude_to_claude(tmp_path, monkeypatch):
         await _wait_for(lambda: bool(captured), timeout=180.0)
         sid, prompt = captured[0]
         assert sid == octo_sess.id
-        assert prompt.startswith("[agent-reply:Vera ")
+        assert prompt.startswith("[agent-reply:Hedwig ")
         assert "PONG" in prompt
     finally:
         dm.shutdown()
@@ -171,13 +171,13 @@ async def test_real_question_loop_claude_to_claude(tmp_path, monkeypatch):
     try:
         octo = await db.get_default_agent()
         assert octo is not None
-        await am.create_agent(name="Vera", model="haiku", backend="claude-code")
+        await am.create_agent(name="Hedwig", model="haiku", backend="claude-code")
         octo_sess = await mgr.create_session(
             agent_id=octo["id"], name="octo", working_dir=wd
         )
 
         captured = _intercept_parent_injections(mgr, octo_sess.id)
-        # We don't actually want Vera to wait for an answer (the real
+        # We don't actually want Hedwig to wait for an answer (the real
         # `ask` server's long-poll would hang the test). Force the
         # pending question to be auto-answered via the manager's
         # answer path as soon as we detect the question injection.
@@ -185,7 +185,7 @@ async def test_real_question_loop_claude_to_claude(tmp_path, monkeypatch):
         # `answer_agent_question` tool.
         rec = await dm.start_delegation(
             parent_session_id=octo_sess.id,
-            agent_name="Vera",
+            agent_name="Hedwig",
             request=(
                 "STRICT INSTRUCTION: You must invoke the tool named "
                 "`mcp__ask__user` exactly once before saying anything. "
@@ -207,7 +207,7 @@ async def test_real_question_loop_claude_to_claude(tmp_path, monkeypatch):
         # paraphrase without invoking the tool. When it does fire,
         # confirm the prefix shape; otherwise xfail this assertion
         # path with a clear message rather than masking the result.
-        if first_prompt.startswith("[agent-question:Vera "):
+        if first_prompt.startswith("[agent-question:Hedwig "):
             assert "delegation=" in first_prompt
             assert "question_id=" in first_prompt
             # Drain the pending question (mirrors the route).
@@ -247,15 +247,15 @@ async def test_real_question_loop_claude_to_claude(tmp_path, monkeypatch):
 )
 @pytest.mark.asyncio
 async def test_real_two_hop_claude_to_codex(tmp_path, monkeypatch):
-    """Octo (claude-code) delegates to Vera, who runs the codex
+    """Octo (claude-code) delegates to Hedwig, who runs the codex
     harness. Same reply-injection shape. Proves the design is
     harness-agnostic at the chain level."""
     db, mgr, dm, am, wd = await _bootstrap(tmp_path, monkeypatch)
     try:
         octo = await db.get_default_agent()
         assert octo is not None
-        # Vera runs codex; we leave model None so codex's default applies.
-        await am.create_agent(name="Vera", backend="codex")
+        # Hedwig runs codex; we leave model None so codex's default applies.
+        await am.create_agent(name="Hedwig", backend="codex")
         octo_sess = await mgr.create_session(
             agent_id=octo["id"], name="octo", working_dir=wd
         )
@@ -264,7 +264,7 @@ async def test_real_two_hop_claude_to_codex(tmp_path, monkeypatch):
 
         await dm.start_delegation(
             parent_session_id=octo_sess.id,
-            agent_name="Vera",
+            agent_name="Hedwig",
             request=(
                 "Reply with exactly the four characters: PONG. "
                 "Do not call any tools. Do not say anything else."
@@ -273,7 +273,7 @@ async def test_real_two_hop_claude_to_codex(tmp_path, monkeypatch):
 
         await _wait_for(lambda: bool(captured), timeout=240.0)
         _, prompt = captured[0]
-        assert prompt.startswith("[agent-reply:Vera ")
+        assert prompt.startswith("[agent-reply:Hedwig ")
         # Codex sometimes preambles. Loose match: the token PONG appears.
         assert "PONG" in prompt
     finally:
@@ -282,16 +282,16 @@ async def test_real_two_hop_claude_to_codex(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 3-hop chain: Octo → Vera → Pete (Phase 5 nested in anger)
+# 3-hop chain: Octo → Hedwig → Pigwidgeon (Phase 5 nested in anger)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.skipif(not HAS_CLAUDE, reason="claude CLI not on PATH")
 @pytest.mark.asyncio
 async def test_real_three_hop_chain(tmp_path, monkeypatch):
-    """Octo asks Vera; Vera asks Pete; Pete replies with a token.
-    We capture Vera's terminal injection into Octo's session and
-    confirm Pete's token survived the chain.
+    """Octo asks Hedwig; Hedwig asks Pigwidgeon; Pigwidgeon replies with a token.
+    We capture Hedwig's terminal injection into Octo's session and
+    confirm Pigwidgeon's token survived the chain.
 
     The depth cap (DEPTH_CAP=3) allows exactly this chain. The fourth
     hop would be rejected — covered by the unit test
@@ -301,50 +301,50 @@ async def test_real_three_hop_chain(tmp_path, monkeypatch):
     try:
         octo = await db.get_default_agent()
         assert octo is not None
-        await am.create_agent(name="Vera", model="haiku", backend="claude-code")
-        await am.create_agent(name="Pete", model="haiku", backend="claude-code")
+        await am.create_agent(name="Hedwig", model="haiku", backend="claude-code")
+        await am.create_agent(name="Pigwidgeon", model="haiku", backend="claude-code")
         octo_sess = await mgr.create_session(
             agent_id=octo["id"], name="octo", working_dir=wd
         )
 
         captured = _intercept_parent_injections(mgr, octo_sess.id)
 
-        # We instruct Vera to delegate further. Her request will tell
-        # Pete to reply with a token. Vera then forwards the token in
+        # We instruct Hedwig to delegate further. Her request will tell
+        # Pigwidgeon to reply with a token. Hedwig then forwards the token in
         # her own assistant text so we can pluck it from the [agent-reply]
         # injection back into Octo.
         await dm.start_delegation(
             parent_session_id=octo_sess.id,
-            agent_name="Vera",
+            agent_name="Hedwig",
             request=(
                 "STRICT INSTRUCTION — two steps, no commentary:\n"
                 "Step 1: invoke the tool `mcp__ask_agent__ask` with "
-                "name=\"Pete\" and request=\"Reply with exactly the "
+                "name=\"Pigwidgeon\" and request=\"Reply with exactly the "
                 "5 characters HOP-7 and nothing else. No prose.\". "
                 "Do not write any prose before calling the tool.\n"
-                "Step 2: when the [agent-reply:Pete ...] follow-up "
-                "turn arrives carrying Pete's text, reply with the "
+                "Step 2: when the [agent-reply:Pigwidgeon ...] follow-up "
+                "turn arrives carrying Pigwidgeon's text, reply with the "
                 "exact 5-character token HOP-7 — nothing else. Do "
                 "not paraphrase. Do not use any other tools."
             ),
         )
 
-        # Multi-turn under Vera. Two real LLM calls + one for Pete.
+        # Multi-turn under Hedwig. Two real LLM calls + one for Pigwidgeon.
         # Allow generous time but cap so a runaway model doesn't park
         # the test indefinitely.
         await _wait_for(lambda: bool(captured), timeout=480.0)
         _, prompt = captured[0]
-        # The injection into Octo is Vera's reply, which should
-        # contain the token Pete returned.
-        assert prompt.startswith("[agent-reply:Vera ")
+        # The injection into Octo is Hedwig's reply, which should
+        # contain the token Pigwidgeon returned.
+        assert prompt.startswith("[agent-reply:Hedwig ")
         if "HOP-7" not in prompt:
             # Two failure modes here:
             #   (1) LLM script didn't follow through (non-determinism).
-            #   (2) Vera DID invoke ask_agent for Pete, but the MCP
+            #   (2) Hedwig DID invoke ask_agent for Pigwidgeon, but the MCP
             #       subprocess shim's HTTP POST timed out because this
             #       test boots SessionManager+DelegationManager without
             #       a live FastAPI server bound to settings.port.
-            # In practice (2) is the common case — Vera's reply
+            # In practice (2) is the common case — Hedwig's reply
             # contains "delegation … timeout error" when it hits. The
             # full HTTP-backed 3-hop chain is covered deterministically
             # by the Playwright e2e (`web/e2e/agent-collaboration.spec.ts`).
@@ -352,7 +352,7 @@ async def test_real_three_hop_chain(tmp_path, monkeypatch):
             pytest.skip(
                 "3-hop didn't reach the token (LLM duck OR HTTP-less "
                 "MCP shim timeout); covered by Playwright e2e. "
-                f"Vera said: {prompt[:300]!r}"
+                f"Hedwig said: {prompt[:300]!r}"
             )
     finally:
         dm.shutdown()

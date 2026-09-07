@@ -36,7 +36,7 @@ def test_ask_agent_misconfigured(monkeypatch):
     monkeypatch.delenv("OWLERY_API_BASE", raising=False)
     monkeypatch.delenv("OWLERY_SESSION_ID", raising=False)
     monkeypatch.delenv("OWLERY_AUTH_TOKEN", raising=False)
-    out = _call("ask_agent", name="Vera", request="r")
+    out = _call("ask_agent", name="Hedwig", request="r")
     assert "misconfigured" in out.lower()
 
 
@@ -44,7 +44,7 @@ def test_ask_agent_rejects_empty_request(monkeypatch):
     monkeypatch.setenv("OWLERY_API_BASE", "http://x")
     monkeypatch.setenv("OWLERY_SESSION_ID", "s")
     monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
-    out = _call("ask_agent", name="Vera", request="   ")
+    out = _call("ask_agent", name="Hedwig", request="   ")
     assert "request" in out.lower() and "non-empty" in out.lower()
 
 
@@ -67,7 +67,7 @@ def test_ask_agent_rejects_when_both_ids_provided(monkeypatch):
     monkeypatch.setenv("OWLERY_API_BASE", "http://x")
     monkeypatch.setenv("OWLERY_SESSION_ID", "s")
     monkeypatch.setenv("OWLERY_AUTH_TOKEN", "t")
-    out = _call("ask_agent", name="Vera", delegation_id="d1", request="r")
+    out = _call("ask_agent", name="Hedwig", delegation_id="d1", request="r")
     assert "exactly one" in out.lower()
 
 
@@ -85,7 +85,7 @@ def test_ask_agent_success(monkeypatch):
             return {
                 "delegation_id": "abcd1234",
                 "sub_session_id": "abcd1234",
-                "target_agent_name": "Vera",
+                "target_agent_name": "Hedwig",
                 "state": "running",
             }
 
@@ -104,7 +104,7 @@ def test_ask_agent_success(monkeypatch):
 
     out = _call(
         "ask_agent",
-        name="vera",
+        name="hedwig",
         request="review the dashboard",
         files=["a.tsx", "b.tsx"],
     )
@@ -112,7 +112,7 @@ def test_ask_agent_success(monkeypatch):
     # OWLERY_SESSION_ID env, with auth header.
     assert posted["url"].endswith("/api/sessions/s/delegations")
     assert posted["body"] == {
-        "agent_name": "vera",
+        "agent_name": "hedwig",
         "request": "review the dashboard",
         "files": ["a.tsx", "b.tsx"],
     }
@@ -124,8 +124,8 @@ def test_ask_agent_success(monkeypatch):
     # Tool's return text quotes the delegation id and target name so
     # the model can cite them back to the user.
     assert "abcd1234" in out
-    assert "Vera" in out
-    assert "agent-reply:Vera" in out
+    assert "Hedwig" in out
+    assert "agent-reply:Hedwig" in out
 
 
 def test_ask_agent_omits_files_when_none(monkeypatch):
@@ -139,7 +139,7 @@ def test_ask_agent_omits_files_when_none(monkeypatch):
         text = ""
 
         def json(self):
-            return {"delegation_id": "id", "target_agent_name": "Vera"}
+            return {"delegation_id": "id", "target_agent_name": "Hedwig"}
 
     def fake_post(
         url, json=None, headers=None, timeout=None, trust_env=None
@@ -150,7 +150,7 @@ def test_ask_agent_omits_files_when_none(monkeypatch):
     import httpx
 
     monkeypatch.setattr(httpx, "post", fake_post)
-    _call("ask_agent", name="Vera", request="r")
+    _call("ask_agent", name="Hedwig", request="r")
     # `files` key is omitted entirely when the caller didn't pass any —
     # cleaner over the wire than an empty list.
     assert "files" not in posted["body"]
@@ -208,7 +208,7 @@ def test_ask_agent_http_error(monkeypatch):
         raise httpx.ConnectError("nope")
 
     monkeypatch.setattr(httpx, "post", boom)
-    out = _call("ask_agent", name="Vera", request="r")
+    out = _call("ask_agent", name="Hedwig", request="r")
     assert "failed to reach Owlery" in out
 
 
@@ -310,7 +310,7 @@ def test_ask_agent_continue_routes_to_follow_up_endpoint(monkeypatch):
         def json(self):
             return {
                 "delegation_id": "d1",
-                "target_agent_name": "Vera",
+                "target_agent_name": "Hedwig",
                 "state": "running",
             }
 
@@ -340,9 +340,9 @@ def test_ask_agent_continue_routes_to_follow_up_endpoint(monkeypatch):
     assert "files" not in posted["body"]
     # The return text frames it as a continuation, not a fresh ask.
     assert "Continued delegation" in out
-    assert "Vera" in out
+    assert "Hedwig" in out
     assert "previous round" in out
-    assert "agent-reply:Vera" in out
+    assert "agent-reply:Hedwig" in out
 
 
 def test_ask_agent_continue_404_nudges_to_fresh(monkeypatch):
@@ -506,13 +506,13 @@ def test_list_agent_tasks_summary(monkeypatch):
             return [
                 {
                     "delegation_id": "d1",
-                    "target_agent_name": "Vera",
+                    "target_agent_name": "Hedwig",
                     "state": "running",
                     "error": None,
                 },
                 {
                     "delegation_id": "d2",
-                    "target_agent_name": "Pete",
+                    "target_agent_name": "Pigwidgeon",
                     "state": "failed",
                     "error": "boom",
                 },
@@ -528,7 +528,7 @@ def test_list_agent_tasks_summary(monkeypatch):
 
     monkeypatch.setattr(httpx, "get", fake_get)
     out = _call("list_agent_tasks")
-    assert "d1" in out and "Vera" in out and "running" in out
-    assert "d2" in out and "Pete" in out and "failed" in out
+    assert "d1" in out and "Hedwig" in out and "running" in out
+    assert "d2" in out and "Pigwidgeon" in out and "failed" in out
     assert captured["trust_env"] is False
     assert "boom" in out

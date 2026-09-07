@@ -101,7 +101,7 @@ async def test_fork_codex_history_replay(manager):
 
 @pytest.mark.asyncio
 async def test_codex_fork_resume_id_null_survives_restart(manager):
-    # Vera review BLOCKING #1: a HISTORY_REPLAY fork must NOT keep the
+    # A HISTORY_REPLAY fork must NOT keep the
     # pre-minted resume-id hint in the DB, else a restart before the first
     # turn reloads the bogus id and spawns `codex resume <bogus>`.
     parent = await _seed_parent(manager, backend="codex")
@@ -330,7 +330,7 @@ async def test_prepare_fork_failure_cleanup_raises_leaves_row(manager, monkeypat
     assert len(rows) == 1 and rows[0]["fork_status"] == "initializing"
     assert parent._forking is False
     # …but the in-memory session is dropped so the failed fork can't appear
-    # as a normal idle session (Vera review SHOULD-FIX #2).
+    # as a normal idle session.
     assert not any(s.origin == "fork" for s in manager.sessions.values())
 
 

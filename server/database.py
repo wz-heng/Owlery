@@ -1975,7 +1975,7 @@ class Database:
         (session-fork.md). No FS, no git, no shell here — a clean rollback
         unit: the two writes are wrapped so a failed message-copy rolls back the
         row insert rather than leaving an open transaction a later commit would
-        flush (Vera review SHOULD-FIX #1)."""
+        flush."""
         await self._ensure_connected()
         try:
             await self._conn.execute(
@@ -3185,9 +3185,8 @@ class Database:
         # the fork's first result; `claude_session_id` must be clearable so a
         # HISTORY_REPLAY fork (Codex) can overwrite the pre-minted resume_id
         # hint with NULL post-prepare_fork — otherwise a restart before the
-        # first turn reloads the bogus hint and spawns `codex resume <bogus>`
-        # (Vera review BLOCKING #1). Other columns omitted by the caller are
-        # left untouched.
+        # first turn reloads the bogus hint and spawns `codex resume <bogus>`.
+        # Other columns omitted by the caller are left untouched.
         nullable = {"fork_metadata", "claude_session_id"}
         bool_fields = {"archived", "fork_needs_replay"}
         updates: dict[str, Any] = {}

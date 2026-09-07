@@ -16,8 +16,8 @@ function makeDelegation(overrides: Partial<Delegation> = {}): Delegation {
     delegation_id: "deleg-001",
     sub_session_id: "deleg-001",
     parent_session_id: "parent",
-    target_agent_id: "vera-id",
-    target_agent_name: "Vera",
+    target_agent_id: "hedwig-id",
+    target_agent_name: "Hedwig",
     request: "review the readme",
     state: "running",
     created_at: "2026-05-29T00:00:00Z",
@@ -53,12 +53,12 @@ describe("AgentDelegationRequestCard", () => {
       <AgentDelegationRequestCard
         sessionId="parent"
         toolUseId={undefined}
-        agentName="Vera"
+        agentName="Hedwig"
         request="review the readme"
         files={undefined}
       />
     );
-    expect(screen.getByText(/Asked Vera/)).toBeInTheDocument();
+    expect(screen.getByText(/Asked Hedwig/)).toBeInTheDocument();
     expect(screen.getByText("running")).toBeInTheDocument();
     expect(screen.getByTitle(/cancel delegation/i)).toBeInTheDocument();
   });
@@ -74,7 +74,7 @@ describe("AgentDelegationRequestCard", () => {
       <AgentDelegationRequestCard
         sessionId="parent"
         toolUseId={undefined}
-        agentName="Vera"
+        agentName="Hedwig"
         request="review the readme"
         files={undefined}
       />
@@ -87,9 +87,9 @@ describe("AgentDelegationRequestCard", () => {
     // Two delegations to the same target with DIFFERENT requests:
     // by-id matching must pick the one the tool_result names, NOT
     // the one whose request happens to equal the tool_input.request.
-    // This is the fan-out invariant Vera flagged: matching by name
-    // alone (or even by name+request after a model round-trip
-    // mismatch) can bind the card to the wrong delegation.
+    // This is the fan-out invariant: matching by name alone (or even
+    // by name+request after a model round-trip mismatch) can bind
+    // the card to the wrong delegation.
     // Production delegation_ids are 12-char hex strings (matching the
     // `[A-Za-z0-9]+` regex the card uses to parse the tool_result).
     // Test ids mirror that shape so the regex actually accepts them.
@@ -119,7 +119,7 @@ describe("AgentDelegationRequestCard", () => {
         tool_name: "mcp__ask_agent__ask",
         tool_use_id: "tu-1",
         tool_input: {
-          name: "Vera",
+          name: "Hedwig",
           request: "review the sidebar — the EXACT round-trip text differs",
         },
       },
@@ -127,7 +127,7 @@ describe("AgentDelegationRequestCard", () => {
         role: "user",
         type: "tool_result",
         tool_use_id: "tu-1",
-        content: "Started delegation `bbbbbbbbbbbb` to Vera. …",
+        content: "Started delegation `bbbbbbbbbbbb` to Hedwig. …",
       },
     ]);
 
@@ -135,7 +135,7 @@ describe("AgentDelegationRequestCard", () => {
       <AgentDelegationRequestCard
         sessionId="parent"
         toolUseId="tu-1"
-        agentName="Vera"
+        agentName="Hedwig"
         request="review the sidebar — the EXACT round-trip text differs"
         files={undefined}
       />
@@ -147,20 +147,20 @@ describe("AgentDelegationRequestCard", () => {
     expect(screen.queryByTitle(/cancel delegation/i)).toBeNull();
   });
 
-  it("matches by lowercase name (so 'vera' tool_input finds 'Vera' record)", () => {
+  it("matches by lowercase name (so 'hedwig' tool_input finds 'Hedwig' record)", () => {
     useSessionStore.getState().upsertDelegation("parent", makeDelegation());
     render(
       <AgentDelegationRequestCard
         sessionId="parent"
         toolUseId={undefined}
-        agentName="vera"
+        agentName="hedwig"
         request="review the readme"
         files={undefined}
       />
     );
     // Same record found despite case mismatch — the card still
     // surfaces the canonical name from the record.
-    expect(screen.getByText(/Asked vera/)).toBeInTheDocument();
+    expect(screen.getByText(/Asked hedwig/)).toBeInTheDocument();
     expect(screen.getByText("running")).toBeInTheDocument();
   });
 
@@ -169,14 +169,14 @@ describe("AgentDelegationRequestCard", () => {
       <AgentDelegationRequestCard
         sessionId="parent"
         toolUseId={undefined}
-        agentName="Vera"
+        agentName="Hedwig"
         request="review the readme"
         files={undefined}
       />
     );
     // No matched record: state defaults to running with the spinner
     // and no delegation-id badge appears.
-    expect(screen.getByText(/Asked Vera/)).toBeInTheDocument();
+    expect(screen.getByText(/Asked Hedwig/)).toBeInTheDocument();
     expect(screen.getByText("running")).toBeInTheDocument();
     expect(screen.queryByTitle(/cancel delegation/i)).toBeNull();
   });
@@ -186,7 +186,7 @@ describe("AgentDelegationRequestCard", () => {
       <AgentDelegationRequestCard
         sessionId="parent"
         toolUseId={undefined}
-        agentName="Vera"
+        agentName="Hedwig"
         request="review"
         files={["a.tsx", "b.tsx"]}
       />
@@ -199,14 +199,14 @@ describe("AgentDelegationRequestCard", () => {
       sessions: [
         {
           id: "deleg-001",
-          name: "Vera ← Octo",
+          name: "Hedwig ← Octo",
           working_dir: "/tmp",
           status: "idle",
           created_at: "2026-05-29T00:00:00Z",
           message_count: 0,
           claude_session_id: null,
           credential_id: null,
-          agent_id: "vera-id",
+          agent_id: "hedwig-id",
           origin: "delegation",
           parent_session_id: "parent",
           delegation_request: "review the readme",
@@ -222,14 +222,14 @@ describe("AgentDelegationRequestCard", () => {
       <AgentDelegationRequestCard
         sessionId="parent"
         toolUseId={undefined}
-        agentName="Vera"
+        agentName="Hedwig"
         request="review the readme"
         files={undefined}
       />
     );
-    fireEvent.click(screen.getByTitle(/open vera's session/i));
+    fireEvent.click(screen.getByTitle(/open hedwig's session/i));
     expect(useSessionStore.getState().activeSessionId).toBe("deleg-001");
-    expect(useSessionStore.getState().activeAgentId).toBe("vera-id");
+    expect(useSessionStore.getState().activeAgentId).toBe("hedwig-id");
   });
 
   it("the cancel button POSTs to the cancel route", async () => {
@@ -242,7 +242,7 @@ describe("AgentDelegationRequestCard", () => {
       <AgentDelegationRequestCard
         sessionId="parent"
         toolUseId={undefined}
-        agentName="Vera"
+        agentName="Hedwig"
         request="review the readme"
         files={undefined}
       />

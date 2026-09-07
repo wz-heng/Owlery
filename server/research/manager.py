@@ -211,7 +211,7 @@ class ResearchManager:
                 # Run leaves in an EMPTY per-job scratch cwd, NOT the session's
                 # working_dir — a web/reasoning leaf has no reason to read the
                 # user's repo, and this keeps the read-only-sandbox/denylist
-                # leaves from touching real files (Vera review).
+                # leaves from touching real files.
                 scratch = os.path.join(_research_dir(), job_id, "cwd")
                 os.makedirs(scratch, exist_ok=True)
                 report = await asyncio.wait_for(
@@ -330,8 +330,8 @@ class ResearchManager:
         assert self.db is not None
         try:
             # Idempotent: if the job is already terminal (e.g. cancel() recorded
-            # it before interrupting), don't overwrite or re-broadcast (Vera
-            # review — avoids the cancel double-write/double-event).
+            # it before interrupting), don't overwrite or re-broadcast
+            # (avoids the cancel double-write/double-event).
             row = await self.db.get_research_job(job_id)
             if row and row["status"] != "running":
                 return
@@ -358,7 +358,7 @@ class ResearchManager:
             raise ResearchError(f"research job {job_id} not found", status_code=404)
         # Record cancelled + broadcast BEFORE interrupting live work, so the
         # state transition is authoritative and the REST caller/UI never see a
-        # stale `running` (Vera review — cancel-as-state-transition). The
+        # stale `running` (cancel-as-state-transition). The
         # CancelledError path's _finalize_failed is now idempotent, so it won't
         # double-write. No-op if already terminal.
         if row["status"] == "running":

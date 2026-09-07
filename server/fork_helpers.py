@@ -400,8 +400,8 @@ async def safe_revert_preflight(
     # Dirty porcelain paths are repo-top-relative; agent-touched paths may be
     # absolute, cwd-relative, or repo-relative. Normalize each touched path
     # against BOTH the working_dir (the agent's cwd) and the repo top so a
-    # working_dir that's a subdir of the repo doesn't cause a false refusal
-    # (Vera review SHOULD-FIX #3). Absolute paths ignore the base.
+    # working_dir that's a subdir of the repo doesn't cause a false refusal.
+    # Absolute paths ignore the base.
     touched_abs: set[str] = set()
     for p in agent_touched_paths:
         touched_abs.add(_norm(p, working_dir))

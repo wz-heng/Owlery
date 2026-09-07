@@ -208,8 +208,8 @@ class DelegationManager:
            their transcripts without reviving a model turn;
         4. only then archive the recovered delegation sessions.
 
-        Keeping archive as the final phase prevents Octo→Vera→Pete recovery
-        from deleting Vera before Pete's terminal event is durably recorded.
+        Keeping archive as the final phase prevents Octo→Hedwig→Pigwidgeon recovery
+        from deleting Hedwig before Pigwidgeon's terminal event is durably recorded.
         """
         if self.session_mgr is None or self.db is None:
             return 0
@@ -483,8 +483,8 @@ class DelegationManager:
 
         Also CASCADE-CANCELS any running descendants whose
         ``parent_session_id`` chain leads to this delegation. Without
-        the cascade, an Octo-cancels-Vera while Vera-asked-Pete
-        scenario would leak Pete: Pete keeps burning tokens and his
+        the cascade, an Octo-cancels-Hedwig while Hedwig-asked-Pigwidgeon
+        scenario would leak Pigwidgeon: Pigwidgeon keeps burning tokens and his
         eventual reply lands on a missing/cancelled parent and is
         silently dropped. Cascade unwinds the chain top-down so the
         terminal injections to each parent stay meaningful.
@@ -553,7 +553,7 @@ class DelegationManager:
         transcript and can build on what she did last round.
 
         Use this for review/iteration loops where context continuity
-        matters (Octo asks Vera "review again — I addressed your
+        matters (Octo asks Hedwig "review again — I addressed your
         finding 3"). Use plain `start_delegation` (the `ask` tool)
         for fresh work or parallel fan-out to the same target —
         sharing a session would serialise concurrent work and mix
@@ -812,7 +812,7 @@ class DelegationManager:
         safety cap, or a non-null ``parent_session_id`` whose target
         the DB also can't find) is rejected as a 409 rather than
         silently treated as a valid (short) chain. The cycle guard is
-        what stands between "Vera asks Octo" and an infinite
+        what stands between "Hedwig asks Octo" and an infinite
         delegation tower — it must never be skipped.
 
         Archived ancestors are allowed: when ``session_mgr.get_session``

@@ -192,7 +192,7 @@ async def follow_up_delegation(
       first), or if the child session is hard-deleted (start a
       fresh `ask` instead)
     """
-    # Vera-round-5 finding: without this guard, an archived /
+    # Without this guard, an archived /
     # deleted parent session could still receive a follow-up that
     # round-resets the record, starts the child, and then silently
     # drops the terminal turn because there's no live parent to

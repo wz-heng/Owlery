@@ -62,7 +62,7 @@ async def cancel_research(
     session_id: str, research_id: str, _: str = Depends(verify_token)
 ) -> dict[str, Any]:
     # Verify session ownership BEFORE mutating — a request scoped to the wrong
-    # session must not cancel a real job (Vera review).
+    # session must not cancel a real job.
     if research_manager.db is None:
         raise HTTPException(503, "research not available")
     existing = await research_manager.db.get_research_job(research_id)

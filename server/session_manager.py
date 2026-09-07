@@ -430,7 +430,7 @@ class SessionManager:
                     # store; Claude ignores it. Prefer the FORK-TIME effective
                     # credential pinned in fork_metadata (so an agent whose
                     # credential changed after the fork doesn't send cleanup to
-                    # the wrong CODEX_HOME — Vera review); else fall back to the
+                    # the wrong CODEX_HOME); else fall back to the
                     # row's credential_id, else its agent's. require_auth=False
                     # so a since-revoked login still yields its home dir.
                     eff_cred_id = None
@@ -517,7 +517,7 @@ class SessionManager:
         `result` (session-rewind.md §5.3.2/§5.6.5): clear
         `fork_needs_replay` (so turn 2+ isn't wrapped) and the ephemeral
         `fork_metadata` keys (so the chat input doesn't re-prefill), while
-        PRESERVING durable keys like `full_copy` (Vera review). `fork_revert_record`
+        PRESERVING durable keys like `full_copy`. `fork_revert_record`
         is a separate column and NEVER touched. No-op on non-fork / cleared."""
         if not session.fork_needs_replay and session.fork_metadata is None:
             return
@@ -696,7 +696,7 @@ class SessionManager:
                     )
                     # Drop the in-memory session so a failed fork can't appear
                     # as a normal idle session (fork_status isn't exposed to
-                    # clients — Vera review SHOULD-FIX #2). The DB row stays for
+                    # clients). The DB row stays for
                     # the startup sweep to purge on the next boot.
                     self.sessions.pop(fork_id, None)
                     raise
@@ -814,7 +814,7 @@ class SessionManager:
             return False
         # Normalize both sides (expanduser + abspath) so a `~/.owlery/fork/...`
         # style row still classifies — otherwise it would leak rather than be
-        # swept (Vera review hardening).
+        # swept.
         norm = lambda p: os.path.normpath(os.path.abspath(os.path.expanduser(p)))
         base = norm(SessionManager._fork_copy_base())
         wd = norm(working_dir)
@@ -871,7 +871,7 @@ class SessionManager:
         resume_id_hint = str(uuid.uuid4())
         dest = self._fork_copy_dest(parent.working_dir, fork_id)
         try:
-            # Snapshot the transcript AFTER claiming `_forking` (Vera review):
+            # Snapshot the transcript AFTER claiming `_forking`:
             # loading it earlier risks a fast turn slipping in between the read
             # and the guard, which would copy a post-turn working dir against a
             # pre-turn message list. With the guard held, both are consistent.
@@ -881,7 +881,7 @@ class SessionManager:
             # only to locate the backend's on-disk transcript store for the copy
             # + cleanup — Codex needs its CODEX_HOME; Claude needs none (→ None).
             # require_auth=False: the rollout must be locatable even if the login
-            # later lapses, and we make no API call here (Vera review).
+            # later lapses, and we make no API call here.
             agent = await self._load_agent(parent)
             eff_cred_id = parent.credential_id or (
                 agent.get("credential_id") if agent else None
@@ -893,7 +893,7 @@ class SessionManager:
 
             # 1. Full literal copy of the working dir (large/slow → off-thread).
             #    copytree can leave a partial dir behind on a mid-copy error, so
-            #    sweep it before surfacing the failure (Vera review).
+            #    sweep it before surfacing the failure.
             try:
                 await asyncio.to_thread(self._copy_tree, parent.working_dir, dest)
             except Exception as e:
@@ -909,7 +909,7 @@ class SessionManager:
             # failure: `full_copy`/`duplicated_from` drive the UI, and
             # `cleanup_credential_id` pins the FORK-TIME effective credential so
             # the startup sweep finds the right CODEX_HOME even if the agent's
-            # credential later changes (Vera review). Omitted when there's none.
+            # credential later changes. Omitted when there's none.
             fork_meta_dict: dict[str, Any] = {
                 "full_copy": True, "duplicated_from": parent.name,
             }
@@ -924,7 +924,7 @@ class SessionManager:
             #    HISTORY_REPLAY backends inject on turn 1 — so it MUST stay set,
             #    or the duplicate would continue with no copied context). The UI
             #    distinguishes a full copy from a rewind via fork_metadata's
-            #    `full_copy` flag, not by nulling fork_after_seq (Vera review).
+            #    `full_copy` flag, not by nulling fork_after_seq.
             try:
                 await self.db.create_fork_session(
                     fork_id=fork_id, name=fork_name, working_dir=dest,
@@ -966,8 +966,8 @@ class SessionManager:
                 # the row + the copied dir. If cleanup fails, leave BOTH the row
                 # ('initializing') AND the copied dir in place so the startup
                 # sweep can retry cleanup idempotently — deleting the dir here
-                # would strand the row pointing at a missing working_dir (Vera
-                # review). The sweep rmtrees the copied dir once cleanup wins.
+                # would strand the row pointing at a missing working_dir.
+                # The sweep rmtrees the copied dir once cleanup wins.
                 try:
                     await harness.cleanup_incomplete_fork_artifacts(
                         dest, resume_id_hint, fork_id, credential=parent_cred
@@ -2626,8 +2626,8 @@ class SessionManager:
         # re-runs the original invocation, so it must restore this — a failed
         # no-output attempt can still emit `session_started` and mutate
         # session.claude_session_id, which would otherwise turn the retry into
-        # a `--resume <failed-id>` of the same prompt (Vera review,
-        # harness-transient-retry.md §4).
+        # a `--resume <failed-id>` of the same prompt
+        # (harness-transient-retry.md §4).
         resume_at_turn_start = session.claude_session_id
 
         while True:
@@ -2995,7 +2995,7 @@ class SessionManager:
                 # TWO modes, by whether the turn already produced output:
                 #   - NO output yet → re-run the ORIGINAL prompt from the
                 #     turn-start resume state (side-effect-free; discard any
-                #     resume id a failed no-output attempt captured — Vera).
+                #     resume id a failed no-output attempt captured).
                 #   - output already streamed (tool_use/text) AND a resume id
                 #     was captured → RESUME with "continue" so we pick up where
                 #     it left off WITHOUT re-running tools or duplicating text.
@@ -3272,7 +3272,7 @@ class SessionManager:
         outlive the credential that created it), NOT for making API calls: a
         directory-backed credential returns its home dir even with a
         missing/revoked `auth.json` (the rollout still lives there and must be
-        cleaned up — Vera review), and a secret-backed credential returns None
+        cleaned up), and a secret-backed credential returns None
         (its transcripts aren't keyed by credential, so no home to locate).
 
         `require_auth=True` (the default, and what every real turn-spawning

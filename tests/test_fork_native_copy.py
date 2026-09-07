@@ -93,7 +93,7 @@ async def test_claude_fork_copy_fallback_when_no_transcript(tmp_path, monkeypatc
 @pytest.mark.asyncio
 async def test_claude_fork_cleanup_reraises_on_oserror(tmp_path, monkeypatch):
     # A real removal failure (not "already gone") must RE-RAISE so the saga
-    # keeps the row for a retry instead of stranding the transcript (Vera).
+    # keeps the row for a retry instead of stranding the transcript.
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     dest_wd = "/x/y"

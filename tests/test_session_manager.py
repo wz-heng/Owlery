@@ -2238,7 +2238,7 @@ async def test_clean_turn_does_not_flag_credential(manager, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_failed_codex_turn_with_tool_unauthorized_does_not_flag(manager, monkeypatch):
-    """Vera review: a Codex turn that FAILS for a non-auth reason whose text
+    """A Codex turn that FAILS for a non-auth reason whose text
     merely contains "Unauthorized" (e.g. an MCP/connector 401 bubbling up) must
     NOT flag the harness credential — only auth-specific phrases do."""
     from server.harness import HarnessEvent
@@ -2336,7 +2336,7 @@ async def test_transient_error_retries_same_prompt_then_succeeds(manager, monkey
 
 @pytest.mark.asyncio
 async def test_transient_retry_ignores_failed_attempts_resume_id(manager, monkeypatch):
-    """Vera review: a failed no-output attempt can still emit `session_started`
+    """A failed no-output attempt can still emit `session_started`
     and mutate session.claude_session_id. The retry must re-run the ORIGINAL
     invocation (turn-start resume state), NOT `--resume <failed-id>`."""
     from server.harness import HarnessEvent

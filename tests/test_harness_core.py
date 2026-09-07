@@ -359,7 +359,7 @@ def test_is_auth_error_codex_matches_and_is_case_insensitive():
 def test_is_auth_error_codex_ignores_bare_unauthorized_from_tools():
     """A non-auth failure that merely contains "unauthorized" (an MCP/connector
     401, a tool error) must NOT be read as a harness-credential failure — the
-    patterns are auth-specific, never a bare "unauthorized" (Vera review)."""
+    patterns are auth-specific, never a bare "unauthorized"."""
     h = get_harness("codex")
     assert not h.is_auth_error("MCP server returned Unauthorized")
     assert not h.is_auth_error("tool failed: GitHub Unauthorized")
@@ -460,7 +460,7 @@ async def test_terminate_process_group_reaps_children(tmp_path):
 @pytest.mark.asyncio
 async def test_run_oneshot_reaps_group_on_cancel(monkeypatch):
     """Cancelling a run_oneshot mid-flight must reap its process group, not
-    orphan the CLI (Vera review). We spy on the group-kill helper."""
+    orphan the CLI. We spy on the group-kill helper."""
     import signal as _signal
     import server.harness.run as run_mod
 

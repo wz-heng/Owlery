@@ -158,7 +158,7 @@ async def test_cancel_marks_cancelled(rm, mgr, db, monkeypatch):
     rid = row["id"]
     await asyncio.wait_for(started.wait(), timeout=5)
     # cancel() records the state transition BEFORE interrupting, so the
-    # returned row is already cancelled (no stale "running") — Vera review.
+    # returned row is already cancelled (no stale "running").
     cancelled = await rm.cancel(rid)
     assert cancelled["status"] == "cancelled"
     assert (await db.get_research_job(rid))["status"] == "cancelled"

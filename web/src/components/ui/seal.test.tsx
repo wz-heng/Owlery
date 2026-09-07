@@ -25,7 +25,7 @@ describe("monogram", () => {
   });
 
   it("skips leading punctuation and whitespace to find one", () => {
-    expect(monogram("  ...vera")).toBe("V");
+    expect(monogram("  ...nova")).toBe("N");
     expect(monogram("🦉 Owlery")).toBe("O");
   });
 

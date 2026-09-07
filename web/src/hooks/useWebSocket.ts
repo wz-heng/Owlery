@@ -425,7 +425,7 @@ function handleWsMessage(data: Record<string, unknown>) {
       const store = getState();
       if (store.sessions.some((s) => s.id === forkId)) break;
       // Fetch the authoritative SessionInfo rather than synthesizing a partial
-      // one (Vera review) — gives the sidebar the right working_dir, backend,
+      // one — gives the sidebar the right working_dir, backend,
       // fork flags, etc. Re-dedupe inside the callback in case the initiating
       // tab's own add raced in first.
       const tok = store.token;
