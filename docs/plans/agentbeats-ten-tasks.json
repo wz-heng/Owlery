@@ -1,0 +1,22 @@
+{
+  "_comment": "Pre-registered 10-task sample for AgentBeats Phase 1 (docs/plans/agentbeats-phase1.md). Committed BEFORE any task is run, per the task card's GAIA-precedent discipline ('先 commit 题单再跑') so the selection cannot be adjusted after seeing results.",
+  "source_repo": "https://github.com/harbor-framework/terminal-bench-2",
+  "source_repo_note": "laude-institute/terminal-bench-2 redirects here as of 2026-11-16 (repo moved/renamed upstream).",
+  "source_commit_sha": "2fd12b88aafdd04a52c298e3940bcb189f9766d6",
+  "source_commit_date": "2026-04-30T05:53:30Z",
+  "total_task_count": 89,
+  "sampling_method": "sorted(task_dir_names); random.Random(42).sample(tasks, 10)",
+  "seed": 42,
+  "selected_tasks": [
+    "build-cython-ext",
+    "configure-git-webserver",
+    "constraints-scheduling",
+    "custom-memory-heap-crash",
+    "fix-code-vulnerability",
+    "gcode-to-text",
+    "headless-terminal",
+    "query-optimize",
+    "torch-pipeline-parallelism",
+    "vulnerable-secret"
+  ]
+}
