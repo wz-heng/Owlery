@@ -394,10 +394,17 @@ async def test_detect_and_flag_dedupes_cross_repository_agent_global_lineage(hea
 async def test_detect_and_flag_scans_past_the_default_200_row_candidate_page(health_runtime):
     rt = health_runtime
     # `Database.list_skill_candidates` defaults to a UI-page-sized
-    # `limit=200` — pad the table with enough OTHER approved candidates
-    # that the real lineage under test would silently fall off that default
-    # page (and never get evaluated) if `skill_health.py` didn't explicitly
-    # ask for everything (Snape review).
+    # `limit=200`, `ORDER BY created_at DESC` — pad the table with enough
+    # NEWER approved candidates that the real lineage under test falls
+    # PAST that default page. The target must be approved FIRST (Snape
+    # review, round 2: inserting fillers before the target left the target
+    # newest-first and passing trivially even with the old, truncating
+    # default — this ordering is what actually exercises the boundary).
+    await _approve_skill(rt)
+    await _run_with_outcome(rt, "failed", seq=1)
+    await _run_with_outcome(rt, "blocked", seq=2)
+    await _run_with_outcome(rt, "completed", seq=3)
+
     from datetime import datetime, timezone
 
     for i in range(205):
@@ -417,10 +424,11 @@ async def test_detect_and_flag_scans_past_the_default_200_row_candidate_page(hea
         )
     await rt.db._conn.commit()
 
-    await _approve_skill(rt)
-    await _run_with_outcome(rt, "failed", seq=1)
-    await _run_with_outcome(rt, "blocked", seq=2)
-    await _run_with_outcome(rt, "completed", seq=3)
+    # Prove the setup actually exercises the truncation boundary: with the
+    # UI-page-sized default, the target lineage is NOT on the first page.
+    default_page = await rt.db.list_skill_candidates(status="approved")
+    assert len(default_page) == 200
+    assert SLUG not in {c["slug"] for c in default_page}
 
     created = await detect_and_flag_corroded_skills(rt.db)
     assert len(created) == 1

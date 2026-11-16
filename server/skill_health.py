@@ -69,14 +69,19 @@ _EVIDENCE_LIMIT = 20
 # take a `limit` that defaults to a UI-page-sized number (200 / 50) — fine
 # for a review page, silently wrong for a batch job that must see every
 # active lineage and every invocation to compute a correct rate (Snape
-# review: the defaults made older lineages past the 200th never get
-# scanned, and could re-flag an already-pending lineage whose earlier flag
-# had aged past that cutoff). `scripts/process_metrics/metrics.py`'s
+# review, round 1: the defaults made older lineages past the 200th never
+# get scanned, and could re-flag an already-pending lineage whose earlier
+# flag had aged past that cutoff). A large constant is not a fix for this —
+# round 2 correctly rejected `1_000_000` as "truncation with a bigger
+# number," not "no truncation." `-1` is SQLite's own documented sentinel
+# for "no upper bound on `LIMIT`" (not a magic number this module invented),
+# so this is genuinely unlimited, matching
+# `scripts/process_metrics/metrics.py`'s
 # read-only reporting view of this same math uses raw, unlimited SQL — this
 # constant is this module's way of matching that "see everything" behavior
 # without writing a second, real-pagination API that nothing else needs at
 # today's table sizes.
-_LIST_ALL = 1_000_000
+_LIST_ALL = -1
 
 
 async def _lineage_decisive_runs(

@@ -178,6 +178,80 @@ async def test_retry_rate_and_human_takeover_rate(dataset):
     assert takeover["denominator"] == 2
     assert takeover["numerator"] == 1
     assert takeover["rate"] == pytest.approx(0.5)
+    # Snape review: the SQL quoted in the report must be literal SQL, not
+    # prose describing it — and must name the actual kind it keys off.
+    assert "task_unblocked" in takeover["sql"]
+    # Real SQL legitimately contains bare `<`/`>` as comparison operators
+    # (`attempt_no > 1`, `created_at <= :claimed_at`) — the thing to rule
+    # out is an angle-bracket PLACEHOLDER token like "<lineage filter>",
+    # not the operators themselves.
+    assert "<lineage" not in takeover["sql"] and "<filter>" not in takeover["sql"]
+
+
+@pytest.mark.asyncio
+async def test_human_takeover_rate_ignores_an_ordinary_comment(dataset):
+    ds = dataset
+    # System unblocks (not a human takeover) — then a USER leaves an
+    # ordinary comment before the retry is claimed. The comment is the most
+    # RECENT task_events row, but it isn't a `task_unblocked` row, so it
+    # must be irrelevant (Snape review round 1/2: an earlier version keyed
+    # off "whatever event is most recent" and would have misread this
+    # comment as the takeover signal).
+    task, _run, _ = await ds.make_task(1, "blocked")
+    await ds.task_repo.unblock_task(task.id, actor_kind="system")
+    await ds.task_repo.add_comment(task.id, "looks fine, go ahead", author_kind="user")
+    run_b = await ds.task_repo.claim_ready(
+        task.id, workspace_mode="git_worktree",
+        workspace_path=str(ds.repo_dir.parent / "ws-1b"), run_id="run-1b",
+    )
+    await ds.task_repo.complete_run(task.id, run_b.id, summary="done on retry")
+
+    conn = _conn(ds.db_path)
+    takeover = metrics.human_takeover_rate(conn)
+    conn.close()
+
+    assert takeover["denominator"] == 1
+    assert takeover["numerator"] == 0
+
+
+@pytest.mark.asyncio
+async def test_human_takeover_rate_uses_the_most_recent_unblock_not_an_earlier_one(dataset):
+    ds = dataset
+    # A human unblock happens first — but the task gets blocked AGAIN on the
+    # next attempt, and THAT time it's the system that unblocks it. The
+    # final claim's relevant signal is the most recent unblock (system),
+    # not the earlier human one (Snape review: a later system event must be
+    # able to supersede an earlier real human unblock, not just the reverse).
+    task = await ds.task_repo.create_task(
+        board_id=ds.board_id, title="Task", body="body",
+        status="todo", assignee_agent_id=ds.agent_id,
+    )
+    run1 = await ds.task_repo.claim_ready(
+        task.id, workspace_mode="git_worktree",
+        workspace_path=str(ds.repo_dir.parent / "ws-a1"), run_id="run-a1",
+    )
+    await ds.task_repo.block_run(task.id, run1.id, reason="needs input")
+    await ds.task_repo.unblock_task(task.id, actor_kind="user")
+
+    run2 = await ds.task_repo.claim_ready(
+        task.id, workspace_mode="git_worktree",
+        workspace_path=str(ds.repo_dir.parent / "ws-a2"), run_id="run-a2",
+    )
+    await ds.task_repo.block_run(task.id, run2.id, reason="needs input again")
+    await ds.task_repo.unblock_task(task.id, actor_kind="system")
+
+    run3 = await ds.task_repo.claim_ready(
+        task.id, workspace_mode="git_worktree",
+        workspace_path=str(ds.repo_dir.parent / "ws-a3"), run_id="run-a3",
+    )
+    await ds.task_repo.complete_run(task.id, run3.id, summary="done on third attempt")
+
+    conn = _conn(ds.db_path)
+    takeover = metrics.human_takeover_rate(conn)
+    conn.close()
+
+    assert takeover["denominator"] == 1  # run-a3: completed, attempt_no>1
+    assert takeover["numerator"] == 0  # most recent unblock was system's
 
 
 # --- turn 死因分布 -----------------------------------------------------------
@@ -313,6 +387,10 @@ async def test_skill_failure_rates_matches_skill_health_definition(dataset):
     assert row["eligible"] == 3  # interrupted excluded
     assert row["fail_like"] == 2  # failed + blocked
     assert row["rate"] == pytest.approx(2 / 3)
+    # Snape review: the methodology text must be the real filter, not a
+    # "<lineage filter>"-style placeholder standing in for it.
+    assert "<" not in metrics.SKILL_FAILURE_RATE_METHODOLOGY
+    assert "sc.repository = :repository" in metrics.SKILL_FAILURE_RATE_METHODOLOGY
 
 
 @pytest.mark.asyncio

@@ -116,10 +116,24 @@ def retry_rate(conn: sqlite3.Connection) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+# Snape review (round 2): the prior version here was English PROSE
+# ("does a row exist") describing the query rather than the query itself —
+# the module docstring promises the latter. It was also imprecise in a way
+# prose made easy to miss: the real signal is the MOST RECENT
+# `task_unblocked` row's own actor, not "does a user-actor row exist
+# anywhere" (two unblocks — an earlier human one, a later system
+# re-dispatch — must read as "not a takeover", since the later one is what
+# actually let this claim happen). Showing the literal statement makes that
+# unambiguous: it is one query with one answer, not an existence check.
 HUMAN_TAKEOVER_SQL = (
-    "per-row: does a task_events row with kind='task_unblocked' AND "
-    "actor_kind='user' exist at or before task_runs.claimed_at (most recent "
-    "one if several), for every completed run with attempt_no>1"
+    "SELECT id, task_id, claimed_at FROM task_runs "
+    "WHERE state = 'completed' AND attempt_no > 1;\n"
+    "-- for each row above, run:\n"
+    "SELECT actor_kind FROM task_events "
+    "WHERE task_id = :task_id AND created_at <= :claimed_at "
+    "AND kind = 'task_unblocked' "
+    "ORDER BY created_at DESC, seq DESC LIMIT 1;\n"
+    "-- numerator += 1 iff that query returns a row AND its actor_kind = 'user'"
 )
 
 
@@ -271,14 +285,26 @@ def cost_per_task(conn: sqlite3.Connection) -> dict[str, Any]:
 _DECISIVE_STATES = ("completed", "failed", "blocked")
 _FAIL_LIKE_STATES = ("failed", "blocked")
 
+# Snape review (round 2): "<lineage filter>" was a placeholder standing in
+# for the real, conditionally-built filter — not what actually ran. Shown
+# here as the two concrete filter forms the code (`skill_failure_rates`
+# below) actually builds, not a paraphrase of them.
 SKILL_FAILURE_RATE_METHODOLOGY = (
-    "per active approved+non-superseded skill lineage (deduped by canonical "
-    "lineage key — repository only distinguishes agent+repo scope): "
-    "SELECT DISTINCT si.run_id FROM skill_invocations si JOIN "
-    "skill_candidates sc ON sc.id = si.candidate_id WHERE si.run_id IS NOT "
-    "NULL AND <lineage filter>; then for each run_id, task_runs.state in "
-    "(completed,failed,blocked) is decisive, state in (failed,blocked) is "
-    "fail-like; rate = fail-like / decisive"
+    "First, dedupe skill_candidates WHERE status='approved' AND "
+    "superseded_at IS NULL to one row per canonical lineage (slug, scope, "
+    "proposed_by_agent_id, repository-only-if-scope='agent+repo'), keeping "
+    "the one with the latest created_at.\n"
+    "Then, per surviving lineage:\n"
+    "SELECT DISTINCT si.run_id FROM skill_invocations si "
+    "JOIN skill_candidates sc ON sc.id = si.candidate_id "
+    "WHERE si.run_id IS NOT NULL AND sc.slug = :slug AND sc.scope = :scope "
+    "AND (sc.proposed_by_agent_id = :agent_id "
+    "     OR (:agent_id IS NULL AND sc.proposed_by_agent_id IS NULL)) "
+    "AND (:scope != 'agent+repo' OR sc.repository = :repository);\n"
+    "-- then per run_id: SELECT state FROM task_runs WHERE id = :run_id — "
+    "decisive = state IN ('completed','failed','blocked'), "
+    "fail-like = state IN ('failed','blocked'); "
+    "rate = count(fail-like) / count(decisive)"
 )
 
 
