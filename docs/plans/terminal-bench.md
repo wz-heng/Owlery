@@ -50,3 +50,19 @@
 - 不做 HAL 集成(二期备选,等本案落地后另议)。
 - 不做 prompt/工具特调冲榜,不挑题,不隐藏低分重跑。
 - 不在本案内修 Owlery 产品代码。
+
+## 6. 改道记录:闸门 0 触发 → HAL 转正(2026-11-16 用户拍板)
+
+**闸门 0 实录**:Phase 0 核实(卡 a73778e6e242 评论 7383660c99f6,$0 花费)确认 Terminal-Bench 全系列(2.0/2.1/3.0/4.0/4.1)对第三方关闭社区提交——官方 `harbor-framework/terminal-bench` 仓 `leaderboard/SUBMIT.md`(2026-11-12 更新)明文只收维护者自跑结果。组织级关门,非技术障碍(Harbor BaseAgent 集成路径现成)。按 §3 闸门 0 上报,用户选 (a):**目标榜改为 HAL(hal.cs.princeton.edu,Princeton,ICLR 2026)**。
+
+**HAL 版 Phase 0(零成本核实,先于一切)**:
+- 提交流程:官网 "Submit an Agent" 指向的 GitHub agents guide 全文;**是否接受外部自定义 agent/harness 提交、由谁跑**(自跑交 trace vs 官方代跑);
+- **trace 公开粒度(新风险点)**:HAL 用 W&B Weave 全程记录轨迹并加密发布——核实公开的 trace 里会不会暴露 Owlery 的 system prompt/人设/内部工具协议,以及能否控制;
+- 九 benchmark 选型:先上一个,选型标准=①提交确认开放 ②命题贴"工作台在真实环境干活"(候选优先级:SWE-bench Verified Mini / TAU-bench Airline / AssistantBench;GAIA 在 HAL 内跑绝对分不违反 gaia-pilot 封盘条款——封的是 vs 裸 CLI 净胜命题)③全量成本最低者优先;
+- 集成工作量与接口:HAL harness 对 agent 的接口形态、W&B 依赖、与 Owlery server 型架构的对接点。
+
+**闸门 0'(HAL 版)**:不收外部 agent 提交,或 trace 公开要求会暴露不可接受的内部细节且无法规避 → block 上报,不硬绕。
+
+其余结构不变:闸门 0' 过 → Phase 1 适配器(硬约束同 §3:走 Owlery 真实栈)→ Phase 2 小样本外推 → 闸门 1 成本用户拍板 → Phase 3 全量+提交(提交动作用户终审,预注册解读规则同 §3)。§4 执行纪律、§5 不做清单原样生效;Phase 0-2 预算盒 $30 重置续用。
+
+**平行支线(用户未拍板,仅备案)**:向 TB 维护者发自荐邮件请其代跑 Owlery——选项 (b),未启动。
