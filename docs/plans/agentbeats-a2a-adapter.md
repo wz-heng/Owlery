@@ -156,6 +156,31 @@ unreachable.
   restart. Acceptable for this phase (short-lived local validation runs,
   explicitly not a 24/7 externally-reachable submission target yet); would
   need a durable table before Phase 2's actual public submission.
+- **No reaper for a green-abandoned task — a confirmed, not just
+  theoretical, orphan leak.** When green's own Harbor-side command
+  execution hits its 300s cap (`agent.py`'s own timeout, independent of
+  anything in this adapter), green raises internally and moves to the
+  next task *without ever sending purple another A2A message* — there is
+  no "final" decision for `AgentBeatsExamManager` to react to, so the
+  throwaway exam agent + session from §2.4 (meant to be hard-deleted
+  "immediately after the terminal decision") never gets that decision and
+  is never torn down. `shutdown()` (`server/agentbeats/manager.py`) only
+  unregisters the broadcast listener — it does not sweep stragglers, and
+  the orphans are DB rows (`agents`/`sessions` tables), so they outlive
+  process restarts too. Observed directly in the ten-task run (§5): 3 of
+  10 tasks hit this exact failure mode (`build-cython-ext`,
+  `configure-git-webserver`, `query-optimize`), and all 3 left an orphaned
+  agent+session pair behind (verified by querying the validation DB after
+  the run — `agents`/`sessions` row counts matched exactly). Not a
+  security or cost issue (the orphan is still fully isolated garbage, and
+  a dormant session accrues no further model spend), but a real
+  resource-cleanup gap that would accumulate rows and memory-dir disk
+  usage over a long AgentBeats campaign. Deferred rather than rushed: the
+  right fix is an idle-timeout reaper (periodic sweep or lazy
+  check-on-access) interacting carefully with the round/budget logic so
+  it can't race a session that's merely slow, not abandoned — that's
+  design work for a dedicated follow-up, not a safe same-session patch
+  under this phase's time-box.
 - **`card_url` is `http://127.0.0.1:{port}` (+ `/a2a` in dev)**, computed by
   `a2a_mount_path_and_card_url` (`server/agentbeats/app.py`) — fine for
   local-only validation; a real AgentBeats submission needs this to reflect
@@ -165,11 +190,25 @@ unreachable.
 - **No streaming.** `AgentCapabilities(streaming=False)` — each round is
   a single request/response, matching the protocol's own round-trip
   shape; there is no intermediate progress to stream within a round.
-- **Docker packaging (`deploy/agentbeats/`) is build-ready, not
-  submission-ready.** It builds and runs locally; it is never pushed to a
-  registry or registered with agentbeats.dev in this phase (hard red line,
-  `agentbeats-phase1.md`'s "不做清单"). Not even locally verified to
-  *build* — no Docker on this dev machine during Phase 1 (§5).
+- **Docker packaging (`deploy/agentbeats/`) is build-verified, not
+  submission-ready.** §5 originally flagged this as not even locally
+  verified to build (no Docker on the dev machine at the time). Now built
+  successfully (`docker build -f deploy/agentbeats/Dockerfile`, image
+  `owlery-agentbeats:local`, 1.27GB) — Docker Scout's static secret
+  scanner flags `ENV ANTHROPIC_API_KEY`/`ENV OWLERY_AUTH_TOKEN` by name
+  (it can't tell an empty placeholder from a baked-in value), which is
+  independent confirmation from a tool with no stake in the claim that the
+  only non-empty one (`OWLERY_AUTH_TOKEN`) is the documented
+  loopback-only shared secret, not a real credential — nothing else got
+  flagged. The image is never pushed to a registry or registered with
+  agentbeats.dev in this phase (hard red line, `agentbeats-phase1.md`'s
+  "不做清单"), and the ten-task validation run itself used the native
+  (non-containerized) server instead — this image's own Claude Code CLI
+  has no OAuth session to inherit (the host's is in the macOS Keychain,
+  not reachable from inside a Linux container), so running a real task
+  through it would need a real `ANTHROPIC_API_KEY` (metered billing) that
+  this phase doesn't have provisioned. Build-verified; task-run-verified
+  only via the native path.
 - **Mount path — resolved, not merely assumed.** §2.6 originally mounted
   unconditionally at `/a2a` to coexist with the rest of Owlery's product on
   one port, flagging as an open risk that `agent-template`'s reference
