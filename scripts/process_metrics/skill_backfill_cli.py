@@ -10,6 +10,14 @@ through (`server/skill_registry.py`'s `propose()`/`approve()`/`reject()`).
 No table, UI, or write path is new; this is the one call site that invokes
 the detector.
 
+Connects via `Database.connect_existing_without_migrating()`, NOT the
+normal `Database.initialize()` — the latter runs the full schema-creation
+and one-time catch-up migration pass (including destructive steps like
+purging legacy Telegram bridge rows), which has no business running a
+second time against a file a live `owlery serve` process already migrated
+on its own startup (Snape review: calling `initialize()` here violated the
+"one write point" design intent in §3.3 above).
+
     .venv/bin/python scripts/process_metrics/skill_backfill_cli.py \\
         --db-path /path/to/owlery.db
 
@@ -33,7 +41,7 @@ from server.skill_health import detect_and_flag_corroded_skills  # noqa: E402
 
 async def _run(db_path: str) -> list[dict]:
     db = Database(db_path)
-    await db.initialize()
+    await db.connect_existing_without_migrating()
     try:
         return await detect_and_flag_corroded_skills(db)
     finally:

@@ -65,6 +65,19 @@ AUTO_FLAG_MARKER = "[process-metrics:auto-flag]"
 
 _EVIDENCE_LIMIT = 20
 
+# `Database.list_skill_candidates`/`list_skill_invocations_for_lineage` both
+# take a `limit` that defaults to a UI-page-sized number (200 / 50) — fine
+# for a review page, silently wrong for a batch job that must see every
+# active lineage and every invocation to compute a correct rate (Snape
+# review: the defaults made older lineages past the 200th never get
+# scanned, and could re-flag an already-pending lineage whose earlier flag
+# had aged past that cutoff). `scripts/process_metrics/metrics.py`'s
+# read-only reporting view of this same math uses raw, unlimited SQL — this
+# constant is this module's way of matching that "see everything" behavior
+# without writing a second, real-pagination API that nothing else needs at
+# today's table sizes.
+_LIST_ALL = 1_000_000
+
 
 async def _lineage_decisive_runs(
     db: "Database", candidate: dict[str, Any]
@@ -77,7 +90,7 @@ async def _lineage_decisive_runs(
         scope=candidate["scope"],
         agent_id=candidate["proposed_by_agent_id"],
         repository=candidate["repository"],
-        limit=10_000,
+        limit=_LIST_ALL,
     )
     decisive: list[dict[str, Any]] = []
     seen_runs: set[str] = set()
@@ -100,15 +113,34 @@ async def _lineage_decisive_runs(
     return decisive
 
 
+def _lineage_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
+    """Canonical lineage identity. MUST mirror
+    `Database.list_skill_invocations_for_lineage`'s own definition exactly:
+    `repository` only participates for `scope='agent+repo'` — an
+    `agent-global` candidate has no repository dimension (same reasoning as
+    `get_latest_approved_skill_by_slug`). Comparing `repository`
+    unconditionally (Snape review) treated the SAME `agent-global` lineage
+    proposed from two different repositories as two independent lineages:
+    `detect_and_flag_corroded_skills` would evaluate it twice and raise two
+    redundant auto-flags for what a reviewer would recognize as one skill,
+    and `scripts/process_metrics/metrics.py`'s report would list it twice
+    with identical co-occurrence stats."""
+    repository = candidate["repository"] if candidate["scope"] == "agent+repo" else None
+    return (
+        candidate["slug"],
+        candidate["scope"],
+        candidate["proposed_by_agent_id"],
+        repository,
+    )
+
+
 def _already_flagged(
     pending_candidates: list[dict[str, Any]], candidate: dict[str, Any]
 ) -> bool:
+    target = _lineage_key(candidate)
     for row in pending_candidates:
         if (
-            row["slug"] == candidate["slug"]
-            and row["scope"] == candidate["scope"]
-            and row["repository"] == candidate["repository"]
-            and row["proposed_by_agent_id"] == candidate["proposed_by_agent_id"]
+            _lineage_key(row) == target
             and AUTO_FLAG_MARKER in (row.get("rationale") or "")
         ):
             return True
@@ -158,30 +190,32 @@ async def detect_and_flag_corroded_skills(
     one malformed row can't take the whole scan down.
 
     This is the ONE write point for the whole feature (process-metrics.md
-    §3.3: "数据写点仅一处:候补生成,复用现有 candidate 机制") — it calls the
-    same `Database.create_skill_candidate` the hand-authored `skills.propose`
-    MCP tool calls, not a new table or a new code path. Safe to run as often
-    as you like (idempotent per lineage via `AUTO_FLAG_MARKER`); intended to
-    run from the same weekly schedule as the process-metrics report, but
+    §3.3: "数据写点仅一处:候补生成,复用现有 candidate 机制") — it inserts into
+    the SAME `skill_candidates` table the hand-authored `skills.propose` MCP
+    tool writes to (via the atomic `Database.
+    create_skill_candidate_if_not_already_flagged`, not a new table or a new
+    code path). Safe to run as often as you like, including concurrently
+    with itself (idempotent per lineage via `AUTO_FLAG_MARKER`, enforced at
+    the database layer rather than by this function's own read-then-write —
+    see that method's docstring); intended to run from the same weekly
+    schedule as the process-metrics report, but
     doesn't depend on it.
     """
-    approved = await db.list_skill_candidates(status="approved")
+    approved = await db.list_skill_candidates(status="approved", limit=_LIST_ALL)
     active = [c for c in approved if not c.get("superseded_at")]
     # One lineage can appear more than once among `active` rows only if two
     # different (agent, repository) pairs independently approved the same
-    # slug — genuinely two different skills that happen to share a name.
-    # Dedup on the full lineage key so each is only ever evaluated once.
+    # slug — genuinely two different skills that happen to share a name —
+    # OR if the same `agent-global` lineage was independently proposed from
+    # two different repositories (same skill, no repository dimension to
+    # tell them apart). Dedup on the CANONICAL lineage key (`_lineage_key`)
+    # so each is only ever evaluated once.
     seen_lineages: set[tuple[Any, ...]] = set()
-    pending = await db.list_skill_candidates(status="pending")
+    pending = await db.list_skill_candidates(status="pending", limit=_LIST_ALL)
     created: list[dict[str, Any]] = []
 
     for candidate in active:
-        lineage_key = (
-            candidate["slug"],
-            candidate["scope"],
-            candidate["proposed_by_agent_id"],
-            candidate["repository"],
-        )
+        lineage_key = _lineage_key(candidate)
         if lineage_key in seen_lineages:
             continue
         seen_lineages.add(lineage_key)
@@ -210,7 +244,7 @@ async def detect_and_flag_corroded_skills(
         # only a single task_id/run_id FK pair, not a list column.
         anchor = fail_like[0]
         candidate_id = uuid.uuid4().hex[:12]
-        new_row = await db.create_skill_candidate(
+        new_row = await db.create_skill_candidate_if_not_already_flagged(
             candidate_id=candidate_id,
             slug=candidate["slug"],
             title=f"[涉败告警] {candidate['title']}",
@@ -245,7 +279,15 @@ async def detect_and_flag_corroded_skills(
                 ],
             },
             created_at=datetime.now(timezone.utc).isoformat(),
+            auto_flag_marker=AUTO_FLAG_MARKER,
         )
-        created.append(new_row)
+        # A concurrent scan (this process or another) may have won the race
+        # and inserted a flag for this same lineage between our `pending`
+        # snapshot above and this INSERT — the atomic WHERE-NOT-EXISTS guard
+        # in `create_skill_candidate_if_not_already_flagged` is what actually
+        # prevents the duplicate; `None` here just means we lost that race,
+        # which is exactly as idempotent as never having raced at all.
+        if new_row is not None:
+            created.append(new_row)
 
     return created

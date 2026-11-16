@@ -29,17 +29,27 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.request import pathname2url
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.process_metrics.metrics import compute_all  # noqa: E402
+from scripts.process_metrics.metrics import (  # noqa: E402
+    SKILL_FAILURE_RATE_METHODOLOGY,
+    compute_all,
+)
 
 
 def snapshot(db_path: str, dest_path: str) -> None:
     """Online SQLite backup — doesn't hold a write lock, doesn't block the
     live server, and never mutates the source file (multiagent-field-report-
-    data.md §1's own method, same safety argument)."""
-    source = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    data.md §1's own method, same safety argument). The source path is
+    percent-encoded via `pathname2url` before being embedded in the `file:`
+    URI — a raw f-string (Snape review) would silently mis-parse a path
+    containing `?`, `#`, or a space, which SQLite's URI filename syntax
+    treats as query-string/fragment delimiters rather than literal path
+    characters."""
+    source_uri = f"file:{pathname2url(str(Path(db_path).resolve()))}?mode=ro"
+    source = sqlite3.connect(source_uri, uri=True)
     try:
         dest = sqlite3.connect(dest_path)
         try:
@@ -56,6 +66,26 @@ def _pct(value: float | None) -> str:
 
 def _money(value: float | None) -> str:
     return "n/a" if value is None else f"${value:.2f}"
+
+
+def _sql_block(sql: str) -> list[str]:
+    """`metrics.py`'s module docstring promises "the exact query is quoted
+    in the rendered report so a reader can verify the number instead of
+    trusting prose" — the original draft never actually did this (Snape
+    review: `render_markdown` computed every section from `data[...]` but
+    never read `data[...]["sql"]`), so that claim was false. This renders
+    it as a collapsed `<details>` block so the prose summary stays the
+    primary reading experience."""
+    return [
+        "",
+        "<details><summary>SQL / 口径明细</summary>",
+        "",
+        "```sql" if "SELECT" in sql.upper() else "```",
+        sql.strip(),
+        "```",
+        "",
+        "</details>",
+    ]
 
 
 def render_markdown(data: dict) -> str:
@@ -80,21 +110,26 @@ def render_markdown(data: dict) -> str:
         "- 口径:completed 且 attempt=1 且该任务从未有任何 run 到达过 "
         "blocked 状态 / 全部曾经 completed 过的任务数。"
     )
+    lines.extend(_sql_block(opr["sql"]))
     lines.append("")
 
     rr = data["retry_rate"]
     lines.append("## 重试率")
     lines.append(f"- {_pct(rr['rate'])}({rr['numerator']}/{rr['denominator']})")
     lines.append("- 口径:`task_runs.state='completed' AND attempt_no>1` / 全部 completed run(run 级,沿田野报告基线)。")
+    lines.extend(_sql_block(rr["sql"]))
     lines.append("")
 
     htr = data["human_takeover_rate"]
     lines.append("## 人工接管率")
     lines.append(f"- {_pct(htr['rate'])}({htr['numerator']}/{htr['denominator']})")
     lines.append(
-        "- 口径:上述重试 run 里,`claimed_at` 之前最近一条 task_events 的 "
-        "actor_kind 是 user 的占比(需要人工 unblock 才能重跑)。"
+        "- 口径:上述重试 run 里,`claimed_at` 之前最近一条 `task_events."
+        "kind='task_unblocked'`(人工解除阻塞)、且 actor_kind 是 user 的占比"
+        "——不是任意最近事件,普通评论等其它 kind 不计入(需要人工 unblock "
+        "才能重跑)。"
     )
+    lines.extend(_sql_block(htr["sql"]))
     lines.append("")
 
     td = data["turn_death_distribution"]
@@ -116,6 +151,7 @@ def render_markdown(data: dict) -> str:
             lines.append(f"| {wk} | " + " | ".join(str(counts.get(r, 0)) for r in reasons) + " |")
     else:
         lines.append("(无数据)")
+    lines.extend(_sql_block(td["sql"]))
     lines.append("")
 
     dfr = data["delegation_failure_rate"]
@@ -131,6 +167,7 @@ def render_markdown(data: dict) -> str:
         lines.append(
             "- 状态分布:" + ", ".join(f"{k}={v}" for k, v in sorted(state_counts.items()))
         )
+    lines.extend(_sql_block(dfr["sql"]))
     lines.append("")
 
     cpt = data["cost_per_task"]
@@ -143,6 +180,7 @@ def render_markdown(data: dict) -> str:
         "- codex 的 cost 恒为 NULL、total_tokens 是线程累计值而非单 turn 增量"
         "(multiagent-field-report-data.md §2.4),不计入。"
     )
+    lines.extend(_sql_block(cpt["sql"]))
     lines.append("")
 
     sfr = data["skill_failure_rates"]
@@ -164,6 +202,7 @@ def render_markdown(data: dict) -> str:
             )
     else:
         lines.append("- (当前没有活跃的已批准技能)")
+    lines.extend(_sql_block(SKILL_FAILURE_RATE_METHODOLOGY))
     lines.append("")
 
     return "\n".join(lines)

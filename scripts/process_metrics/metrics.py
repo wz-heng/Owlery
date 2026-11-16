@@ -116,6 +116,13 @@ def retry_rate(conn: sqlite3.Connection) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+HUMAN_TAKEOVER_SQL = (
+    "per-row: does a task_events row with kind='task_unblocked' AND "
+    "actor_kind='user' exist at or before task_runs.claimed_at (most recent "
+    "one if several), for every completed run with attempt_no>1"
+)
+
+
 def human_takeover_rate(conn: sqlite3.Connection) -> dict[str, Any]:
     retried = _rows(
         conn,
@@ -124,17 +131,20 @@ def human_takeover_rate(conn: sqlite3.Connection) -> dict[str, Any]:
     )
     numerator = 0
     for run in retried:
-        # `task_claimed` is excluded: `claim_ready` stamps it at the SAME
-        # instant as the run's own `claimed_at` (it's the dispatcher's own
-        # auto-claim event, actor_kind is always 'system') — without this
-        # exclusion it's always the most recent row at-or-before
-        # `claimed_at` and the real preceding signal (the unblock) is never
-        # seen. multiagent-field-report-data.md §5.2 did this by eyeballing
-        # the last 3 events per run instead of one hard rule; excluding
-        # task_claimed is the mechanical equivalent of skipping past it.
+        # Earlier draft looked at "whatever task_events row is most recent
+        # before claimed_at" and trusted its actor_kind — that misclassifies
+        # an ordinary user COMMENT left after a SYSTEM-driven retry as a
+        # takeover, and conversely can miss a real human unblock if some
+        # later system event (e.g. a subsequent automatic retry's own
+        # bookkeeping) landed between the unblock and this claim (Snape
+        # review). The actual signal is narrower and unambiguous: did a
+        # `task_unblocked` event — the one `TaskRepository.unblock()` stamps
+        # (server/task_board/repository.py) — attributed to a human precede
+        # this claim. Any other event kind, including comments, is
+        # irrelevant to whether a human had to intervene.
         preceding = conn.execute(
             "SELECT actor_kind FROM task_events "
-            "WHERE task_id = ? AND created_at <= ? AND kind != 'task_claimed' "
+            "WHERE task_id = ? AND created_at <= ? AND kind = 'task_unblocked' "
             "ORDER BY created_at DESC, seq DESC LIMIT 1",
             (run["task_id"], run["claimed_at"]),
         ).fetchone()
@@ -145,11 +155,7 @@ def human_takeover_rate(conn: sqlite3.Connection) -> dict[str, Any]:
         "numerator": numerator,
         "denominator": denominator,
         "rate": (numerator / denominator) if denominator else None,
-        "sql": (
-            "per-row: most recent task_events.actor_kind (excluding "
-            "task_claimed) at or before task_runs.claimed_at, for every "
-            "completed run with attempt_no>1"
-        ),
+        "sql": HUMAN_TAKEOVER_SQL,
     }
 
 
@@ -265,13 +271,46 @@ def cost_per_task(conn: sqlite3.Connection) -> dict[str, Any]:
 _DECISIVE_STATES = ("completed", "failed", "blocked")
 _FAIL_LIKE_STATES = ("failed", "blocked")
 
+SKILL_FAILURE_RATE_METHODOLOGY = (
+    "per active approved+non-superseded skill lineage (deduped by canonical "
+    "lineage key — repository only distinguishes agent+repo scope): "
+    "SELECT DISTINCT si.run_id FROM skill_invocations si JOIN "
+    "skill_candidates sc ON sc.id = si.candidate_id WHERE si.run_id IS NOT "
+    "NULL AND <lineage filter>; then for each run_id, task_runs.state in "
+    "(completed,failed,blocked) is decisive, state in (failed,blocked) is "
+    "fail-like; rate = fail-like / decisive"
+)
+
+
+def _skill_lineage_key(cand: sqlite3.Row) -> tuple[Any, ...]:
+    """Canonical lineage identity — same rule as `server/skill_health.py`'s
+    `_lineage_key`: `repository` only distinguishes lineages for
+    `scope='agent+repo'`. Without this, a same-scope revision (which leaves
+    the PRIOR row's `superseded_at` NULL forever — only a scope CHANGE
+    supersedes) makes both rows satisfy `status='approved' AND
+    superseded_at IS NULL` and the report lists the same lineage's identical
+    co-occurrence stats twice (Snape review)."""
+    repository = cand["repository"] if cand["scope"] == "agent+repo" else None
+    return (cand["slug"], cand["scope"], cand["proposed_by_agent_id"], repository)
+
 
 def skill_failure_rates(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    candidates = _rows(
+    all_approved = _rows(
         conn,
-        "SELECT id, slug, title, scope, proposed_by_agent_id, repository "
-        "FROM skill_candidates WHERE status = 'approved' AND superseded_at IS NULL",
+        "SELECT id, slug, title, scope, proposed_by_agent_id, repository, "
+        "created_at FROM skill_candidates "
+        "WHERE status = 'approved' AND superseded_at IS NULL "
+        "ORDER BY created_at DESC",
     )
+    seen: set[tuple[Any, ...]] = set()
+    candidates: list[sqlite3.Row] = []
+    for cand in all_approved:
+        key = _skill_lineage_key(cand)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(cand)
+
     results: list[dict[str, Any]] = []
     for cand in candidates:
         lineage_filter = "sc.slug = ? AND sc.scope = ?"

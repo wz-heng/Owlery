@@ -346,3 +346,244 @@ async def test_detect_and_flag_never_raises_on_a_lineage_with_a_dangling_run_id(
     # taking the entire job down — it'll be re-evaluated clean next run.
     created = await detect_and_flag_corroded_skills(rt.db)
     assert created == []
+
+
+@pytest.mark.asyncio
+async def test_detect_and_flag_dedupes_cross_repository_agent_global_lineage(health_runtime):
+    rt = health_runtime
+    await _approve_skill(rt, scope="agent-global")
+    await _run_with_outcome(rt, "failed", seq=1)
+    await _run_with_outcome(rt, "blocked", seq=2)
+    await _run_with_outcome(rt, "completed", seq=3)
+
+    # An `agent-global` candidate has no repository dimension
+    # (`Database.list_skill_invocations_for_lineage` only filters on
+    # `repository` for `scope='agent+repo'`) — proposing the SAME slug from
+    # a SECOND repository is the SAME lineage, sharing the same invocation
+    # history, not an independent one. Comparing `repository`
+    # unconditionally (Snape review) would evaluate it twice and raise two
+    # redundant auto-flags.
+    other_repo = rt.repo_dir.parent / "other-repo"
+    other_repo.mkdir()
+    _git(other_repo, "init", "-q")
+    _git(other_repo, "config", "user.name", "Test")
+    _git(other_repo, "config", "user.email", "test@example.com")
+    (other_repo / "README.md").write_text("base\n")
+    _git(other_repo, "add", "README.md")
+    _git(other_repo, "commit", "-q", "-m", "base")
+    from types import SimpleNamespace
+
+    rt.reg.session_mgr.sessions["session-2"] = SimpleNamespace(
+        agent_id=rt.agent_id, working_dir=str(other_repo)
+    )
+    other_repository = await rt.reg.resolve_repository(str(other_repo))
+    assert other_repository != rt.repository
+
+    second = await rt.reg.propose(
+        session_id="session-2", slug=SLUG, title="Hermes PR flow",
+        description=DESCRIPTION, body_markdown=_skill_body(),
+        rationale="Proposed again from a different repo.", scope="agent-global",
+    )
+    await rt.reg.approve(second["id"])
+
+    created = await detect_and_flag_corroded_skills(rt.db)
+    assert len(created) == 1
+
+
+@pytest.mark.asyncio
+async def test_detect_and_flag_scans_past_the_default_200_row_candidate_page(health_runtime):
+    rt = health_runtime
+    # `Database.list_skill_candidates` defaults to a UI-page-sized
+    # `limit=200` — pad the table with enough OTHER approved candidates
+    # that the real lineage under test would silently fall off that default
+    # page (and never get evaluated) if `skill_health.py` didn't explicitly
+    # ask for everything (Snape review).
+    from datetime import datetime, timezone
+
+    for i in range(205):
+        await rt.db._conn.execute(
+            "INSERT INTO skill_candidates "
+            "(id, slug, title, description, body_markdown, repository, "
+            "rationale, status, proposed_by_agent_id, scope, use_count, "
+            "created_at, updated_at) "
+            "VALUES (?, ?, 'Filler', 'filler', 'filler', ?, 'filler', "
+            "'approved', ?, 'agent+repo', 0, ?, ?)",
+            (
+                f"filler-{i}", f"filler-skill-{i}", str(rt.repo_dir),
+                rt.agent_id,
+                datetime.now(timezone.utc).isoformat(),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+    await rt.db._conn.commit()
+
+    await _approve_skill(rt)
+    await _run_with_outcome(rt, "failed", seq=1)
+    await _run_with_outcome(rt, "blocked", seq=2)
+    await _run_with_outcome(rt, "completed", seq=3)
+
+    created = await detect_and_flag_corroded_skills(rt.db)
+    assert len(created) == 1
+    assert created[0]["slug"] == SLUG
+
+
+@pytest.mark.asyncio
+async def test_detect_and_flag_is_race_safe_under_concurrent_scans(health_runtime):
+    import asyncio
+
+    rt = health_runtime
+    await _approve_skill(rt)
+    await _run_with_outcome(rt, "failed", seq=1)
+    await _run_with_outcome(rt, "blocked", seq=2)
+    await _run_with_outcome(rt, "completed", seq=3)
+
+    # Two scans racing against the same lineage (e.g. two overlapping
+    # Schedule-triggered runs, or a manual CLI run overlapping the Schedule)
+    # must still produce exactly ONE pending auto-flag — a plain
+    # check-then-insert (read `pending`, then INSERT) lets both coroutines
+    # pass the check before either commits its insert (Snape review);
+    # `Database.create_skill_candidate_if_not_already_flagged`'s atomic
+    # `INSERT ... WHERE NOT EXISTS` is what actually has to prevent this.
+    results = await asyncio.gather(
+        detect_and_flag_corroded_skills(rt.db),
+        detect_and_flag_corroded_skills(rt.db),
+    )
+    total_created = sum(len(r) for r in results)
+    assert total_created == 1
+    pending = await rt.db.list_skill_candidates(status="pending")
+    assert len(pending) == 1
+
+
+# --- Database.create_skill_candidate_if_not_already_flagged (direct) -------
+# --- Database.connect_existing_without_migrating (direct) ------------------
+
+
+def _candidate_kwargs(**overrides) -> dict:
+    from datetime import datetime, timezone
+
+    kwargs = dict(
+        candidate_id="c1", slug=SLUG, title="Hermes PR flow",
+        description=DESCRIPTION, body_markdown=_skill_body(),
+        repository="/tmp/some-repo", rationale=f"{AUTO_FLAG_MARKER}\nbody",
+        proposed_by_agent_id=None, proposed_by_session_id=None,
+        task_id=None, run_id=None, scope="agent+repo", bundle_files=None,
+        lint_results=None, created_at=datetime.now(timezone.utc).isoformat(),
+        auto_flag_marker=AUTO_FLAG_MARKER,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+@pytest.mark.asyncio
+async def test_create_skill_candidate_if_not_already_flagged_skips_a_second_call(tmp_path: Path):
+    db = Database(str(tmp_path / "direct.db"))
+    await db.initialize()
+    try:
+        first = await db.create_skill_candidate_if_not_already_flagged(
+            **_candidate_kwargs(candidate_id="c1")
+        )
+        assert first is not None
+        second = await db.create_skill_candidate_if_not_already_flagged(
+            **_candidate_kwargs(candidate_id="c2")
+        )
+        assert second is None
+        rows = await db.list_skill_candidates(status="pending")
+        assert [r["id"] for r in rows] == ["c1"]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_create_skill_candidate_if_not_already_flagged_scopes_by_repository_for_agent_repo(
+    tmp_path: Path,
+):
+    db = Database(str(tmp_path / "direct.db"))
+    await db.initialize()
+    try:
+        first = await db.create_skill_candidate_if_not_already_flagged(
+            **_candidate_kwargs(candidate_id="c1", repository="/tmp/repo-a")
+        )
+        # A different repository under `agent+repo` scope IS a different
+        # lineage — must NOT be skipped.
+        second = await db.create_skill_candidate_if_not_already_flagged(
+            **_candidate_kwargs(candidate_id="c2", repository="/tmp/repo-b")
+        )
+        assert first is not None
+        assert second is not None
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_create_skill_candidate_if_not_already_flagged_ignores_repository_for_agent_global(
+    tmp_path: Path,
+):
+    db = Database(str(tmp_path / "direct.db"))
+    await db.initialize()
+    try:
+        first = await db.create_skill_candidate_if_not_already_flagged(
+            **_candidate_kwargs(
+                candidate_id="c1", repository="/tmp/repo-a", scope="agent-global"
+            )
+        )
+        # `agent-global` has no repository dimension — a different
+        # repository is still the SAME lineage and must be skipped.
+        second = await db.create_skill_candidate_if_not_already_flagged(
+            **_candidate_kwargs(
+                candidate_id="c2", repository="/tmp/repo-b", scope="agent-global"
+            )
+        )
+        assert first is not None
+        assert second is None
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_connect_existing_without_migrating_raises_on_a_schema_less_file(tmp_path: Path):
+    # An empty file has no `skill_candidates` table — this connection mode
+    # intentionally refuses to help (that's what `initialize()` is for) so
+    # a caller never silently operates against a stale/absent schema.
+    empty_path = tmp_path / "empty.db"
+    empty_path.touch()
+    db = Database(str(empty_path))
+    with pytest.raises(RuntimeError, match="skill_candidates"):
+        await db.connect_existing_without_migrating()
+
+
+@pytest.mark.asyncio
+async def test_connect_existing_without_migrating_does_not_rerun_migrations(tmp_path: Path):
+    db_path = str(tmp_path / "live.db")
+    # Bring the schema fully current the normal way first — mirrors a real
+    # production file a live `owlery serve` process already migrated.
+    db = Database(db_path)
+    await db.initialize()
+    # A row that only still exists because the one-time Telegram-bridge
+    # purge in `_apply_migrations()` already ran and won't run again.
+    await db._conn.execute(
+        "INSERT INTO bridge_mappings (chat_id, agent_id, session_id, platform) "
+        "VALUES ('chat-1', NULL, NULL, 'telegram')"
+    )
+    await db._conn.commit()
+    await db.close()
+
+    # Reconnect via the migration-skipping path (what
+    # `skill_backfill_cli.py` uses against a live production file) and
+    # confirm the purge did NOT run a second time (Snape review: the CLI
+    # previously called `initialize()` here, which would delete this row).
+    db2 = Database(db_path)
+    await db2.connect_existing_without_migrating()
+    try:
+        row = await db2._conn.execute(
+            "SELECT COUNT(*) FROM bridge_mappings WHERE platform = 'telegram'"
+        )
+        count = (await row.fetchone())[0]
+        assert count == 1
+
+        # The connection is still fully usable for the one real write point.
+        created = await db2.create_skill_candidate_if_not_already_flagged(
+            **_candidate_kwargs(candidate_id="c1")
+        )
+        assert created is not None
+    finally:
+        await db2.close()

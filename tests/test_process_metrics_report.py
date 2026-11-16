@@ -315,6 +315,106 @@ async def test_skill_failure_rates_matches_skill_health_definition(dataset):
     assert row["rate"] == pytest.approx(2 / 3)
 
 
+@pytest.mark.asyncio
+async def test_skill_failure_rates_dedupes_same_scope_revision(dataset):
+    ds = dataset
+    candidate = await ds.reg.propose(
+        session_id="session-1", slug="hermes-pr-flow", title="Hermes PR flow",
+        description="How to open a PR.",
+        body_markdown="---\nname: hermes-pr-flow\ndescription: How to open a PR.\n---\n\nBody.\n",
+        rationale="Will recur.",
+    )
+    await ds.reg.approve(candidate["id"])
+
+    task1, run1, _ = await ds.make_task(1, "failed")
+    task2, run2, _ = await ds.make_task(2, "completed")
+    for task, run in ((task1, run1), (task2, run2)):
+        await ds.reg.record_usage(
+            "hermes-pr-flow", agent_id=ds.agent_id, repository=ds.repository,
+            task_id=task.id, run_id=run.id,
+        )
+
+    # A same-scope revision's `approve()` only marks a PRIOR row
+    # `superseded_at` on a SCOPE change — a same-scope re-approval leaves it
+    # NULL forever, so both rows satisfy `status='approved' AND
+    # superseded_at IS NULL` (test_skill_health.py pins this same
+    # assumption). Without canonical-lineage dedup this lineage's identical
+    # co-occurrence stats would be listed twice (Snape review).
+    revision = await ds.reg.propose(
+        session_id="session-1", slug="hermes-pr-flow", title="Hermes PR flow v2",
+        description="How to open a PR.",
+        body_markdown="---\nname: hermes-pr-flow\ndescription: How to open a PR.\n---\n\nBody v2.\n",
+        rationale="Hand-authored revision.",
+    )
+    await ds.reg.approve(revision["id"])
+
+    conn = _conn(ds.db_path)
+    rows = metrics.skill_failure_rates(conn)
+    conn.close()
+
+    assert len(rows) == 1
+    assert rows[0]["title"] == "Hermes PR flow v2"  # newest/active row wins
+    assert rows[0]["eligible"] == 2
+    assert rows[0]["fail_like"] == 1
+
+
+@pytest.mark.asyncio
+async def test_skill_failure_rates_dedupes_cross_repository_agent_global(dataset):
+    ds = dataset
+    cand_a = await ds.reg.propose(
+        session_id="session-1", slug="global-flow", title="Global flow",
+        description="Works anywhere.",
+        body_markdown="---\nname: global-flow\ndescription: Works anywhere.\n---\n\nBody.\n",
+        rationale="Useful everywhere.", scope="agent-global",
+    )
+    await ds.reg.approve(cand_a["id"])
+
+    task1, run1, _ = await ds.make_task(1, "failed")
+    task2, run2, _ = await ds.make_task(2, "blocked")
+    task3, run3, _ = await ds.make_task(3, "completed")
+    for task, run in ((task1, run1), (task2, run2), (task3, run3)):
+        await ds.reg.record_usage(
+            "global-flow", agent_id=ds.agent_id, repository=ds.repository,
+            task_id=task.id, run_id=run.id,
+        )
+
+    # An agent-global candidate has no repository dimension — proposing the
+    # SAME slug from a second repository is the SAME lineage, not a second
+    # one (Snape review: comparing `repository` unconditionally listed it
+    # twice with identical stats).
+    other_repo = ds.repo_dir.parent / "other-repo"
+    other_repo.mkdir()
+    _git(other_repo, "init", "-q")
+    _git(other_repo, "config", "user.name", "Test")
+    _git(other_repo, "config", "user.email", "test@example.com")
+    (other_repo / "README.md").write_text("base\n")
+    _git(other_repo, "add", "README.md")
+    _git(other_repo, "commit", "-q", "-m", "base")
+    from types import SimpleNamespace
+
+    ds.reg.session_mgr.sessions["session-2"] = SimpleNamespace(
+        agent_id=ds.agent_id, working_dir=str(other_repo)
+    )
+    other_repository = await ds.reg.resolve_repository(str(other_repo))
+    assert other_repository != ds.repository  # sanity: genuinely a different repo
+    cand_b = await ds.reg.propose(
+        session_id="session-2", slug="global-flow", title="Global flow",
+        description="Works anywhere.",
+        body_markdown="---\nname: global-flow\ndescription: Works anywhere.\n---\n\nBody.\n",
+        rationale="Proposed again from a different repo.", scope="agent-global",
+    )
+    await ds.reg.approve(cand_b["id"])
+    assert (await ds.db.get_skill_candidate(cand_b["id"]))["repository"] == other_repository
+
+    conn = _conn(ds.db_path)
+    rows = metrics.skill_failure_rates(conn)
+    conn.close()
+
+    assert len(rows) == 1
+    assert rows[0]["eligible"] == 3
+    assert rows[0]["fail_like"] == 2
+
+
 # --- report.py plumbing -----------------------------------------------------
 
 
@@ -342,13 +442,22 @@ def test_render_markdown_includes_every_metric_section():
     data = {
         "metrics_version": 1,
         "generated_at": "2026-01-01T00:00:00+00:00",
-        "one_pass_rate": {"numerator": 1, "denominator": 2, "rate": 0.5},
-        "retry_rate": {"numerator": 1, "denominator": 4, "rate": 0.25},
-        "human_takeover_rate": {"numerator": 1, "denominator": 1, "rate": 1.0},
-        "turn_death_distribution": {"counts": {"completed": 1}, "total": 1, "rates": {"completed": 1.0}},
+        "one_pass_rate": {"numerator": 1, "denominator": 2, "rate": 0.5, "sql": "SELECT 1 /* one_pass */"},
+        "retry_rate": {"numerator": 1, "denominator": 4, "rate": 0.25, "sql": "SELECT 1 /* retry */"},
+        "human_takeover_rate": {"numerator": 1, "denominator": 1, "rate": 1.0, "sql": "SELECT 1 /* takeover */"},
+        "turn_death_distribution": {
+            "counts": {"completed": 1}, "total": 1, "rates": {"completed": 1.0},
+            "sql": "SELECT 1 /* turn_death */",
+        },
         "turn_death_distribution_by_week": {"2026-W01": {"completed": 1}},
-        "delegation_failure_rate": {"numerator": 0, "denominator": 1, "rate": 0.0, "state_counts": {"completed": 1}},
-        "cost_per_task": {"task_count": 1, "mean": 1.5, "median": 1.5, "total": 1.5},
+        "delegation_failure_rate": {
+            "numerator": 0, "denominator": 1, "rate": 0.0, "state_counts": {"completed": 1},
+            "sql": "SELECT 1 /* delegation */",
+        },
+        "cost_per_task": {
+            "task_count": 1, "mean": 1.5, "median": 1.5, "total": 1.5,
+            "sql": "SELECT 1 /* cost */",
+        },
         "skill_failure_rates": [{"slug": "s", "title": "S", "eligible": 3, "fail_like": 2, "rate": 2 / 3}],
     }
     out = render_markdown(data)
@@ -357,3 +466,11 @@ def test_render_markdown_includes_every_metric_section():
         "每任务成本", "技能涉败率",
     ):
         assert heading in out
+    # Snape review: the module docstring promises the exact SQL is quoted in
+    # the rendered report so a reader can verify the number — assert the
+    # SQL/methodology actually shows up, not just the prose summary.
+    for sql_marker in (
+        "one_pass", "retry", "takeover", "turn_death", "delegation", "cost",
+    ):
+        assert sql_marker in out
+    assert "SELECT DISTINCT si.run_id" in out  # skill_failure_rates methodology
