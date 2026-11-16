@@ -7,7 +7,9 @@ path a live session's Skill tool use takes."""
 
 from __future__ import annotations
 
+import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -595,3 +597,74 @@ async def test_connect_existing_without_migrating_does_not_rerun_migrations(tmp_
         assert created is not None
     finally:
         await db2.close()
+
+
+@pytest.mark.asyncio
+async def test_skill_backfill_cli_only_ever_writes_skill_candidates(
+    health_runtime, tmp_path: Path
+):
+    """Snape review, round 3: `docs/reports/process-metrics/2026-11-16-
+    schedule-fire-evidence.md` had claimed the Schedule-fire run was
+    "全程只读", but `skill_backfill_cli.py` connects via
+    `connect_existing_without_migrating()`, which is read-WRITE capable —
+    it has to be, since inserting a new `skill_candidates` row IS the one
+    real write point §3.3 calls for. That a particular run against
+    production happened to write nothing (nothing crossed the threshold)
+    was an observed fact about THAT run, not a structural guarantee the
+    evidence doc was entitled to generalize from. This is the durable,
+    re-runnable proof instead: a full before/after row-count diff across
+    EVERY table in the database, through the REAL CLI entrypoint
+    (subprocess, not a direct Python call) against a disposable db —
+    never production — in a scenario that DOES cross the threshold,
+    asserting the only table that changes is `skill_candidates`, by
+    exactly the one row the detector creates."""
+    rt = health_runtime
+    await _approve_skill(rt)
+    await _run_with_outcome(rt, "failed", seq=1)
+    await _run_with_outcome(rt, "blocked", seq=2)
+    await _run_with_outcome(rt, "completed", seq=3)
+
+    db_path = tmp_path / "health.db"
+
+    def _table_row_counts() -> dict[str, int]:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            tables = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+            ]
+            return {
+                t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                for t in tables
+            }
+        finally:
+            conn.close()
+
+    before = _table_row_counts()
+
+    repo_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(repo_root / "scripts" / "process_metrics" / "skill_backfill_cli.py"),
+            "--db-path",
+            str(db_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "flagged" in result.stdout
+
+    after = _table_row_counts()
+    changed = {t: (before[t], after[t]) for t in before if before[t] != after[t]}
+    assert changed == {
+        "skill_candidates": (
+            before["skill_candidates"],
+            before["skill_candidates"] + 1,
+        )
+    }

@@ -171,7 +171,7 @@ test.describe("Skill health auto-flag (process-metrics.md §3.3/§4.2)", () => {
       async function runToStatus(
         title: string,
         expectStatus: "blocked" | "done"
-      ): Promise<void> {
+      ): Promise<string> {
         const taskResponse = await request.post(`${API}/api/task-boards/${board.id}/tasks`, {
           headers: AUTH,
           data: {
@@ -193,16 +193,22 @@ test.describe("Skill health auto-flag (process-metrics.md §3.3/§4.2)", () => {
             { timeout: 15_000 }
           )
           .toBe(expectStatus);
+        return created.id;
       }
 
-      await runToStatus(
+      // Kept (not discarded, Snape review round 3): the evidence chain's
+      // whole point is that a reviewer can open the SPECIFIC fail-like
+      // task a candidate's rationale names — asserting the marker/rate
+      // text is visible proves the rationale was computed, not that it
+      // names the real tasks this run actually produced.
+      const blockedTaskIdA = await runToStatus(
         `Invoke A ${fake(
           { t: "discover_skill" },
           { t: "task_block", reason: "hit friction again" }
         )}`,
         "blocked"
       );
-      await runToStatus(
+      const blockedTaskIdB = await runToStatus(
         `Invoke B ${fake(
           { t: "discover_skill" },
           { t: "task_block", reason: "hit friction once more" }
@@ -266,6 +272,21 @@ test.describe("Skill health auto-flag (process-metrics.md §3.3/§4.2)", () => {
       expect(flagged).toBeTruthy();
       expect(flagged!.rationale).toContain("[process-metrics:auto-flag]");
       expect(flagged!.title).toBe("[涉败告警] Corroding flow");
+
+      // Snape review round 3: visible marker/rate text proves a rationale
+      // was COMPUTED, not that it names the actual tasks this run produced
+      // — assert the specific blocked task ids are in it, and that one of
+      // them really is a live, blocked task (not just a string the test
+      // happens to recognize).
+      expect(flagged!.rationale).toContain(blockedTaskIdA);
+      expect(flagged!.rationale).toContain(blockedTaskIdB);
+      const evidenceTaskResponse = await request.get(
+        `${API}/api/tasks/${blockedTaskIdA}`,
+        { headers: AUTH }
+      );
+      expect(evidenceTaskResponse.ok()).toBeTruthy();
+      const evidenceTask = (await evidenceTaskResponse.json()) as { status: string };
+      expect(evidenceTask.status).toBe("blocked");
     } finally {
       rmSync(scratch, { recursive: true, force: true });
     }

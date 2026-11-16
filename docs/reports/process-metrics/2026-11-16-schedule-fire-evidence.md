@@ -13,9 +13,30 @@
   `127.0.0.1:8923`,`OWLERY_LEGACY_HOME_DIR=""`。
 - PATH 未加任何 fake-CLI 目录 —— harness 解析到真实 `/opt/homebrew/bin/claude`
   (已登录状态),不是 e2e 套件的罐头 CLI。
-- 全程未写入 `/Users/wuzhongheng/owlery-deploy/` 或真实 `~/.owlery`(只对
-  生产 `owlery.db` 做 `mode=ro` 只读连接 + `sqlite3.Connection.backup()` 快照,
-  同手动跑那次的安全惯例)。
+- **隔离范围的如实说明(Snape 复核第三轮纠正)**:下方 Prompt 跑的两条命令
+  对生产 `owlery.db` 的隔离程度并不相同,此前版本把两者混为一谈写成"全程
+  只读"是不准确的:
+  - 命令①`report.py` 对生产库的连接确实是 `mode=ro` 只读 URI + 本地临时文件
+    `.backup()` 快照——这条连接结构上不可能写生产文件。
+  - 命令②`skill_backfill_cli.py` 走 `Database.connect_existing_without_
+    migrating()`,是一条**具备写能力**的普通连接——这是设计使然:往
+    `skill_candidates` 插入新候补正是 §3.3 要求的"唯一写点"本身,不可能做成
+    只读连接。这次真实运行打印了"no skill crossed the co-occurrence
+    threshold; nothing flagged",按代码路径(`detect_and_flag_corroded_
+    skills` 的插入调用只在阈值判定通过的分支里才会执行)可以确定**这一次
+    具体执行确实零写入**,但这是"这次运行恰好没写"的事实,不是"这条连接
+    不能写"的结构性保证——此前文档把后者当结论来写,是过度概括。
+  - "skill_backfill_cli.py 具备写能力的连接只会动 skill_candidates 表、
+    不会动别的"这条结构性断言,已经用一个独立、可重跑的测试
+    (`tests/test_skill_health.py::
+    test_skill_backfill_cli_only_ever_writes_skill_candidates`)在**一次性
+    临时数据库**上验证——构造真实涉败场景、跑真实 CLI 子进程、对全部表的
+    行数做改前/改后 diff,断言唯一变化的表是 `skill_candidates`、且恰好
+    +1 行。这条证据不依赖、也不需要再碰生产库。
+  - `/Users/wuzhongheng/owlery-deploy/` 与真实 `~/.owlery` 全程未被写入
+    (`owlery.db-wal` 的 mtime 变化来自生产自身持续运行的 `owlery serve`
+    进程的正常写流量,与本次任一连接无关)——这条"确实没写"的结论没有变,
+    变的只是"命令②的连接本身是不是只读"这句措辞。
 
 ## 1. 创建 Schedule(真实 REST API,非内部直调 Python 函数)
 
