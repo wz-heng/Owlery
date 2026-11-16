@@ -15,6 +15,7 @@ card a real green agent would see.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from uuid import uuid4
 
 import httpx
@@ -22,14 +23,11 @@ import pytest
 from a2a.client import A2ACardResolver, ClientConfig, ClientFactory
 from a2a.types import Message, Part, Role, TextPart
 
-from starlette.routing import Route
-
 from server.agent_manager import AgentManager
 from server.agentbeats.app import a2a_mount_path_and_card_url, build_a2a_app
 from server.agentbeats.manager import AgentBeatsExamManager
 from server.database import Database
 from server.harness import HarnessEvent
-from server.main import app as real_app
 from server.session_manager import SessionManager
 
 
@@ -45,44 +43,77 @@ def test_a2a_mount_path_root_when_no_spa():
     assert card_url == "http://127.0.0.1:9010"
 
 
-def test_a2a_mount_registered_after_explicit_routes_in_real_app():
-    # Structural regression guard for the ordering bug the full backend
-    # suite caught, not a hand-written assumption. This only bites in the
-    # root-mounted branch (`a2a_mount_path_and_card_url`'s "/" case, active
-    # exactly when `web/dist/` is absent — the real AgentBeats submission
-    # image's own condition), since a root Mount's regex matches every
-    # path; skip rather than pass-trivially-for-the-wrong-reason if a dev
-    # build happens to be sitting in this checkout.
+@pytest.mark.asyncio
+async def test_a2a_mount_ordering_and_reachability_for_both_branches(monkeypatch):
+    """Deterministic version of the ordering regression guard — the
+    earlier version depended on whether this checkout happened to have
+    `web/dist/` built, which flips which branch `server.main.app` is
+    actually in and can silently stop testing the one that broke. Forces
+    *both* branches by reloading `server.main` with `Path.is_dir` patched
+    (scoped to the specific `_dist_dir` check by path suffix, restored
+    immediately after the reload) and makes real ASGI HTTP requests
+    against each resulting app — not just introspecting the route table,
+    which FastAPI's `include_router` makes opaque (`_IncludedRouter`
+    objects, not flattened `Route`s) anyway. Also closes the other half
+    of Snape's review: the dev-mode (SPA-present) branch's card now
+    advertises `/a2a/` (trailing slash) specifically so a client that
+    doesn't follow redirects can still reach it using exactly that URL,
+    which this test calls with `follow_redirects=False` to prove.
+    """
+    import importlib
+
     import server.main as main_module
 
-    if main_module._dist_dir.is_dir():
-        pytest.skip("web/dist present -> A2A sub-path-mounted, not the branch this guards")
+    real_is_dir = Path.is_dir
 
-    routes = real_app.router.routes
-    index_by_name = {r.name: i for i, r in enumerate(routes) if getattr(r, "name", None)}
-    a2a_index = index_by_name["a2a"]
-    # Mount.__init__ does `self.path = path.rstrip("/")`, so root is "".
-    assert real_app.router.routes[a2a_index].path == ""
+    def make_patched_is_dir(dist_present: bool):
+        def _patched(self):
+            if str(self).endswith("web/dist"):
+                return dist_present
+            return real_is_dir(self)
+        return _patched
 
-    # Starlette runs Route/Mount entries in registration order and stops at
-    # the first match, so every explicit route below must be registered
-    # *before* the root A2A mount or it would be swallowed (404 inside the
-    # A2A sub-app, which has none of them) -- exactly as /health and
-    # /api/backends briefly were.
-    health_index = next(
-        i for i, r in enumerate(routes) if isinstance(r, Route) and r.path == "/health"
-    )
-    backends_index = next(
-        i for i, r in enumerate(routes) if isinstance(r, Route) and r.path == "/api/backends"
-    )
-    assert health_index < a2a_index
-    assert backends_index < a2a_index
+    def reload_as(dist_present: bool):
+        monkeypatch.setattr(Path, "is_dir", make_patched_is_dir(dist_present))
+        try:
+            importlib.reload(main_module)
+        finally:
+            monkeypatch.undo()  # never let the patch leak past this one reload
+        return main_module.app
 
-    # And before the SPA catch-all, if one happens to be mounted (it isn't
-    # in this branch, since the two are mutually exclusive on `web/dist/`
-    # existing) -- it would make the A2A mount permanently unreachable.
-    if "spa" in index_by_name:
-        assert a2a_index < index_by_name["spa"]
+    try:
+        # --- Branch 1: no web/dist -> A2A root-mounted ---
+        app_root = reload_as(False)
+        transport_root = httpx.ASGITransport(app=app_root)
+        async with httpx.AsyncClient(
+            transport=transport_root, base_url="http://test", follow_redirects=False
+        ) as c:
+            # Exactly the routes the regression swallowed (404, inside the
+            # A2A sub-app, which has neither).
+            assert (await c.get("/health")).status_code != 404
+            assert (await c.get("/api/backends")).status_code != 404
+            card = await c.get("/.well-known/agent-card.json")
+            assert card.status_code == 200
+            assert "/a2a" not in card.json()["url"]
+
+        # --- Branch 2: web/dist present -> A2A sub-path-mounted at /a2a,
+        # card advertises /a2a/ with the trailing slash the whole fix is
+        # about. A non-redirect-following client must reach it directly.
+        app_dev = reload_as(True)
+        transport_dev = httpx.ASGITransport(app=app_dev)
+        async with httpx.AsyncClient(
+            transport=transport_dev, base_url="http://test", follow_redirects=False
+        ) as c:
+            assert (await c.get("/health")).status_code != 404
+            assert (await c.get("/api/backends")).status_code != 404
+            card = await c.get("/a2a/.well-known/agent-card.json")
+            assert card.status_code == 200
+            advertised_url = card.json()["url"]
+            assert advertised_url.endswith("/a2a/")
+    finally:
+        # Leave the module in its real, filesystem-driven state for every
+        # other test file that imports `server.main` after this one.
+        importlib.reload(main_module)
 
 
 def test_a2a_mount_path_subpath_when_spa_present():
@@ -104,7 +135,7 @@ async def a2a_client():
     await session_mgr.initialize(db)
     agent_mgr = AgentManager(db)
     exam_mgr = AgentBeatsExamManager()
-    exam_mgr.bind(session_mgr=session_mgr, agent_mgr=agent_mgr)
+    await exam_mgr.bind(session_mgr=session_mgr, agent_mgr=agent_mgr)
     # Built standalone here (unprefixed) — unlike the real app, which mounts
     # this same builder's output under "/a2a" (server/main.py). The a2a-sdk
     # client sends every follow-up request to the *card's* advertised `url`,

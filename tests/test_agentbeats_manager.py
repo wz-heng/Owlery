@@ -29,6 +29,7 @@ from server.agentbeats.manager import (
     TASK_ROUND_BUDGET,
     AgentBeatsExamManager,
     ExamTaskError,
+    _EXAM_AGENT_NAME_PREFIX,
 )
 from server.database import Database
 from server.harness import HarnessEvent
@@ -43,7 +44,7 @@ async def ctx():
     await session_mgr.initialize(db)
     agent_mgr = AgentManager(db)
     exam_mgr = AgentBeatsExamManager()
-    exam_mgr.bind(session_mgr=session_mgr, agent_mgr=agent_mgr)
+    await exam_mgr.bind(session_mgr=session_mgr, agent_mgr=agent_mgr)
     try:
         yield session_mgr, agent_mgr, exam_mgr
     finally:
@@ -360,3 +361,45 @@ async def test_reap_idle_leaves_a_fresh_record_alone(ctx):
     assert record.finished is False
     assert await agent_mgr.get_agent(agent["id"]) is not None
     assert session_mgr.get_session(session.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_bind_sweeps_exam_leftovers_from_a_previous_process():
+    """The in-memory reaper above only reaches orphans within *this*
+    process's lifetime — restart (or crash) between "purple handed back a
+    decision" and the idle threshold wipes `_records` but not the DB rows,
+    and a fresh `AgentBeatsExamManager` instance has no memory of them at
+    all. `bind()`'s startup sweep is the other half: it must find and
+    delete that leftover agent + session through nothing but the DB,
+    using a *second*, independently-constructed `SessionManager` the way
+    a real restart would."""
+    db = Database(":memory:")
+    await db.initialize()
+    agent_mgr = AgentManager(db)
+
+    # First "process": starts an exam task and then simply vanishes, as if
+    # the whole Owlery process restarted right after handing a decision
+    # back to green -- never reaching this exam manager's own teardown.
+    old_session_mgr = SessionManager()
+    await old_session_mgr.initialize(db)
+    leftover_agent = await agent_mgr.create_agent(
+        name=f"{_EXAM_AGENT_NAME_PREFIX}{'a' * 10}"
+    )
+    leftover_session = await old_session_mgr.create_session(
+        agent_id=leftover_agent["id"], origin="agentbeats"
+    )
+
+    # Second "process": a fresh SessionManager re-initialized from the same
+    # persisted DB, and a fresh AgentBeatsExamManager that never saw the
+    # first process's in-memory state.
+    new_session_mgr = SessionManager()
+    await new_session_mgr.initialize(db)
+    new_exam_mgr = AgentBeatsExamManager()
+    try:
+        await new_exam_mgr.bind(session_mgr=new_session_mgr, agent_mgr=agent_mgr)
+
+        assert await agent_mgr.get_agent(leftover_agent["id"]) is None
+        assert new_session_mgr.get_session(leftover_session.id) is None
+    finally:
+        await new_exam_mgr.shutdown()
+        await db.close()

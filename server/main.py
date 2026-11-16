@@ -162,7 +162,7 @@ async def lifespan(app: FastAPI):
     agents.set_manager(AgentManager(db))
     # AgentManager is stateless CRUD over `db` (agent_manager.py docstring);
     # a second instance here is equivalent, not a second source of truth.
-    agentbeats_exam_manager.bind(session_mgr=session_manager, agent_mgr=AgentManager(db))
+    await agentbeats_exam_manager.bind(session_mgr=session_manager, agent_mgr=AgentManager(db))
     connectors.set_manager(ConnectorManager(db))
     credentials.set_db(db)
     notifiers.set_db(db)

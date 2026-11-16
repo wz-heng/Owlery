@@ -65,6 +65,18 @@ ROUND_TIMEOUT_SEC = 280.0
 IDLE_REAP_SEC = 900.0
 REAP_POLL_SEC = 60.0
 
+# Shared between `_start_task` (naming) and `_sweep_stale_exam_state`
+# (matching) so they can't drift. The in-memory `_records`/reaper above
+# only reach orphans within *this* process's lifetime — a restart between
+# "purple handed back a decision" and the idle threshold wipes that state
+# but not the DB rows, so a fresh process has no record of them at all.
+# The sweep is the other half: on bind(), find every exam agent left over
+# from a previous process (name prefix below, plus `origin="agentbeats"`
+# on its session as a second, independent signal) and delete it — these
+# are one-shot by design (§2.4), so any that still exist at a fresh
+# process's startup are leftovers, never a resumable in-progress trial.
+_EXAM_AGENT_NAME_PREFIX = "tb-exam-"
+
 # Claude Code's native tools, denied in full for the exam agent. The only
 # thing it can act through is the two `tbexec` MCP tools — the task's real
 # filesystem lives inside the green agent's sandbox, not on this machine, so
@@ -162,12 +174,53 @@ class AgentBeatsExamManager:
 
     # ------------------------------------------------------------ wiring
 
-    def bind(self, session_mgr: "SessionManager", agent_mgr: "AgentManager") -> None:
+    async def bind(self, session_mgr: "SessionManager", agent_mgr: "AgentManager") -> None:
         self.session_mgr = session_mgr
         self.agent_mgr = agent_mgr
         session_mgr.on_broadcast(self.BROADCAST_KEY, self._on_broadcast)
+        await self._sweep_stale_exam_state()
         if self._reaper_task is None or self._reaper_task.done():
             self._reaper_task = asyncio.ensure_future(self._reap_loop())
+
+    async def _sweep_stale_exam_state(self) -> None:
+        """Delete every exam agent (+ its session) left over from a
+        *previous* process — see the module comment above
+        `_EXAM_AGENT_NAME_PREFIX` for why anything matching here is
+        necessarily a leftover, never a resumable trial. Runs once per
+        `bind()`, after `SessionManager.initialize()` has already loaded
+        every persisted session into `session_mgr.sessions` (true for
+        `bind()`'s one real caller, `main.py`'s lifespan — it runs
+        `initialize()` first)."""
+        agents = await self.agent_mgr.list_agents(include_archived=True)
+        stale_agent_ids = [
+            a["id"] for a in agents if a["name"].startswith(_EXAM_AGENT_NAME_PREFIX)
+        ]
+        if not stale_agent_ids:
+            return
+        stale_agent_ids_set = set(stale_agent_ids)
+        stale_sessions = [
+            s for s in self.session_mgr.sessions.values()
+            if s.agent_id in stale_agent_ids_set and s.origin == "agentbeats"
+        ]
+        for session in stale_sessions:
+            try:
+                await self.session_mgr.delete_session(session.id)
+            except Exception:
+                logger.exception(
+                    "Failed to delete stale exam session %s on startup sweep", session.id
+                )
+        for agent_id in stale_agent_ids:
+            try:
+                await self.agent_mgr.delete_agent(agent_id)
+            except Exception:
+                logger.exception(
+                    "Failed to delete stale exam agent %s on startup sweep", agent_id
+                )
+        logger.warning(
+            "AgentBeats startup sweep: deleted %d leftover exam agent(s) "
+            "(%d session(s)) from a previous process",
+            len(stale_agent_ids), len(stale_sessions),
+        )
 
     async def shutdown(self) -> None:
         if self.session_mgr is not None:
@@ -227,7 +280,7 @@ class AgentBeatsExamManager:
 
     async def _start_task(self, context_id: str, payload: dict[str, Any]) -> ExamTaskRecord:
         agent = await self.agent_mgr.create_agent(
-            name=f"tb-exam-{uuid.uuid4().hex[:10]}",
+            name=f"{_EXAM_AGENT_NAME_PREFIX}{uuid.uuid4().hex[:10]}",
             description=(
                 "Throwaway AgentBeats Terminal Bench 2.0 exam agent "
                 "(agentbeats-a2a-adapter.md) — no production persona, no "

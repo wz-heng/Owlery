@@ -315,20 +315,27 @@ patches to its own `Dockerfile` (RDI-Foundation/terminal-bench-green
    (`-aarch64` because this host is Apple Silicon; use `-x86_64` on an
    Intel/cloud host.)
 
-Both the patched Dockerfile's own `git clone`/`curl` steps and this
-machine's separate `docker compose exec ... git clone` task-repo fetch
-needed outbound internet from *inside* a container on this network, which
-only worked through this host's local proxy, explicitly, as build-time
-and run-time arguments — plain `docker build`/`docker run` with no proxy
-configuration got `Could not connect`/timeout failures from inside the
-container even though the host itself reaches the same URLs fine
-unproxied:
+This is a **build-time-only** proxy need, not a runtime one. The patched
+Dockerfile's own `git clone` (pre-baking the task repo) and `curl`
+(fetching the compose plugin binary) steps need outbound internet from
+*inside* the build container on this network, which only worked through
+this host's local proxy, explicitly, as `--build-arg`s — plain
+`docker build` with no proxy configuration got `Could not connect`/
+timeout failures from inside the container even though the host itself
+reaches the same URLs fine unproxied:
 ```
 docker build --add-host=host.docker.internal:host-gateway \
   --build-arg http_proxy=http://host.docker.internal:7890 \
   --build-arg https_proxy=http://host.docker.internal:7890 \
   -t terminal-bench-green:latest .
-
+```
+At **runtime**, green needs no proxy and no general internet access at
+all: its own task-repo fetch (`agent.py`'s `_ensure_task_repo`) is a
+local `shutil.copytree` from the pre-baked path, not a network call, and
+the only two things it does reach over the network are the DOOD-mounted
+Docker socket and this adapter — both purely local, wired with
+`--add-host`/volume mounts, no proxy involved:
+```
 docker run -d --name tbgreen -p 9009:9009 \
   --add-host=host.docker.internal:host-gateway \
   --group-add <host docker.sock gid, via `colima ssh -- getent group docker`> \
