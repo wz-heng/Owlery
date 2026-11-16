@@ -156,11 +156,12 @@ unreachable.
   restart. Acceptable for this phase (short-lived local validation runs,
   explicitly not a 24/7 externally-reachable submission target yet); would
   need a durable table before Phase 2's actual public submission.
-- **`card_url` is hardcoded to `http://127.0.0.1:{port}/a2a`** in
-  `server/main.py`'s mount call. Fine for local-only validation; a real
-  AgentBeats submission needs this to reflect the deployed image's actual
-  externally-reachable URL (an amber `config_schema`/env concern, not
-  touched here since Phase 1 does zero public submission).
+- **`card_url` is `http://127.0.0.1:{port}` (+ `/a2a` in dev)**, computed by
+  `a2a_mount_path_and_card_url` (`server/agentbeats/app.py`) — fine for
+  local-only validation; a real AgentBeats submission needs this to reflect
+  the deployed image's actual externally-reachable URL (an amber
+  `config_schema`/env concern, not touched here since Phase 1 does zero
+  public submission).
 - **No streaming.** `AgentCapabilities(streaming=False)` — each round is
   a single request/response, matching the protocol's own round-trip
   shape; there is no intermediate progress to stream within a round.
@@ -169,14 +170,24 @@ unreachable.
   registry or registered with agentbeats.dev in this phase (hard red line,
   `agentbeats-phase1.md`'s "不做清单"). Not even locally verified to
   *build* — no Docker on this dev machine during Phase 1 (§5).
-- **Mount path vs. the real platform's expectation, unverified.** The
-  adapter mounts at `/a2a` (§2.6) so it can coexist with the rest of
-  Owlery's product on one port. `agent-template`'s reference purple agent
-  mounts at root instead. Whether AgentBeats' gateway assumes a
-  root-mounted purple agent URL (no extra path segment) is unconfirmed —
-  finding out means registering a real agent, which this phase's red line
-  forbids. Flagged as a risk residual for whoever picks up Phase 2, not
-  silently assumed either way.
+- **Mount path — resolved, not merely assumed.** §2.6 originally mounted
+  unconditionally at `/a2a` to coexist with the rest of Owlery's product on
+  one port, flagging as an open risk that `agent-template`'s reference
+  purple agent mounts at root instead. Local ten-task validation (§5)
+  turned that "unconfirmed" into a confirmed bug: the real
+  `terminal-bench-green` reference agent's own A2A client (`a2a-sdk`
+  httpx, no redirect-following) hard-fails on a bare `/a2a` request because
+  Starlette's `Mount(path="/a2a")` 307-redirects it to `/a2a/`. Fix:
+  `a2a_mount_path_and_card_url` (`server/agentbeats/app.py`) mounts at root
+  `/` whenever `web/dist/` is absent — true for the real submission image,
+  which never copies it in, so there's no SPA catch-all to coexist with.
+  Dev checkouts (web/dist present) keep the `/a2a` sub-path; no real
+  AgentBeats client ever talks to a dev checkout, so the redirect caveat
+  there is moot. What's still genuinely unconfirmed (would need registering
+  a real agent, still forbidden this phase): whether the platform's own
+  slot-wiring always hands purple's `participants.agent` URL with a
+  trailing slash, independent of what this fix does — root-mounting makes
+  that moot too, since root never needs trailing-slash normalization.
 
 ## 4. Tests
 

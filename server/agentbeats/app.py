@@ -18,6 +18,26 @@ from .executor import OwleryExamExecutor
 from .manager import AgentBeatsExamManager
 
 
+def a2a_mount_path_and_card_url(*, dist_dir_exists: bool, port: int) -> tuple[str, str]:
+    """Where to mount the A2A sub-app, and what URL to advertise in its
+    agent card, as a function of whether `web/dist/` exists (server/main.py).
+
+    Root "/" when there's no SPA to coexist with (the real AgentBeats
+    submission image never copies `web/dist/` in) — confirmed against the
+    real terminal-bench-green reference agent, not just assumed: its
+    a2a-sdk client doesn't follow redirects, and Starlette's
+    ``Mount(path="/a2a")`` 307-redirects a request to the bare "/a2a" (no
+    trailing slash) to "/a2a/", which that client treats as a hard failure.
+    Root-mounting needs no such trailing-slash normalization. Dev mode
+    (web/dist present) keeps the "/a2a" sub-path to coexist with the SPA at
+    "/" — no real AgentBeats client ever talks to a dev checkout, so the
+    redirect caveat there is moot.
+    """
+    if dist_dir_exists:
+        return "/a2a", f"http://127.0.0.1:{port}/a2a"
+    return "/", f"http://127.0.0.1:{port}"
+
+
 def build_a2a_app(manager: AgentBeatsExamManager, *, card_url: str | None = None) -> Starlette:
     """`card_url` is the externally-reachable base URL to advertise in the
     agent card (e.g. ``http://127.0.0.1:8000/a2a``); omit for relative

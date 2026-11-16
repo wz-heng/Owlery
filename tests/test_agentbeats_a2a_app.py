@@ -23,11 +23,31 @@ from a2a.client import A2ACardResolver, ClientConfig, ClientFactory
 from a2a.types import Message, Part, Role, TextPart
 
 from server.agent_manager import AgentManager
-from server.agentbeats.app import build_a2a_app
+from server.agentbeats.app import a2a_mount_path_and_card_url, build_a2a_app
 from server.agentbeats.manager import AgentBeatsExamManager
 from server.database import Database
 from server.harness import HarnessEvent
 from server.session_manager import SessionManager
+
+
+def test_a2a_mount_path_root_when_no_spa():
+    # No `web/dist/` (the real AgentBeats submission image never copies it
+    # in) -> root mount. Verified necessary, not just convenient: the real
+    # terminal-bench-green reference agent's a2a-sdk client doesn't follow
+    # redirects, and Starlette's Mount(path="/a2a") 307s a bare "/a2a"
+    # request (no trailing slash) to "/a2a/", which that client treats as a
+    # hard failure. A root mount needs no such trailing-slash redirect.
+    path, card_url = a2a_mount_path_and_card_url(dist_dir_exists=False, port=9010)
+    assert path == "/"
+    assert card_url == "http://127.0.0.1:9010"
+
+
+def test_a2a_mount_path_subpath_when_spa_present():
+    # Dev checkouts build `web/dist/` for the SPA, which already claims
+    # "/" -> A2A must live at a sub-path to coexist.
+    path, card_url = a2a_mount_path_and_card_url(dist_dir_exists=True, port=8000)
+    assert path == "/a2a"
+    assert card_url == "http://127.0.0.1:8000/a2a"
 
 
 @pytest.fixture

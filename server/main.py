@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .auth import verify_token
 
-from .agentbeats.app import build_a2a_app
+from .agentbeats.app import a2a_mount_path_and_card_url, build_a2a_app
 from .agentbeats.manager import agentbeats_exam_manager
 from .bg_tasks import bg_task_manager
 from .delegations import delegation_manager
@@ -301,6 +301,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Owlery", version="0.1.0", lifespan=lifespan)
 
+# Built frontend, if present (dev checkouts / local-deploy slots). Computed
+# up front because both the A2A mount path below and the SPA catch-all
+# further down branch on its presence.
+_dist_dir = Path(__file__).resolve().parent.parent / "web" / "dist"
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -335,11 +340,14 @@ app.include_router(ws.router)
 # registered before the "/" SPA StaticFiles catch-all mount below: Starlette
 # commits to the first Mount whose prefix matches and never falls through to
 # a later one, so appending this after "/" would make it permanently 404.
+# See `a2a_mount_path_and_card_url`'s docstring for why the mount path
+# itself is conditional.
+_a2a_mount_path, _a2a_card_url = a2a_mount_path_and_card_url(
+    dist_dir_exists=_dist_dir.is_dir(), port=settings.port
+)
 app.mount(
-    "/a2a",
-    build_a2a_app(
-        agentbeats_exam_manager, card_url=f"http://127.0.0.1:{settings.port}/a2a"
-    ),
+    _a2a_mount_path,
+    build_a2a_app(agentbeats_exam_manager, card_url=_a2a_card_url),
 )
 
 
@@ -399,7 +407,6 @@ async def _running_deploy_sha_slot() -> tuple[str | None, str | None]:
 
 # Serve built frontend as static files (SPA catch-all).
 # Mounted after API routes so /api/*, /ws, /health take priority.
-_dist_dir = Path(__file__).resolve().parent.parent / "web" / "dist"
 if _dist_dir.is_dir():
     app.mount("/", StaticFiles(directory=str(_dist_dir), html=True), name="spa")
 
