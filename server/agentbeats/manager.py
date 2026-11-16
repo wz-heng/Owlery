@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -47,6 +48,22 @@ TASK_ROUND_BUDGET = 50
 # timeout (terminal-bench-green's `messenger.py` default is 300s) so we are
 # never the one left holding a half-finished round when it gives up first.
 ROUND_TIMEOUT_SEC = 280.0
+
+# Green abandons a task without ever telling purple when its own exec call
+# times out (confirmed against the real reference agent, not a theoretical
+# concern — agentbeats-a2a-adapter.md §3): there is then no further
+# `handle_message` call to react to, so nothing would otherwise ever delete
+# the throwaway exam agent+session. `_reap_idle` sweeps for exactly that:
+# an unfinished record whose last incoming message is older than
+# `IDLE_REAP_SEC`. That threshold must clear the largest legitimate gap
+# between two `handle_message` calls on the same context — either our own
+# `ROUND_TIMEOUT_SEC` (while a round is in flight) or green's own exec-side
+# wait (clamped to 300s upstream, plus container teardown/startup
+# overhead) — with real margin, so the reaper can never race a round that's
+# merely slow, only one that's truly gone. `REAP_POLL_SEC` just paces how
+# often the sweep runs; it doesn't itself need to be tight.
+IDLE_REAP_SEC = 900.0
+REAP_POLL_SEC = 60.0
 
 # Claude Code's native tools, denied in full for the exam agent. The only
 # thing it can act through is the two `tbexec` MCP tools — the task's real
@@ -127,6 +144,7 @@ class ExamTaskRecord:
     finished: bool = False
     aborted_reason: str | None = None
     final_output: str | None = None
+    last_activity_at: float = field(default_factory=time.monotonic)
 
 
 class AgentBeatsExamManager:
@@ -140,6 +158,7 @@ class AgentBeatsExamManager:
         self._records: dict[str, ExamTaskRecord] = {}  # context_id -> record
         self._session_to_context: dict[str, str] = {}
         self._current_round: dict[str, _ExamRound] = {}  # context_id -> round
+        self._reaper_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------ wiring
 
@@ -147,10 +166,19 @@ class AgentBeatsExamManager:
         self.session_mgr = session_mgr
         self.agent_mgr = agent_mgr
         session_mgr.on_broadcast(self.BROADCAST_KEY, self._on_broadcast)
+        if self._reaper_task is None or self._reaper_task.done():
+            self._reaper_task = asyncio.ensure_future(self._reap_loop())
 
-    def shutdown(self) -> None:
+    async def shutdown(self) -> None:
         if self.session_mgr is not None:
             self.session_mgr.remove_broadcast(self.BROADCAST_KEY)
+        if self._reaper_task is not None:
+            self._reaper_task.cancel()
+            try:
+                await self._reaper_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._reaper_task = None
 
     # ------------------------------------------------------------ ledger
 
@@ -182,6 +210,11 @@ class AgentBeatsExamManager:
             if kind != "exec_result":
                 raise ExamTaskError(f"Expected kind='exec_result', got {kind!r}")
             prompt = _format_exec_result(payload)
+
+        # Refresh before any `await` below so a concurrent `_reap_idle` sweep
+        # always sees a live round as freshly active, never idle (see
+        # IDLE_REAP_SEC's comment for why that margin holds).
+        record.last_activity_at = time.monotonic()
 
         decision = await self._run_round(record, prompt)
         if decision["kind"] == "final":
@@ -236,6 +269,40 @@ class AgentBeatsExamManager:
             "AgentBeats exam task %s torn down: rounds=%d cost=$%.4f",
             record.context_id, record.round_no, record.cumulative_cost_usd,
         )
+
+    # ------------------------------------------------------------ idle reaper
+
+    async def _reap_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(REAP_POLL_SEC)
+                await self._reap_idle()
+        except asyncio.CancelledError:
+            pass
+
+    async def _reap_idle(self) -> None:
+        """Tear down any unfinished record green has gone silent on. Safe
+        against racing a round that's merely slow: `handle_message` stamps
+        `last_activity_at` fresh before awaiting anything, and the longest
+        a round can legitimately run before either returning or green's
+        next call arriving is far under `IDLE_REAP_SEC` (its own docstring
+        above works out the margin) — so anything still idle past that is
+        abandoned, not busy. Setting `finished = True` before the (async)
+        teardown closes the same race the other end of `handle_message`
+        already guards with its own `record.finished` check."""
+        now = time.monotonic()
+        for record in list(self._records.values()):
+            if record.finished:
+                continue
+            if now - record.last_activity_at <= IDLE_REAP_SEC:
+                continue
+            record.finished = True
+            record.aborted_reason = "idle timeout: green agent never responded"
+            logger.warning(
+                "AgentBeats exam task %s reaped: idle %.0fs with no message from green",
+                record.context_id, now - record.last_activity_at,
+            )
+            await self._teardown(record)
 
     # ------------------------------------------------------------ one round
 

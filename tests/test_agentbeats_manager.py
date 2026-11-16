@@ -18,11 +18,13 @@ here" (tests/test_tbexec_router.py covers the POST route itself).
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 
 from server.agent_manager import AgentManager
 from server.agentbeats.manager import (
+    IDLE_REAP_SEC,
     TASK_COST_BUDGET_USD,
     TASK_ROUND_BUDGET,
     AgentBeatsExamManager,
@@ -45,7 +47,7 @@ async def ctx():
     try:
         yield session_mgr, agent_mgr, exam_mgr
     finally:
-        exam_mgr.shutdown()
+        await exam_mgr.shutdown()
         await db.close()
 
 
@@ -305,3 +307,56 @@ async def test_record_decision_conflict_on_second_call(ctx):
 async def test_record_decision_unknown_session_returns_false(ctx):
     _session_mgr, _agent_mgr, exam_mgr = ctx
     assert exam_mgr.record_decision("no-such-session", {"kind": "finish", "output": "x"}) is False
+
+
+@pytest.mark.asyncio
+async def test_reap_idle_tears_down_a_record_green_abandoned(ctx):
+    """The confirmed-not-theoretical failure mode (agentbeats-a2a-adapter.md
+    §2.4/§3): green's own exec call times out on *its* side and it never
+    sends purple another A2A message, so nothing else would ever react.
+    `_reap_idle` must notice and actually delete the throwaway agent +
+    session, not just flip a flag."""
+    session_mgr, agent_mgr, exam_mgr = ctx
+    from server.agentbeats.manager import ExamTaskRecord
+
+    agent = await agent_mgr.create_agent(name="pre-seeded-exam-abandoned")
+    session = await session_mgr.create_session(agent_id=agent["id"], origin="agentbeats")
+    record = ExamTaskRecord(
+        context_id="ctx-abandoned",
+        agent_id=agent["id"],
+        session_id=session.id,
+        last_activity_at=time.monotonic() - IDLE_REAP_SEC - 1,
+    )
+    exam_mgr._records["ctx-abandoned"] = record
+    exam_mgr._session_to_context[session.id] = "ctx-abandoned"
+
+    await exam_mgr._reap_idle()
+
+    assert record.finished is True
+    assert "idle timeout" in (record.aborted_reason or "")
+    assert await agent_mgr.get_agent(agent["id"]) is None
+    assert session_mgr.get_session(session.id) is None
+    assert session.id not in exam_mgr._session_to_context
+
+
+@pytest.mark.asyncio
+async def test_reap_idle_leaves_a_fresh_record_alone(ctx):
+    """A round that's merely slow (still well under `IDLE_REAP_SEC`) must
+    never be mistaken for abandoned — the sweep would otherwise be able to
+    race a real in-flight trial."""
+    session_mgr, agent_mgr, exam_mgr = ctx
+    from server.agentbeats.manager import ExamTaskRecord
+
+    agent = await agent_mgr.create_agent(name="pre-seeded-exam-fresh")
+    session = await session_mgr.create_session(agent_id=agent["id"], origin="agentbeats")
+    record = ExamTaskRecord(
+        context_id="ctx-fresh", agent_id=agent["id"], session_id=session.id
+    )
+    exam_mgr._records["ctx-fresh"] = record
+    exam_mgr._session_to_context[session.id] = "ctx-fresh"
+
+    await exam_mgr._reap_idle()
+
+    assert record.finished is False
+    assert await agent_mgr.get_agent(agent["id"]) is not None
+    assert session_mgr.get_session(session.id) is not None

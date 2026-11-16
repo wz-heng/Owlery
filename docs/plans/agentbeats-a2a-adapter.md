@@ -123,6 +123,19 @@ throwaway Owlery agent + session, created lazily on the first message:
 - Hard-deleted (`delete_session` + `delete_agent`, which also removes the
   memory dir) immediately after the terminal decision — not merely
   archived. These are one-shot, never reused.
+- **Backstop for when there is no terminal decision**: the ten-task run
+  (§5) confirmed, not just hypothesized, that green can abandon a task
+  without ever sending purple another A2A message — its own Harbor-side
+  exec call can hit *its* 300s cap and raise internally, moving on to the
+  next task with nothing sent back here. `_reap_idle` (a periodic sweep,
+  `IDLE_REAP_SEC`/`REAP_POLL_SEC`) tears down any unfinished record whose
+  last incoming message is older than a threshold set well above the
+  longest legitimate gap between two `handle_message` calls on the same
+  context (`ROUND_TIMEOUT_SEC` while a round is in flight, or green's own
+  exec-side wait once we've handed back a decision) — see its own comment
+  for the margin, and `record.last_activity_at`'s refresh-before-any-await
+  placement in `handle_message` for why it can't race a round that's
+  merely slow.
 
 ### 2.5 Budget enforcement
 
@@ -136,18 +149,40 @@ touching `SessionManager` again. A per-round wall-clock timeout
 client timeout) force-interrupts a wedged turn rather than hanging the
 whole evaluation.
 
-### 2.6 Mounting — no separate process
+### 2.6 Mounting — no separate process, and a path that depends on the SPA
 
-The A2A endpoint is mounted at `/a2a` directly on Owlery's main FastAPI
-app (`server/main.py`), not a separate standalone server. This is also why
-the eventual AgentBeats Docker image needs no special-purpose shell: the
+The A2A endpoint is mounted directly on Owlery's main FastAPI app
+(`server/main.py`), not a separate standalone server. This is also why the
+eventual AgentBeats Docker image needs no special-purpose shell: the
 entrypoint is literally `uvicorn server.main:app`, and "the real stack" is
-the whole product, not a slogan. **Must be registered before the "/" SPA
-`StaticFiles` mount** (same ordering constraint the Feishu webhook route
-already documents in `main.py`): Starlette commits to the first `Mount`
-whose prefix matches a request path and never falls through to a later
-one, so a Mount appended after a catch-all `Mount("/")` is permanently
-unreachable.
+the whole product, not a slogan.
+
+The mount *path* is conditional, computed by
+`a2a_mount_path_and_card_url` (`server/agentbeats/app.py`): root `/` when
+`web/dist/` is absent (true for the real submission image, which never
+copies it in), `/a2a` when present (dev checkouts, where `/` is already
+claimed by the SPA). This isn't cosmetic — it's a confirmed bug fix, not a
+preference: the real `terminal-bench-green` reference agent's own
+a2a-sdk client doesn't follow redirects, and Starlette's
+`Mount(path="/a2a")` 307-redirects a bare `/a2a` request (no trailing
+slash) to `/a2a/`, which that client then hard-fails on. Root-mounting
+needs no such trailing-slash normalization, so it sidesteps the problem
+entirely rather than depending on every caller happening to include the
+slash.
+
+Registration **order** matters twice over, for the same underlying
+reason — Starlette commits to the first route (`Route` or `Mount`) whose
+prefix matches a request path and never falls through to a later one:
+- Must be registered **after every explicit route** above it
+  (`/health`, `/api/backends`, the various `include_router` calls): when
+  root-mounted, its path regex matches *everything*, so if it were
+  registered first it would swallow those routes too (404 inside the A2A
+  sub-app, which has none of them) — caught by the full backend suite,
+  not by hand.
+- Must be registered **before the "/" SPA `StaticFiles` catch-all**
+  (same ordering constraint the Feishu webhook route already documents in
+  `main.py`): appending it after a catch-all `Mount("/")` would make it
+  permanently unreachable.
 
 ## 3. What this explicitly defers (§10 discipline)
 
@@ -156,31 +191,6 @@ unreachable.
   restart. Acceptable for this phase (short-lived local validation runs,
   explicitly not a 24/7 externally-reachable submission target yet); would
   need a durable table before Phase 2's actual public submission.
-- **No reaper for a green-abandoned task — a confirmed, not just
-  theoretical, orphan leak.** When green's own Harbor-side command
-  execution hits its 300s cap (`agent.py`'s own timeout, independent of
-  anything in this adapter), green raises internally and moves to the
-  next task *without ever sending purple another A2A message* — there is
-  no "final" decision for `AgentBeatsExamManager` to react to, so the
-  throwaway exam agent + session from §2.4 (meant to be hard-deleted
-  "immediately after the terminal decision") never gets that decision and
-  is never torn down. `shutdown()` (`server/agentbeats/manager.py`) only
-  unregisters the broadcast listener — it does not sweep stragglers, and
-  the orphans are DB rows (`agents`/`sessions` tables), so they outlive
-  process restarts too. Observed directly in the ten-task run (§5): 3 of
-  10 tasks hit this exact failure mode (`build-cython-ext`,
-  `configure-git-webserver`, `query-optimize`), and all 3 left an orphaned
-  agent+session pair behind (verified by querying the validation DB after
-  the run — `agents`/`sessions` row counts matched exactly). Not a
-  security or cost issue (the orphan is still fully isolated garbage, and
-  a dormant session accrues no further model spend), but a real
-  resource-cleanup gap that would accumulate rows and memory-dir disk
-  usage over a long AgentBeats campaign. Deferred rather than rushed: the
-  right fix is an idle-timeout reaper (periodic sweep or lazy
-  check-on-access) interacting carefully with the round/budget logic so
-  it can't race a session that's merely slow, not abandoned — that's
-  design work for a dedicated follow-up, not a safe same-session patch
-  under this phase's time-box.
 - **`card_url` is `http://127.0.0.1:{port}` (+ `/a2a` in dev)**, computed by
   `a2a_mount_path_and_card_url` (`server/agentbeats/app.py`) — fine for
   local-only validation; a real AgentBeats submission needs this to reflect
@@ -194,13 +204,19 @@ unreachable.
   submission-ready.** §5 originally flagged this as not even locally
   verified to build (no Docker on the dev machine at the time). Now built
   successfully (`docker build -f deploy/agentbeats/Dockerfile`, image
-  `owlery-agentbeats:local`, 1.27GB) — Docker Scout's static secret
-  scanner flags `ENV ANTHROPIC_API_KEY`/`ENV OWLERY_AUTH_TOKEN` by name
-  (it can't tell an empty placeholder from a baked-in value), which is
-  independent confirmation from a tool with no stake in the claim that the
-  only non-empty one (`OWLERY_AUTH_TOKEN`) is the documented
-  loopback-only shared secret, not a real credential — nothing else got
-  flagged. The image is never pushed to a registry or registered with
+  `owlery-agentbeats:local`, 1.27GB). Docker Scout's static secret scanner
+  flagged exactly `ENV ANTHROPIC_API_KEY` and `ENV OWLERY_AUTH_TOKEN` by
+  name (it flags any env var matching a known secret-name pattern,
+  regardless of whether a real value is present — not an exhaustive
+  secret audit, and not evidence that no *other* secret exists anywhere
+  in the image). What it does support, read against the `Dockerfile`
+  itself (`ENV ANTHROPIC_API_KEY=""`): the flagged key is explicitly
+  empty, consistent with the design's claim that it's injected at
+  container runtime, never baked in. The other flagged value,
+  `OWLERY_AUTH_TOKEN=agentbeats-local`, is non-empty but is the documented
+  loopback-only shared secret between this process and its own spawned
+  MCP subprocesses (Dockerfile comment, §2.2) — not a real credential.
+  The image is never pushed to a registry or registered with
   agentbeats.dev in this phase (hard red line, `agentbeats-phase1.md`'s
   "不做清单"), and the ten-task validation run itself used the native
   (non-containerized) server instead — this image's own Claude Code CLI
@@ -257,10 +273,78 @@ local run (which does spend real budget) is attempted separately.
 
 ## 5. Local validation status
 
-This dev machine had no Docker installed at the start of Phase 1
-(`which docker` empty). Running the real `terminal-bench-green` locally —
-and therefore the ten-task validation in `agentbeats-phase1.md` — requires
-a real Docker daemon (confirmed by reading `agent.py`: green spins up
-Harbor's `DockerEnvironment` directly, not optionally). See the task
-card's comment thread for the resulting decision on whether/how that
-environment setup proceeded, and the ten-task results themselves.
+This dev machine had no Docker at the start of Phase 1 (`which docker`
+empty); running the real `terminal-bench-green` locally — and therefore
+the ten-task validation in `agentbeats-phase1.md` — needs one (confirmed
+by reading `agent.py`: green spins up Harbor's `DockerEnvironment`
+directly, not optionally). `brew install colima docker docker-compose`,
+authorized and capped by Albus per the task card's comment thread
+(≤4 CPU/≤6G memory/40G disk for the colima VM); stopped (`colima stop`)
+and all images/build-cache pruned (`docker system prune -a -f --volumes`)
+once the ten-task run below finished — not uninstalled, so `colima start`
+picks back up without reinstalling anything.
+
+Getting the real green agent running against this adapter needed two
+patches to its own `Dockerfile` (RDI-Foundation/terminal-bench-green
+@ `dcaba23f`, cloned disposably — not vendored into this repo):
+
+1. **`docker.io` instead of `get.docker.com`.** The upstream Dockerfile
+   installs Docker via `curl -fsSL https://get.docker.com | sh`, which
+   TLS-resets from inside the build container's bridged network on this
+   network path (reproducible 5/5, direct from the colima VM itself
+   works fine over the same domain — the break is specific to the
+   container's bridged path, not a generic outage). Swap for Debian
+   bookworm's own `docker.io` package, which is sufficient for a pure
+   DOOD client (no dockerd ever starts inside green's container; it only
+   ever talks to the host daemon over the mounted socket):
+   ```
+   RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates docker.io git && \
+       rm -rf /var/lib/apt/lists/*
+   ```
+2. **A separately-fetched `docker compose` v2 CLI plugin.** Debian's
+   `docker.io` (20.10.24) predates the v2 compose plugin architecture, but
+   Harbor's `DockerEnvironment._run_docker_compose_command` hardcodes v2
+   syntax (`docker compose --project-name ...`) with no v1 fallback — so
+   `docker compose version` fails outright without this:
+   ```
+   RUN mkdir -p /usr/local/lib/docker/cli-plugins && \
+       curl -fSL -o /usr/local/lib/docker/cli-plugins/docker-compose \
+         https://github.com/docker/compose/releases/download/v2.32.4/docker-compose-linux-aarch64 && \
+       chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+   ```
+   (`-aarch64` because this host is Apple Silicon; use `-x86_64` on an
+   Intel/cloud host.)
+
+Both the patched Dockerfile's own `git clone`/`curl` steps and this
+machine's separate `docker compose exec ... git clone` task-repo fetch
+needed outbound internet from *inside* a container on this network, which
+only worked through this host's local proxy, explicitly, as build-time
+and run-time arguments — plain `docker build`/`docker run` with no proxy
+configuration got `Could not connect`/timeout failures from inside the
+container even though the host itself reaches the same URLs fine
+unproxied:
+```
+docker build --add-host=host.docker.internal:host-gateway \
+  --build-arg http_proxy=http://host.docker.internal:7890 \
+  --build-arg https_proxy=http://host.docker.internal:7890 \
+  -t terminal-bench-green:latest .
+
+docker run -d --name tbgreen -p 9009:9009 \
+  --add-host=host.docker.internal:host-gateway \
+  --group-add <host docker.sock gid, via `colima ssh -- getent group docker`> \
+  -e WORKSPACE=/workspace -e DOCKER_HOST=unix:///var/run/docker.sock \
+  -v /var/run/docker.sock:/var/run/docker.sock -v /workspace:/workspace \
+  terminal-bench-green:latest --host 0.0.0.0 --port 9009
+```
+The `--group-add` is needed because the image's own `Dockerfile` creates
+its `docker` group at a fixed gid (999) that won't generally match the
+*host's* docker.sock gid once that socket is bind-mounted in (DOOD, not a
+locally-created socket) — without it the non-root `agent` user inside the
+container can't open the socket at all.
+
+`scripts/agentbeats_drive_green.py` is the AgentBeats-gateway stand-in
+used to actually drive a run once both sides are up — see its own
+docstring for the full sequence including starting this adapter itself.
+The resulting ten-task scores, cost ledger, and extrapolation are on the
+task card's comment thread, not duplicated here (that is genuinely
+run-specific, not design documentation).

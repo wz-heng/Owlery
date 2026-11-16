@@ -22,11 +22,14 @@ import pytest
 from a2a.client import A2ACardResolver, ClientConfig, ClientFactory
 from a2a.types import Message, Part, Role, TextPart
 
+from starlette.routing import Route
+
 from server.agent_manager import AgentManager
 from server.agentbeats.app import a2a_mount_path_and_card_url, build_a2a_app
 from server.agentbeats.manager import AgentBeatsExamManager
 from server.database import Database
 from server.harness import HarnessEvent
+from server.main import app as real_app
 from server.session_manager import SessionManager
 
 
@@ -42,12 +45,55 @@ def test_a2a_mount_path_root_when_no_spa():
     assert card_url == "http://127.0.0.1:9010"
 
 
+def test_a2a_mount_registered_after_explicit_routes_in_real_app():
+    # Structural regression guard for the ordering bug the full backend
+    # suite caught, not a hand-written assumption. This only bites in the
+    # root-mounted branch (`a2a_mount_path_and_card_url`'s "/" case, active
+    # exactly when `web/dist/` is absent — the real AgentBeats submission
+    # image's own condition), since a root Mount's regex matches every
+    # path; skip rather than pass-trivially-for-the-wrong-reason if a dev
+    # build happens to be sitting in this checkout.
+    import server.main as main_module
+
+    if main_module._dist_dir.is_dir():
+        pytest.skip("web/dist present -> A2A sub-path-mounted, not the branch this guards")
+
+    routes = real_app.router.routes
+    index_by_name = {r.name: i for i, r in enumerate(routes) if getattr(r, "name", None)}
+    a2a_index = index_by_name["a2a"]
+    # Mount.__init__ does `self.path = path.rstrip("/")`, so root is "".
+    assert real_app.router.routes[a2a_index].path == ""
+
+    # Starlette runs Route/Mount entries in registration order and stops at
+    # the first match, so every explicit route below must be registered
+    # *before* the root A2A mount or it would be swallowed (404 inside the
+    # A2A sub-app, which has none of them) -- exactly as /health and
+    # /api/backends briefly were.
+    health_index = next(
+        i for i, r in enumerate(routes) if isinstance(r, Route) and r.path == "/health"
+    )
+    backends_index = next(
+        i for i, r in enumerate(routes) if isinstance(r, Route) and r.path == "/api/backends"
+    )
+    assert health_index < a2a_index
+    assert backends_index < a2a_index
+
+    # And before the SPA catch-all, if one happens to be mounted (it isn't
+    # in this branch, since the two are mutually exclusive on `web/dist/`
+    # existing) -- it would make the A2A mount permanently unreachable.
+    if "spa" in index_by_name:
+        assert a2a_index < index_by_name["spa"]
+
+
 def test_a2a_mount_path_subpath_when_spa_present():
     # Dev checkouts build `web/dist/` for the SPA, which already claims
-    # "/" -> A2A must live at a sub-path to coexist.
+    # "/" -> A2A must live at a sub-path to coexist. The card URL still
+    # carries the trailing slash the mount path argument doesn't need, so
+    # calling back on the card's own advertised address lands directly
+    # rather than depending on a redirect too.
     path, card_url = a2a_mount_path_and_card_url(dist_dir_exists=True, port=8000)
     assert path == "/a2a"
-    assert card_url == "http://127.0.0.1:8000/a2a"
+    assert card_url == "http://127.0.0.1:8000/a2a/"
 
 
 @pytest.fixture
@@ -69,7 +115,7 @@ async def a2a_client():
     transport = httpx.ASGITransport(app=starlette_app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
         yield hc, session_mgr, exam_mgr
-    exam_mgr.shutdown()
+    await exam_mgr.shutdown()
     await db.close()
 
 

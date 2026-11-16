@@ -293,7 +293,7 @@ async def lifespan(app: FastAPI):
     await research_manager.shutdown()
     await bg_task_manager.shutdown()
     delegation_manager.shutdown()
-    agentbeats_exam_manager.shutdown()
+    await agentbeats_exam_manager.shutdown()
     await session_manager.shutdown_session_injections()
     await task_repository.close()
     await db.close()
@@ -405,6 +405,7 @@ _a2a_mount_path, _a2a_card_url = a2a_mount_path_and_card_url(
 app.mount(
     _a2a_mount_path,
     build_a2a_app(agentbeats_exam_manager, card_url=_a2a_card_url),
+    name="a2a",
 )
 
 # Serve built frontend as static files (SPA catch-all).

@@ -30,11 +30,14 @@ def a2a_mount_path_and_card_url(*, dist_dir_exists: bool, port: int) -> tuple[st
     trailing slash) to "/a2a/", which that client treats as a hard failure.
     Root-mounting needs no such trailing-slash normalization. Dev mode
     (web/dist present) keeps the "/a2a" sub-path to coexist with the SPA at
-    "/" — no real AgentBeats client ever talks to a dev checkout, so the
-    redirect caveat there is moot.
+    "/" — the card URL there is `/a2a/`, *with* the trailing slash, so
+    anyone who calls back using the card's own advertised address (as the
+    real reference agent's messenger.py does) lands on it directly rather
+    than depending on a redirect too; the mount path argument to
+    `app.mount()` itself doesn't need the slash (Starlette strips it).
     """
     if dist_dir_exists:
-        return "/a2a", f"http://127.0.0.1:{port}/a2a"
+        return "/a2a", f"http://127.0.0.1:{port}/a2a/"
     return "/", f"http://127.0.0.1:{port}"
 
 
