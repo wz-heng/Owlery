@@ -335,21 +335,6 @@ app.include_router(notifiers.router)
 app.include_router(skills_router.router)
 app.include_router(ws.router)
 
-# A2A sub-app (AgentBeats adapter, agentbeats-a2a-adapter.md). A Mount, not
-# an APIRoute, so — like the Feishu webhook route above — it must be
-# registered before the "/" SPA StaticFiles catch-all mount below: Starlette
-# commits to the first Mount whose prefix matches and never falls through to
-# a later one, so appending this after "/" would make it permanently 404.
-# See `a2a_mount_path_and_card_url`'s docstring for why the mount path
-# itself is conditional.
-_a2a_mount_path, _a2a_card_url = a2a_mount_path_and_card_url(
-    dist_dir_exists=_dist_dir.is_dir(), port=settings.port
-)
-app.mount(
-    _a2a_mount_path,
-    build_a2a_app(agentbeats_exam_manager, card_url=_a2a_card_url),
-)
-
 
 @app.get("/api/backends")
 async def list_backends(_: str = Depends(verify_token)):
@@ -404,6 +389,23 @@ async def _running_deploy_sha_slot() -> tuple[str | None, str | None]:
     sha = out.strip() if rc == 0 and out else None
     return sha, slot
 
+
+# A2A sub-app (AgentBeats adapter, agentbeats-a2a-adapter.md). A Mount, not
+# an APIRoute, so — like the Feishu webhook route above — it must be
+# registered after every explicit API route above (otherwise, root-mounted
+# per below, it would greedily swallow them — Starlette commits to the
+# first Mount whose prefix matches, including a root Mount matching
+# everything) and before the "/" SPA StaticFiles catch-all below (Starlette
+# never falls through to a later Mount, so appending this after "/" would
+# make it permanently 404). See `a2a_mount_path_and_card_url`'s docstring
+# for why the mount path itself is conditional.
+_a2a_mount_path, _a2a_card_url = a2a_mount_path_and_card_url(
+    dist_dir_exists=_dist_dir.is_dir(), port=settings.port
+)
+app.mount(
+    _a2a_mount_path,
+    build_a2a_app(agentbeats_exam_manager, card_url=_a2a_card_url),
+)
 
 # Serve built frontend as static files (SPA catch-all).
 # Mounted after API routes so /api/*, /ws, /health take priority.
