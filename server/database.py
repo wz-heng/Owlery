@@ -3816,6 +3816,122 @@ class Database:
         assert candidate is not None
         return candidate
 
+    async def create_skill_candidate_if_not_already_flagged(
+        self,
+        *,
+        candidate_id: str,
+        slug: str,
+        title: str,
+        description: str,
+        body_markdown: str,
+        repository: str,
+        rationale: str,
+        proposed_by_agent_id: str | None,
+        proposed_by_session_id: str | None,
+        task_id: str | None,
+        run_id: str | None,
+        scope: str,
+        bundle_files: dict[str, str] | None,
+        lint_results: dict[str, Any] | None,
+        created_at: str,
+        auto_flag_marker: str,
+    ) -> dict[str, Any] | None:
+        """Atomic counterpart to `create_skill_candidate` for the
+        process-metrics auto-flag path (`server/skill_health.py`): the INSERT
+        only executes if no OTHER pending row already carries
+        `auto_flag_marker` in its rationale for this same lineage, as a
+        single `INSERT ... SELECT ... WHERE NOT EXISTS` statement — SQLite
+        serializes writers at the file level, so this is race-safe against
+        two scans (same or different process) running concurrently, unlike
+        a separate read-then-insert (Snape review,
+        docs/plans/process-metrics.md §3.3: two concurrent scans would
+        otherwise both pass their own `list_skill_candidates` snapshot check
+        and both insert). Returns the created row, or None if skipped
+        because a flag already existed.
+
+        Lineage identity here matches `list_skill_invocations_for_lineage`'s
+        own definition EXACTLY: `repository` only participates for
+        `scope='agent+repo'` — an `agent-global` candidate has no repository
+        dimension, so two `agent-global` proposals of the same slug from two
+        different repositories are the SAME lineage and must dedup against
+        each other, not be treated as independent (Snape review: the naive
+        version compared `repository` unconditionally and would create a
+        duplicate auto-flag, one per originating repository)."""
+        await self._ensure_connected()
+        if scope == "agent+repo":
+            repo_clause = "repository = ?"
+            repo_params: list[Any] = [repository]
+        else:
+            repo_clause = "1=1"
+            repo_params = []
+        if proposed_by_agent_id is not None:
+            agent_clause = "proposed_by_agent_id = ?"
+            agent_params: list[Any] = [proposed_by_agent_id]
+        else:
+            agent_clause = "proposed_by_agent_id IS NULL"
+            agent_params = []
+        cursor = await self._conn.execute(
+            "INSERT INTO skill_candidates "
+            "(id, slug, title, description, body_markdown, repository, rationale, "
+            "status, proposed_by_agent_id, proposed_by_session_id, task_id, run_id, "
+            "use_count, scope, bundle_files, lint_results, created_at, updated_at) "
+            "SELECT ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, 0, ?, ?, ?, ?, ? "
+            "WHERE NOT EXISTS ("
+            "  SELECT 1 FROM skill_candidates "
+            f"  WHERE slug = ? AND scope = ? AND {repo_clause} AND {agent_clause} "
+            "    AND status = 'pending' AND rationale LIKE ?"
+            ")",
+            (
+                candidate_id, slug, title, description, body_markdown, repository,
+                rationale, proposed_by_agent_id, proposed_by_session_id, task_id,
+                run_id, scope,
+                json.dumps(bundle_files) if bundle_files else None,
+                json.dumps(lint_results) if lint_results else None,
+                created_at, created_at,
+                slug, scope, *repo_params, *agent_params, f"%{auto_flag_marker}%",
+            ),
+        )
+        await self._conn.commit()
+        if cursor.rowcount == 0:
+            return None
+        candidate = await self.get_skill_candidate(candidate_id)
+        assert candidate is not None
+        return candidate
+
+    async def connect_existing_without_migrating(self) -> None:
+        """Open the connection against an ALREADY-CURRENT database without
+        running `_SCHEMA`/`_apply_migrations()` — for tools that must touch
+        only a narrow slice of an existing production file (the
+        process-metrics skill-backfill CLI, `scripts/process_metrics/
+        skill_backfill_cli.py`) and must never risk `_apply_migrations()`'s
+        one-time catch-up side effects (e.g. the Telegram-mapping purge, the
+        sessions.agent_id backfill) running a second time against a file a
+        live `owlery serve` process already has open (Snape review: the
+        skill-backfill CLI calling the normal `initialize()` executed a full
+        schema+migration pass against the live production DB, which is not
+        the single, narrow write point §3.3 calls for).
+
+        Raises `RuntimeError` if `skill_candidates` doesn't exist — that
+        means the schema genuinely IS stale, and the normal `initialize()`
+        (which this intentionally skips) is the correct way to bring it
+        current; this method only serves callers that know the DB is
+        already live and current."""
+        self._conn = await aiosqlite.connect(self._db_path)
+        await self._conn.execute("PRAGMA foreign_keys=ON")
+        await self._conn.execute("PRAGMA busy_timeout=5000")
+        cursor = await self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='skill_candidates'"
+        )
+        if await cursor.fetchone() is None:
+            await self._conn.close()
+            self._conn = None
+            raise RuntimeError(
+                "skill_candidates table is missing from this database — it "
+                "predates the skill registry schema. Run the normal server "
+                "startup (which applies migrations) against it at least "
+                "once before using this tool."
+            )
+
     async def get_skill_candidate(self, candidate_id: str) -> dict[str, Any] | None:
         await self._ensure_connected()
         cursor = await self._conn.execute(

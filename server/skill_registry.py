@@ -613,8 +613,13 @@ class SkillRegistry:
         with an `agent+repo` candidate at the same slug for the same
         agent+repository. `session_id`/`task_id`/`run_id`/`backend` are
         purely additive — the invocation log they feed (experience-
-        consolidation-v2.md §3⑤) is a foreign key and a display list only,
-        never aggregated into a rate or threshold (§4 "不做")."""
+        consolidation-v2.md §3⑤) started as a foreign key and a display list
+        only. `server/skill_health.py` (process-metrics.md §3.3) is the
+        later, deliberate follow-up that DOES aggregate it into a
+        co-occurrence rate — by design a looser claim than the causal
+        "effectiveness layer" §4 ruled out (common fate, not blame), gated by
+        a human on the existing candidate review queue before anything
+        changes."""
         if self.db is None:
             return
         try:
