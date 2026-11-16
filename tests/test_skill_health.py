@@ -603,21 +603,22 @@ async def test_connect_existing_without_migrating_does_not_rerun_migrations(tmp_
 async def test_skill_backfill_cli_only_ever_writes_skill_candidates(
     health_runtime, tmp_path: Path
 ):
-    """Snape review, round 3: `docs/reports/process-metrics/2026-11-16-
-    schedule-fire-evidence.md` had claimed the Schedule-fire run was
-    "全程只读", but `skill_backfill_cli.py` connects via
+    """Snape review, round 3 (and the narrower round-4 correction on this
+    same test): `docs/reports/process-metrics/2026-11-16-schedule-fire-
+    evidence.md` had claimed the Schedule-fire run was "全程只读", but
+    `skill_backfill_cli.py` connects via
     `connect_existing_without_migrating()`, which is read-WRITE capable —
     it has to be, since inserting a new `skill_candidates` row IS the one
-    real write point §3.3 calls for. That a particular run against
-    production happened to write nothing (nothing crossed the threshold)
-    was an observed fact about THAT run, not a structural guarantee the
-    evidence doc was entitled to generalize from. This is the durable,
-    re-runnable proof instead: a full before/after row-count diff across
-    EVERY table in the database, through the REAL CLI entrypoint
-    (subprocess, not a direct Python call) against a disposable db —
-    never production — in a scenario that DOES cross the threshold,
-    asserting the only table that changes is `skill_candidates`, by
-    exactly the one row the detector creates."""
+    real write point §3.3 calls for. This test is a narrower, honestly-
+    scoped proof, run through the REAL CLI entrypoint (subprocess, not a
+    direct Python call) against a disposable db — never production — in a
+    scenario that DOES cross the threshold: in THIS scenario, the only
+    table whose ROW COUNT changes is `skill_candidates`, by exactly the
+    one row the detector creates. A row-count diff is NOT a full
+    content/schema audit — it cannot catch an UPDATE, or a same-table
+    delete+insert that nets to the same count, in some other table. Don't
+    cite this as proof no other table was touched; cite it as: in this
+    run, these were the row-count deltas."""
     rt = health_runtime
     await _approve_skill(rt)
     await _run_with_outcome(rt, "failed", seq=1)

@@ -23,20 +23,26 @@
     `skill_candidates` 插入新候补正是 §3.3 要求的"唯一写点"本身,不可能做成
     只读连接。这次真实运行打印了"no skill crossed the co-occurrence
     threshold; nothing flagged",按代码路径(`detect_and_flag_corroded_
-    skills` 的插入调用只在阈值判定通过的分支里才会执行)可以确定**这一次
-    具体执行确实零写入**,但这是"这次运行恰好没写"的事实,不是"这条连接
-    不能写"的结构性保证——此前文档把后者当结论来写,是过度概括。
-  - "skill_backfill_cli.py 具备写能力的连接只会动 skill_candidates 表、
-    不会动别的"这条结构性断言,已经用一个独立、可重跑的测试
+    skills` 的插入调用只在阈值判定通过的分支里才会执行)可以确定**该次 CLI
+    未创建新候补**——但本次没有采集进程级文件写入审计(如 `dtrace`/
+    `fs_usage` 之类的系统调用追踪),**不能据此确认部署目录零写入,也不能
+    独立归因 WAL 文件的变化**(Snape 复核第三轮再次纠正:"未创建候补"只是
+    对 `skill_candidates` 这一张表、通过应用层观察到的事实,不是对整个文件
+    系统写入行为的审计结论,此前的措辞仍把两者混为一谈)。
+  - 下面这条更窄、经得住复核的断言,已经用一个独立、可重跑的测试
     (`tests/test_skill_health.py::
     test_skill_backfill_cli_only_ever_writes_skill_candidates`)在**一次性
-    临时数据库**上验证——构造真实涉败场景、跑真实 CLI 子进程、对全部表的
-    行数做改前/改后 diff,断言唯一变化的表是 `skill_candidates`、且恰好
-    +1 行。这条证据不依赖、也不需要再碰生产库。
-  - `/Users/wuzhongheng/owlery-deploy/` 与真实 `~/.owlery` 全程未被写入
-    (`owlery.db-wal` 的 mtime 变化来自生产自身持续运行的 `owlery serve`
-    进程的正常写流量,与本次任一连接无关)——这条"确实没写"的结论没有变,
-    变的只是"命令②的连接本身是不是只读"这句措辞。
+    临时数据库**上验证:构造真实涉败场景、跑真实 CLI 子进程、对全部表的
+    行数做改前/改后 diff,**该场景下唯一行数发生变化的表是
+    `skill_candidates`,且恰好 +1 行**。这只是行数对比,不是逐行内容/schema
+    比对,检测不出"同表内等量删除+插入"或"UPDATE 未改变行数"这类变更——
+    不构成"其余表内容完全不变"的结构性证明,只构成这一条更窄的事实。这条
+    证据不依赖、也不需要再碰生产库。
+  - `/Users/wuzhongheng/owlery-deploy/` 与真实 `~/.owlery`:本次没有做文件
+    级写入审计,因此同样不宣称"全程零写入"——只能确认命令①的连接结构上
+    不可能写(`mode=ro`),命令②"未创建新候补"是观察到的应用层事实,
+    `owlery.db-wal` 的 mtime 变化**未被独立归因**到生产自身进程还是本次
+    操作,两者都缺乏进程级审计证据去区分。
 
 ## 1. 创建 Schedule(真实 REST API,非内部直调 Python 函数)
 
@@ -132,10 +138,15 @@ GET    http://127.0.0.1:8923/api/schedules → []
 ```
 
 随后:kill 服务进程(PID 22549)→ 确认 `lsof -i :8923` 为空 → 删除全部临时
-`/tmp/owlery-schedule-proof-*` 目录 → 核实
-`/Users/wuzhongheng/owlery-deploy/owlery.db{,-shm,-wal}` 与真实 `~/.owlery`
-未被本次操作写入(`owlery.db-wal` 的 mtime 变化来自生产自身持续运行的
-`owlery serve` 进程的正常写流量,与本次只读连接无关——读连接从不写源文件)。
+`/tmp/owlery-schedule-proof-*` 目录。
+
+关于生产目录是否被写入(Snape 复核第三轮纠正,见上方"隔离范围的如实说明"):
+本次没有做进程级文件写入审计,**不宣称** `/Users/wuzhongheng/owlery-deploy/`
+或真实 `~/.owlery` "全程零写入"。能确认的只是:命令①的连接结构上不可能写
+(`mode=ro`);命令②在应用层未创建新候补(观察到的事实,不是文件系统层的
+审计结论)。`owlery.db-wal` 的 mtime 变化**未被独立归因**——既没有证据证明
+是本次操作所致,也没有证据排除,只是把它留在"未审计"这一类,而不是像此前
+版本那样直接断言"与本次只读连接无关"。
 
 ## 复核方法(供独立核验)
 
