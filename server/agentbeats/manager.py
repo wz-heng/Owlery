@@ -190,18 +190,32 @@ class AgentBeatsExamManager:
         `bind()`, after `SessionManager.initialize()` has already loaded
         every persisted session into `session_mgr.sessions` (true for
         `bind()`'s one real caller, `main.py`'s lifespan — it runs
-        `initialize()` first)."""
-        agents = await self.agent_mgr.list_agents(include_archived=True)
-        stale_agent_ids = [
-            a["id"] for a in agents if a["name"].startswith(_EXAM_AGENT_NAME_PREFIX)
-        ]
-        if not stale_agent_ids:
+        `initialize()` first).
+
+        Name prefix alone is not a safe deletion key — nothing stops a
+        user from naming their own agent `tb-exam-whatever`, and a brand
+        new one would have zero sessions, so it'd otherwise sail through
+        `delete_agent`'s own "no live sessions" guard untouched. An agent
+        only counts as a leftover if it *also* owns a session with
+        `origin="agentbeats"` — a value nothing in the public API lets a
+        user set (`CreateSessionRequest` has no `origin` field; only this
+        manager's own `_start_task` ever passes it) — so `stale_agent_ids`
+        is derived from the matched sessions, never from name matching on
+        its own.
+        """
+        agents_by_id = {
+            a["id"]: a for a in await self.agent_mgr.list_agents(include_archived=True)
+            if a["name"].startswith(_EXAM_AGENT_NAME_PREFIX)
+        }
+        if not agents_by_id:
             return
-        stale_agent_ids_set = set(stale_agent_ids)
         stale_sessions = [
             s for s in self.session_mgr.sessions.values()
-            if s.agent_id in stale_agent_ids_set and s.origin == "agentbeats"
+            if s.agent_id in agents_by_id and s.origin == "agentbeats"
         ]
+        stale_agent_ids = {s.agent_id for s in stale_sessions}
+        if not stale_agent_ids:
+            return
         for session in stale_sessions:
             try:
                 await self.session_mgr.delete_session(session.id)

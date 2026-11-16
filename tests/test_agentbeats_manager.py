@@ -403,3 +403,31 @@ async def test_bind_sweeps_exam_leftovers_from_a_previous_process():
     finally:
         await new_exam_mgr.shutdown()
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_bind_sweep_never_touches_a_same_named_personal_agent():
+    """Name prefix alone must never be the deletion key: nothing stops a
+    user from naming their own agent `tb-exam-whatever`, and the public
+    API has no `origin` field at all (`CreateSessionRequest` doesn't
+    accept one -- only this manager's own `_start_task` ever sets
+    `origin="agentbeats"`), so a personal agent sharing the prefix, with
+    no `agentbeats`-origin session, must survive the startup sweep even
+    with zero sessions (which would otherwise sail straight through
+    `delete_agent`'s own "no live sessions" guard)."""
+    db = Database(":memory:")
+    await db.initialize()
+    agent_mgr = AgentManager(db)
+    session_mgr = SessionManager()
+    await session_mgr.initialize(db)
+
+    personal_agent = await agent_mgr.create_agent(name=f"{_EXAM_AGENT_NAME_PREFIX}personal")
+
+    exam_mgr = AgentBeatsExamManager()
+    try:
+        await exam_mgr.bind(session_mgr=session_mgr, agent_mgr=agent_mgr)
+
+        assert await agent_mgr.get_agent(personal_agent["id"]) is not None
+    finally:
+        await exam_mgr.shutdown()
+        await db.close()

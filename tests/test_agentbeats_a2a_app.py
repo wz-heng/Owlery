@@ -150,8 +150,83 @@ async def a2a_client():
     await db.close()
 
 
-async def _send(hc: httpx.AsyncClient, text: str, context_id: str | None):
-    resolver = A2ACardResolver(httpx_client=hc, base_url="http://test")
+@pytest.fixture
+async def a2a_client_subpath():
+    """Mirrors the dev-mode (web/dist present) branch exactly: A2A lives
+    at a sub-path, and the card advertises it *with* the trailing slash
+    (`a2a_mount_path_and_card_url`'s fix) rather than relying on a
+    redirect — httpx.AsyncClient defaults to `follow_redirects=False`,
+    same as the real green agent's own a2a-sdk client, so this fixture
+    only works end to end if the trailing slash is actually right."""
+    from starlette.applications import Starlette
+    from starlette.routing import Mount
+
+    db = Database(":memory:")
+    await db.initialize()
+    session_mgr = SessionManager()
+    await session_mgr.initialize(db)
+    agent_mgr = AgentManager(db)
+    exam_mgr = AgentBeatsExamManager()
+    await exam_mgr.bind(session_mgr=session_mgr, agent_mgr=agent_mgr)
+    inner_app = build_a2a_app(exam_mgr, card_url="http://test/a2a/")
+    wrapper = Starlette(routes=[Mount("/a2a", app=inner_app)])
+
+    transport = httpx.ASGITransport(app=wrapper)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        yield hc, session_mgr, exam_mgr
+    await exam_mgr.shutdown()
+    await db.close()
+
+
+async def test_a2a_subpath_card_advertises_a_url_reachable_without_redirect(
+    a2a_client_subpath,
+):
+    """The actual communication the mount-path fix exists for, not just
+    the card's advertised string: resolve the card, then call back
+    through a real A2A message using exactly the URL it advertises."""
+    hc, session_mgr, exam_mgr = a2a_client_subpath
+
+    def factory(s, agent=None, connectors=None, **_kw):
+        class ScriptedBackend:
+            name = "scripted"
+
+            async def start(self, prompt, working_dir, resume_id=None, credential=None):
+                pass
+
+            def stream(self):
+                async def _gen():
+                    exam_mgr.record_decision(
+                        s.id, {"kind": "exec", "command": "ls", "timeout": 10}
+                    )
+                    yield HarnessEvent(type="result", session_id="x", cost=0.004)
+
+                return _gen()
+
+            async def stop(self):
+                pass
+
+        return ScriptedBackend()
+
+    session_mgr._make_run = factory  # type: ignore[method-assign]
+
+    task_payload = json.dumps(
+        {"kind": "task", "protocol": "terminal-bench-shell-v1", "instruction": "do X"}
+    )
+    event, agent_card = await _send(
+        hc, task_payload, context_id=None, base_url="http://test/a2a/"
+    )
+
+    assert agent_card.url == "http://test/a2a/"
+    task, _update = event
+    assert task.status.state.value == "completed"
+    decision = json.loads(task.artifacts[0].parts[0].root.text)
+    assert decision == {"kind": "exec_request", "command": "ls", "timeout": 10}
+
+
+async def _send(
+    hc: httpx.AsyncClient, text: str, context_id: str | None, *, base_url: str = "http://test"
+):
+    resolver = A2ACardResolver(httpx_client=hc, base_url=base_url)
     agent_card = await resolver.get_agent_card()
     factory = ClientFactory(ClientConfig(httpx_client=hc, streaming=False))
     client = factory.create(agent_card)
