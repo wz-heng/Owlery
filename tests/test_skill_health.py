@@ -1,0 +1,348 @@
+"""server/skill_health.py — skill co-occurrence health check
+(process-metrics.md §3.3, "技能成败回填"). Builds real Task Board tasks/runs
+through `TaskRepository` (not raw SQL) so `task_runs.state` carries the same
+FK-enforced, lifecycle-correct values production does, then drives real
+`skill_invocations` rows through `SkillRegistry.record_usage` — the exact
+path a live session's Skill tool use takes."""
+
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from server.config import settings
+from server.database import Database
+from server.skill_health import (
+    AUTO_FLAG_MARKER,
+    MIN_FAILURE_RATE,
+    MIN_INVOCATIONS,
+    detect_and_flag_corroded_skills,
+)
+from server.skill_registry import SkillRegistry
+from server.task_board.repository import TaskRepository
+
+SLUG = "hermes-pr-flow"
+DESCRIPTION = "How to open a PR against an external repo."
+
+
+def _skill_body(name: str = SLUG, description: str = DESCRIPTION) -> str:
+    return f"---\nname: {name}\ndescription: {description}\n---\n\nBody content.\n"
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+
+@pytest.fixture
+async def health_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    _git(repo_dir, "init", "-q")
+    _git(repo_dir, "config", "user.name", "Test")
+    _git(repo_dir, "config", "user.email", "test@example.com")
+    (repo_dir / "README.md").write_text("base\n")
+    _git(repo_dir, "add", "README.md")
+    _git(repo_dir, "commit", "-q", "-m", "base")
+
+    monkeypatch.setattr(settings, "task_workspaces_dir", str(tmp_path / "workspaces"))
+    monkeypatch.setattr(settings, "task_artifacts_dir", str(tmp_path / "artifacts"))
+
+    db_path = str(tmp_path / "health.db")
+    db = Database(db_path)
+    await db.initialize()
+    task_repo = TaskRepository(db_path)
+    await task_repo.initialize()
+    agent = await db.get_default_agent()
+
+    from types import SimpleNamespace
+
+    session_mgr = SimpleNamespace(
+        sessions={"session-1": SimpleNamespace(agent_id=agent["id"], working_dir=str(repo_dir))}
+    )
+    reg = SkillRegistry()
+    reg.bind(db=db, session_mgr=session_mgr)
+
+    board = await task_repo.create_board(name="Board", working_dir=str(repo_dir))
+    # Resolve the same way `propose()` resolves it internally (via `git
+    # rev-parse --git-common-dir`) rather than trusting the raw tmp_path
+    # string — on macOS `/tmp` is itself a symlink, so a raw-string
+    # `repository` passed to `record_usage` can silently mismatch the
+    # resolved one `propose()` stored, making the lookup return no match
+    # and the invocation record silently (record_usage never raises) vanish.
+    repository = await reg.resolve_repository(str(repo_dir))
+
+    try:
+        yield SimpleNamespace(
+            db=db, task_repo=task_repo, reg=reg, agent_id=agent["id"],
+            board_id=board.id, repo_dir=repo_dir, repository=repository,
+        )
+    finally:
+        await task_repo.close()
+        await db.close()
+
+
+async def _run_with_outcome(rt, outcome: str, *, seq: int):
+    """Create one task + one run reaching the given terminal `task_runs`
+    state, then record a skill invocation against that run — mirroring a
+    live session invoking the skill mid-task."""
+    task = await rt.task_repo.create_task(
+        board_id=rt.board_id,
+        title=f"Task {seq}",
+        body="body",
+        status="todo",
+        assignee_agent_id=rt.agent_id,
+    )
+    run = await rt.task_repo.claim_ready(
+        task.id,
+        workspace_mode="git_worktree",
+        workspace_path=str(rt.repo_dir.parent / f"ws-{seq}"),
+        run_id=f"run-{seq}",
+    )
+    if outcome == "completed":
+        await rt.task_repo.complete_run(task.id, run.id, summary="done")
+    elif outcome == "failed":
+        await rt.task_repo.fail_run(task.id, run.id, error="boom")
+    elif outcome == "blocked":
+        await rt.task_repo.block_run(task.id, run.id, reason="needs input")
+    elif outcome == "interrupted":
+        await rt.task_repo.interrupt_run(task.id, run.id, reason="watchdog")
+    elif outcome == "cancelled":
+        await rt.task_repo.cancel_run(task.id, run.id)
+    else:
+        raise ValueError(outcome)
+
+    await rt.reg.record_usage(
+        SLUG, agent_id=rt.agent_id, repository=rt.repository,
+        task_id=task.id, run_id=run.id,
+    )
+    return task, run
+
+
+async def _approve_skill(rt, **overrides):
+    kwargs = dict(
+        session_id="session-1",
+        slug=SLUG,
+        title="Hermes PR flow",
+        description=DESCRIPTION,
+        body_markdown=_skill_body(),
+        rationale="Walked this once, will recur.",
+    )
+    kwargs.update(overrides)
+    candidate = await rt.reg.propose(**kwargs)
+    return await rt.reg.approve(candidate["id"])
+
+
+def test_threshold_constants_match_process_metrics_frozen_baseline():
+    # process-metrics.md §3.3: "涉败率 ≥ 50% 且总调用 ≥ 3" — frozen on first
+    # report; changing either number is a baseline change, not a tuning knob.
+    assert MIN_INVOCATIONS == 3
+    assert MIN_FAILURE_RATE == 0.5
+
+
+@pytest.mark.asyncio
+async def test_detect_and_flag_creates_candidate_when_threshold_crossed(health_runtime):
+    rt = health_runtime
+    await _approve_skill(rt)
+    # failed, blocked, completed → 2/3 fail-like = 66.7% ≥ 50%, eligible=3 ≥ 3.
+    # interrupted is the environmental carve-out — must not count either way.
+    await _run_with_outcome(rt, "failed", seq=1)
+    await _run_with_outcome(rt, "blocked", seq=2)
+    await _run_with_outcome(rt, "completed", seq=3)
+    await _run_with_outcome(rt, "interrupted", seq=4)
+
+    created = await detect_and_flag_corroded_skills(rt.db)
+
+    assert len(created) == 1
+    flagged = created[0]
+    assert flagged["status"] == "pending"
+    assert flagged["slug"] == SLUG
+    assert flagged["title"] == "[涉败告警] Hermes PR flow"
+    # Body/description copied verbatim — approving this is a safe no-op
+    # re-affirmation, never an auto-edit of the skill's actual content.
+    assert flagged["body_markdown"] == _skill_body()
+    assert flagged["description"] == DESCRIPTION
+    assert AUTO_FLAG_MARKER in flagged["rationale"]
+    assert "66%" in flagged["rationale"] or "67%" in flagged["rationale"]
+    # The anchor task/run is one of the fail-like ones — gives the review
+    # page's existing single "open task" evidence link a real target.
+    anchor_tasks = {f"run-1", f"run-2"}
+    assert flagged["run_id"] in anchor_tasks
+    assert flagged["lint_results"]["slug_conflict"] is True
+
+    # The review queue now shows it alongside the approved original.
+    pending = await rt.db.list_skill_candidates(status="pending")
+    assert [c["id"] for c in pending] == [flagged["id"]]
+
+
+@pytest.mark.asyncio
+async def test_detect_and_flag_excludes_environmental_states_from_denominator(health_runtime):
+    rt = health_runtime
+    await _approve_skill(rt)
+    # 1 failed + 2 completed = 3 eligible, 33% fail rate: below 50% threshold
+    # EVEN THOUGH there are also 5 interrupted/cancelled runs that would tip
+    # it over 50% if wrongly counted as fail-like or even just as eligible.
+    await _run_with_outcome(rt, "failed", seq=1)
+    await _run_with_outcome(rt, "completed", seq=2)
+    await _run_with_outcome(rt, "completed", seq=3)
+    for seq in (4, 5, 6):
+        await _run_with_outcome(rt, "interrupted", seq=seq)
+    for seq in (7, 8):
+        await _run_with_outcome(rt, "cancelled", seq=seq)
+
+    created = await detect_and_flag_corroded_skills(rt.db)
+    assert created == []
+
+
+@pytest.mark.asyncio
+async def test_detect_and_flag_requires_minimum_invocations(health_runtime):
+    rt = health_runtime
+    await _approve_skill(rt)
+    # 2 eligible, both fail-like (100%) — rate clears the bar but the
+    # MIN_INVOCATIONS floor (3) does not; too thin a sample to flag.
+    await _run_with_outcome(rt, "failed", seq=1)
+    await _run_with_outcome(rt, "blocked", seq=2)
+
+    created = await detect_and_flag_corroded_skills(rt.db)
+    assert created == []
+
+
+@pytest.mark.asyncio
+async def test_detect_and_flag_requires_minimum_failure_rate(health_runtime):
+    rt = health_runtime
+    await _approve_skill(rt)
+    # 4 eligible, 1 fail-like = 25% < 50%.
+    await _run_with_outcome(rt, "failed", seq=1)
+    await _run_with_outcome(rt, "completed", seq=2)
+    await _run_with_outcome(rt, "completed", seq=3)
+    await _run_with_outcome(rt, "completed", seq=4)
+
+    created = await detect_and_flag_corroded_skills(rt.db)
+    assert created == []
+
+
+@pytest.mark.asyncio
+async def test_detect_and_flag_is_idempotent_while_the_flag_is_still_pending(health_runtime):
+    rt = health_runtime
+    await _approve_skill(rt)
+    await _run_with_outcome(rt, "failed", seq=1)
+    await _run_with_outcome(rt, "blocked", seq=2)
+    await _run_with_outcome(rt, "completed", seq=3)
+
+    first = await detect_and_flag_corroded_skills(rt.db)
+    assert len(first) == 1
+
+    # Another co-occurring failure shows up, but the open flag from the
+    # first scan hasn't been reviewed yet — must not spam a second one.
+    await _run_with_outcome(rt, "failed", seq=4)
+    second = await detect_and_flag_corroded_skills(rt.db)
+    assert second == []
+    pending = await rt.db.list_skill_candidates(status="pending")
+    assert len(pending) == 1
+
+
+@pytest.mark.asyncio
+async def test_detect_and_flag_reflags_after_the_prior_flag_is_resolved(health_runtime):
+    rt = health_runtime
+    await _approve_skill(rt)
+    await _run_with_outcome(rt, "failed", seq=1)
+    await _run_with_outcome(rt, "blocked", seq=2)
+    await _run_with_outcome(rt, "completed", seq=3)
+
+    first = await detect_and_flag_corroded_skills(rt.db)
+    assert len(first) == 1
+    await rt.reg.reject(first[0]["id"], review_note="false alarm, unrelated env flake")
+
+    await _run_with_outcome(rt, "failed", seq=4)
+    second = await detect_and_flag_corroded_skills(rt.db)
+    assert len(second) == 1
+
+
+@pytest.mark.asyncio
+async def test_detect_and_flag_follows_a_same_scope_revision_but_keeps_shared_lineage_history(
+    health_runtime,
+):
+    rt = health_runtime
+    await _approve_skill(rt)
+    await _run_with_outcome(rt, "failed", seq=1)
+    await _run_with_outcome(rt, "blocked", seq=2)
+    await _run_with_outcome(rt, "completed", seq=3)
+
+    # A later, same-scope revision is approved. `approve()`'s `superseded_at`
+    # marking only fires on a SCOPE change (a relocation) — a same-scope
+    # re-approval leaves the prior row's `superseded_at` NULL forever, and
+    # `list_skill_candidates(status='approved')` orders newest-first, so the
+    # revision (not the original) is the one `detect_and_flag` evaluates for
+    # this lineage. It has zero invocations of its OWN, but
+    # `list_skill_invocations_for_lineage` groups by (slug, scope, agent,
+    # repository) rather than by candidate row id — so the prior failures
+    # still belong to "this skill" and must still surface.
+    revision = await rt.reg.propose(
+        session_id="session-1", slug=SLUG, title="Hermes PR flow",
+        description=DESCRIPTION, body_markdown=_skill_body() + "\nMore.\n",
+        rationale="Hand-authored revision, unrelated to the auto-flag.",
+    )
+    await rt.reg.approve(revision["id"])
+    assert (await rt.db.get_skill_candidate(revision["id"]))["superseded_at"] is None
+
+    created = await detect_and_flag_corroded_skills(rt.db)
+    assert len(created) == 1
+    assert created[0]["slug"] == SLUG
+    # Anchored off the active (revision) row's identity, not the dead one.
+    assert created[0]["proposed_by_agent_id"] == revision["proposed_by_agent_id"]
+
+
+@pytest.mark.asyncio
+async def test_detect_and_flag_ignores_a_cross_scope_superseded_row(health_runtime):
+    rt = health_runtime
+    await _approve_skill(rt)  # agent+repo (default)
+    await _run_with_outcome(rt, "failed", seq=1)
+    await _run_with_outcome(rt, "blocked", seq=2)
+    await _run_with_outcome(rt, "completed", seq=3)
+
+    # Relocating to agent-global IS a scope change — this one really does
+    # mark the prior row `superseded_at` and de-materializes it. The
+    # now-dead `agent+repo` row must not be separately evaluated under its
+    # own (now-defunct) lineage key just because `superseded_at` wasn't
+    # checked.
+    global_revision = await rt.reg.propose(
+        session_id="session-1", slug=SLUG, title="Hermes PR flow",
+        description=DESCRIPTION, body_markdown=_skill_body() + "\nGlobal.\n",
+        rationale="Relocating to agent-global.", scope="agent-global",
+    )
+    approved_global = await rt.reg.approve(global_revision["id"])
+    assert approved_global["superseded_at"] is None
+    old_candidates = await rt.db.list_skill_candidates(status="approved")
+    old_row = next(c for c in old_candidates if c["scope"] == "agent+repo")
+    assert old_row["superseded_at"] is not None
+
+    # The relocated (agent-global) lineage has zero invocations of its own
+    # — below MIN_INVOCATIONS — so nothing should be flagged at all.
+    created = await detect_and_flag_corroded_skills(rt.db)
+    assert created == []
+
+
+@pytest.mark.asyncio
+async def test_detect_and_flag_never_raises_on_a_lineage_with_a_dangling_run_id(health_runtime, monkeypatch):
+    rt = health_runtime
+    await _approve_skill(rt)
+    await _run_with_outcome(rt, "failed", seq=1)
+    await _run_with_outcome(rt, "blocked", seq=2)
+    await _run_with_outcome(rt, "completed", seq=3)
+
+    # Simulate a run_id that no longer resolves (e.g. a race with cascade
+    # delete) by monkeypatching get_run_summary to blow up for one id.
+    original_get_run_summary = rt.db.get_run_summary
+
+    async def flaky(run_id):
+        if run_id == "run-2":
+            raise RuntimeError("simulated dangling row")
+        return await original_get_run_summary(run_id)
+
+    monkeypatch.setattr(rt.db, "get_run_summary", flaky)
+
+    # The whole lineage is skipped for this scan rather than raising and
+    # taking the entire job down — it'll be re-evaluated clean next run.
+    created = await detect_and_flag_corroded_skills(rt.db)
+    assert created == []
