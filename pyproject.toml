@@ -24,6 +24,13 @@ dependencies = [
     # pulled in transitively by uvicorn[standard]; pinned explicitly since
     # server/routers/memory.py imports it directly.
     "pyyaml>=6.0",
+    # AgentBeats A2A adapter (docs/plans/agentbeats-a2a-adapter.md) —
+    # server/agentbeats/ speaks the A2A protocol as a purple (competitor)
+    # agent. Pinned exact, not a floor: 1.x changed the server-app API
+    # (`a2a.server.apps` is gone) and we need to interoperate with the real
+    # Terminal Bench 2.0 green agent, whose own uv.lock locks exactly this
+    # version (RDI-Foundation/terminal-bench-green).
+    "a2a-sdk[http-server]==0.3.20",
 ]
 
 [project.optional-dependencies]

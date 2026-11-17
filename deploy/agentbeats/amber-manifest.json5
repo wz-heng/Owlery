@@ -1,0 +1,58 @@
+// AgentBeats purple-agent manifest for Owlery's Terminal Bench 2.0 adapter.
+// Shape ported from RDI-Foundation/agent-template's amber-manifest.json5
+// (docs/plans/agentbeats-a2a-adapter.md §1-2). NOT registered with amber or
+// agentbeats.dev in this phase — build-ready only, per the Phase 1 task
+// card's "不做清单" (no registration, no publishing).
+{
+  manifest_version: "0.1.0",
+
+  config_schema: {
+    type: "object",
+    properties: {
+      // Never baked into the image (deploy/agentbeats/Dockerfile) — amber
+      // injects this as a runtime env var; Claude Code's own subprocess
+      // spawn picks it up via ambient-env inheritance
+      // (server/harness/run.py), no Owlery DB credential row involved.
+      anthropic_api_key: { type: "string", secret: true },
+    },
+    required: ["anthropic_api_key"],
+    additionalProperties: false,
+  },
+
+  slots: {
+    proxy: { kind: "a2a", optional: true },
+  },
+
+  program: {
+    // TODO (not done in this phase — zero public submission, per the task
+    // card's red line): replace with the real pushed image once Phase 2
+    // is authorized.
+    image: "ghcr.io/<your-username>/owlery-agentbeats:latest",
+    entrypoint: "uvicorn server.main:app --host 0.0.0.0 --port 9010",
+
+    env: {
+      ANTHROPIC_API_KEY: "${config.anthropic_api_key}",
+    },
+
+    network: {
+      endpoints: [
+        { name: "a2a_endpoint", port: 9010 },
+      ],
+    },
+  },
+
+  provides: {
+    a2a: { kind: "a2a", endpoint: "a2a_endpoint" },
+  },
+
+  exports: { a2a: "a2a" },
+
+  metadata: {
+    // UNVERIFIED (agentbeats-a2a-adapter.md §3): this server mounts the A2A
+    // endpoint at /a2a, not at root like agent-template's reference purple
+    // agent. Whether the real platform's gateway assumes a root-mounted
+    // purple agent URL is unconfirmed without registering a real agent,
+    // which this phase's red line forbids — flagged, not silently assumed.
+    a2a_path_note: "endpoint serves the A2A protocol under /a2a, not /",
+  },
+}

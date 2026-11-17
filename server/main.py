@@ -17,6 +17,8 @@ from fastapi.staticfiles import StaticFiles
 
 from .auth import verify_token
 
+from .agentbeats.app import a2a_mount_path_and_card_url, build_a2a_app
+from .agentbeats.manager import agentbeats_exam_manager
 from .bg_tasks import bg_task_manager
 from .delegations import delegation_manager
 from .research import research_manager
@@ -29,7 +31,7 @@ from .legacy_rename import migrate_legacy_state, rewrite_legacy_paths
 from .notifiers import notifier_manager
 from .agent_manager import AgentManager
 from .connector_manager import ConnectorManager
-from .routers import agents, attachments, bg_tasks as bg_tasks_router, budgets as budgets_router, connectors, credentials, delegations as delegations_router, files, memory as memory_router, notifiers, questions, research as research_router, schedules, sessions, skills as skills_router, task_boards as task_boards_router, usage as usage_router, ws
+from .routers import agents, attachments, bg_tasks as bg_tasks_router, budgets as budgets_router, connectors, credentials, delegations as delegations_router, files, memory as memory_router, notifiers, questions, research as research_router, schedules, sessions, skills as skills_router, task_boards as task_boards_router, tbexec as tbexec_router, usage as usage_router, ws
 from .parked_turns import ParkedTurnRunner
 from .scheduler import ScheduleRunner
 from .session_manager import session_manager
@@ -158,6 +160,9 @@ async def lifespan(app: FastAPI):
     usage_router._db = db
     budgets_router._db = db
     agents.set_manager(AgentManager(db))
+    # AgentManager is stateless CRUD over `db` (agent_manager.py docstring);
+    # a second instance here is equivalent, not a second source of truth.
+    await agentbeats_exam_manager.bind(session_mgr=session_manager, agent_mgr=AgentManager(db))
     connectors.set_manager(ConnectorManager(db))
     credentials.set_db(db)
     notifiers.set_db(db)
@@ -288,12 +293,18 @@ async def lifespan(app: FastAPI):
     await research_manager.shutdown()
     await bg_task_manager.shutdown()
     delegation_manager.shutdown()
+    await agentbeats_exam_manager.shutdown()
     await session_manager.shutdown_session_injections()
     await task_repository.close()
     await db.close()
 
 
 app = FastAPI(title="Owlery", version="0.1.0", lifespan=lifespan)
+
+# Built frontend, if present (dev checkouts / local-deploy slots). Computed
+# up front because both the A2A mount path below and the SPA catch-all
+# further down branch on its presence.
+_dist_dir = Path(__file__).resolve().parent.parent / "web" / "dist"
 
 app.add_middleware(
     CORSMiddleware,
@@ -308,6 +319,7 @@ app.include_router(sessions.router)
 app.include_router(attachments.router)
 app.include_router(files.router)
 app.include_router(bg_tasks_router.router)
+app.include_router(tbexec_router.router)
 app.include_router(delegations_router.router)
 app.include_router(research_router.router)
 app.include_router(task_boards_router.router)
@@ -378,9 +390,26 @@ async def _running_deploy_sha_slot() -> tuple[str | None, str | None]:
     return sha, slot
 
 
+# A2A sub-app (AgentBeats adapter, agentbeats-a2a-adapter.md). A Mount, not
+# an APIRoute, so — like the Feishu webhook route above — it must be
+# registered after every explicit API route above (otherwise, root-mounted
+# per below, it would greedily swallow them — Starlette commits to the
+# first Mount whose prefix matches, including a root Mount matching
+# everything) and before the "/" SPA StaticFiles catch-all below (Starlette
+# never falls through to a later Mount, so appending this after "/" would
+# make it permanently 404). See `a2a_mount_path_and_card_url`'s docstring
+# for why the mount path itself is conditional.
+_a2a_mount_path, _a2a_card_url = a2a_mount_path_and_card_url(
+    dist_dir_exists=_dist_dir.is_dir(), port=settings.port
+)
+app.mount(
+    _a2a_mount_path,
+    build_a2a_app(agentbeats_exam_manager, card_url=_a2a_card_url),
+    name="a2a",
+)
+
 # Serve built frontend as static files (SPA catch-all).
 # Mounted after API routes so /api/*, /ws, /health take priority.
-_dist_dir = Path(__file__).resolve().parent.parent / "web" / "dist"
 if _dist_dir.is_dir():
     app.mount("/", StaticFiles(directory=str(_dist_dir), html=True), name="spa")
 

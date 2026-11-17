@@ -39,7 +39,18 @@ _BUILTIN_MODULES = {
     # Skill candidate proposal (experience-consolidation.md §3.3/§3.4). Thin
     # shim to /api/sessions/{sid}/skills/candidates in front of SkillRegistry.
     "skills": "server.mcp_servers.skills",
+    # terminal-bench-shell-v1 decision relay for the AgentBeats A2A exam
+    # agent (agentbeats-a2a-adapter.md §2). Deliberately NOT in
+    # `DEFAULT_MCP_SERVERS` and excluded from the `mcp_servers=None` ("all
+    # builtins") expansion below — reachable only by a session that
+    # explicitly opts in, never by a production agent's unrestricted set.
+    "tbexec": "server.mcp_servers.tbexec",
 }
+
+# Builtins excluded from the `mcp_servers=None` ("all") expansion in
+# `select_mcp_servers` — opt-in only, regardless of how "unrestricted" an
+# agent's own selection is.
+_EXAM_ONLY_BUILTINS = frozenset({"tbexec"})
 
 
 def repo_root() -> str:
@@ -74,9 +85,10 @@ def select_mcp_servers(
     connectors: list[tuple[Any, Any]],
     callback_env: dict[str, str],
 ) -> list[McpServerEntry]:
-    """The built-in servers the agent enabled (None = all builtins) plus one
-    entry per enabled connector installation. Order is stable: bg, ask, then
-    connectors — so rendered argv is deterministic for tests. Unknown names in
+    """The built-in servers the agent enabled (None = all builtins except
+    `_EXAM_ONLY_BUILTINS`, which are opt-in only) plus one entry per enabled
+    connector installation. Order is stable: bg, ask, then connectors — so
+    rendered argv is deterministic for tests. Unknown names in
     `mcp_servers` (e.g. a legacy `"viewer"` from before the viewer became a
     client-only flow) are silently filtered."""
     builtin_specs: dict[str, dict[str, Any]] = {
@@ -110,11 +122,18 @@ def select_mcp_servers(
             "args": ["-m", _BUILTIN_MODULES["skills"]],
             "env": dict(callback_env),
         },
+        "tbexec": {
+            "command": sys.executable,
+            "args": ["-m", _BUILTIN_MODULES["tbexec"]],
+            "env": dict(callback_env),
+        },
     }
     if mcp_servers is not None:
         selected = {k: v for k, v in builtin_specs.items() if k in mcp_servers}
     else:
-        selected = builtin_specs
+        selected = {
+            k: v for k, v in builtin_specs.items() if k not in _EXAM_ONLY_BUILTINS
+        }
 
     entries: list[McpServerEntry] = [
         McpServerEntry(key=key, command=spec["command"], args=spec["args"], env=spec["env"])
